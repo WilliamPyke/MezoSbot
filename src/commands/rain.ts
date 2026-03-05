@@ -1,5 +1,5 @@
 import { EmbedBuilder, type ChatInputCommandInteraction, type TextChannel } from "discord.js";
-import { subtractBalance, addBalance } from "../balance.js";
+import { subtractBalance, addBalance, getBalance } from "../balance.js";
 import { registerDepositAddress } from "../evm.js";
 import { formatSats, roundSats } from "../format.js";
 
@@ -22,9 +22,14 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     return interaction.reply({ content: "❌ Rain only works in text channels.", ephemeral: true });
   }
 
-  await interaction.deferReply();
-
   const totalAmount = interaction.options.getNumber("amount", true);
+
+  const balance = await getBalance(interaction.user.id);
+  if (balance < totalAmount) {
+    return interaction.reply({ content: "❌ Insufficient balance.", ephemeral: true });
+  }
+
+  await interaction.deferReply();
   const count = interaction.options.getInteger("count", true);
 
   // Fetch recent messages, sort newest-first, pick the last N unique users

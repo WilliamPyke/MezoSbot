@@ -1,6 +1,6 @@
 import type { ChatInputCommandInteraction } from "discord.js";
 import { supabase } from "../db.js";
-import { subtractBalance } from "../balance.js";
+import { subtractBalance, getBalance } from "../balance.js";
 import { roundSats } from "../format.js";
 import { buildDropEmbed, buildClaimButton, type Drop } from "../drops.js";
 
@@ -24,6 +24,11 @@ export async function execute(interaction: ChatInputCommandInteraction) {
       content: "❌ `per_claim` × `max_claims` cannot exceed `total`.",
       ephemeral: true,
     });
+  }
+
+  const balance = await getBalance(interaction.user.id);
+  if (balance < total) {
+    return interaction.reply({ content: "❌ Insufficient balance.", ephemeral: true });
   }
 
   await interaction.deferReply();
