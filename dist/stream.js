@@ -1,5 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.setHealthStatusProvider = setHealthStatusProvider;
 exports.startStream = startStream;
 exports.stopStream = stopStream;
 /**
@@ -19,6 +20,7 @@ let httpServer = null;
 let wss = null;
 let unsubscribeFrames = null;
 let latestObservedFrame = null;
+let healthStatusProvider = null;
 const targetFps = Math.max(1, Math.min(config_js_1.config.streaming.maxFps, config_js_1.config.streaming.targetFps));
 const stats = {
     producedFrames: 0,
@@ -183,6 +185,9 @@ function sendHtml(res, html) {
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.end(html);
 }
+function setHealthStatusProvider(provider) {
+    healthStatusProvider = provider;
+}
 function removeClient(id) {
     const client = streamClients.get(id);
     if (!client)
@@ -237,8 +242,12 @@ async function handleHttpRequest(req, res) {
         return;
     }
     if (method === "GET" && url.pathname === "/healthz") {
-        sendJson(res, 200, {
+        const health = healthStatusProvider?.() ?? {
             status: "ok",
+            discordReady: true,
+        };
+        sendJson(res, health.discordReady ? 200 : 503, {
+            ...health,
             pokemonEnabled: config_js_1.config.gameboy.enabled,
             stream: {
                 ...stats,

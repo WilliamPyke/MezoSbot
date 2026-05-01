@@ -25,7 +25,7 @@ import {
   type GBButton,
   type RoundResult,
 } from "./emulator.js";
-import { startStream } from "./stream.js";
+import { setHealthStatusProvider, startStream } from "./stream.js";
 import { getBalance, subtractBalances } from "./balance.js";
 import {
   processClaim,
@@ -68,13 +68,22 @@ if (
 
 console.log(`[Discord] Gateway intents: ${intents.join(", ")}`);
 
+let discordState = "not_started";
+
 const client = new Client({
   intents,
 });
 
+setHealthStatusProvider(() => ({
+  status: client.isReady() ? "ok" : "starting",
+  discordReady: client.isReady(),
+  discordState,
+}));
+
 const commandMap = new Map(commands.map((c) => [c.data.name, c.execute]));
 
 client.on("error", (err) => {
+  discordState = "client_error";
   console.error("[Discord] Client error:", (err as Error)?.message ?? err);
 });
 
@@ -83,18 +92,22 @@ client.on("warn", (message) => {
 });
 
 client.on("shardError", (err, shardId) => {
+  discordState = "shard_error";
   console.error(`[Discord] Shard ${shardId} error:`, (err as Error)?.message ?? err);
 });
 
 client.on("shardDisconnect", (event, shardId) => {
+  discordState = "disconnected";
   console.warn(`[Discord] Shard ${shardId} disconnected: code=${event.code} reason=${event.reason || "(none)"}`);
 });
 
 client.on("shardReady", (shardId) => {
+  discordState = "shard_ready";
   console.log(`[Discord] Shard ${shardId} ready`);
 });
 
 client.on("invalidated", () => {
+  discordState = "invalidated";
   console.error("[Discord] Session invalidated");
 });
 
@@ -126,16 +139,20 @@ async function connectDiscordWithRetry(): Promise<void> {
     attempt += 1;
 
     try {
+      discordState = `login_attempt_${attempt}`;
       console.log(`[Discord] Logging in as application ${config.discord.clientId}...`);
       await Promise.race([
         client.login(config.discord.token),
         timeoutAfter(120_000, "Discord login"),
       ]);
+      discordState = "waiting_ready";
       console.log("[Discord] Login call completed; waiting for gateway ready...");
       await waitForDiscordReady(120_000);
+      discordState = "ready";
       console.log("[Discord] Gateway ready confirmed");
       return;
     } catch (err) {
+      discordState = "retry_wait";
       const message = (err as Error)?.message ?? String(err);
       const retryAfterMs = Math.min(5 * 60_000, 15_000 * attempt);
       console.error(`[Discord] Connection attempt ${attempt} failed:`, message);
@@ -166,6 +183,7 @@ TEXT_INPUT_MAP.set("r", "RIGHT");
 /* ── Events ─────────────────────────────────────────────────────── */
 
 client.once(Events.ClientReady, async (c) => {
+  discordState = "ready";
   console.log(`Ready as ${c.user.tag}`);
 
   registerSlashCommands().catch((err) => {

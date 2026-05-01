@@ -38,11 +38,18 @@ interface StreamStats {
   avgCompressedSizeBytes: number;
 }
 
+interface HealthStatus {
+  status: "starting" | "ok" | "degraded";
+  discordReady: boolean;
+  discordState?: string;
+}
+
 const streamClients = new Map<string, StreamClient>();
 let httpServer: Server | null = null;
 let wss: WebSocketServer | null = null;
 let unsubscribeFrames: (() => void) | null = null;
 let latestObservedFrame: FrameMeta | null = null;
+let healthStatusProvider: (() => HealthStatus) | null = null;
 const targetFps = Math.max(1, Math.min(config.streaming.maxFps, config.streaming.targetFps));
 
 const stats: StreamStats = {
@@ -215,6 +222,10 @@ function sendHtml(res: ServerResponse, html: string): void {
   res.end(html);
 }
 
+export function setHealthStatusProvider(provider: () => HealthStatus): void {
+  healthStatusProvider = provider;
+}
+
 function removeClient(id: string): void {
   const client = streamClients.get(id);
   if (!client) return;
@@ -276,8 +287,13 @@ async function handleHttpRequest(req: IncomingMessage, res: ServerResponse): Pro
   }
 
   if (method === "GET" && url.pathname === "/healthz") {
-    sendJson(res, 200, {
-      status: "ok",
+    const health = healthStatusProvider?.() ?? {
+      status: "ok" as const,
+      discordReady: true,
+    };
+
+    sendJson(res, health.discordReady ? 200 : 503, {
+      ...health,
       pokemonEnabled: config.gameboy.enabled,
       stream: {
         ...stats,
