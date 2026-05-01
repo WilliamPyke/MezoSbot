@@ -35,11 +35,11 @@ async function execute(interaction) {
         });
     }
     const totalNeeded = (0, format_js_1.roundSats)(perUser * validUsers.length);
+    await interaction.deferReply();
     const balance = await (0, balance_js_1.getBalance)(interaction.user.id);
     if (balance < totalNeeded) {
-        return interaction.reply({ content: "❌ Insufficient balance.", ephemeral: true });
+        return interaction.editReply({ content: "❌ Insufficient balance." });
     }
-    await interaction.deferReply();
     if (!(await (0, balance_js_1.subtractBalance)(interaction.user.id, totalNeeded))) {
         return interaction.editReply({ content: "❌ Insufficient balance." });
     }

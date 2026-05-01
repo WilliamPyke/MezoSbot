@@ -28,12 +28,12 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     });
   }
 
+  await interaction.deferReply();
+
   const balance = await getBalance(interaction.user.id);
   if (balance < total) {
-    return interaction.reply({ content: "❌ Insufficient balance.", ephemeral: true });
+    return interaction.editReply({ content: "❌ Insufficient balance." });
   }
-
-  await interaction.deferReply();
 
   if (!(await subtractBalance(interaction.user.id, total))) {
     return interaction.editReply({ content: "❌ Insufficient balance." });

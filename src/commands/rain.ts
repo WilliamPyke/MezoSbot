@@ -26,12 +26,12 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   }
 
   const totalAmount = interaction.options.getNumber("amount", true);
+  await interaction.deferReply();
+
   const balance = await getBalance(interaction.user.id);
   if (balance < totalAmount) {
-    return interaction.reply({ content: "❌ Insufficient balance.", ephemeral: true });
+    return interaction.editReply({ content: "❌ Insufficient balance." });
   }
-
-  await interaction.deferReply();
 
   const count = interaction.options.getInteger("count", true);
   const role = interaction.options.getRole("role");

@@ -15,6 +15,9 @@ const notifications_js_1 = require("./notifications.js");
 process.on("unhandledRejection", (err) => {
     console.error("Unhandled rejection:", err?.message ?? err);
 });
+process.on("uncaughtException", (err) => {
+    console.error("Uncaught exception:", err?.message ?? err);
+});
 const client = new discord_js_1.Client({
     intents: [
         discord_js_1.GatewayIntentBits.Guilds,
@@ -25,6 +28,39 @@ const client = new discord_js_1.Client({
     ],
 });
 const commandMap = new Map(index_js_1.commands.map((c) => [c.data.name, c.execute]));
+client.on("error", (err) => {
+    console.error("[Discord] Client error:", err?.message ?? err);
+});
+client.on("warn", (message) => {
+    console.warn("[Discord] Warning:", message);
+});
+client.on("shardError", (err, shardId) => {
+    console.error(`[Discord] Shard ${shardId} error:`, err?.message ?? err);
+});
+client.on("shardDisconnect", (event, shardId) => {
+    console.warn(`[Discord] Shard ${shardId} disconnected: code=${event.code} reason=${event.reason || "(none)"}`);
+});
+client.on("shardReady", (shardId) => {
+    console.log(`[Discord] Shard ${shardId} ready`);
+});
+client.on("invalidated", () => {
+    console.error("[Discord] Session invalidated");
+});
+function timeoutAfter(ms, label) {
+    return new Promise((_, reject) => {
+        setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    });
+}
+async function waitForDiscordReady(timeoutMs) {
+    if (client.isReady())
+        return;
+    await Promise.race([
+        new Promise((resolve) => {
+            client.once(discord_js_1.Events.ClientReady, () => resolve());
+        }),
+        timeoutAfter(timeoutMs, "Discord ready"),
+    ]);
+}
 /* ── Valid text inputs for the game channel ─────────────────────── */
 const TEXT_INPUT_MAP = new Map();
 for (const btn of emulator_js_1.BUTTONS) {
@@ -60,6 +96,7 @@ client.once(discord_js_1.Events.ClientReady, async (c) => {
 });
 client.on(discord_js_1.Events.InteractionCreate, async (interaction) => {
     if (interaction.isButton()) {
+        console.log(`[Discord] Button interaction ${interaction.customId} from ${interaction.user.tag}`);
         const customId = interaction.customId;
         if (customId.startsWith("claim_drop_")) {
             await handleDropButton(interaction);
@@ -68,9 +105,13 @@ client.on(discord_js_1.Events.InteractionCreate, async (interaction) => {
     }
     if (!interaction.isChatInputCommand())
         return;
+    console.log(`[Discord] Command /${interaction.commandName} from ${interaction.user.tag}`);
     const handler = commandMap.get(interaction.commandName);
-    if (!handler)
+    if (!handler) {
+        console.warn(`[Discord] No handler registered for /${interaction.commandName}`);
+        await interaction.reply({ content: "This command is not available right now.", ephemeral: true }).catch(() => { });
         return;
+    }
     const { username, displayName, avatarUrl } = (0, profile_js_1.extractProfile)(interaction);
     (0, profile_js_1.updateUserProfile)(interaction.user.id, username, displayName, avatarUrl).catch(() => { });
     try {
@@ -261,7 +302,14 @@ async function main() {
             u.send({ embeds: [embed] }).catch(() => { });
         }).catch(() => { });
     });
-    await client.login(config_js_1.config.discord.token);
+    console.log(`[Discord] Logging in as application ${config_js_1.config.discord.clientId}...`);
+    await Promise.race([
+        client.login(config_js_1.config.discord.token),
+        timeoutAfter(30_000, "Discord login"),
+    ]);
+    console.log("[Discord] Login call completed; waiting for gateway ready...");
+    await waitForDiscordReady(30_000);
+    console.log("[Discord] Gateway ready confirmed");
     if (!config_js_1.config.gameboy.enabled) {
         console.log("[Pokemon] POKEMON_ENABLED=false - emulator and controls disabled");
         return;

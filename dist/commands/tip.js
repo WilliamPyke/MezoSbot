@@ -31,11 +31,11 @@ async function execute(interaction) {
     if (target.bot) {
         return interaction.reply({ content: "❌ You can't tip bots.", ephemeral: true });
     }
+    await interaction.deferReply();
     const balance = await (0, balance_js_1.getBalance)(interaction.user.id);
     if (balance < amount) {
-        return interaction.reply({ content: "❌ Insufficient balance.", ephemeral: true });
+        return interaction.editReply({ content: "❌ Insufficient balance." });
     }
-    await interaction.deferReply();
     if (!(await (0, balance_js_1.subtractBalance)(interaction.user.id, amount))) {
         return interaction.editReply({ content: "❌ Insufficient balance." });
     }

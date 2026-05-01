@@ -26,11 +26,11 @@ async function execute(interaction) {
         return interaction.reply({ content: "❌ Rain only works in text channels.", ephemeral: true });
     }
     const totalAmount = interaction.options.getNumber("amount", true);
+    await interaction.deferReply();
     const balance = await (0, balance_js_1.getBalance)(interaction.user.id);
     if (balance < totalAmount) {
-        return interaction.reply({ content: "❌ Insufficient balance.", ephemeral: true });
+        return interaction.editReply({ content: "❌ Insufficient balance." });
     }
-    await interaction.deferReply();
     const count = interaction.options.getInteger("count", true);
     const role = interaction.options.getRole("role");
     const rawMessage = interaction.options.getString("message");

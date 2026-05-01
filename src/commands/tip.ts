@@ -33,12 +33,12 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     return interaction.reply({ content: "❌ You can't tip bots.", ephemeral: true });
   }
 
+  await interaction.deferReply();
+
   const balance = await getBalance(interaction.user.id);
   if (balance < amount) {
-    return interaction.reply({ content: "❌ Insufficient balance.", ephemeral: true });
+    return interaction.editReply({ content: "❌ Insufficient balance." });
   }
-
-  await interaction.deferReply();
 
   if (!(await subtractBalance(interaction.user.id, amount))) {
     return interaction.editReply({ content: "❌ Insufficient balance." });

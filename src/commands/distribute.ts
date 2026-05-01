@@ -37,12 +37,12 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   }
 
   const totalNeeded = roundSats(perUser * validUsers.length);
+  await interaction.deferReply();
+
   const balance = await getBalance(interaction.user.id);
   if (balance < totalNeeded) {
-    return interaction.reply({ content: "❌ Insufficient balance.", ephemeral: true });
+    return interaction.editReply({ content: "❌ Insufficient balance." });
   }
-
-  await interaction.deferReply();
 
   if (!(await subtractBalance(interaction.user.id, totalNeeded))) {
     return interaction.editReply({ content: "❌ Insufficient balance." });

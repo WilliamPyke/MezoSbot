@@ -27,11 +27,11 @@ async function execute(interaction) {
             ephemeral: true,
         });
     }
+    await interaction.deferReply();
     const balance = await (0, balance_js_1.getBalance)(interaction.user.id);
     if (balance < total) {
-        return interaction.reply({ content: "❌ Insufficient balance.", ephemeral: true });
+        return interaction.editReply({ content: "❌ Insufficient balance." });
     }
-    await interaction.deferReply();
     if (!(await (0, balance_js_1.subtractBalance)(interaction.user.id, total))) {
         return interaction.editReply({ content: "❌ Insufficient balance." });
     }

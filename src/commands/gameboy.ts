@@ -19,24 +19,25 @@ async function handlePress(interaction: ChatInputCommandInteraction, button: GBB
     return interaction.reply({ content: `❌ Minimum bid is ${formatSats(minBid)}.`, ephemeral: true });
   }
 
+  await interaction.deferReply({ ephemeral: true });
+
   // Check balance
   const balance = await getBalance(interaction.user.id);
   if (balance < amount) {
-    return interaction.reply({ content: "❌ Not enough sats.", ephemeral: true });
+    return interaction.editReply({ content: "❌ Not enough sats." });
   }
 
   // Submit bid
   const result = submitBid(interaction.user.id, button, amount);
   if (!result.ok) {
-    return interaction.reply({ content: `❌ ${result.reason}`, ephemeral: true });
+    return interaction.editReply({ content: `❌ ${result.reason}` });
   }
 
   await registerDepositAddress(interaction.user.id);
 
   // Vote accepted — charged only if this button wins the round
-  await interaction.reply({
+  await interaction.editReply({
     content: `${emoji} Voted **${formatSats(amount)}** on **${button}** — tips are pooled, highest total wins!`,
-    ephemeral: true,
   });
 }
 
