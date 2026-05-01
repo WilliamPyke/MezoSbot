@@ -51,7 +51,6 @@ console.log("[Network] DNS result order set to ipv4first");
 
 const intents = [
   GatewayIntentBits.Guilds,
-  GatewayIntentBits.DirectMessages,
 ];
 
 if (config.discord.guildMembersIntent) {
@@ -120,55 +119,6 @@ async function waitForDiscordReady(timeoutMs: number): Promise<void> {
   ]);
 }
 
-async function checkDiscordHttpPreflight(): Promise<{ ok: true } | { ok: false; retryAfterMs: number }> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 15_000);
-
-  try {
-    console.log("[Discord] Checking REST API connectivity...");
-    const res = await fetch("https://discord.com/api/v10/gateway/bot", {
-      headers: {
-        Authorization: `Bot ${config.discord.token}`,
-      },
-      signal: controller.signal,
-    });
-
-    if (!res.ok) {
-      const body = await res.text().catch(() => "");
-      const retryAfterSeconds = Number(res.headers.get("retry-after"));
-      const retryAfterMs = Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
-        ? Math.ceil(retryAfterSeconds * 1000)
-        : 5 * 60_000;
-
-      if (res.status === 429) {
-        console.warn(
-          `[Discord] REST preflight rate-limited; retrying Discord login in ${Math.round(retryAfterMs / 1000)}s`
-        );
-        console.warn(`[Discord] Rate-limit response preview: ${body.slice(0, 200)}`);
-        return { ok: false, retryAfterMs };
-      }
-
-      throw new Error(`Discord REST preflight failed: ${res.status} ${res.statusText} ${body.slice(0, 300)}`);
-    }
-
-    const payload = await res.json() as {
-      url?: string;
-      shards?: number;
-      session_start_limit?: {
-        remaining?: number;
-        reset_after?: number;
-      };
-    };
-
-    console.log(
-      `[Discord] REST API ok; gateway=${payload.url ?? "(missing)"} shards=${payload.shards ?? "(unknown)"} sessionStartsRemaining=${payload.session_start_limit?.remaining ?? "(unknown)"}`
-    );
-    return { ok: true };
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
 async function connectDiscordWithRetry(): Promise<void> {
   let attempt = 0;
 
@@ -176,12 +126,6 @@ async function connectDiscordWithRetry(): Promise<void> {
     attempt += 1;
 
     try {
-      const preflight = await checkDiscordHttpPreflight();
-      if (!preflight.ok) {
-        await sleep(preflight.retryAfterMs);
-        continue;
-      }
-
       console.log(`[Discord] Logging in as application ${config.discord.clientId}...`);
       await Promise.race([
         client.login(config.discord.token),
@@ -193,7 +137,7 @@ async function connectDiscordWithRetry(): Promise<void> {
       return;
     } catch (err) {
       const message = (err as Error)?.message ?? String(err);
-      const retryAfterMs = Math.min(10 * 60_000, 30_000 * attempt);
+      const retryAfterMs = Math.min(5 * 60_000, 15_000 * attempt);
       console.error(`[Discord] Connection attempt ${attempt} failed:`, message);
 
       try {
@@ -224,12 +168,9 @@ TEXT_INPUT_MAP.set("r", "RIGHT");
 client.once(Events.ClientReady, async (c) => {
   console.log(`Ready as ${c.user.tag}`);
 
-  const rest = new REST().setToken(config.discord.token);
-  await rest.put(
-    Routes.applicationCommands(config.discord.clientId),
-    { body: commandsData },
-  );
-  console.log(`Slash commands registered (${commandsData.length} commands)`);
+  registerSlashCommands().catch((err) => {
+    console.error("[Discord] Slash command registration failed:", (err as Error)?.message ?? err);
+  });
 
   if (!config.gameboy.enabled) {
     console.log("[Pokemon] Disabled by POKEMON_ENABLED=false");
@@ -487,6 +428,8 @@ async function main() {
     console.error("[Recovery] Failed:", (err as Error)?.message ?? err)
   );
 
+  await connectDiscordWithRetry();
+
   startDepositPoller((discordId, amountSats, gasSats) => {
     console.log(`Auto-deposit: ${formatSats(amountSats)} (gas: ~${formatSats(gasSats)}) for ${discordId}`);
     client.users.fetch(discordId).then((u) => {
@@ -509,8 +452,6 @@ async function main() {
       u.send({ embeds: [embed] }).catch(() => {});
     }).catch(() => {});
   });
-
-  await connectDiscordWithRetry();
 
   if (!config.gameboy.enabled) {
     console.log("[Pokemon] POKEMON_ENABLED=false - emulator and controls disabled");
@@ -548,3 +489,12 @@ main().catch((err) => {
   console.error(err);
   process.exit(1);
 });
+
+async function registerSlashCommands() {
+  const rest = new REST().setToken(config.discord.token);
+  await rest.put(
+    Routes.applicationCommands(config.discord.clientId),
+    { body: commandsData },
+  );
+  console.log(`Slash commands registered (${commandsData.length} commands)`);
+}
