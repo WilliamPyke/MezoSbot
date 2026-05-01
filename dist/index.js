@@ -1,6 +1,7 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 const discord_js_1 = require("discord.js");
+const node_dns_1 = require("node:dns");
 const config_js_1 = require("./config.js");
 const format_js_1 = require("./format.js");
 const evm_js_1 = require("./evm.js");
@@ -18,6 +19,8 @@ process.on("unhandledRejection", (err) => {
 process.on("uncaughtException", (err) => {
     console.error("Uncaught exception:", err?.message ?? err);
 });
+(0, node_dns_1.setDefaultResultOrder)("ipv4first");
+console.log("[Network] DNS result order set to ipv4first");
 const intents = [
     discord_js_1.GatewayIntentBits.Guilds,
     discord_js_1.GatewayIntentBits.DirectMessages,
@@ -68,6 +71,28 @@ async function waitForDiscordReady(timeoutMs) {
         }),
         timeoutAfter(timeoutMs, "Discord ready"),
     ]);
+}
+async function checkDiscordHttpPreflight() {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15_000);
+    try {
+        console.log("[Discord] Checking REST API connectivity...");
+        const res = await fetch("https://discord.com/api/v10/gateway/bot", {
+            headers: {
+                Authorization: `Bot ${config_js_1.config.discord.token}`,
+            },
+            signal: controller.signal,
+        });
+        if (!res.ok) {
+            const body = await res.text().catch(() => "");
+            throw new Error(`Discord REST preflight failed: ${res.status} ${res.statusText} ${body.slice(0, 300)}`);
+        }
+        const payload = await res.json();
+        console.log(`[Discord] REST API ok; gateway=${payload.url ?? "(missing)"} shards=${payload.shards ?? "(unknown)"} sessionStartsRemaining=${payload.session_start_limit?.remaining ?? "(unknown)"}`);
+    }
+    finally {
+        clearTimeout(timeout);
+    }
 }
 /* ── Valid text inputs for the game channel ─────────────────────── */
 const TEXT_INPUT_MAP = new Map();
@@ -326,6 +351,7 @@ async function main() {
             u.send({ embeds: [embed] }).catch(() => { });
         }).catch(() => { });
     });
+    await checkDiscordHttpPreflight();
     console.log(`[Discord] Logging in as application ${config_js_1.config.discord.clientId}...`);
     await Promise.race([
         client.login(config_js_1.config.discord.token),

@@ -10,6 +10,7 @@ import {
   type TextChannel,
   type Message,
 } from "discord.js";
+import { setDefaultResultOrder } from "node:dns";
 import { config } from "./config.js";
 import { formatSats } from "./format.js";
 import { initEVM, getTreasuryAddress, startDepositPoller, registerDepositAddress, recoverPendingWithdrawals } from "./evm.js";
@@ -44,6 +45,9 @@ process.on("unhandledRejection", (err) => {
 process.on("uncaughtException", (err) => {
   console.error("Uncaught exception:", (err as Error)?.message ?? err);
 });
+
+setDefaultResultOrder("ipv4first");
+console.log("[Network] DNS result order set to ipv4first");
 
 const intents = [
   GatewayIntentBits.Guilds,
@@ -110,6 +114,41 @@ async function waitForDiscordReady(timeoutMs: number): Promise<void> {
     }),
     timeoutAfter(timeoutMs, "Discord ready"),
   ]);
+}
+
+async function checkDiscordHttpPreflight(): Promise<void> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15_000);
+
+  try {
+    console.log("[Discord] Checking REST API connectivity...");
+    const res = await fetch("https://discord.com/api/v10/gateway/bot", {
+      headers: {
+        Authorization: `Bot ${config.discord.token}`,
+      },
+      signal: controller.signal,
+    });
+
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      throw new Error(`Discord REST preflight failed: ${res.status} ${res.statusText} ${body.slice(0, 300)}`);
+    }
+
+    const payload = await res.json() as {
+      url?: string;
+      shards?: number;
+      session_start_limit?: {
+        remaining?: number;
+        reset_after?: number;
+      };
+    };
+
+    console.log(
+      `[Discord] REST API ok; gateway=${payload.url ?? "(missing)"} shards=${payload.shards ?? "(unknown)"} sessionStartsRemaining=${payload.session_start_limit?.remaining ?? "(unknown)"}`
+    );
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 /* ── Valid text inputs for the game channel ─────────────────────── */
@@ -413,6 +452,8 @@ async function main() {
       u.send({ embeds: [embed] }).catch(() => {});
     }).catch(() => {});
   });
+
+  await checkDiscordHttpPreflight();
 
   console.log(`[Discord] Logging in as application ${config.discord.clientId}...`);
   await Promise.race([
