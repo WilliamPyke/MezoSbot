@@ -17,6 +17,10 @@ services:
         sync: false
       - key: ADMIN_IDS
         sync: false
+      - key: DISCORD_GUILD_MEMBERS_INTENT
+        value: "false"
+      - key: DISCORD_MESSAGE_CONTENT_INTENT
+        value: "false"
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_SERVICE_ROLE_KEY
@@ -45,6 +49,8 @@ services:
         value: "900000"
       - key: POKEMON_ENABLED
         value: "true"
+      - key: POKEMON_TEXT_INPUT_ENABLED
+        value: "false"
       - key: GB_CHANNEL_ID
         sync: false
       - key: ROM_PATH

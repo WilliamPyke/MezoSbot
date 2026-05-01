@@ -45,14 +45,28 @@ process.on("uncaughtException", (err) => {
   console.error("Uncaught exception:", (err as Error)?.message ?? err);
 });
 
+const intents = [
+  GatewayIntentBits.Guilds,
+  GatewayIntentBits.DirectMessages,
+];
+
+if (config.discord.guildMembersIntent) {
+  intents.push(GatewayIntentBits.GuildMembers);
+}
+
+if (
+  config.gameboy.enabled &&
+  config.gameboy.textInputEnabled &&
+  config.gameboy.gameChannelId &&
+  config.discord.messageContentIntent
+) {
+  intents.push(GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent);
+}
+
+console.log(`[Discord] Gateway intents: ${intents.join(", ")}`);
+
 const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.GuildMembers,
-    GatewayIntentBits.DirectMessages,
-    GatewayIntentBits.MessageContent,
-  ],
+  intents,
 });
 
 const commandMap = new Map(commands.map((c) => [c.data.name, c.execute]));
@@ -125,6 +139,14 @@ client.once(Events.ClientReady, async (c) => {
     console.log("[Pokemon] Disabled by POKEMON_ENABLED=false");
     return;
   }
+  if (!config.gameboy.textInputEnabled) {
+    console.log("[Pokemon] Text input disabled by POKEMON_TEXT_INPUT_ENABLED=false");
+    return;
+  }
+  if (!config.discord.messageContentIntent) {
+    console.log("[Pokemon] Text input disabled by DISCORD_MESSAGE_CONTENT_INTENT=false");
+    return;
+  }
 
   // Log game channel config for diagnostics
   const configuredChannelId = config.gameboy.gameChannelId;
@@ -183,6 +205,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
 client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot) return;
   if (!config.gameboy.enabled) return;
+  if (!config.gameboy.textInputEnabled) return;
+  if (!config.discord.messageContentIntent) return;
 
   const gameChannelId = config.gameboy.gameChannelId;
   if (!gameChannelId || message.channelId !== gameChannelId) return;
@@ -234,6 +258,8 @@ const FEED_THROTTLE_MS = 1000; // max 1 Discord message edit per second
 
 function setupGameBoyCallbacks() {
   if (!config.gameboy.enabled) return;
+  if (!config.gameboy.textInputEnabled) return;
+  if (!config.discord.messageContentIntent) return;
   if (!config.gameboy.gameChannelId) return;
 
   onRound((result: RoundResult) => {
@@ -391,10 +417,10 @@ async function main() {
   console.log(`[Discord] Logging in as application ${config.discord.clientId}...`);
   await Promise.race([
     client.login(config.discord.token),
-    timeoutAfter(30_000, "Discord login"),
+    timeoutAfter(120_000, "Discord login"),
   ]);
   console.log("[Discord] Login call completed; waiting for gateway ready...");
-  await waitForDiscordReady(30_000);
+  await waitForDiscordReady(120_000);
   console.log("[Discord] Gateway ready confirmed");
 
   if (!config.gameboy.enabled) {
@@ -429,4 +455,7 @@ process.on("SIGTERM", async () => {
   process.exit(0);
 });
 
-main().catch(console.error);
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});

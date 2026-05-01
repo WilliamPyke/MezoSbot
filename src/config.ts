@@ -21,6 +21,8 @@ export const config = {
     token: required("DISCORD_TOKEN"),
     clientId: required("DISCORD_CLIENT_ID"),
     adminIds: (process.env.ADMIN_IDS ?? "").split(",").map((s) => s.trim()).filter(Boolean),
+    guildMembersIntent: optionalBool("DISCORD_GUILD_MEMBERS_INTENT", false),
+    messageContentIntent: optionalBool("DISCORD_MESSAGE_CONTENT_INTENT", false),
   },
   supabase: {
     url: required("SUPABASE_URL"),
@@ -43,6 +45,7 @@ export const config = {
   },
   gameboy: {
     enabled: optionalBool("POKEMON_ENABLED", true),
+    textInputEnabled: optionalBool("POKEMON_TEXT_INPUT_ENABLED", false),
     /** Text channel where users type button names to play */
     gameChannelId: optional("GB_CHANNEL_ID", ""),
     romPath: optional("ROM_PATH", ""),

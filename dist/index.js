@@ -18,14 +18,22 @@ process.on("unhandledRejection", (err) => {
 process.on("uncaughtException", (err) => {
     console.error("Uncaught exception:", err?.message ?? err);
 });
+const intents = [
+    discord_js_1.GatewayIntentBits.Guilds,
+    discord_js_1.GatewayIntentBits.DirectMessages,
+];
+if (config_js_1.config.discord.guildMembersIntent) {
+    intents.push(discord_js_1.GatewayIntentBits.GuildMembers);
+}
+if (config_js_1.config.gameboy.enabled &&
+    config_js_1.config.gameboy.textInputEnabled &&
+    config_js_1.config.gameboy.gameChannelId &&
+    config_js_1.config.discord.messageContentIntent) {
+    intents.push(discord_js_1.GatewayIntentBits.GuildMessages, discord_js_1.GatewayIntentBits.MessageContent);
+}
+console.log(`[Discord] Gateway intents: ${intents.join(", ")}`);
 const client = new discord_js_1.Client({
-    intents: [
-        discord_js_1.GatewayIntentBits.Guilds,
-        discord_js_1.GatewayIntentBits.GuildMessages,
-        discord_js_1.GatewayIntentBits.GuildMembers,
-        discord_js_1.GatewayIntentBits.DirectMessages,
-        discord_js_1.GatewayIntentBits.MessageContent,
-    ],
+    intents,
 });
 const commandMap = new Map(index_js_1.commands.map((c) => [c.data.name, c.execute]));
 client.on("error", (err) => {
@@ -78,6 +86,14 @@ client.once(discord_js_1.Events.ClientReady, async (c) => {
     console.log(`Slash commands registered (${index_js_1.commandsData.length} commands)`);
     if (!config_js_1.config.gameboy.enabled) {
         console.log("[Pokemon] Disabled by POKEMON_ENABLED=false");
+        return;
+    }
+    if (!config_js_1.config.gameboy.textInputEnabled) {
+        console.log("[Pokemon] Text input disabled by POKEMON_TEXT_INPUT_ENABLED=false");
+        return;
+    }
+    if (!config_js_1.config.discord.messageContentIntent) {
+        console.log("[Pokemon] Text input disabled by DISCORD_MESSAGE_CONTENT_INTENT=false");
         return;
     }
     // Log game channel config for diagnostics
@@ -140,6 +156,10 @@ client.on(discord_js_1.Events.MessageCreate, async (message) => {
         return;
     if (!config_js_1.config.gameboy.enabled)
         return;
+    if (!config_js_1.config.gameboy.textInputEnabled)
+        return;
+    if (!config_js_1.config.discord.messageContentIntent)
+        return;
     const gameChannelId = config_js_1.config.gameboy.gameChannelId;
     if (!gameChannelId || message.channelId !== gameChannelId)
         return;
@@ -184,6 +204,10 @@ let lastFeedTime = 0;
 const FEED_THROTTLE_MS = 1000; // max 1 Discord message edit per second
 function setupGameBoyCallbacks() {
     if (!config_js_1.config.gameboy.enabled)
+        return;
+    if (!config_js_1.config.gameboy.textInputEnabled)
+        return;
+    if (!config_js_1.config.discord.messageContentIntent)
         return;
     if (!config_js_1.config.gameboy.gameChannelId)
         return;
@@ -305,10 +329,10 @@ async function main() {
     console.log(`[Discord] Logging in as application ${config_js_1.config.discord.clientId}...`);
     await Promise.race([
         client.login(config_js_1.config.discord.token),
-        timeoutAfter(30_000, "Discord login"),
+        timeoutAfter(120_000, "Discord login"),
     ]);
     console.log("[Discord] Login call completed; waiting for gateway ready...");
-    await waitForDiscordReady(30_000);
+    await waitForDiscordReady(120_000);
     console.log("[Discord] Gateway ready confirmed");
     if (!config_js_1.config.gameboy.enabled) {
         console.log("[Pokemon] POKEMON_ENABLED=false - emulator and controls disabled");
@@ -340,4 +364,7 @@ process.on("SIGTERM", async () => {
     await (0, emulator_js_1.stopEmulator)();
     process.exit(0);
 });
-main().catch(console.error);
+main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+});
