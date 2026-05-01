@@ -62,6 +62,9 @@ function timeoutAfter(ms, label) {
         setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
     });
 }
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
 async function waitForDiscordReady(timeoutMs) {
     if (client.isReady())
         return;
@@ -85,13 +88,58 @@ async function checkDiscordHttpPreflight() {
         });
         if (!res.ok) {
             const body = await res.text().catch(() => "");
+            const retryAfterSeconds = Number(res.headers.get("retry-after"));
+            const retryAfterMs = Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
+                ? Math.ceil(retryAfterSeconds * 1000)
+                : 5 * 60_000;
+            if (res.status === 429) {
+                console.warn(`[Discord] REST preflight rate-limited; retrying Discord login in ${Math.round(retryAfterMs / 1000)}s`);
+                console.warn(`[Discord] Rate-limit response preview: ${body.slice(0, 200)}`);
+                return { ok: false, retryAfterMs };
+            }
             throw new Error(`Discord REST preflight failed: ${res.status} ${res.statusText} ${body.slice(0, 300)}`);
         }
         const payload = await res.json();
         console.log(`[Discord] REST API ok; gateway=${payload.url ?? "(missing)"} shards=${payload.shards ?? "(unknown)"} sessionStartsRemaining=${payload.session_start_limit?.remaining ?? "(unknown)"}`);
+        return { ok: true };
     }
     finally {
         clearTimeout(timeout);
+    }
+}
+async function connectDiscordWithRetry() {
+    let attempt = 0;
+    while (!client.isReady()) {
+        attempt += 1;
+        try {
+            const preflight = await checkDiscordHttpPreflight();
+            if (!preflight.ok) {
+                await sleep(preflight.retryAfterMs);
+                continue;
+            }
+            console.log(`[Discord] Logging in as application ${config_js_1.config.discord.clientId}...`);
+            await Promise.race([
+                client.login(config_js_1.config.discord.token),
+                timeoutAfter(120_000, "Discord login"),
+            ]);
+            console.log("[Discord] Login call completed; waiting for gateway ready...");
+            await waitForDiscordReady(120_000);
+            console.log("[Discord] Gateway ready confirmed");
+            return;
+        }
+        catch (err) {
+            const message = err?.message ?? String(err);
+            const retryAfterMs = Math.min(10 * 60_000, 30_000 * attempt);
+            console.error(`[Discord] Connection attempt ${attempt} failed:`, message);
+            try {
+                client.destroy();
+            }
+            catch {
+                // no-op
+            }
+            console.log(`[Discord] Retrying connection in ${Math.round(retryAfterMs / 1000)}s`);
+            await sleep(retryAfterMs);
+        }
     }
 }
 /* ── Valid text inputs for the game channel ─────────────────────── */
@@ -351,15 +399,7 @@ async function main() {
             u.send({ embeds: [embed] }).catch(() => { });
         }).catch(() => { });
     });
-    await checkDiscordHttpPreflight();
-    console.log(`[Discord] Logging in as application ${config_js_1.config.discord.clientId}...`);
-    await Promise.race([
-        client.login(config_js_1.config.discord.token),
-        timeoutAfter(120_000, "Discord login"),
-    ]);
-    console.log("[Discord] Login call completed; waiting for gateway ready...");
-    await waitForDiscordReady(120_000);
-    console.log("[Discord] Gateway ready confirmed");
+    await connectDiscordWithRetry();
     if (!config_js_1.config.gameboy.enabled) {
         console.log("[Pokemon] POKEMON_ENABLED=false - emulator and controls disabled");
         return;
