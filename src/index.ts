@@ -132,6 +132,45 @@ async function waitForDiscordReady(timeoutMs: number): Promise<void> {
   ]);
 }
 
+async function checkDiscordRestPreflight(): Promise<
+  | { ok: true; sessionsRemaining: number | null; resetAfterMs: number | null }
+  | { ok: false; status: number; retryAfterMs: number; bodyPreview: string }
+> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15_000);
+  try {
+    const res = await fetch("https://discord.com/api/v10/gateway/bot", {
+      headers: { Authorization: `Bot ${config.discord.token}` },
+      signal: controller.signal,
+    });
+    const bodyText = await res.text().catch(() => "");
+    if (!res.ok) {
+      const retryAfterHeader = Number(res.headers.get("retry-after"));
+      const retryAfterMs =
+        Number.isFinite(retryAfterHeader) && retryAfterHeader > 0
+          ? Math.ceil(retryAfterHeader * 1000)
+          : 60_000;
+      return { ok: false, status: res.status, retryAfterMs, bodyPreview: bodyText.slice(0, 300) };
+    }
+    const payload = JSON.parse(bodyText) as {
+      url?: string;
+      shards?: number;
+      session_start_limit?: { remaining?: number; total?: number; reset_after?: number };
+    };
+    const ssl = payload.session_start_limit;
+    console.log(
+      `[Discord] REST preflight ok: gateway=${payload.url ?? "?"} shards=${payload.shards ?? "?"} sessions=${ssl?.remaining ?? "?"}/${ssl?.total ?? "?"} resetIn=${ssl?.reset_after != null ? Math.round(ssl.reset_after / 1000) + "s" : "?"}`
+    );
+    return {
+      ok: true,
+      sessionsRemaining: ssl?.remaining ?? null,
+      resetAfterMs: ssl?.reset_after ?? null,
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function connectDiscordWithRetry(): Promise<void> {
   let attempt = 0;
 
@@ -139,6 +178,30 @@ async function connectDiscordWithRetry(): Promise<void> {
     attempt += 1;
 
     try {
+      discordState = `preflight_${attempt}`;
+      const preflight = await checkDiscordRestPreflight();
+      if (!preflight.ok) {
+        discordState = `preflight_failed_${preflight.status}`;
+        console.error(
+          `[Discord] REST preflight failed: HTTP ${preflight.status}. Body: ${preflight.bodyPreview}`
+        );
+        if (preflight.status === 401) {
+          console.error("[Discord] 401 Unauthorized — DISCORD_TOKEN is invalid or revoked. Reset the bot token in the Developer Portal (Bot tab) and update DISCORD_TOKEN on Render.");
+        }
+        console.log(`[Discord] Backing off ${Math.round(preflight.retryAfterMs / 1000)}s before retry`);
+        await sleep(preflight.retryAfterMs);
+        continue;
+      }
+      if (preflight.sessionsRemaining != null && preflight.sessionsRemaining < 5) {
+        const waitMs = (preflight.resetAfterMs ?? 60 * 60_000) + 60_000;
+        discordState = "session_limit_low";
+        console.error(
+          `[Discord] Session start limit nearly exhausted (${preflight.sessionsRemaining} left). Sleeping ${Math.round(waitMs / 1000)}s to avoid lockout.`
+        );
+        await sleep(waitMs);
+        continue;
+      }
+
       discordState = `login_attempt_${attempt}`;
       console.log(`[Discord] Logging in as application ${config.discord.clientId}...`);
       await Promise.race([
