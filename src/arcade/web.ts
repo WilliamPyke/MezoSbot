@@ -509,6 +509,7 @@ function renderPlayPage(): string {
   .cell.ghost-ok { background: rgba(30,232,129,.55); }
   .cell.ghost-mult { background: rgba(255,138,26,.7); }
   .cell.ghost-bad { background: rgba(255,77,109,.55); }
+  .cell.keyboard-cursor { outline: 2px solid var(--text); outline-offset: -3px; }
   .cell.clear-hint { outline: 2px solid rgba(30,232,129,.65); outline-offset: -2px; }
   .grid-rule { box-shadow: inset 0 0 0 1px rgba(255,255,255,.04); }
   /* heavier 3x3 separators */
@@ -533,6 +534,15 @@ function renderPlayPage(): string {
   .btn.primary:hover { background: var(--neon-2); }
   .btn.danger { background: transparent; border-color: rgba(255,77,109,.5); color: #ff8a9c; }
   .btn:disabled { opacity: .4; cursor: not-allowed; }
+  .tabs { display: flex; gap: 6px; margin-top: 12px; border-bottom: 1px solid var(--line); }
+  .tab { flex: 0 1 auto; background: transparent; border: 0; border-bottom: 2px solid transparent; color: var(--muted); padding: 9px 10px; font-weight: 700; font-size: 13px; cursor: pointer; }
+  .tab.active { color: var(--text); border-bottom-color: var(--neon); }
+  .panel { display: none; background: var(--bg-2); border: 1px solid var(--line); border-top: 0; border-radius: 0 0 14px 14px; padding: 12px; }
+  .panel.active { display: block; }
+  .shortcuts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 12px; }
+  .shortcut { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--muted); font-size: 13px; }
+  .keys { display: inline-flex; align-items: center; gap: 4px; flex-wrap: wrap; justify-content: flex-end; }
+  kbd { min-width: 24px; padding: 3px 6px; border: 1px solid var(--line); border-bottom-color: #3a4254; border-radius: 6px; background: var(--bg-3); color: var(--text); font: 700 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; text-align: center; }
   .opponent { display: flex; align-items: center; justify-content: space-between; background: var(--bg-2); border: 1px solid var(--line); border-radius: 14px; padding: 10px 12px; margin-top: 12px; font-size: 13px; }
   .opponent .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); display: inline-block; margin-right: 6px; }
   .opponent.live .dot { background: var(--neon-2); box-shadow: 0 0 8px rgba(30,232,129,.7); }
@@ -548,6 +558,7 @@ function renderPlayPage(): string {
   @media (max-width: 480px) {
     .stats { grid-template-columns: repeat(2, 1fr); }
     .stat .value { font-size: 17px; }
+    .shortcuts { grid-template-columns: 1fr; }
   }
 </style>
 </head>
@@ -578,6 +589,24 @@ function renderPlayPage(): string {
     <button id="rotateBtn" class="btn">Rotate</button>
     <button id="clearBtn" class="btn">Clear</button>
     <button id="submitBtn" class="btn primary" style="display:none;">Submit final score</button>
+  </div>
+
+  <div class="tabs" role="tablist" aria-label="Game info">
+    <button id="playTab" class="tab active" type="button" role="tab" aria-selected="true" aria-controls="playPanel">Play</button>
+    <button id="shortcutsTab" class="tab" type="button" role="tab" aria-selected="false" aria-controls="shortcutsPanel">Shortcuts</button>
+  </div>
+  <div id="playPanel" class="panel active" role="tabpanel" aria-labelledby="playTab">
+    <div class="shortcut"><span>Keyboard cursor</span><span class="keys"><kbd>↑</kbd><kbd>↓</kbd><kbd>←</kbd><kbd>→</kbd></span></div>
+  </div>
+  <div id="shortcutsPanel" class="panel" role="tabpanel" aria-labelledby="shortcutsTab">
+    <div class="shortcuts">
+      <div class="shortcut"><span>Switch piece</span><span class="keys"><kbd>Tab</kbd></span></div>
+      <div class="shortcut"><span>Select piece</span><span class="keys"><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd></span></div>
+      <div class="shortcut"><span>Move piece</span><span class="keys"><kbd>↑</kbd><kbd>↓</kbd><kbd>←</kbd><kbd>→</kbd></span></div>
+      <div class="shortcut"><span>Place piece</span><span class="keys"><kbd>Space</kbd><kbd>Enter</kbd></span></div>
+      <div class="shortcut"><span>Rotate</span><span class="keys"><kbd>R</kbd></span></div>
+      <div class="shortcut"><span>Clear selection</span><span class="keys"><kbd>C</kbd><kbd>Esc</kbd></span></div>
+    </div>
   </div>
 
   <div id="opponentBox" class="opponent" style="display:none;"></div>
@@ -612,13 +641,17 @@ function renderPlayPage(): string {
   const $rotate = document.getElementById('rotateBtn');
   const $clear = document.getElementById('clearBtn');
   const $submit = document.getElementById('submitBtn');
+  const $playTab = document.getElementById('playTab');
+  const $shortcutsTab = document.getElementById('shortcutsTab');
+  const $playPanel = document.getElementById('playPanel');
+  const $shortcutsPanel = document.getElementById('shortcutsPanel');
   const $opponent = document.getElementById('opponentBox');
   const $end = document.getElementById('endBox');
   const $toast = document.getElementById('toast');
   const $pot = document.getElementById('potBox');
 
   let state = null;
-  let selected = { pieceIndex: null, rotation: 0, hoverRow: null, hoverCol: null };
+  let selected = { pieceIndex: null, rotation: 0, hoverRow: 0, hoverCol: 0 };
   let serverOffsetMs = 0;
   let timeoutRefreshPending = false;
 
@@ -645,7 +678,7 @@ function renderPlayPage(): string {
     render();
   }
   $clear.addEventListener('click', () => {
-    selected = { pieceIndex: null, rotation: 0, hoverRow: null, hoverCol: null };
+    selected = { pieceIndex: null, rotation: 0, hoverRow: selected.hoverRow ?? 0, hoverCol: selected.hoverCol ?? 0 };
     render();
   });
   $submit.addEventListener('click', async () => {
@@ -655,15 +688,35 @@ function renderPlayPage(): string {
     selected.pieceIndex = null;
     render();
   });
+  $playTab.addEventListener('click', () => setInfoTab('play'));
+  $shortcutsTab.addEventListener('click', () => setInfoTab('shortcuts'));
   window.addEventListener('keydown', (event) => {
     if (event.ctrlKey || event.metaKey || event.altKey || event.repeat) return;
     const key = event.key.toLowerCase();
     if (key === 'r') {
       event.preventDefault();
       rotateSelected();
+    } else if (key === 'tab') {
+      event.preventDefault();
+      cyclePiece(event.shiftKey ? -1 : 1);
+    } else if (key === 'arrowup') {
+      event.preventDefault();
+      moveCursor(-1, 0);
+    } else if (key === 'arrowdown') {
+      event.preventDefault();
+      moveCursor(1, 0);
+    } else if (key === 'arrowleft') {
+      event.preventDefault();
+      moveCursor(0, -1);
+    } else if (key === 'arrowright') {
+      event.preventDefault();
+      moveCursor(0, 1);
+    } else if (key === ' ' || key === 'spacebar') {
+      event.preventDefault();
+      placeAtCursor();
     } else if (key === 'escape' || key === 'c') {
       event.preventDefault();
-      selected = { pieceIndex: null, rotation: 0, hoverRow: null, hoverCol: null };
+      selected = { pieceIndex: null, rotation: 0, hoverRow: selected.hoverRow ?? 0, hoverCol: selected.hoverCol ?? 0 };
       render();
     } else if (key >= '1' && key <= '3') {
       const idx = Number(key) - 1;
@@ -671,13 +724,65 @@ function renderPlayPage(): string {
         event.preventDefault();
         selected.pieceIndex = idx;
         selected.rotation = 0;
+        ensureCursor();
         render();
       }
-    } else if (key === 'enter' && $submit.style.display !== 'none' && !$submit.disabled) {
+    } else if (key === 'enter') {
       event.preventDefault();
-      $submit.click();
+      if ($submit.style.display !== 'none' && !$submit.disabled) $submit.click();
+      else placeAtCursor();
     }
   });
+
+  function setInfoTab(name) {
+    const shortcuts = name === 'shortcuts';
+    $playTab.classList.toggle('active', !shortcuts);
+    $shortcutsTab.classList.toggle('active', shortcuts);
+    $playPanel.classList.toggle('active', !shortcuts);
+    $shortcutsPanel.classList.toggle('active', shortcuts);
+    $playTab.setAttribute('aria-selected', String(!shortcuts));
+    $shortcutsTab.setAttribute('aria-selected', String(shortcuts));
+  }
+
+  function availablePieceIndexes() {
+    if (!state?.self?.pieces) return [];
+    return state.self.pieces
+      .map((piece, index) => piece.placed ? -1 : index)
+      .filter((index) => index >= 0);
+  }
+
+  function cyclePiece(direction) {
+    if (!state || state.result.completed || state.self.phase === 'finished' || isTimeExpired()) return;
+    const indexes = availablePieceIndexes();
+    if (indexes.length === 0) return;
+    const current = indexes.indexOf(selected.pieceIndex);
+    const base = current >= 0 ? current : direction > 0 ? -1 : 0;
+    const next = indexes[(base + direction + indexes.length) % indexes.length];
+    selected.pieceIndex = next;
+    selected.rotation = 0;
+    ensureCursor();
+    render();
+  }
+
+  function ensureCursor() {
+    if (selected.hoverRow == null || selected.hoverCol == null) {
+      selected.hoverRow = 0;
+      selected.hoverCol = 0;
+    }
+  }
+
+  function moveCursor(rowDelta, colDelta) {
+    if (!state || state.result.completed) return;
+    ensureCursor();
+    selected.hoverRow = Math.max(0, Math.min(8, selected.hoverRow + rowDelta));
+    selected.hoverCol = Math.max(0, Math.min(8, selected.hoverCol + colDelta));
+    paintBoard();
+  }
+
+  function placeAtCursor() {
+    ensureCursor();
+    placeAt(selected.hoverRow, selected.hoverCol);
+  }
 
   function showToast(msg) {
     $toast.textContent = msg;
@@ -770,6 +875,10 @@ function renderPlayPage(): string {
   }
 
   function previewAt(r, c) {
+    if (r == null || c == null) {
+      paintBoard();
+      return;
+    }
     selected.hoverRow = r;
     selected.hoverCol = c;
     paintBoard();
@@ -810,8 +919,8 @@ function renderPlayPage(): string {
       selected.pieceIndex = null;
     }
     selected.rotation = 0;
-    selected.hoverRow = null;
-    selected.hoverCol = null;
+    selected.hoverRow = r;
+    selected.hoverCol = c;
     render();
   }
 
@@ -841,6 +950,10 @@ function renderPlayPage(): string {
         node.className = 'cell grid-rule';
         if (v === 1) node.classList.add('fill-1');
         else if (v === 2) node.classList.add('fill-2');
+
+        if (selected.hoverRow === r && selected.hoverCol === c) {
+          node.classList.add('keyboard-cursor');
+        }
 
         if (ghostMap.has(r * 9 + c)) {
           if (!wouldFit) node.classList.add('ghost-bad');
@@ -996,6 +1109,7 @@ function renderPlayPage(): string {
       const idx = state.self.pieces.findIndex(p => !p.placed);
       if (idx >= 0) selected.pieceIndex = idx;
     }
+    ensureCursor();
     render();
   }
 
