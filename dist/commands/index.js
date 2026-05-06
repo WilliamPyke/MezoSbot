@@ -49,6 +49,7 @@ const treasury = __importStar(require("./treasury.js"));
 const backfill = __importStar(require("./backfill.js"));
 const credit = __importStar(require("./credit.js"));
 const sweep = __importStar(require("./sweep.js"));
+const arcade = __importStar(require("./arcade.js"));
 const gameboy_js_1 = require("./gameboy.js");
 const config_js_1 = require("../config.js");
 const baseCommands = [
@@ -67,6 +68,7 @@ const baseCommands = [
     backfill,
     credit,
     sweep,
+    arcade,
 ];
 // Merge base commands + gameboy button commands into a single list
 exports.commands = [

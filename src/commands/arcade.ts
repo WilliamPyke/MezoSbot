@@ -1,5 +1,6 @@
 import {
   EmbedBuilder,
+  MessageFlags,
   type ChatInputCommandInteraction,
 } from "discord.js";
 import { config } from "../config.js";
@@ -86,12 +87,12 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     case "leaderboard":
       return runLeaderboard(interaction);
     default:
-      return interaction.reply({ content: "Unknown subcommand.", ephemeral: true });
+      return interaction.reply({ content: "Unknown subcommand.", flags: MessageFlags.Ephemeral });
   }
 }
 
 async function runPractice(interaction: ChatInputCommandInteraction) {
-  await interaction.deferReply({ ephemeral: true });
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   const match = await createMatch({
     mode: "practice",
     createdById: interaction.user.id,
@@ -112,10 +113,10 @@ async function runChallenge(interaction: ChatInputCommandInteraction) {
   const stake = interaction.options.getNumber("stake") ?? 0;
 
   if (target.id === interaction.user.id) {
-    return interaction.reply({ content: "❌ You can't challenge yourself.", ephemeral: true });
+    return interaction.reply({ content: "❌ You can't challenge yourself.", flags: MessageFlags.Ephemeral });
   }
   if (target.bot) {
-    return interaction.reply({ content: "❌ Bots can't play.", ephemeral: true });
+    return interaction.reply({ content: "❌ Bots can't play.", flags: MessageFlags.Ephemeral });
   }
 
   await interaction.deferReply();
@@ -180,7 +181,7 @@ async function runRules(interaction: ChatInputCommandInteraction) {
         "**Stakes** — for staked matches, both players put in the same sats. Winner receives gross pot minus 10% platform fee. Tie refunds both stakes.",
       ].join("\n")
     );
-  await interaction.reply({ embeds: [embed], ephemeral: true });
+  await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
 }
 
 async function runTiers(interaction: ChatInputCommandInteraction) {
@@ -200,10 +201,11 @@ async function runTiers(interaction: ChatInputCommandInteraction) {
         "Use `/arcade challenge @user stake:<amount>` to start a staked match. Any stake above 0 is allowed (these are convenience tiers).",
       ].join("\n")
     );
-  await interaction.reply({ embeds: [embed], ephemeral: true });
+  await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
 }
 
 async function runLeaderboard(interaction: ChatInputCommandInteraction) {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   const rows = await topValidatedScores(10);
   const lines = rows.length
     ? rows.map(
@@ -215,5 +217,5 @@ async function runLeaderboard(interaction: ChatInputCommandInteraction) {
     .setColor(0x00cc6a)
     .setTitle("Slice Arcade — Top scores")
     .setDescription(lines.join("\n"));
-  await interaction.reply({ embeds: [embed], ephemeral: true });
+  await interaction.editReply({ embeds: [embed] });
 }

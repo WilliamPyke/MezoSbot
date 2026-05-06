@@ -13,6 +13,7 @@ const drops_js_1 = require("./drops.js");
 const db_js_1 = require("./db.js");
 const profile_js_1 = require("./profile.js");
 const notifications_js_1 = require("./notifications.js");
+const interactions_js_1 = require("./arcade/interactions.js");
 process.on("unhandledRejection", (err) => {
     console.error("Unhandled rejection:", err?.message ?? err);
 });
@@ -210,6 +211,11 @@ client.once(discord_js_1.Events.ClientReady, async (c) => {
     }
 });
 client.on(discord_js_1.Events.InteractionCreate, async (interaction) => {
+    if ((0, interactions_js_1.isArcadeInteraction)(interaction)) {
+        console.log(`[Discord] Arcade interaction ${("customId" in interaction && interaction.customId) || ""} from ${interaction.user.tag}`);
+        await (0, interactions_js_1.handleArcadeInteraction)(interaction);
+        return;
+    }
     if (interaction.isButton()) {
         console.log(`[Discord] Button interaction ${interaction.customId} from ${interaction.user.tag}`);
         const customId = interaction.customId;

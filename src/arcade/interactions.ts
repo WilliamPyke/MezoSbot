@@ -1,5 +1,6 @@
 import {
   EmbedBuilder,
+  MessageFlags,
   type ButtonInteraction,
   type Client,
   type Interaction,
@@ -12,7 +13,6 @@ import {
   joinMatch,
   recordSubmission,
   refundAllEscrow,
-  setMatchMessage,
   trySettleMatch,
   type ArcadeMatchRow,
 } from "./db.js";
@@ -22,6 +22,7 @@ import {
   ensureRuntime,
   getRuntime,
   rebuildState,
+  type MatchRuntime,
 } from "./runtime.js";
 import {
   CUSTOM_ID_PREFIX,
@@ -41,6 +42,8 @@ import { formatSats } from "../format.js";
 import { supabase } from "../db.js";
 import type { Move } from "./types.js";
 
+type ArcadeInteraction = ButtonInteraction | StringSelectMenuInteraction;
+
 export function isArcadeInteraction(interaction: Interaction): boolean {
   if (interaction.isButton() || interaction.isStringSelectMenu()) {
     return interaction.customId.startsWith(`${CUSTOM_ID_PREFIX}:`);
@@ -54,6 +57,24 @@ export async function handleArcadeInteraction(interaction: Interaction): Promise
   if (!parsed) return;
 
   const { action, parts } = parsed;
+
+  // Ack within Discord's 3s window before doing any DB work. "play" creates a
+  // new ephemeral playfield reply; every other action mutates the existing
+  // message. Deferring here gives us 15 minutes to finish.
+  try {
+    if (!interaction.deferred && !interaction.replied) {
+      if (action === "play") {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      } else {
+        await interaction.deferUpdate();
+      }
+    }
+  } catch (err) {
+    if ((err as { code?: number })?.code === 10062) return;
+    console.error(`[Arcade] Defer failed for ${action}:`, (err as Error)?.message ?? err);
+    return;
+  }
+
   try {
     switch (action) {
       case "accept":
@@ -79,13 +100,12 @@ export async function handleArcadeInteraction(interaction: Interaction): Promise
         return await handleSubmit(interaction as ButtonInteraction, +parts[0]);
     }
   } catch (err) {
+    if ((err as { code?: number })?.code === 10062) return;
     const message = (err as Error)?.message ?? String(err);
     console.error(`[Arcade] Interaction ${action} failed:`, message);
-    if (!interaction.replied && !interaction.deferred) {
-      await interaction.reply({ content: `❌ ${message}`, ephemeral: true }).catch(() => {});
-    } else {
-      await interaction.followUp({ content: `❌ ${message}`, ephemeral: true }).catch(() => {});
-    }
+    await interaction
+      .followUp({ content: `❌ ${message}`, flags: MessageFlags.Ephemeral })
+      .catch(() => {});
   }
 }
 
@@ -106,7 +126,6 @@ async function handleAccept(interaction: ButtonInteraction, matchId: number) {
 
   const join = await joinMatch(matchId, interaction.user.id);
   if (!join.ok || !join.match) {
-    // Refund if escrow was taken
     if (match.mode === "staked_pvp") await refundAllEscrow(matchId);
     return reply(interaction, join.error ?? "Could not join match.");
   }
@@ -114,7 +133,7 @@ async function handleAccept(interaction: ButtonInteraction, matchId: number) {
   const updated = join.match;
   ensureRuntime(updated.id, updated.seed, [updated.player_a_id, updated.player_b_id!]);
 
-  await interaction.update({
+  await interaction.editReply({
     embeds: [buildMatchFeedEmbed(updated)],
     components: buildMatchFeedComponents(updated),
   });
@@ -136,7 +155,7 @@ async function handleCancel(interaction: ButtonInteraction, matchId: number) {
       .eq("id", matchId);
 
   const refreshed = (await getMatch(matchId))!;
-  await interaction.update({
+  await interaction.editReply({
     embeds: [buildMatchFeedEmbed(refreshed)],
     components: buildMatchFeedComponents(refreshed),
   });
@@ -152,7 +171,6 @@ async function handlePlay(interaction: ButtonInteraction, matchId: number) {
   let runtime = getRuntime(matchId);
   if (!runtime) {
     runtime = ensureRuntime(matchId, match.seed, playerIds);
-    // Try restoring move logs if any
     const { data: subs } = await supabase
       .from("arcade_submissions")
       .select("user_id, move_log")
@@ -169,10 +187,9 @@ async function handlePlay(interaction: ButtonInteraction, matchId: number) {
 
   const state = runtime.players.get(interaction.user.id)!;
   const selection = getSelection(matchId, interaction.user.id);
-  await interaction.reply({
+  await interaction.editReply({
     embeds: [buildPlayfieldEmbed(match, state, runtime, selection)],
     components: buildPlayfieldComponents(matchId, state, runtime, selection),
-    ephemeral: true,
   });
 }
 
@@ -186,7 +203,7 @@ async function handlePickPiece(
   const ctx = await ensureContext(interaction, matchId);
   if (!ctx) return;
   setSelection(matchId, interaction.user.id, { pieceIndex, rotation: 0 });
-  await renderPlayfield(interaction, matchId);
+  await renderPlayfield(interaction, ctx.match, ctx.runtime);
 }
 
 async function handleRotate(interaction: ButtonInteraction, matchId: number) {
@@ -195,7 +212,7 @@ async function handleRotate(interaction: ButtonInteraction, matchId: number) {
   const sel = getSelection(matchId, interaction.user.id);
   const next = ((sel.rotation + 1) % 4) as 0 | 1 | 2 | 3;
   setSelection(matchId, interaction.user.id, { rotation: next });
-  await renderPlayfield(interaction, matchId);
+  await renderPlayfield(interaction, ctx.match, ctx.runtime);
 }
 
 async function handleSelectRow(
@@ -206,7 +223,7 @@ async function handleSelectRow(
   if (!ctx) return;
   const row = +interaction.values[0];
   setSelection(matchId, interaction.user.id, { row });
-  await renderPlayfield(interaction, matchId);
+  await renderPlayfield(interaction, ctx.match, ctx.runtime);
 }
 
 async function handleSelectCol(
@@ -217,14 +234,14 @@ async function handleSelectCol(
   if (!ctx) return;
   const col = +interaction.values[0];
   setSelection(matchId, interaction.user.id, { col });
-  await renderPlayfield(interaction, matchId);
+  await renderPlayfield(interaction, ctx.match, ctx.runtime);
 }
 
 async function handleReset(interaction: ButtonInteraction, matchId: number) {
   const ctx = await ensureContext(interaction, matchId);
   if (!ctx) return;
   resetSelection(matchId, interaction.user.id);
-  await renderPlayfield(interaction, matchId);
+  await renderPlayfield(interaction, ctx.match, ctx.runtime);
 }
 
 /* ─────────── Place ─────────── */
@@ -249,13 +266,14 @@ async function handlePlace(interaction: ButtonInteraction, matchId: number) {
   const result = applyMoveForPlayer(matchId, interaction.user.id, move);
   if (!result.ok) return reply(interaction, result.error);
 
-  // Reset coord selection but keep piece picker fresh for next placement.
   resetSelection(matchId, interaction.user.id);
 
-  // Draft-persist the move log so a restart can recover state.
-  await persistDraft(match, interaction.user.id, runtime.players.get(interaction.user.id)!);
-
-  await renderPlayfield(interaction, matchId);
+  // Render first so the user sees the move land immediately; persist the
+  // draft afterwards so a slow Supabase write can't delay the editReply.
+  await renderPlayfield(interaction, match, runtime);
+  persistDraft(match, interaction.user.id, runtime.players.get(interaction.user.id)!).catch(
+    (err) => console.error("[Arcade] persistDraft failed:", (err as Error)?.message ?? err)
+  );
 }
 
 /* ─────────── Submit / End ─────────── */
@@ -278,7 +296,7 @@ async function handleSubmit(interaction: ButtonInteraction, matchId: number) {
 
   const settlement = await trySettleMatch(matchId);
 
-  await interaction.update({
+  await interaction.editReply({
     embeds: [
       new EmbedBuilder()
         .setColor(0x00cc6a)
@@ -297,8 +315,8 @@ async function handleSubmit(interaction: ButtonInteraction, matchId: number) {
     components: [],
   });
 
-  // Update the public match feed if we have one
-  await updateMatchFeed(interaction.client, settlement.match);
+  // Public match feed update can't block the player's submit ack.
+  updateMatchFeed(interaction.client, settlement.match).catch(() => {});
 
   if (settlement.status !== "waiting") clearRuntime(matchId);
 }
@@ -306,9 +324,9 @@ async function handleSubmit(interaction: ButtonInteraction, matchId: number) {
 /* ─────────── Helpers ─────────── */
 
 async function ensureContext(
-  interaction: ButtonInteraction | StringSelectMenuInteraction,
+  interaction: ArcadeInteraction,
   matchId: number
-) {
+): Promise<{ match: ArcadeMatchRow; runtime: MatchRuntime } | null> {
   const match = await getMatch(matchId);
   if (!match) {
     await reply(interaction, "Match not found.");
@@ -324,17 +342,15 @@ async function ensureContext(
 }
 
 async function renderPlayfield(
-  interaction: ButtonInteraction | StringSelectMenuInteraction,
-  matchId: number
+  interaction: ArcadeInteraction,
+  match: ArcadeMatchRow,
+  runtime: MatchRuntime
 ) {
-  const match = await getMatch(matchId);
-  if (!match) return reply(interaction, "Match not found.");
-  const runtime = getRuntime(matchId)!;
   const state = runtime.players.get(interaction.user.id)!;
-  const selection = getSelection(matchId, interaction.user.id);
-  await interaction.update({
+  const selection = getSelection(match.id, interaction.user.id);
+  await interaction.editReply({
     embeds: [buildPlayfieldEmbed(match, state, runtime, selection)],
-    components: buildPlayfieldComponents(matchId, state, runtime, selection),
+    components: buildPlayfieldComponents(match.id, state, runtime, selection),
   });
 }
 
@@ -343,8 +359,6 @@ async function persistDraft(
   userId: string,
   state: { moves: Move[]; score: number },
 ) {
-  // Upsert as a draft so we can restore on bot restart. We don't mark
-  // player_a_submitted / player_b_submitted yet — only final submit does that.
   await supabase.from("arcade_submissions").upsert(
     {
       match_id: match.id,
@@ -374,14 +388,10 @@ async function updateMatchFeed(client: Client, match: ArcadeMatchRow) {
   }
 }
 
-async function reply(
-  interaction: ButtonInteraction | StringSelectMenuInteraction,
-  content: string
-) {
-  if (interaction.replied || interaction.deferred) {
-    await interaction.followUp({ content: `❌ ${content}`, ephemeral: true }).catch(() => {});
-  } else {
-    await interaction.reply({ content: `❌ ${content}`, ephemeral: true }).catch(() => {});
-  }
+async function reply(interaction: ArcadeInteraction, content: string) {
+  // We always defer at the top of handleArcadeInteraction, so an error reply
+  // is always a followUp. Ephemeral so it only shows to the clicker.
+  await interaction
+    .followUp({ content: `❌ ${content}`, flags: MessageFlags.Ephemeral })
+    .catch(() => {});
 }
-
