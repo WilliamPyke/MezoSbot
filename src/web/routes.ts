@@ -74,7 +74,7 @@ export async function handleWalletWebRequest(
         stakeAmountUnits: stringField(body, "stakeAmountUnits"),
         chainId,
       });
-      return sendJson(res, 200, withContractArgs(draft));
+      return sendJson(res, 200, { session: withContractArgs(draft) });
     }
 
     if (parts[2] === "sessions" && parts[3]) {
