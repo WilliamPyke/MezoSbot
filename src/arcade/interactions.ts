@@ -165,11 +165,18 @@ async function handlePlay(interaction: ButtonInteraction, matchId: number) {
     .setDescription(
       `Open the link below to play match #${matchId} in your browser.\n\n*This link is for you only and expires in a few hours. Don't share it.*`
     );
-  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setLabel("Open browser playfield").setStyle(ButtonStyle.Link).setURL(url)
-  );
 
-  await interaction.editReply({ embeds: [embed], components: [row] });
+  if (isPublicHttpsUrl(url)) {
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setLabel("Open browser playfield").setStyle(ButtonStyle.Link).setURL(url)
+    );
+    await interaction.editReply({ embeds: [embed], components: [row] });
+  } else {
+    await interaction.editReply({
+      content: `⚠️ The bot is missing \`PUBLIC_BASE_URL\` — set it to the bot's public HTTPS URL on the host and redeploy.\n\nLink for this match (testing only):\n\`${url}\``,
+      embeds: [embed],
+    });
+  }
 }
 
 /* ─────────── Helpers ─────────── */
@@ -177,6 +184,18 @@ async function handlePlay(interaction: ButtonInteraction, matchId: number) {
 function buildPlayUrl(matchId: number, userId: string): string {
   const token = issueMatchToken(matchId, userId);
   return `${config.publicBaseUrl}/arcade/play?t=${encodeURIComponent(token)}`;
+}
+
+function isPublicHttpsUrl(url: string): boolean {
+  try {
+    const u = new URL(url);
+    if (u.protocol !== "https:") return false;
+    const host = u.hostname.toLowerCase();
+    if (host === "localhost" || host === "127.0.0.1" || host === "0.0.0.0") return false;
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function sendPlayLinkDm(client: Client, matchId: number, userId: string) {
@@ -189,10 +208,14 @@ async function sendPlayLinkDm(client: Client, matchId: number, userId: string) {
       .setDescription(
         "Your match is live. Open the link to play in your browser. *This link is for you only.*"
       );
-    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder().setLabel("Open browser playfield").setStyle(ButtonStyle.Link).setURL(url)
-    );
-    await user.send({ embeds: [embed], components: [row] });
+    if (isPublicHttpsUrl(url)) {
+      const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder().setLabel("Open browser playfield").setStyle(ButtonStyle.Link).setURL(url)
+      );
+      await user.send({ embeds: [embed], components: [row] });
+    } else {
+      await user.send({ content: `Match #${matchId} is ready. Link: \`${url}\``, embeds: [embed] });
+    }
   } catch {
     // DMs closed or fetch failed — ignore. The user can still click the
     // public "Open browser playfield" button.

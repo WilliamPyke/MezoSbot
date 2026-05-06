@@ -99,21 +99,57 @@ export function buildPlayUrl(matchId: number, userId: string): string {
   return `${base}/arcade/play?t=${encodeURIComponent(token)}`;
 }
 
+/**
+ * Discord Link buttons require an https:// (or http://) URL that's reachable
+ * from the player's device. localhost falls back values are useful for local
+ * dev but would 404 for anyone but the operator. Detect that here so we can
+ * print the URL as plain text instead of trying to create a button Discord
+ * will reject.
+ */
+function isPublicHttpsUrl(url: string): boolean {
+  try {
+    const u = new URL(url);
+    if (u.protocol !== "https:") return false;
+    const host = u.hostname.toLowerCase();
+    if (host === "localhost" || host === "127.0.0.1" || host === "0.0.0.0") return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function playLinkRow(url: string, label = "Open Slice Arcade") {
   return new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setLabel(label).setStyle(ButtonStyle.Link).setURL(url)
   );
 }
 
+function describeBadUrl(): string {
+  return [
+    "⚠️ The bot is missing a public URL config — Discord won't accept a play-link button until it's set.",
+    "",
+    "Set the `PUBLIC_BASE_URL` env var on the host to the bot's public HTTPS URL, e.g. `https://mezosbot.example.com`, then redeploy.",
+  ].join("\n");
+}
+
 /* ────────────────────────────────────────────────────────────────── */
 
 async function runPractice(interaction: ChatInputCommandInteraction) {
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-  const match = await createMatch({
-    mode: "practice",
-    createdById: interaction.user.id,
-    playerAId: interaction.user.id,
-  });
+  let match;
+  try {
+    match = await createMatch({
+      mode: "practice",
+      createdById: interaction.user.id,
+      playerAId: interaction.user.id,
+    });
+  } catch (err) {
+    const msg = (err as Error)?.message ?? String(err);
+    console.error("[Arcade] /arcade practice createMatch failed:", msg);
+    await interaction.editReply({ content: `❌ Could not create match: ${msg}` });
+    return;
+  }
+
   const url = buildPlayUrl(match.id, interaction.user.id);
   const embed = new EmbedBuilder()
     .setColor(0x00cc6a)
@@ -121,7 +157,17 @@ async function runPractice(interaction: ChatInputCommandInteraction) {
     .setDescription(
       `Match #${match.id} — open the link to play in your browser.\n\nThis link is for you only and expires in a few hours.`
     );
-  await interaction.editReply({ embeds: [embed], components: [playLinkRow(url, "Play in browser")] });
+
+  if (isPublicHttpsUrl(url)) {
+    await interaction.editReply({ embeds: [embed], components: [playLinkRow(url, "Play in browser")] });
+  } else {
+    // Discord rejects http:// or localhost URLs in Link buttons. Fall back to
+    // a plain-text URL so the operator can still test and see what's wrong.
+    await interaction.editReply({
+      content: `${describeBadUrl()}\n\nLink for this match (testing only):\n\`${url}\``,
+      embeds: [embed],
+    });
+  }
 }
 
 async function runChallenge(interaction: ChatInputCommandInteraction) {
