@@ -44,6 +44,8 @@ cp .env.example .env
 | `STREAM_MIN_FPS` / `STREAM_MAX_FPS` | Auto-tuning floor/ceiling |
 | `STREAM_AUTO_TUNE` | Enables adaptive FPS under load (`true`/`false`) |
 | `STUN_SERVERS` | Comma-separated STUN servers for WebRTC |
+| `PUBLIC_BASE_URL` | Public URL of this bot's HTTP server (used for Slice Arcade browser-play links). E.g. `https://mezosbot.example.com`. Defaults to `http://localhost:<STREAM_PORT>` for local dev. |
+| `ARCADE_TOKEN_SECRET` | Optional HMAC secret for Slice Arcade browser tokens. Falls back to `TREASURY_PRIVATE_KEY` if unset. |
 | `DEPOSIT_POLL_MS` | Deposit wallet chain polling interval (default `15000`) |
 | `DEPOSIT_ADDRESS_REFRESH_MS` | Supabase address-list cache refresh interval (default `300000`) |
 
@@ -100,14 +102,15 @@ Recipients receive DMs when they are credited from tips, rains, distributions, a
 
 ## Slice Arcade — head-to-head block puzzle
 
-A 9×9 block puzzle PvP game playable directly in Discord. Both players get the same seeded piece sequence; highest validated score wins the pot after a 10% platform fee.
+A 9×9 block puzzle PvP game. **Matchmaking happens in Discord; the match itself plays in your browser.** Both players get the same seeded piece sequence; highest validated score wins the pot after a 10% platform fee.
 
-- `/arcade practice` opens an ephemeral playfield only you can see.
-- `/arcade challenge @opponent` posts a public challenge card. Add `stake:1000` (or any positive sats amount) to escrow that amount from each player into the match. Free PvP omits the stake.
-- After both players accept, each clicks **Play / view your board** to open a private playfield. Pick a piece, choose a row and column, hit **Place**. End-of-match auto-detects no-legal-moves or 12 levels complete.
-- Stakes are debited from each player's `/balance`. On settle, the winner is credited the gross pot minus 10% rake; ties refund both stakes. The 10% rake stays in the treasury (recorded in `arcade_fees`).
+- `/arcade practice` replies with a private link that opens the playfield in your browser.
+- `/arcade challenge @opponent` posts a public challenge card. Add `stake:1000` (or any positive sats amount) to escrow that amount from each player. Free PvP omits the stake.
+- When the opponent accepts, each player gets a per-user signed link (DM if their DMs are open, plus the **Open browser playfield** button on the match card). Open the link and play: pick a piece, click a board cell to place. End-of-match auto-detects no-legal-moves or 12 levels complete.
+- Every move is server-validated. The browser is a thin client that POSTs `{pieceIndex, rotation, row, col}` to `/arcade/api/move` — the server is the source of truth for board, score, and multiplier.
+- Stakes are debited from each player's `/balance`. On settle, the winner is credited the gross pot minus 10% rake; ties refund both stakes. The 10% rake stays in the treasury (recorded in `arcade_fees`). The public Discord match card refreshes automatically when the match settles.
 
-The deterministic engine, scoring, and rake math live in `src/arcade/`. Match runtime state is reconstructible from a seed + move log, so a bot restart can recover any in-progress match.
+The deterministic engine, scoring, and rake math live in `src/arcade/`. Match runtime state is reconstructible from a seed + move log, so a bot restart can recover any in-progress match. Set `PUBLIC_BASE_URL` (e.g. `https://your-bot.example.com`) so the bot can build absolute browser-play URLs; defaults to `http://localhost:<STREAM_PORT>` for local dev.
 
 ## How Deposits Work
 

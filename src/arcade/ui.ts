@@ -3,20 +3,9 @@ import {
   ButtonBuilder,
   ButtonStyle,
   EmbedBuilder,
-  StringSelectMenuBuilder,
 } from "discord.js";
 
-type ActionRowJSON = ReturnType<ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>["toJSON"]>;
-import { BOARD_SIZE, PIECES_PER_LEVEL, MAX_LEVELS, type PlayerState } from "./types.js";
-import { rotateCells } from "./pieces.js";
-import {
-  renderBoard,
-  renderPiecePreview,
-  pieceShortLabel,
-  coordLabel,
-} from "./render.js";
-import type { MatchRuntime } from "./runtime.js";
-import type { Selection } from "./selection.js";
+type ActionRowJSON = ReturnType<ActionRowBuilder<ButtonBuilder>["toJSON"]>;
 import type { ArcadeMatchRow } from "./db.js";
 import { formatSats } from "../format.js";
 
@@ -34,171 +23,6 @@ export function parseCid(customId: string): { action: string; parts: string[] } 
   return { action, parts };
 }
 
-/* ─────────── Playfield (ephemeral, per-player) ─────────── */
-
-export function buildPlayfieldEmbed(
-  match: ArcadeMatchRow,
-  state: PlayerState,
-  runtime: MatchRuntime,
-  selection: Selection
-): EmbedBuilder {
-  const pieces = runtime.sequence[Math.min(state.level, MAX_LEVELS - 1)];
-  const selectedPiece = selection.pieceIndex != null ? pieces[selection.pieceIndex] : null;
-  const rotatedCells = selectedPiece
-    ? rotateCells(selectedPiece.cells, selection.rotation)
-    : null;
-
-  const ghost =
-    rotatedCells && selection.row != null && selection.col != null
-      ? { cells: rotatedCells, row: selection.row, col: selection.col }
-      : undefined;
-
-  const board = renderBoard(state.board, { ghost, showLabels: true });
-
-  const piecesField = pieces
-    .map((p, i) => {
-      const used = state.placedThisLevel[i] ? " ❌" : "";
-      const sel = selection.pieceIndex === i ? " ◀" : "";
-      return `**${i + 1}.** ${pieceShortLabel(p.cells)}${used}${sel}\n${renderPiecePreview(
-        p.cells
-      )}`;
-    })
-    .join("\n\n");
-
-  const modeLabel = match.mode === "practice"
-    ? "Practice"
-    : match.mode === "free_pvp"
-      ? "Free PvP"
-      : `Stake ${formatSats(match.stake_amount_sats ?? 0)}`;
-
-  const embed = new EmbedBuilder()
-    .setColor(state.phase === "finished" ? 0xff9900 : 0x00cc6a)
-    .setTitle(`Slice Arcade — ${modeLabel} #${match.id}`)
-    .setDescription(board)
-    .addFields(
-      { name: "Score", value: `**${state.score.toLocaleString()}**`, inline: true },
-      { name: "Multiplier", value: `${state.multiplier}×`, inline: true },
-      { name: "Level", value: `${Math.min(state.level + 1, MAX_LEVELS)}/${MAX_LEVELS}`, inline: true },
-      { name: "Pieces", value: piecesField, inline: false }
-    );
-
-  if (selection.pieceIndex != null) {
-    const target =
-      selection.row != null && selection.col != null
-        ? coordLabel(selection.row, selection.col)
-        : "(pick row + col)";
-    embed.addFields({
-      name: "Selection",
-      value: `Piece ${selection.pieceIndex + 1} • rotation ${selection.rotation * 90}° • target ${target}`,
-    });
-  }
-
-  if (state.phase === "finished") {
-    const reason = state.endReason === "no_moves" ? "no legal moves" : "all 12 levels complete";
-    embed.addFields({
-      name: "Match over",
-      value: `Final score: **${state.score.toLocaleString()}** — ${reason}`,
-    });
-  }
-
-  return embed;
-}
-
-export function buildPlayfieldComponents(
-  matchId: number,
-  state: PlayerState,
-  runtime: MatchRuntime,
-  selection: Selection
-): ActionRowJSON[] {
-  const rows: ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>[] = [];
-
-  if (state.phase === "finished") {
-    const submit = new ButtonBuilder()
-      .setCustomId(cid("submit", matchId))
-      .setLabel("Submit final score")
-      .setStyle(ButtonStyle.Success);
-    rows.push(new ActionRowBuilder<ButtonBuilder>().addComponents(submit));
-    return rows.map((r) => r.toJSON() as ActionRowJSON);
-  }
-
-  // Row 1: piece buttons + rotate
-  const pieces = runtime.sequence[Math.min(state.level, MAX_LEVELS - 1)];
-  const pieceRow = new ActionRowBuilder<ButtonBuilder>();
-  for (let i = 0; i < PIECES_PER_LEVEL; i++) {
-    const used = state.placedThisLevel[i];
-    const selected = selection.pieceIndex === i;
-    pieceRow.addComponents(
-      new ButtonBuilder()
-        .setCustomId(cid("p", matchId, i))
-        .setLabel(`Piece ${i + 1}`)
-        .setStyle(used ? ButtonStyle.Secondary : selected ? ButtonStyle.Primary : ButtonStyle.Secondary)
-        .setDisabled(used)
-    );
-  }
-
-  const rotateAllowed =
-    selection.pieceIndex != null
-      ? // Look up the piece's allowRotation flag indirectly via cells — we let any piece rotate.
-        true
-      : false;
-  pieceRow.addComponents(
-    new ButtonBuilder()
-      .setCustomId(cid("rot", matchId))
-      .setLabel("Rotate")
-      .setStyle(ButtonStyle.Secondary)
-      .setDisabled(!rotateAllowed)
-  );
-  rows.push(pieceRow);
-
-  // Row 2: row select
-  const rowMenu = new StringSelectMenuBuilder()
-    .setCustomId(cid("row", matchId))
-    .setPlaceholder(selection.row != null ? `Row: ${"ABCDEFGHI"[selection.row]}` : "Pick row…");
-  for (let r = 0; r < BOARD_SIZE; r++) {
-    rowMenu.addOptions({
-      label: `Row ${"ABCDEFGHI"[r]}`,
-      value: String(r),
-      default: selection.row === r,
-    });
-  }
-  rows.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(rowMenu));
-
-  // Row 3: col select
-  const colMenu = new StringSelectMenuBuilder()
-    .setCustomId(cid("col", matchId))
-    .setPlaceholder(selection.col != null ? `Col: ${selection.col + 1}` : "Pick column…");
-  for (let c = 0; c < BOARD_SIZE; c++) {
-    colMenu.addOptions({
-      label: `Col ${c + 1}`,
-      value: String(c),
-      default: selection.col === c,
-    });
-  }
-  rows.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(colMenu));
-
-  // Row 4: place + reset + end-now
-  const placeRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder()
-      .setCustomId(cid("place", matchId))
-      .setLabel("Place")
-      .setStyle(ButtonStyle.Success)
-      .setDisabled(
-        selection.pieceIndex == null || selection.row == null || selection.col == null
-      ),
-    new ButtonBuilder()
-      .setCustomId(cid("reset", matchId))
-      .setLabel("Clear selection")
-      .setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder()
-      .setCustomId(cid("end", matchId))
-      .setLabel("End match now")
-      .setStyle(ButtonStyle.Danger)
-  );
-  rows.push(placeRow);
-
-  return rows.map((r) => r.toJSON() as ActionRowJSON);
-}
-
 /* ─────────── Public match feed (channel announcement) ─────────── */
 
 export function buildMatchFeedEmbed(match: ArcadeMatchRow): EmbedBuilder {
@@ -214,7 +38,8 @@ export function buildMatchFeedEmbed(match: ArcadeMatchRow): EmbedBuilder {
     .setTitle(`Slice Arcade — Match #${match.id}`)
     .addFields(
       { name: "Mode", value: tier, inline: true },
-      { name: "Status", value: humanStatus(match), inline: true }
+      { name: "Status", value: humanStatus(match), inline: true },
+      { name: "Where", value: "Plays in your browser", inline: true }
     );
 
   if (match.mode === "staked_pvp" && match.stake_amount_sats != null) {
@@ -280,7 +105,7 @@ export function buildMatchFeedComponents(
       new ActionRowBuilder<ButtonBuilder>().addComponents(
         new ButtonBuilder()
           .setCustomId(cid("play", match.id))
-          .setLabel("Play / view your board")
+          .setLabel("Open browser playfield")
           .setStyle(ButtonStyle.Primary)
       )
     );

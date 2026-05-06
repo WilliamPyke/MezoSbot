@@ -38,6 +38,13 @@ export const config = {
     skipWithdrawalMin: process.env.SKIP_WITHDRAWAL_MIN === "1" || process.env.SKIP_WITHDRAWAL_MIN === "true",
   },
   depositWebUrl: optional("DEPOSIT_WEB_URL", "https://deposit.mallard.sh/sbot"),
+  /**
+   * Public base URL of this bot's HTTP server (no trailing slash).
+   * Used to build the Slice Arcade browser-play links posted in Discord.
+   * Falls back to local dev address if unset.
+   */
+  publicBaseUrl: (process.env.PUBLIC_BASE_URL ?? `http://localhost:${process.env.STREAM_PORT ?? process.env.PORT ?? "8787"}`).replace(/\/+$/, ""),
+  arcadeTokenSecret: process.env.ARCADE_TOKEN_SECRET ?? process.env.TREASURY_PRIVATE_KEY ?? "",
   depositAdminOnly: process.env.DEPOSIT_ADMIN_ONLY === "1" || process.env.DEPOSIT_ADMIN_ONLY === "true",
   deposits: {
     pollMs: parseInt(optional("DEPOSIT_POLL_MS", "60000"), 10),

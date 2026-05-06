@@ -15,6 +15,7 @@ import {
   type FrameMeta,
 } from "./emulator.js";
 import { config } from "./config.js";
+import { handleArcadeWebRequest } from "./arcade/web.js";
 
 const deflateAsync = promisify(deflate);
 
@@ -280,6 +281,11 @@ async function pushFrameToClients(rgba: Buffer): Promise<void> {
 async function handleHttpRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const method = req.method ?? "GET";
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+
+  if (url.pathname.startsWith("/arcade")) {
+    const handled = await handleArcadeWebRequest(req, res, url);
+    if (handled) return;
+  }
 
   if (method === "GET" && url.pathname === "/") {
     sendHtml(res, buildViewerHtml());

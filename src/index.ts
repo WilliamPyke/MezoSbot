@@ -37,7 +37,13 @@ import {
 import { supabase } from "./db.js";
 import { extractProfile, updateUserProfile } from "./profile.js";
 import { sendTransferReceivedDm } from "./notifications.js";
-import { handleArcadeInteraction, isArcadeInteraction } from "./arcade/interactions.js";
+import {
+  handleArcadeInteraction,
+  isArcadeInteraction,
+  updateMatchFeed,
+} from "./arcade/interactions.js";
+import { setMatchSettledHandler } from "./arcade/notify.js";
+import { getMatch as getArcadeMatch } from "./arcade/db.js";
 
 process.on("unhandledRejection", (err) => {
   console.error("Unhandled rejection:", (err as Error)?.message ?? err);
@@ -555,6 +561,13 @@ async function handleDropButton(interaction: ButtonInteraction) {
 async function main() {
   // ── Web canvas server (start first — Render needs an open port quickly) ──
   await startStream();
+
+  // When a Slice Arcade match settles via the browser flow, refresh the
+  // public match card in Discord so spectators see the result.
+  setMatchSettledHandler(async (matchId) => {
+    const match = await getArcadeMatch(matchId);
+    if (match) await updateMatchFeed(client, match);
+  });
 
   initEVM();
   console.log(`Treasury: ${getTreasuryAddress()}`);

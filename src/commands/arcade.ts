@@ -1,4 +1,7 @@
 import {
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
   EmbedBuilder,
   MessageFlags,
   type ChatInputCommandInteraction,
@@ -9,17 +12,14 @@ import { getBalance } from "../balance.js";
 import {
   createMatch,
   fundEscrowFromBalance,
+  setMatchMessage,
   topValidatedScores,
 } from "../arcade/db.js";
-import { ensureRuntime } from "../arcade/runtime.js";
+import { issueMatchToken } from "../arcade/tokens.js";
 import {
-  buildMatchFeedEmbed,
   buildMatchFeedComponents,
-  buildPlayfieldEmbed,
-  buildPlayfieldComponents,
+  buildMatchFeedEmbed,
 } from "../arcade/ui.js";
-import { getSelection } from "../arcade/selection.js";
-import { setMatchMessage } from "../arcade/db.js";
 import {
   STAKE_TIERS,
   describeRakeTier,
@@ -28,17 +28,17 @@ import {
 
 export const data = {
   name: "arcade",
-  description: "Slice Arcade — block puzzle PvP for sats",
+  description: "Slice Arcade — block puzzle PvP for sats (plays in your browser)",
   options: [
     {
       type: 1 as const,
       name: "practice",
-      description: "Play a solo match (no stake) to learn the game",
+      description: "Play a solo match in your browser (no stake)",
     },
     {
       type: 1 as const,
       name: "challenge",
-      description: "Challenge another user to a match",
+      description: "Challenge another user — match plays in the browser",
       options: [
         {
           type: 6 as const,
@@ -91,6 +91,22 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   }
 }
 
+/* ────────────────────────────────────────────────────────────────── */
+
+export function buildPlayUrl(matchId: number, userId: string): string {
+  const token = issueMatchToken(matchId, userId);
+  const base = config.publicBaseUrl;
+  return `${base}/arcade/play?t=${encodeURIComponent(token)}`;
+}
+
+function playLinkRow(url: string, label = "Open Slice Arcade") {
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setLabel(label).setStyle(ButtonStyle.Link).setURL(url)
+  );
+}
+
+/* ────────────────────────────────────────────────────────────────── */
+
 async function runPractice(interaction: ChatInputCommandInteraction) {
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   const match = await createMatch({
@@ -98,14 +114,14 @@ async function runPractice(interaction: ChatInputCommandInteraction) {
     createdById: interaction.user.id,
     playerAId: interaction.user.id,
   });
-  const runtime = ensureRuntime(match.id, match.seed, [interaction.user.id]);
-  const state = runtime.players.get(interaction.user.id)!;
-  const selection = getSelection(match.id, interaction.user.id);
-
-  await interaction.editReply({
-    embeds: [buildPlayfieldEmbed(match, state, runtime, selection)],
-    components: buildPlayfieldComponents(match.id, state, runtime, selection),
-  });
+  const url = buildPlayUrl(match.id, interaction.user.id);
+  const embed = new EmbedBuilder()
+    .setColor(0x00cc6a)
+    .setTitle("Practice match ready")
+    .setDescription(
+      `Match #${match.id} — open the link to play in your browser.\n\nThis link is for you only and expires in a few hours.`
+    );
+  await interaction.editReply({ embeds: [embed], components: [playLinkRow(url, "Play in browser")] });
 }
 
 async function runChallenge(interaction: ChatInputCommandInteraction) {
@@ -149,7 +165,7 @@ async function runChallenge(interaction: ChatInputCommandInteraction) {
   }
 
   const reply = await interaction.editReply({
-    content: `<@${target.id}> — you've been challenged!`,
+    content: `<@${target.id}> — you've been challenged! Click **Accept** to start; the match will open in your browser.`,
     embeds: [buildMatchFeedEmbed(match)],
     components: buildMatchFeedComponents(match),
     allowedMentions: { users: [target.id] },
@@ -168,11 +184,13 @@ async function runRules(interaction: ChatInputCommandInteraction) {
     .setTitle("Slice Arcade — Rules")
     .setDescription(
       [
-        "**Head-to-head block puzzle.** You and your opponent receive the same shapes from the same seed. Highest validated score wins.",
+        "**Head-to-head block puzzle, played in your browser.** Discord starts the match; both players open a private link to play.",
+        "",
+        "**Same shapes** — both players receive the exact same seeded piece sequence. Highest validated score wins.",
         "",
         "**Board** — 9×9 grid. Place blocks to fill rows, columns, or 3×3 squares. Filled zones clear and score points.",
         "",
-        "**Levels** — 12 levels per match. Each level deals 3 pieces; you can place them in any order. Match ends if no remaining piece fits.",
+        "**Levels** — 12 levels per match. Each level deals 3 pieces; place them in any order. Match ends if no remaining piece fits.",
         "",
         "**Scoring** — +10 per placed cell, +25 per cleared row/column/3×3 square, +25 per extra zone in a combo.",
         "",
