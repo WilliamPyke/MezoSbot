@@ -12,6 +12,7 @@ export default defineConfig({
     port: 5173,
     proxy: {
       "/api": "http://localhost:8787",
+      "/web/play": "http://localhost:8787",
     },
   },
 });

@@ -229,7 +229,7 @@ function sendHtml(res: ServerResponse, html: string): void {
 async function tryServeWebApp(req: IncomingMessage, res: ServerResponse, url: URL): Promise<boolean> {
   if ((req.method ?? "GET").toUpperCase() !== "GET") return false;
   if (url.pathname.startsWith("/api/") || url.pathname === "/healthz" || url.pathname === "/metrics") return false;
-  if (url.pathname === "/stream" || url.pathname.startsWith("/arcade")) return false;
+  if (url.pathname === "/stream" || url.pathname.startsWith("/arcade") || url.pathname.startsWith("/web/play/")) return false;
 
   const webRoot = join(process.cwd(), "web", "dist");
   const requestedPath = url.pathname === "/" ? "index.html" : decodeURIComponent(url.pathname.slice(1));
@@ -332,7 +332,7 @@ async function handleHttpRequest(req: IncomingMessage, res: ServerResponse): Pro
   const method = req.method ?? "GET";
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
 
-  if (url.pathname.startsWith("/api/web")) {
+  if (url.pathname.startsWith("/api/web") || url.pathname.startsWith("/web/play/")) {
     const handled = await handleWalletWebRequest(req, res, url);
     if (handled) return;
   }

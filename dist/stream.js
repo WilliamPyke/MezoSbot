@@ -194,7 +194,7 @@ async function tryServeWebApp(req, res, url) {
         return false;
     if (url.pathname.startsWith("/api/") || url.pathname === "/healthz" || url.pathname === "/metrics")
         return false;
-    if (url.pathname === "/stream" || url.pathname.startsWith("/arcade"))
+    if (url.pathname === "/stream" || url.pathname.startsWith("/arcade") || url.pathname.startsWith("/web/play/"))
         return false;
     const webRoot = (0, node_path_1.join)(process.cwd(), "web", "dist");
     const requestedPath = url.pathname === "/" ? "index.html" : decodeURIComponent(url.pathname.slice(1));
@@ -296,7 +296,7 @@ async function pushFrameToClients(rgba) {
 async function handleHttpRequest(req, res) {
     const method = req.method ?? "GET";
     const url = new node_url_1.URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
-    if (url.pathname.startsWith("/api/web")) {
+    if (url.pathname.startsWith("/api/web") || url.pathname.startsWith("/web/play/")) {
         const handled = await (0, routes_js_1.handleWalletWebRequest)(req, res, url);
         if (handled)
             return;
