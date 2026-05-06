@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { URL } from "node:url";
 import { ethers } from "ethers";
+import { renderArcadePlayPage } from "../arcade/web.js";
 import {
   clearSessionCookie,
   createNonce,
@@ -9,7 +10,7 @@ import {
   verifyLogin,
 } from "./auth.js";
 import { createSessionDraft, getWebSession, markCreated, markJoined, type WebArcadeSessionRow } from "./db.js";
-import { applyWebMove, buildGameState, submitWebScore } from "./game.js";
+import { applyWebMove, buildGameState, buildWalletArcadePlayState, submitWebScore } from "./game.js";
 import { chainConfigForId, webChainsConfig } from "./chains.js";
 import type { Move } from "../arcade/types.js";
 
@@ -20,6 +21,22 @@ export async function handleWalletWebRequest(
   res: ServerResponse,
   url: URL
 ): Promise<boolean> {
+  if (url.pathname.startsWith("/web/play/") && (req.method ?? "GET").toUpperCase() === "GET") {
+    const sessionId = normalizeSessionId(url.pathname.split("/").filter(Boolean)[2] ?? "");
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.setHeader("Cache-Control", "no-store");
+    res.end(renderArcadePlayPage({
+      requiresToken: false,
+      missingAccessHtml: '<div class="wrap"><h2>Sign in required.</h2><p>Return to the arcade lobby and sign in with your wallet.</p></div>',
+      statePath: `/api/web/play/${sessionId}/state`,
+      movePath: `/api/web/play/${sessionId}/move`,
+      submitPath: `/api/web/play/${sessionId}/submit`,
+      doneMessage: "You can close this tab — escrow settlement is recorded on-chain.",
+    }));
+    return true;
+  }
+
   if (!url.pathname.startsWith("/api/web")) return false;
 
   try {
@@ -127,6 +144,35 @@ export async function handleWalletWebRequest(
       if (method === "POST" && parts[4] === "submit") {
         const wallet = requireSession(req);
         return sendJson(res, 200, await submitWebScore(sessionId, wallet.address));
+      }
+    }
+
+    if (parts[2] === "play" && parts[3]) {
+      const sessionId = normalizeSessionId(parts[3]);
+
+      if (method === "GET" && parts[4] === "state") {
+        const wallet = requireSession(req);
+        return sendJson(res, 200, await buildWalletArcadePlayState(sessionId, wallet.address));
+      }
+
+      if (method === "POST" && parts[4] === "move") {
+        const wallet = requireSession(req);
+        const body = await readJsonBody(req);
+        const move: Move = {
+          level: numberField(body, "level"),
+          pieceIndex: numberField(body, "pieceIndex"),
+          rotation: (numberField(body, "rotation") % 4) as 0 | 1 | 2 | 3,
+          row: numberField(body, "row"),
+          col: numberField(body, "col"),
+        };
+        await applyWebMove(sessionId, wallet.address, move);
+        return sendJson(res, 200, await buildWalletArcadePlayState(sessionId, wallet.address));
+      }
+
+      if (method === "POST" && parts[4] === "submit") {
+        const wallet = requireSession(req);
+        await submitWebScore(sessionId, wallet.address);
+        return sendJson(res, 200, await buildWalletArcadePlayState(sessionId, wallet.address));
       }
     }
 

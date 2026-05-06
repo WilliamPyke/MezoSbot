@@ -76,6 +76,52 @@ export type WebGameState = {
   boardSize: number;
 };
 
+export type WalletArcadePlayState = {
+  boardSize: number;
+  match: {
+    id: string;
+    mode: "staked_pvp";
+    status: WebArcadeSessionRow["status"];
+    stakeSats: null;
+    grossPotSats: null;
+    winnerPayoutSats: null;
+    stakeFormatted: string;
+    grossPotFormatted: string;
+    winnerPayoutFormatted: string;
+    durationSeconds: number;
+    startedAt: string | null;
+    deadlineAt: string | null;
+    serverNow: string;
+  };
+  self: {
+    userId: string;
+    score: number;
+    multiplier: number;
+    level: number;
+    levelDisplay: number;
+    maxLevels: number;
+    phase: PlayerState["phase"];
+    endReason?: PlayerState["endReason"];
+    submitted: boolean;
+    pieces: Array<{ cells: PieceCell[]; placed: boolean }>;
+    board: number[][];
+  };
+  opponent: {
+    userId: string | null;
+    submitted: boolean;
+    score: number | null;
+  } | null;
+  result: {
+    completed: boolean;
+    winnerId: string | null;
+    isWinner: boolean | null;
+    isTie: boolean;
+    aScore: number | null;
+    bScore: number | null;
+    payoutFormatted: string | null;
+  };
+};
+
 export async function buildGameState(sessionId: string, wallet: string): Promise<WebGameState> {
   const session = await getWebSession(sessionId);
   if (!session) throw new Error("Session not found");
@@ -153,6 +199,72 @@ export async function buildGameState(sessionId: string, wallet: string): Promise
       isTie: freshSession.status === "refunded" && freshSession.result_hash != null,
       aScore: freshSession.player_a_score,
       bScore: freshSession.player_b_score,
+    },
+  };
+}
+
+export async function buildWalletArcadePlayState(
+  sessionId: string,
+  wallet: string
+): Promise<WalletArcadePlayState> {
+  const state = await buildGameState(sessionId, wallet);
+  if (!state.self) throw new Error("Wallet is not a player in this session");
+
+  const session = await getWebSession(sessionId);
+  if (!session) throw new Error("Session not found");
+  const asset = assetForSession(session);
+  const stake = BigInt(state.session.stakeAmountUnits);
+  const grossPot = stake * 2n;
+  const fee = (grossPot * BigInt(state.session.platformFeeBps)) / 10000n;
+  const winnerPayout = grossPot - fee;
+
+  return {
+    boardSize: state.boardSize,
+    match: {
+      id: shortSessionId(state.session.id),
+      mode: "staked_pvp",
+      status: state.session.status,
+      stakeSats: null,
+      grossPotSats: null,
+      winnerPayoutSats: null,
+      stakeFormatted: `${ethers.formatUnits(stake, asset.decimals)} ${asset.symbol}`,
+      grossPotFormatted: `${ethers.formatUnits(grossPot, asset.decimals)} ${asset.symbol}`,
+      winnerPayoutFormatted: `${ethers.formatUnits(winnerPayout, asset.decimals)} ${asset.symbol}`,
+      durationSeconds: Math.max(1, Math.round((Date.parse(state.session.playDeadline) - Date.parse(state.session.joinDeadline)) / 1000)),
+      startedAt: null,
+      deadlineAt: ["active", "submitted"].includes(state.session.status) ? state.session.playDeadline : null,
+      serverNow: state.session.serverNow,
+    },
+    self: {
+      userId: shortAddress(state.self.address),
+      score: state.self.score,
+      multiplier: state.self.multiplier,
+      level: state.self.level,
+      levelDisplay: state.self.levelDisplay,
+      maxLevels: state.self.maxLevels,
+      phase: state.self.phase,
+      endReason: state.self.endReason,
+      submitted: state.self.submitted,
+      pieces: state.self.pieces,
+      board: state.self.board,
+    },
+    opponent: state.opponent
+      ? {
+          userId: state.opponent.address ? shortAddress(state.opponent.address) : null,
+          submitted: state.opponent.submitted,
+          score: state.opponent.score,
+        }
+      : null,
+    result: {
+      completed: state.result.completed,
+      winnerId: state.session.winner ? shortAddress(state.session.winner) : null,
+      isWinner: state.result.isWinner,
+      isTie: state.result.isTie,
+      aScore: state.result.aScore,
+      bScore: state.result.bScore,
+      payoutFormatted: state.result.completed && state.result.isWinner
+        ? `${ethers.formatUnits(winnerPayout, asset.decimals)} ${asset.symbol}`
+        : null,
     },
   };
 }
@@ -274,4 +386,20 @@ function resultHashFor(sessionId: string, winner: string | null, aScore: number,
       [sessionId, winner ?? ethers.ZeroAddress, BigInt(aScore), BigInt(bScore)]
     )
   );
+}
+
+function assetForSession(session: WebArcadeSessionRow) {
+  const chain = chainConfigForId(session.chain_id);
+  return chain.assets.find((asset) => ethers.getAddress(asset.address) === ethers.getAddress(session.asset_address)) ?? {
+    symbol: session.asset_symbol,
+    decimals: 18,
+  };
+}
+
+function shortSessionId(id: string) {
+  return `${id.slice(0, 8)}...${id.slice(-6)}`;
+}
+
+function shortAddress(address: string) {
+  return `${address.slice(0, 6)}...${address.slice(-4)}`;
 }

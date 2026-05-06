@@ -53,7 +53,15 @@ export async function handleArcadeWebRequest(
     return true;
   }
   if (method === "GET" && path === "/arcade/play") {
-    sendHtml(res, 200, renderPlayPage());
+    sendHtml(res, 200, renderArcadePlayPage({
+      requiresToken: true,
+      tokenParam: "t",
+      missingAccessHtml: '<div class="wrap"><h2>Missing token.</h2><p>Open this page from the link Discord gave you.</p></div>',
+      statePath: "/arcade/api/state",
+      movePath: "/arcade/api/move",
+      submitPath: "/arcade/api/submit",
+      doneMessage: "You can close this tab — the result is posted in Discord.",
+    }));
     return true;
   }
   if (method === "GET" && path === "/arcade/api/state") {
@@ -464,7 +472,24 @@ function sendHtml(res: ServerResponse, status: number, html: string): void {
 /*  HTML page                                                          */
 /* ────────────────────────────────────────────────────────────────── */
 
-function renderPlayPage(): string {
+export function renderArcadePlayPage(options: {
+  requiresToken: boolean;
+  tokenParam?: string;
+  missingAccessHtml: string;
+  statePath: string;
+  movePath: string;
+  submitPath: string;
+  doneMessage: string;
+}): string {
+  const clientConfig = JSON.stringify({
+    requiresToken: options.requiresToken,
+    tokenParam: options.tokenParam ?? "t",
+    missingAccessHtml: options.missingAccessHtml,
+    statePath: options.statePath,
+    movePath: options.movePath,
+    submitPath: options.submitPath,
+    doneMessage: options.doneMessage,
+  });
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -622,10 +647,11 @@ function renderPlayPage(): string {
 
 <script>
 (() => {
+  const CONFIG = ${clientConfig};
   const params = new URLSearchParams(location.search);
-  const TOKEN = params.get('t');
-  if (!TOKEN) {
-    document.body.innerHTML = '<div class="wrap"><h2>Missing token.</h2><p>Open this page from the link Discord gave you.</p></div>';
+  const TOKEN = CONFIG.requiresToken ? params.get(CONFIG.tokenParam || 't') : null;
+  if (CONFIG.requiresToken && !TOKEN) {
+    document.body.innerHTML = CONFIG.missingAccessHtml;
     return;
   }
 
@@ -683,7 +709,7 @@ function renderPlayPage(): string {
   });
   $submit.addEventListener('click', async () => {
     $submit.disabled = true;
-    const next = await api('POST', '/arcade/api/submit', {});
+    const next = await api('POST', CONFIG.submitPath, {});
     if (next) state = next;
     selected.pieceIndex = null;
     render();
@@ -827,8 +853,11 @@ function renderPlayPage(): string {
 
   async function api(method, path, body) {
     try {
-      const url = path + (path.includes('?') ? '&' : '?') + 't=' + encodeURIComponent(TOKEN);
-      const init = { method, headers: { 'X-Arcade-Token': TOKEN } };
+      const url = CONFIG.requiresToken
+        ? path + (path.includes('?') ? '&' : '?') + (CONFIG.tokenParam || 't') + '=' + encodeURIComponent(TOKEN)
+        : path;
+      const init = { method, credentials: 'include', headers: {} };
+      if (CONFIG.requiresToken) init.headers['X-Arcade-Token'] = TOKEN;
       if (body !== undefined) {
         init.headers['Content-Type'] = 'application/json';
         init.body = JSON.stringify(body);
@@ -902,7 +931,7 @@ function renderPlayPage(): string {
       showToast("That doesn't fit");
       return;
     }
-    const next = await api('POST', '/arcade/api/move', {
+    const next = await api('POST', CONFIG.movePath, {
       level: state.self.level,
       pieceIndex: selected.pieceIndex,
       rotation: selected.rotation,
@@ -1088,7 +1117,7 @@ function renderPlayPage(): string {
         html += '<div class="row">Final score</div>';
         html += '<div class="row"><span>You</span><span>' + state.self.score.toLocaleString() + '</span></div>';
       }
-      html += '<div class="row" style="margin-top:6px;">You can close this tab — the result is posted in Discord.</div>';
+      html += '<div class="row" style="margin-top:6px;">' + CONFIG.doneMessage + '</div>';
       $end.innerHTML = html;
     } else {
       $end.style.display = 'none';
@@ -1102,7 +1131,7 @@ function renderPlayPage(): string {
   }
 
   async function refresh() {
-    const next = await api('GET', '/arcade/api/state');
+    const next = await api('GET', CONFIG.statePath);
     if (!next) return;
     state = next;
     if (selected.pieceIndex == null && state.self.phase === 'playing') {

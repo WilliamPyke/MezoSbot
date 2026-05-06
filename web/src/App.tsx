@@ -349,9 +349,38 @@ function SessionView({
         <JoinSession chain={sessionChain} session={session} setBusy={setBusy} setStatus={setStatus} onJoined={load} />
       ) : null}
 
-      {game?.self ? <GameBoard game={game} reload={load} setStatus={setStatus} /> : <WaitingPanel session={session} walletSession={walletSession} />}
+      {game?.self ? <WalletPlayPanel game={game} sessionId={sessionId} /> : <WaitingPanel session={session} walletSession={walletSession} />}
       {busy ? <div className="notice">Waiting for wallet transaction...</div> : null}
     </section>
+  );
+}
+
+function WalletPlayPanel({ game, sessionId }: { game: GameState; sessionId: `0x${string}` }) {
+  const playUrl = `/web/play/${sessionId}`;
+  const playable = ["active", "submitted"].includes(game.session.status);
+  return (
+    <div className="playLaunch">
+      <div>
+        <h3>Slice Arcade Playfield</h3>
+        <p>
+          This escrow session uses the same server-validated browser game as Discord arcade.
+        </p>
+      </div>
+      {playable ? (
+        <a className="button primary" href={playUrl}>Open playfield</a>
+      ) : (
+        <div className="empty compact">Waiting for both escrow deposits before play starts.</div>
+      )}
+      <div className="summary">
+        <span>Status</span>
+        <strong>{game.session.status}</strong>
+      </div>
+      {game.session.settlementTxHash ? (
+        <a className="settlementLink" href={`${game.session.explorerUrl}/tx/${game.session.settlementTxHash}`}>
+          Settlement transaction
+        </a>
+      ) : null}
+    </div>
   );
 }
 
