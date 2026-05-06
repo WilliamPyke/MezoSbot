@@ -49,6 +49,9 @@ export const config = {
   deposits: {
     pollMs: parseInt(optional("DEPOSIT_POLL_MS", "60000"), 10),
     addressRefreshMs: parseInt(optional("DEPOSIT_ADDRESS_REFRESH_MS", "900000"), 10),
+    balanceConcurrency: parseInt(optional("DEPOSIT_BALANCE_CONCURRENCY", "8"), 10),
+    balanceBatchSize: parseInt(optional("DEPOSIT_BALANCE_BATCH_SIZE", "25"), 10),
+    initialPollDelayMs: parseInt(optional("DEPOSIT_INITIAL_POLL_DELAY_MS", "15000"), 10),
   },
   gameboy: {
     enabled: optionalBool("POKEMON_ENABLED", true),

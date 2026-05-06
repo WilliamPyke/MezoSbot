@@ -1,4 +1,4 @@
-import { EmbedBuilder, type ChatInputCommandInteraction } from "discord.js";
+import { EmbedBuilder, MessageFlags, type ChatInputCommandInteraction } from "discord.js";
 import { supabase } from "../db.js";
 import { processClaim, updateDropMessage, type Drop } from "../drops.js";
 import { formatSats } from "../format.js";
@@ -10,7 +10,7 @@ export const data = {
 };
 
 export async function execute(interaction: ChatInputCommandInteraction) {
-  await interaction.deferReply({ ephemeral: true });
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
   const { data: drop } = await supabase
     .from("drops")

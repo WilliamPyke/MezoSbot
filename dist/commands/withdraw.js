@@ -21,12 +21,12 @@ async function execute(interaction) {
     const amount = interaction.options.getNumber("amount", true);
     const addressOpt = interaction.options.getString("address");
     if (addressOpt && !/^0x[a-fA-F0-9]{40}$/i.test(addressOpt)) {
-        return interaction.reply({ content: "❌ Invalid address.", ephemeral: true });
+        return interaction.reply({ content: "❌ Invalid address.", flags: discord_js_1.MessageFlags.Ephemeral });
     }
     if (!config_js_1.config.evm.skipWithdrawalMin && amount < MIN_WITHDRAWAL_SATS) {
-        return interaction.reply({ content: `❌ Minimum withdrawal is **${MIN_WITHDRAWAL_SATS.toLocaleString()} sats**.`, ephemeral: true });
+        return interaction.reply({ content: `❌ Minimum withdrawal is **${MIN_WITHDRAWAL_SATS.toLocaleString()} sats**.`, flags: discord_js_1.MessageFlags.Ephemeral });
     }
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: discord_js_1.MessageFlags.Ephemeral });
     const address = addressOpt || (await (0, balance_js_1.getWalletForUser)(interaction.user.id));
     if (!address) {
         return interaction.editReply({

@@ -1,4 +1,4 @@
-import { EmbedBuilder, type ChatInputCommandInteraction } from "discord.js";
+import { EmbedBuilder, MessageFlags, type ChatInputCommandInteraction } from "discord.js";
 import { linkWallet } from "../balance.js";
 
 export const data = {
@@ -10,7 +10,7 @@ export const data = {
 };
 
 export async function execute(interaction: ChatInputCommandInteraction) {
-  await interaction.deferReply({ ephemeral: true });
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
   const address = interaction.options.getString("address", true);
   const { ok, error } = await linkWallet(interaction.user.id, address);

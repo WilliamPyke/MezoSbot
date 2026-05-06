@@ -24,14 +24,14 @@ async function execute(interaction) {
     if (validUsers.length === 0) {
         return interaction.reply({
             content: "❌ Include at least one valid user mention, e.g. `@user1 @user2`",
-            ephemeral: true,
+            flags: discord_js_1.MessageFlags.Ephemeral,
         });
     }
     const perUser = (0, format_js_1.roundSats)(totalAmount / validUsers.length);
     if (perUser < 0.000001) {
         return interaction.reply({
             content: "❌ Amount per user must be at least 0.000001 sats.",
-            ephemeral: true,
+            flags: discord_js_1.MessageFlags.Ephemeral,
         });
     }
     const totalNeeded = (0, format_js_1.roundSats)(perUser * validUsers.length);

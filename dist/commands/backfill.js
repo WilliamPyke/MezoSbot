@@ -18,10 +18,10 @@ exports.data = {
 };
 async function execute(interaction) {
     if (!config_js_1.config.discord.adminIds.includes(interaction.user.id)) {
-        return interaction.reply({ content: "❌ Admin only.", ephemeral: true });
+        return interaction.reply({ content: "❌ Admin only.", flags: discord_js_1.MessageFlags.Ephemeral });
     }
     const target = interaction.options.getUser("user", true);
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: discord_js_1.MessageFlags.Ephemeral });
     await (0, evm_js_1.registerDepositAddress)(target.id);
     const address = (0, evm_js_1.getUserDepositAddress)(target.id);
     const provider = (0, evm_js_1.getProvider)();

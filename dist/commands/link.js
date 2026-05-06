@@ -12,7 +12,7 @@ exports.data = {
     ],
 };
 async function execute(interaction) {
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: discord_js_1.MessageFlags.Ephemeral });
     const address = interaction.options.getString("address", true);
     const { ok, error } = await (0, balance_js_1.linkWallet)(interaction.user.id, address);
     if (!ok) {

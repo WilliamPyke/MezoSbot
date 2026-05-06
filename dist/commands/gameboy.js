@@ -17,9 +17,9 @@ async function handlePress(interaction, button) {
     const minBid = config_js_1.config.gameboy.minBid;
     const amount = interaction.options.getNumber("amount") ?? minBid;
     if (amount < minBid) {
-        return interaction.reply({ content: `❌ Minimum bid is ${(0, format_js_1.formatSats)(minBid)}.`, ephemeral: true });
+        return interaction.reply({ content: `❌ Minimum bid is ${(0, format_js_1.formatSats)(minBid)}.`, flags: discord_js_1.MessageFlags.Ephemeral });
     }
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: discord_js_1.MessageFlags.Ephemeral });
     // Check balance
     const balance = await (0, balance_js_1.getBalance)(interaction.user.id);
     if (balance < amount) {

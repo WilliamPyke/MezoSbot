@@ -23,13 +23,13 @@ async function execute(interaction) {
     const trimmedMessage = rawMessage?.trim() ?? "";
     const customMessage = trimmedMessage.length > 0 ? trimmedMessage : undefined;
     if (customMessage && customMessage.length > 200) {
-        return interaction.reply({ content: "❌ Message must be 200 characters or fewer.", ephemeral: true });
+        return interaction.reply({ content: "❌ Message must be 200 characters or fewer.", flags: discord_js_1.MessageFlags.Ephemeral });
     }
     if (target.id === interaction.user.id) {
-        return interaction.reply({ content: "❌ You can't tip yourself.", ephemeral: true });
+        return interaction.reply({ content: "❌ You can't tip yourself.", flags: discord_js_1.MessageFlags.Ephemeral });
     }
     if (target.bot) {
-        return interaction.reply({ content: "❌ You can't tip bots.", ephemeral: true });
+        return interaction.reply({ content: "❌ You can't tip bots.", flags: discord_js_1.MessageFlags.Ephemeral });
     }
     await interaction.deferReply();
     const balance = await (0, balance_js_1.getBalance)(interaction.user.id);

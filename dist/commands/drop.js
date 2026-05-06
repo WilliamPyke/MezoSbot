@@ -2,6 +2,7 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.data = void 0;
 exports.execute = execute;
+const discord_js_1 = require("discord.js");
 const db_js_1 = require("../db.js");
 const balance_js_1 = require("../balance.js");
 const format_js_1 = require("../format.js");
@@ -24,7 +25,7 @@ async function execute(interaction) {
     if (perClaim * maxClaims > total) {
         return interaction.reply({
             content: "❌ `per_claim` × `max_claims` cannot exceed `total`.",
-            ephemeral: true,
+            flags: discord_js_1.MessageFlags.Ephemeral,
         });
     }
     await interaction.deferReply();

@@ -11,7 +11,7 @@ exports.data = {
     description: "View the bot's treasury balance",
 };
 async function execute(interaction) {
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: discord_js_1.MessageFlags.Ephemeral });
     try {
         const bal = await (0, evm_js_1.getTreasuryBalanceSats)();
         const addr = (0, evm_js_1.getTreasuryAddress)();

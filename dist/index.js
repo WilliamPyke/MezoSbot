@@ -14,6 +14,8 @@ const db_js_1 = require("./db.js");
 const profile_js_1 = require("./profile.js");
 const notifications_js_1 = require("./notifications.js");
 const interactions_js_1 = require("./arcade/interactions.js");
+const notify_js_1 = require("./arcade/notify.js");
+const db_js_2 = require("./arcade/db.js");
 process.on("unhandledRejection", (err) => {
     console.error("Unhandled rejection:", err?.message ?? err);
 });
@@ -45,6 +47,7 @@ const client = new discord_js_1.Client({
     discordState,
 }));
 const commandMap = new Map(index_js_1.commands.map((c) => [c.data.name, c.execute]));
+const STALE_INTERACTION_SKIP_MS = 2_800;
 client.on("error", (err) => {
     discordState = "client_error";
     console.error("[Discord] Client error:", err?.message ?? err);
@@ -250,6 +253,15 @@ client.on(discord_js_1.Events.InteractionCreate, async (interaction) => {
     const arrivalLagMs = Date.now() - interaction.createdTimestamp;
     const startMs = Date.now();
     const tag = interaction.user.tag;
+    if (arrivalLagMs >= STALE_INTERACTION_SKIP_MS) {
+        const name = interaction.isChatInputCommand()
+            ? `/${interaction.commandName}`
+            : "customId" in interaction
+                ? interaction.customId
+                : interaction.type.toString();
+        console.warn(`[Discord] Skipping stale interaction ${name} from ${tag} (arrivalLag=${arrivalLagMs}ms) — already near Discord's 3s response deadline`);
+        return;
+    }
     if ((0, interactions_js_1.isArcadeInteraction)(interaction)) {
         const cid = ("customId" in interaction && interaction.customId) || "";
         console.log(`[Discord] Arcade interaction ${cid} from ${tag} (arrivalLag=${arrivalLagMs}ms)`);
@@ -275,7 +287,7 @@ client.on(discord_js_1.Events.InteractionCreate, async (interaction) => {
     const handler = commandMap.get(interaction.commandName);
     if (!handler) {
         console.warn(`[Discord] No handler registered for /${interaction.commandName}`);
-        await interaction.reply({ content: "This command is not available right now.", ephemeral: true }).catch(() => { });
+        await interaction.reply({ content: "This command is not available right now.", flags: discord_js_1.MessageFlags.Ephemeral }).catch(() => { });
         return;
     }
     const { username, displayName, avatarUrl } = (0, profile_js_1.extractProfile)(interaction);
@@ -290,7 +302,7 @@ client.on(discord_js_1.Events.InteractionCreate, async (interaction) => {
             return;
         }
         console.error(`Command /${interaction.commandName} error:`, err?.message ?? err);
-        const msg = { content: "❌ Something went wrong.", ephemeral: true };
+        const msg = { content: "❌ Something went wrong.", flags: discord_js_1.MessageFlags.Ephemeral };
         if (interaction.replied || interaction.deferred) {
             await interaction.followUp(msg).catch(() => { });
         }
@@ -406,7 +418,7 @@ async function handleDropButton(interaction) {
     const dropId = parseInt(interaction.customId.replace("claim_drop_", ""), 10);
     if (isNaN(dropId))
         return;
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: discord_js_1.MessageFlags.Ephemeral });
     const member = interaction.guild
         ? await interaction.guild.members.fetch(interaction.user.id).catch(() => null)
         : null;
@@ -458,6 +470,13 @@ async function handleDropButton(interaction) {
 async function main() {
     // ── Web canvas server (start first — Render needs an open port quickly) ──
     await (0, stream_js_1.startStream)();
+    // When a Slice Arcade match settles via the browser flow, refresh the
+    // public match card in Discord so spectators see the result.
+    (0, notify_js_1.setMatchSettledHandler)(async (matchId) => {
+        const match = await (0, db_js_2.getMatch)(matchId);
+        if (match)
+            await (0, interactions_js_1.updateMatchFeed)(client, match);
+    });
     (0, evm_js_1.initEVM)();
     console.log(`Treasury: ${(0, evm_js_1.getTreasuryAddress)()}`);
     // Resolve any withdrawals left pending from a previous session

@@ -2,7 +2,7 @@
  * Game Boy button slash commands (fallback — text input in the game channel is faster).
  * Each one submits a vote to the current democracy round. Tips are summed per button.
  */
-import { SlashCommandBuilder, type ChatInputCommandInteraction } from "discord.js";
+import { MessageFlags, SlashCommandBuilder, type ChatInputCommandInteraction } from "discord.js";
 import { getBalance } from "../balance.js";
 import { submitBid, getButtonEmoji, type GBButton } from "../emulator.js";
 import { config } from "../config.js";
@@ -16,10 +16,10 @@ async function handlePress(interaction: ChatInputCommandInteraction, button: GBB
   const amount = interaction.options.getNumber("amount") ?? minBid;
 
   if (amount < minBid) {
-    return interaction.reply({ content: `❌ Minimum bid is ${formatSats(minBid)}.`, ephemeral: true });
+    return interaction.reply({ content: `❌ Minimum bid is ${formatSats(minBid)}.`, flags: MessageFlags.Ephemeral });
   }
 
-  await interaction.deferReply({ ephemeral: true });
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
   // Check balance
   const balance = await getBalance(interaction.user.id);

@@ -1,4 +1,4 @@
-import { ActionRowBuilder, AttachmentBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder, type ChatInputCommandInteraction } from "discord.js";
+import { ActionRowBuilder, AttachmentBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder, MessageFlags, type ChatInputCommandInteraction } from "discord.js";
 import QRCode from "qrcode";
 import { registerDepositAddress } from "../evm.js";
 import { config } from "../config.js";
@@ -10,10 +10,10 @@ export const data = {
 
 export async function execute(interaction: ChatInputCommandInteraction) {
   if (config.depositAdminOnly && !config.discord.adminIds.includes(interaction.user.id)) {
-    return interaction.reply({ content: "❌ Deposits are currently disabled.", ephemeral: true });
+    return interaction.reply({ content: "❌ Deposits are currently disabled.", flags: MessageFlags.Ephemeral });
   }
 
-  await interaction.deferReply({ ephemeral: true });
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
   const address = await registerDepositAddress(interaction.user.id);
   const explorer = config.evm.explorerUrl;

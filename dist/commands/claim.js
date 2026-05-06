@@ -12,7 +12,7 @@ exports.data = {
     description: "Claim sats from the active drop in this channel",
 };
 async function execute(interaction) {
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: discord_js_1.MessageFlags.Ephemeral });
     const { data: drop } = await db_js_1.supabase
         .from("drops")
         .select("*")

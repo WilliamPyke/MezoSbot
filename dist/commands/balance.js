@@ -10,7 +10,7 @@ exports.data = {
     description: "Check your sats balance",
 };
 async function execute(interaction) {
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: discord_js_1.MessageFlags.Ephemeral });
     const bal = await (0, balance_js_1.getBalance)(interaction.user.id);
     const embed = new discord_js_1.EmbedBuilder()
         .setColor(0x5865f2)

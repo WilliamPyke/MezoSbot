@@ -1,4 +1,4 @@
-import { EmbedBuilder, type ChatInputCommandInteraction } from "discord.js";
+import { EmbedBuilder, MessageFlags, type ChatInputCommandInteraction } from "discord.js";
 import { withdraw } from "../evm.js";
 import { subtractBalance, addBalance, getWalletForUser } from "../balance.js";
 import { supabase } from "../db.js";
@@ -21,14 +21,14 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   const addressOpt = interaction.options.getString("address");
 
   if (addressOpt && !/^0x[a-fA-F0-9]{40}$/i.test(addressOpt)) {
-    return interaction.reply({ content: "❌ Invalid address.", ephemeral: true });
+    return interaction.reply({ content: "❌ Invalid address.", flags: MessageFlags.Ephemeral });
   }
 
   if (!config.evm.skipWithdrawalMin && amount < MIN_WITHDRAWAL_SATS) {
-    return interaction.reply({ content: `❌ Minimum withdrawal is **${MIN_WITHDRAWAL_SATS.toLocaleString()} sats**.`, ephemeral: true });
+    return interaction.reply({ content: `❌ Minimum withdrawal is **${MIN_WITHDRAWAL_SATS.toLocaleString()} sats**.`, flags: MessageFlags.Ephemeral });
   }
 
-  await interaction.deferReply({ ephemeral: true });
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
   const address = addressOpt || (await getWalletForUser(interaction.user.id));
   if (!address) {

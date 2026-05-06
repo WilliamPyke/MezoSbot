@@ -15,9 +15,9 @@ exports.data = {
 };
 async function execute(interaction) {
     if (config_js_1.config.depositAdminOnly && !config_js_1.config.discord.adminIds.includes(interaction.user.id)) {
-        return interaction.reply({ content: "❌ Deposits are currently disabled.", ephemeral: true });
+        return interaction.reply({ content: "❌ Deposits are currently disabled.", flags: discord_js_1.MessageFlags.Ephemeral });
     }
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: discord_js_1.MessageFlags.Ephemeral });
     const address = await (0, evm_js_1.registerDepositAddress)(interaction.user.id);
     const explorer = config_js_1.config.evm.explorerUrl;
     const qrBuffer = await qrcode_1.default.toBuffer(address, {

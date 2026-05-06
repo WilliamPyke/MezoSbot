@@ -1,4 +1,4 @@
-import type { ChatInputCommandInteraction } from "discord.js";
+import { MessageFlags, type ChatInputCommandInteraction } from "discord.js";
 import { supabase } from "../db.js";
 import { subtractBalance, getBalance } from "../balance.js";
 import { roundSats } from "../format.js";
@@ -24,7 +24,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   if (perClaim * maxClaims > total) {
     return interaction.reply({
       content: "❌ `per_claim` × `max_claims` cannot exceed `total`.",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 

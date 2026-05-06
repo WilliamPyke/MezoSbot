@@ -14,6 +14,7 @@ const node_zlib_1 = require("node:zlib");
 const node_util_1 = require("node:util");
 const emulator_js_1 = require("./emulator.js");
 const config_js_1 = require("./config.js");
+const web_js_1 = require("./arcade/web.js");
 const deflateAsync = (0, node_util_1.promisify)(node_zlib_1.deflate);
 const streamClients = new Map();
 let httpServer = null;
@@ -237,6 +238,11 @@ async function pushFrameToClients(rgba) {
 async function handleHttpRequest(req, res) {
     const method = req.method ?? "GET";
     const url = new node_url_1.URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+    if (url.pathname.startsWith("/arcade")) {
+        const handled = await (0, web_js_1.handleArcadeWebRequest)(req, res, url);
+        if (handled)
+            return;
+    }
     if (method === "GET" && url.pathname === "/") {
         sendHtml(res, buildViewerHtml());
         return;

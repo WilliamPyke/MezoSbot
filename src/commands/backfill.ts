@@ -1,4 +1,4 @@
-import { EmbedBuilder, type ChatInputCommandInteraction } from "discord.js";
+import { EmbedBuilder, MessageFlags, type ChatInputCommandInteraction } from "discord.js";
 import { config, tokenUnitsToSats } from "../config.js";
 import {
   getProvider,
@@ -21,11 +21,11 @@ export const data = {
 
 export async function execute(interaction: ChatInputCommandInteraction) {
   if (!config.discord.adminIds.includes(interaction.user.id)) {
-    return interaction.reply({ content: "❌ Admin only.", ephemeral: true });
+    return interaction.reply({ content: "❌ Admin only.", flags: MessageFlags.Ephemeral });
   }
 
   const target = interaction.options.getUser("user", true);
-  await interaction.deferReply({ ephemeral: true });
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
   await registerDepositAddress(target.id);
 

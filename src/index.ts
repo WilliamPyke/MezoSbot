@@ -3,6 +3,7 @@ import {
   EmbedBuilder,
   Events,
   GatewayIntentBits,
+  MessageFlags,
   REST,
   Routes,
   type ChatInputCommandInteraction,
@@ -88,6 +89,7 @@ setHealthStatusProvider(() => ({
 }));
 
 const commandMap = new Map(commands.map((c) => [c.data.name, c.execute]));
+const STALE_INTERACTION_SKIP_MS = 2_800;
 
 client.on("error", (err) => {
   discordState = "client_error";
@@ -328,6 +330,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
   const startMs = Date.now();
   const tag = interaction.user.tag;
 
+  if (arrivalLagMs >= STALE_INTERACTION_SKIP_MS) {
+    const name =
+      interaction.isChatInputCommand()
+        ? `/${interaction.commandName}`
+        : "customId" in interaction
+          ? interaction.customId
+          : interaction.type.toString();
+    console.warn(
+      `[Discord] Skipping stale interaction ${name} from ${tag} (arrivalLag=${arrivalLagMs}ms) — already near Discord's 3s response deadline`
+    );
+    return;
+  }
+
   if (isArcadeInteraction(interaction)) {
     const cid = ("customId" in interaction && interaction.customId) || "";
     console.log(`[Discord] Arcade interaction ${cid} from ${tag} (arrivalLag=${arrivalLagMs}ms)`);
@@ -354,7 +369,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
   const handler = commandMap.get(interaction.commandName);
   if (!handler) {
     console.warn(`[Discord] No handler registered for /${interaction.commandName}`);
-    await interaction.reply({ content: "This command is not available right now.", ephemeral: true }).catch(() => {});
+    await interaction.reply({ content: "This command is not available right now.", flags: MessageFlags.Ephemeral }).catch(() => {});
     return;
   }
   const { username, displayName, avatarUrl } = extractProfile(interaction as ChatInputCommandInteraction);
@@ -368,7 +383,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
     console.error(`Command /${interaction.commandName} error:`, (err as Error)?.message ?? err);
-    const msg = { content: "❌ Something went wrong.", ephemeral: true };
+    const msg = { content: "❌ Something went wrong.", flags: MessageFlags.Ephemeral as const };
     if (interaction.replied || interaction.deferred) {
       await interaction.followUp(msg).catch(() => {});
     } else {
@@ -497,7 +512,7 @@ async function handleDropButton(interaction: ButtonInteraction) {
   const dropId = parseInt(interaction.customId.replace("claim_drop_", ""), 10);
   if (isNaN(dropId)) return;
 
-  await interaction.deferReply({ ephemeral: true });
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
   const member = interaction.guild
     ? await interaction.guild.members.fetch(interaction.user.id).catch(() => null)

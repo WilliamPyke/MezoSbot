@@ -73,6 +73,39 @@ let depositAddressCacheLoadedAt = 0;
 let depositAddressCacheRefresh: Promise<void> | null = null;
 const DEPOSIT_UPDATE_BATCH_SIZE = 500;
 
+function clampPositiveInt(value: number, fallback: number): number {
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+}
+
+function yieldToEventLoop(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  mapper: (item: T) => Promise<R>,
+): Promise<PromiseSettledResult<R>[]> {
+  const results = new Array<PromiseSettledResult<R>>(items.length);
+  let nextIndex = 0;
+
+  async function worker(): Promise<void> {
+    while (nextIndex < items.length) {
+      const index = nextIndex++;
+      try {
+        results[index] = { status: "fulfilled", value: await mapper(items[index]) };
+      } catch (reason) {
+        results[index] = { status: "rejected", reason };
+      }
+      await yieldToEventLoop();
+    }
+  }
+
+  const workerCount = Math.min(concurrency, items.length);
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  return results;
+}
+
 function normalizeDepositRow(row: DepositAddressRow): DepositAddressRow {
   return {
     discord_id: row.discord_id,
@@ -346,6 +379,12 @@ export function startDepositPoller(
   onDeposit?: (discordId: string, amountSats: number, gasSats: number) => void
 ) {
   let isPolling = false;
+  const balanceConcurrency = clampPositiveInt(config.deposits.balanceConcurrency, 8);
+  const balanceBatchSize = Math.max(
+    balanceConcurrency,
+    clampPositiveInt(config.deposits.balanceBatchSize, 25),
+  );
+  const initialPollDelayMs = clampPositiveInt(config.deposits.initialPollDelayMs, 15_000);
 
   const poll = async () => {
     if (isPolling) {
@@ -354,6 +393,7 @@ export function startDepositPoller(
     }
 
     isPolling = true;
+    const startedAt = Date.now();
 
     try {
       await refreshDepositAddressCache(depositAddressCacheLoadedAt === 0);
@@ -361,74 +401,87 @@ export function startDepositPoller(
 
       if (rows.length === 0) return;
 
-      const balanceChecks = await Promise.allSettled(
-        rows.map(async (row) => {
-          const bal = await provider.getBalance(row.address);
-          return { row, bal };
-        })
-      );
-
       const updates: Array<{ row: DepositAddressRow; balance: string }> = [];
+      let gasPriceForPoll: bigint | null = null;
 
-      for (const result of balanceChecks) {
-        if (result.status === "rejected") continue;
+      for (let i = 0; i < rows.length; i += balanceBatchSize) {
+        const batch = rows.slice(i, i + balanceBatchSize);
+        const balanceChecks = await mapWithConcurrency(
+          batch,
+          balanceConcurrency,
+          async (row) => {
+            const bal = await provider.getBalance(row.address);
+            return { row, bal };
+          },
+        );
 
-        const { row, bal } = result.value;
-        const prev = BigInt(row.last_checked_balance || "0");
+        for (const result of balanceChecks) {
+          if (result.status === "rejected") continue;
 
-        // Credit only when balance INCREASES (new deposit arrived).
-        if (bal > prev) {
-          const diff = bal - prev;
+          const { row, bal } = result.value;
+          const prev = BigInt(row.last_checked_balance || "0");
 
-          // Exact gas cost: matches the pinned gasPrice on the sweep tx.
-          const gasPrice = await getGasPrice();
-          const gasCost = 21000n * gasPrice;
-          const netDeposit = diff - gasCost;
+          // Credit only when balance INCREASES (new deposit arrived).
+          if (bal > prev) {
+            const diff = bal - prev;
 
-          if (netDeposit > 0n) {
-            const netSats = tokenUnitsToSats(netDeposit);
-            const gasSats = tokenUnitsToSats(gasCost);
+            // Exact gas cost: matches the pinned gasPrice on the sweep tx.
+            gasPriceForPoll ??= await getGasPrice();
+            const gasCost = 21000n * gasPriceForPoll;
+            const netDeposit = diff - gasCost;
 
-            if (netSats > 0) {
-              const txId = `auto-${Date.now()}-${row.discord_id}`;
-              await supabase.from("deposits").insert({
-                discord_id: row.discord_id,
-                tx_hash: txId,
-                amount_sats: netSats,
-                block_number: 0,
-              });
-              await addBalance(row.discord_id, netSats);
-              onDeposit?.(row.discord_id, netSats, gasSats);
+            if (netDeposit > 0n) {
+              const netSats = tokenUnitsToSats(netDeposit);
+              const gasSats = tokenUnitsToSats(gasCost);
+
+              if (netSats > 0) {
+                const txId = `auto-${Date.now()}-${row.discord_id}`;
+                await supabase.from("deposits").insert({
+                  discord_id: row.discord_id,
+                  tx_hash: txId,
+                  amount_sats: netSats,
+                  block_number: 0,
+                });
+                await addBalance(row.discord_id, netSats);
+                onDeposit?.(row.discord_id, netSats, gasSats);
+              }
+            } else {
+              console.log(
+                `Deposit too small to cover gas for ${row.discord_id}: ${diff} wei < gas ${gasCost} wei`
+              );
             }
-          } else {
-            console.log(
-              `Deposit too small to cover gas for ${row.discord_id}: ${diff} wei < gas ${gasCost} wei`
-            );
+
+            // Sweep immediately after crediting a new deposit.
+            sweepToTreasury(row.discord_id).catch((err) => {
+              console.error(
+                `Sweep failed for ${row.discord_id}:`,
+                (err as Error)?.message ?? err
+              );
+            });
           }
 
-          // Sweep immediately after crediting a new deposit.
-          sweepToTreasury(row.discord_id).catch((err) => {
-            console.error(
-              `Sweep failed for ${row.discord_id}:`,
-              (err as Error)?.message ?? err
-            );
-          });
+          if (bal !== prev) {
+            updates.push({ row, balance: bal.toString() });
+          }
         }
 
-        if (bal !== prev) {
-          updates.push({ row, balance: bal.toString() });
-        }
+        await yieldToEventLoop();
       }
 
       await updateDepositAddressBalances(updates);
+      if (Date.now() - startedAt > config.deposits.pollMs) {
+        console.warn(
+          `[Deposits] Poll took ${Date.now() - startedAt}ms for ${rows.length} address(es); consider raising DEPOSIT_POLL_MS or lowering DEPOSIT_BALANCE_CONCURRENCY`
+        );
+      }
     } finally {
       isPolling = false;
     }
   };
 
   setInterval(poll, config.deposits.pollMs);
-  // Initial poll after 5s (let bot finish starting)
-  setTimeout(poll, 5_000);
+  // Initial poll after Discord has had a moment to settle.
+  setTimeout(poll, initialPollDelayMs);
 }
 
 export interface WithdrawResult {

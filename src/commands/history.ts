@@ -1,4 +1,4 @@
-import { EmbedBuilder, type ChatInputCommandInteraction } from "discord.js";
+import { EmbedBuilder, MessageFlags, type ChatInputCommandInteraction } from "discord.js";
 import { supabase } from "../db.js";
 import { formatSats } from "../format.js";
 import { config } from "../config.js";
@@ -9,7 +9,7 @@ export const data = {
 };
 
 export async function execute(interaction: ChatInputCommandInteraction) {
-  await interaction.deferReply({ ephemeral: true });
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
   const userId = interaction.user.id;
   const explorer = config.evm.explorerUrl;

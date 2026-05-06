@@ -1,4 +1,4 @@
-import { EmbedBuilder, type ChatInputCommandInteraction } from "discord.js";
+import { EmbedBuilder, MessageFlags, type ChatInputCommandInteraction } from "discord.js";
 import { subtractBalance, addBalance, getBalance } from "../balance.js";
 import { registerDepositAddress } from "../evm.js";
 import { formatSats } from "../format.js";
@@ -22,15 +22,15 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   const customMessage = trimmedMessage.length > 0 ? trimmedMessage : undefined;
 
   if (customMessage && customMessage.length > 200) {
-    return interaction.reply({ content: "❌ Message must be 200 characters or fewer.", ephemeral: true });
+    return interaction.reply({ content: "❌ Message must be 200 characters or fewer.", flags: MessageFlags.Ephemeral });
   }
 
   if (target.id === interaction.user.id) {
-    return interaction.reply({ content: "❌ You can't tip yourself.", ephemeral: true });
+    return interaction.reply({ content: "❌ You can't tip yourself.", flags: MessageFlags.Ephemeral });
   }
 
   if (target.bot) {
-    return interaction.reply({ content: "❌ You can't tip bots.", ephemeral: true });
+    return interaction.reply({ content: "❌ You can't tip bots.", flags: MessageFlags.Ephemeral });
   }
 
   await interaction.deferReply();

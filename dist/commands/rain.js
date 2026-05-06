@@ -19,11 +19,11 @@ exports.data = {
 };
 async function execute(interaction) {
     if (!interaction.guild) {
-        return interaction.reply({ content: "❌ Rain only works in servers.", ephemeral: true });
+        return interaction.reply({ content: "❌ Rain only works in servers.", flags: discord_js_1.MessageFlags.Ephemeral });
     }
     const channel = interaction.channel;
     if (!channel || !("messages" in channel)) {
-        return interaction.reply({ content: "❌ Rain only works in text channels.", ephemeral: true });
+        return interaction.reply({ content: "❌ Rain only works in text channels.", flags: discord_js_1.MessageFlags.Ephemeral });
     }
     const totalAmount = interaction.options.getNumber("amount", true);
     await interaction.deferReply();

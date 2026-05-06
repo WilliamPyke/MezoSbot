@@ -1,4 +1,4 @@
-import { EmbedBuilder, type ChatInputCommandInteraction, type TextChannel } from "discord.js";
+import { EmbedBuilder, MessageFlags, type ChatInputCommandInteraction, type TextChannel } from "discord.js";
 import { subtractBalance, addBalance, getBalance } from "../balance.js";
 import { registerDepositAddress } from "../evm.js";
 import { formatSats, roundSats } from "../format.js";
@@ -17,12 +17,12 @@ export const data = {
 
 export async function execute(interaction: ChatInputCommandInteraction) {
   if (!interaction.guild) {
-    return interaction.reply({ content: "❌ Rain only works in servers.", ephemeral: true });
+    return interaction.reply({ content: "❌ Rain only works in servers.", flags: MessageFlags.Ephemeral });
   }
 
   const channel = interaction.channel;
   if (!channel || !("messages" in channel)) {
-    return interaction.reply({ content: "❌ Rain only works in text channels.", ephemeral: true });
+    return interaction.reply({ content: "❌ Rain only works in text channels.", flags: MessageFlags.Ephemeral });
   }
 
   const totalAmount = interaction.options.getNumber("amount", true);

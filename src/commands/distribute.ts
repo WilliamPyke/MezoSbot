@@ -1,4 +1,4 @@
-import { EmbedBuilder, type ChatInputCommandInteraction } from "discord.js";
+import { EmbedBuilder, MessageFlags, type ChatInputCommandInteraction } from "discord.js";
 import { subtractBalance, addBalance, getBalance } from "../balance.js";
 import { registerDepositAddress } from "../evm.js";
 import { formatSats, roundSats } from "../format.js";
@@ -24,7 +24,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   if (validUsers.length === 0) {
     return interaction.reply({
       content: "❌ Include at least one valid user mention, e.g. `@user1 @user2`",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
@@ -32,7 +32,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   if (perUser < 0.000001) {
     return interaction.reply({
       content: "❌ Amount per user must be at least 0.000001 sats.",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 

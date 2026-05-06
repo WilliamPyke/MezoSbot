@@ -11,7 +11,7 @@ exports.data = {
     description: "View your recent deposit and withdrawal history",
 };
 async function execute(interaction) {
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: discord_js_1.MessageFlags.Ephemeral });
     const userId = interaction.user.id;
     const explorer = config_js_1.config.evm.explorerUrl;
     const { data: deposits } = await db_js_1.supabase

@@ -18,15 +18,15 @@ exports.data = {
 };
 async function execute(interaction) {
     if (!config_js_1.config.discord.adminIds.includes(interaction.user.id)) {
-        return interaction.reply({ content: "❌ Admin only.", ephemeral: true });
+        return interaction.reply({ content: "❌ Admin only.", flags: discord_js_1.MessageFlags.Ephemeral });
     }
     const target = interaction.options.getUser("user", true);
     const amount = interaction.options.getNumber("amount", true);
     const reason = interaction.options.getString("reason") ?? "Manual adjustment";
     if (amount === 0) {
-        return interaction.reply({ content: "❌ Amount can't be zero.", ephemeral: true });
+        return interaction.reply({ content: "❌ Amount can't be zero.", flags: discord_js_1.MessageFlags.Ephemeral });
     }
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: discord_js_1.MessageFlags.Ephemeral });
     if (amount > 0) {
         await (0, balance_js_1.addBalance)(target.id, amount);
     }
