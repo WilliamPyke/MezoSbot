@@ -88,10 +88,26 @@ npm run dev
 | `/rain <amount> <count> [role] [message]` | Rain sats on recently active users (optionally role-filtered) |
 | `/drop <total> <per_claim> <max_claims> [role]` | Create a claimable drop (optionally role-gated) |
 | `/claim <drop_id>` | Claim from an active drop |
+| `/arcade practice` | Solo block-puzzle warm-up — no stake |
+| `/arcade challenge <user> [stake]` | Challenge another user (omit stake for free PvP) |
+| `/arcade rules` | How the game works |
+| `/arcade tiers` | Stake tiers and rake math |
+| `/arcade leaderboard` | Top validated scores |
 
 Recipients receive DMs when they are credited from tips, rains, distributions, and drop claims.
 
 **All amounts use sats** and support decimals (e.g. `100.5`, `0.25`) for easier denomination. Precision: 6 decimal places.
+
+## Slice Arcade — head-to-head block puzzle
+
+A 9×9 block puzzle PvP game playable directly in Discord. Both players get the same seeded piece sequence; highest validated score wins the pot after a 10% platform fee.
+
+- `/arcade practice` opens an ephemeral playfield only you can see.
+- `/arcade challenge @opponent` posts a public challenge card. Add `stake:1000` (or any positive sats amount) to escrow that amount from each player into the match. Free PvP omits the stake.
+- After both players accept, each clicks **Play / view your board** to open a private playfield. Pick a piece, choose a row and column, hit **Place**. End-of-match auto-detects no-legal-moves or 12 levels complete.
+- Stakes are debited from each player's `/balance`. On settle, the winner is credited the gross pot minus 10% rake; ties refund both stakes. The 10% rake stays in the treasury (recorded in `arcade_fees`).
+
+The deterministic engine, scoring, and rake math live in `src/arcade/`. Match runtime state is reconstructible from a seed + move log, so a bot restart can recover any in-progress match.
 
 ## How Deposits Work
 

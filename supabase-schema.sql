@@ -156,6 +156,65 @@ CREATE TABLE IF NOT EXISTS game_saves (
   updated_at TIMESTAMPTZ DEFAULT now()
 );
 
+-- Slice Arcade PvP — block puzzle head-to-head
+CREATE TABLE IF NOT EXISTS arcade_matches (
+  id BIGSERIAL PRIMARY KEY,
+  seed TEXT NOT NULL,
+  mode TEXT NOT NULL,                          -- 'practice' | 'free_pvp' | 'staked_pvp'
+  status TEXT NOT NULL DEFAULT 'waiting',      -- waiting | active | submitted | completed | cancelled
+  channel_id TEXT,
+  message_id TEXT,
+  stake_amount_sats DOUBLE PRECISION,
+  gross_pot_sats DOUBLE PRECISION,
+  platform_rake_bps INTEGER NOT NULL DEFAULT 1000,
+  rake_amount_sats DOUBLE PRECISION,
+  winner_payout_sats DOUBLE PRECISION,
+  created_by_id TEXT NOT NULL,
+  player_a_id TEXT NOT NULL,
+  player_b_id TEXT,
+  player_a_score DOUBLE PRECISION,
+  player_b_score DOUBLE PRECISION,
+  player_a_submitted BOOLEAN NOT NULL DEFAULT FALSE,
+  player_b_submitted BOOLEAN NOT NULL DEFAULT FALSE,
+  winner_id TEXT,
+  escrow_status TEXT NOT NULL DEFAULT 'none',  -- none | pending | funded | released | refunded
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  completed_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS arcade_submissions (
+  id BIGSERIAL PRIMARY KEY,
+  match_id BIGINT NOT NULL REFERENCES arcade_matches(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL,
+  move_log JSONB NOT NULL,
+  claimed_score DOUBLE PRECISION NOT NULL,
+  validated_score DOUBLE PRECISION,
+  valid BOOLEAN,
+  validation_error TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(match_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS arcade_escrow (
+  id BIGSERIAL PRIMARY KEY,
+  match_id BIGINT NOT NULL REFERENCES arcade_matches(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL,
+  amount_sats DOUBLE PRECISION NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',      -- pending | funded | refunded | released
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(match_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS arcade_fees (
+  id BIGSERIAL PRIMARY KEY,
+  match_id BIGINT NOT NULL UNIQUE REFERENCES arcade_matches(id) ON DELETE CASCADE,
+  rake_amount_sats DOUBLE PRECISION NOT NULL,
+  platform_rake_bps INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'collected',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_links_discord ON links(discord_id);
 CREATE INDEX IF NOT EXISTS idx_links_wallet ON links(wallet_address);
@@ -163,3 +222,8 @@ CREATE INDEX IF NOT EXISTS idx_deposits_tx ON deposits(tx_hash);
 CREATE INDEX IF NOT EXISTS idx_deposits_discord ON deposits(discord_id);
 CREATE INDEX IF NOT EXISTS idx_withdrawals_discord ON withdrawals(discord_id);
 CREATE INDEX IF NOT EXISTS idx_drops_channel ON drops(channel_id);
+CREATE INDEX IF NOT EXISTS idx_arcade_matches_status ON arcade_matches(status);
+CREATE INDEX IF NOT EXISTS idx_arcade_matches_player_a ON arcade_matches(player_a_id);
+CREATE INDEX IF NOT EXISTS idx_arcade_matches_player_b ON arcade_matches(player_b_id);
+CREATE INDEX IF NOT EXISTS idx_arcade_submissions_match ON arcade_submissions(match_id);
+CREATE INDEX IF NOT EXISTS idx_arcade_escrow_match ON arcade_escrow(match_id);

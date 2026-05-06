@@ -37,6 +37,7 @@ import {
 import { supabase } from "./db.js";
 import { extractProfile, updateUserProfile } from "./profile.js";
 import { sendTransferReceivedDm } from "./notifications.js";
+import { handleArcadeInteraction, isArcadeInteraction } from "./arcade/interactions.js";
 
 process.on("unhandledRejection", (err) => {
   console.error("Unhandled rejection:", (err as Error)?.message ?? err);
@@ -281,6 +282,12 @@ client.once(Events.ClientReady, async (c) => {
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
+  if (isArcadeInteraction(interaction)) {
+    console.log(`[Discord] Arcade interaction ${("customId" in interaction && interaction.customId) || ""} from ${interaction.user.tag}`);
+    await handleArcadeInteraction(interaction);
+    return;
+  }
+
   if (interaction.isButton()) {
     console.log(`[Discord] Button interaction ${interaction.customId} from ${interaction.user.tag}`);
     const customId = interaction.customId;

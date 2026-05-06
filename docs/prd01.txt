@@ -1,0 +1,743 @@
+Before coding, create a short implementation plan and list the exact files you will create. Then implement.
+
+You are building the first MVP for a Slice Ads-powered PvP skill arcade on Mezo Network.
+
+Project name:
+Slice Arcade PvP MVP
+
+Core concept:
+Build a web-first head-to-head PvP skill game where two players stake the same amount of BTC, play the same deterministic block puzzle challenge, and the highest server-validated score wins the pot after platform rake.
+
+This is player vs player.
+The platform is not the opponent.
+The platform does not fund prizes.
+The platform does not take directional risk on match outcomes.
+The platform earns revenue from rake and later from Slice Ads.
+
+Primary economy:
+- Player A stakes BTC.
+- Player B stakes BTC.
+- Both stakes form the gross pot.
+- Platform takes a configurable rake from the gross pot.
+- Winner receives gross pot minus rake.
+- Platform keeps the rake.
+- Slice Ads are shown around the experience as an additional monetization layer.
+- Slice Ads do not fund payouts.
+- Slice Ads do not modify gameplay.
+- Slice Ads do not modify match results.
+
+Default MVP economics:
+- platformRakeBps = 1000
+- 1000 bps = 10%
+- grossPotSats = playerAStakeSats + playerBStakeSats
+- rakeSats = floor(grossPotSats * platformRakeBps / 10000)
+- winnerPayoutSats = grossPotSats - rakeSats
+
+Example:
+- Player A stake: 1,000 sats
+- Player B stake: 1,000 sats
+- Gross pot: 2,000 sats
+- Rake: 200 sats
+- Winner payout: 1,800 sats
+- Platform revenue: 200 sats
+
+Important product constraints:
+- Do not build a casino.
+- Do not build player-vs-house games.
+- Do not build chance-based wagering.
+- Do not build random outcomes that determine winners.
+- Do not build operator-funded prizes.
+- Do not build ad-funded prizes.
+- Do not build reward pools.
+- This is deterministic PvP skill gameplay.
+- Both players receive the same block sequence.
+- Highest validated score wins.
+- Rake is the platform business model.
+
+MVP funding constraint:
+For the MVP, real Mezo BTC escrow can be stubbed.
+Practice mode and free PvP should be playable.
+Staked PvP tiers should be visible but disabled unless escrow is fully stubbed in a safe mock flow.
+The code should be architected so real Mezo BTC escrow can be added later.
+
+Tech stack:
+- Next.js
+- TypeScript
+- React
+- Tailwind
+- Next.js API routes
+- PostgreSQL or Supabase-ready schema
+- wagmi / viem for EVM wallet connection
+- Mezo Network config
+- Deterministic TypeScript game engine
+- Vitest for unit tests
+- Mock Slice Ads provider
+- Stubbed Mezo BTC escrow layer
+
+Visual style:
+Dark arcade UI.
+Black/dark gray background.
+Neon green primary CTA.
+Rounded modals/cards.
+Simple chip/block tiles.
+Mobile-first responsive layout.
+The game should visually resemble a polished competitive arcade product, not a crypto dashboard.
+
+Reference gameplay:
+A 9x9 block puzzle board.
+Players place provided block shapes onto the board.
+Completing full rows, columns, or 3x3 squares clears those cells and scores points.
+Some blocks are multiplier blocks.
+Multiplier blocks are visually orange.
+Normal blocks are visually blue.
+When a player clears a multiplier block, all future points are worth a higher multiple.
+Each match has 12 levels/rounds or a timed limit.
+Both players receive the exact same piece sequence.
+The winner is the player with the highest server-validated score.
+
+Core screens:
+1. Landing / match lobby
+2. Match selection modal
+3. Practice mode
+4. Free PvP match screen
+5. Staked PvP preview modal
+6. Match result screen
+7. Leaderboard
+8. My matches
+9. Rules modal
+10. Admin/debug page for inspecting matches and score validation
+
+For MVP, implement:
+- Practice mode
+- Create free PvP match
+- Join free PvP match
+- Play match
+- Submit score
+- Compare scores
+- Show winner
+- Mock staked match tiers with rake math
+- Mock Slice ad placements
+- Wallet connect
+- Basic database models
+- Deterministic validation
+- Local two-browser-window playable flow
+
+Match selection modal:
+Show:
+- Practice: Free
+- Free PvP: No stake, no payout
+- 1,000 sats stake / gross pot 2,000 / rake 200 / winner receives 1,800
+- 5,000 sats stake / gross pot 10,000 / rake 1,000 / winner receives 9,000
+- 10,000 sats stake / gross pot 20,000 / rake 2,000 / winner receives 18,000
+- 50,000 sats stake / gross pot 100,000 / rake 10,000 / winner receives 90,000
+- 100,000 sats stake / gross pot 200,000 / rake 20,000 / winner receives 180,000
+
+For MVP:
+- Practice is enabled.
+- Free PvP is enabled.
+- Staked BTC tiers are disabled and labeled “Escrow coming soon.”
+- The rake math must still be displayed clearly.
+- No operator-funded prizes.
+- No ad-funded payouts.
+
+User-facing language:
+Use:
+- Head-to-head
+- PvP match
+- Same shapes
+- Highest score wins
+- Winner receives pot after rake
+- Platform fee
+- Practice
+- Free PvP
+- BTC stake
+
+Do not use:
+- House
+- Casino
+- Bankroll
+- Reward pool
+- Arcade Points
+- Reward Credits
+- Operator-funded prize
+- Ad-funded prize
+
+Game rules:
+
+Board:
+- 9x9 grid
+- Grid cells can be empty, normal block, or multiplier block
+- 3x3 sub-squares count as clearable zones
+- Rows, columns, and 3x3 squares clear when fully occupied
+
+Turn / level flow:
+- Player receives 3 pieces per level
+- Player can place the 3 pieces in any order
+- If no remaining piece can be placed, the game ends
+- After all 3 are placed, advance to next level and deal 3 more pieces
+- Maximum 12 levels for MVP
+- Add a 3-minute timer for each match in the UI
+- Timer should be enforced server-side if feasible; otherwise structure code with a TODO for server-side enforcement
+
+Scoring:
+- +10 per placed cell
+- +25 bonus per cleared row
+- +25 bonus per cleared column
+- +25 bonus per cleared 3x3 square
+- Combo bonus: if multiple zones clear from one placement, add +25 per extra cleared zone
+- Multiplier starts at 1x
+- If a placement clears a multiplier block, increase multiplier by +1x
+- All future points are multiplied by current multiplier
+- Cap multiplier at 5x for MVP
+
+Important scoring detail:
+Only increase multiplier when a multiplier block is actually cleared through a row, column, or 3x3 square clear.
+Do not increase multiplier merely because a multiplier cell was placed.
+
+Piece system:
+The game needs a flexible shape definition system that supports:
+- connected pieces
+- disconnected pieces
+- diagonal-only pieces
+- single-cell pieces
+- sparse patterns inside a bounding box
+- multiplier cells inside any piece
+
+Represent every piece as normalized cell coordinates, not as a string grid that assumes connectivity.
+
+Use these types or equivalent:
+
+type PieceCell = {
+  x: number
+  y: number
+  kind: "normal" | "multiplier"
+}
+
+type PieceDefinition = {
+  id: string
+  label: string
+  cells: PieceCell[]
+  allowRotation: boolean
+  weight: number
+  minLevel?: number
+  maxLevel?: number
+}
+
+Coordinates are relative to the piece origin.
+
+Examples:
+
+single:
+cells = [{ x: 0, y: 0, kind: "normal" }]
+
+two_horizontal:
+cells = [
+  { x: 0, y: 0, kind: "normal" },
+  { x: 1, y: 0, kind: "normal" }
+]
+
+diagonal_2:
+cells = [
+  { x: 0, y: 0, kind: "normal" },
+  { x: 1, y: 1, kind: "normal" }
+]
+
+diagonal_3:
+cells = [
+  { x: 0, y: 0, kind: "normal" },
+  { x: 1, y: 1, kind: "normal" },
+  { x: 2, y: 2, kind: "normal" }
+]
+
+anti_diagonal_3:
+cells = [
+  { x: 2, y: 0, kind: "normal" },
+  { x: 1, y: 1, kind: "normal" },
+  { x: 0, y: 2, kind: "normal" }
+]
+
+sparse_corner_3:
+cells = [
+  { x: 0, y: 0, kind: "normal" },
+  { x: 2, y: 0, kind: "normal" },
+  { x: 0, y: 2, kind: "normal" }
+]
+
+offset_pair:
+cells = [
+  { x: 0, y: 0, kind: "normal" },
+  { x: 2, y: 1, kind: "normal" }
+]
+
+l_5:
+cells = [
+  { x: 0, y: 0, kind: "normal" },
+  { x: 0, y: 1, kind: "normal" },
+  { x: 0, y: 2, kind: "normal" },
+  { x: 1, y: 2, kind: "normal" },
+  { x: 2, y: 2, kind: "normal" }
+]
+
+plus_5:
+cells = [
+  { x: 1, y: 0, kind: "normal" },
+  { x: 0, y: 1, kind: "normal" },
+  { x: 1, y: 1, kind: "normal" },
+  { x: 2, y: 1, kind: "normal" },
+  { x: 1, y: 2, kind: "normal" }
+]
+
+Multiplier variants:
+Any generated piece may include exactly one multiplier cell.
+The multiplier cell should be marked as kind: "multiplier".
+Multiplier pieces should be visually orange for the multiplier cell only.
+Normal cells should be visually blue.
+
+Important:
+Disconnected and diagonal pieces are legal.
+A piece is placeable if all of its cells fit inside the board and none overlap occupied cells.
+Connectivity does not matter.
+Clearing still only applies to full rows, full columns, and full 3x3 squares.
+
+Shape generation:
+Create:
+src/game/pieceLibrary.ts
+
+Include at least 35 piece definitions:
+- singles
+- 2/3/4/5-length lines
+- small squares
+- L shapes
+- T shapes
+- Z/S shapes
+- plus shape
+- diagonal 2
+- diagonal 3
+- anti-diagonal 2
+- anti-diagonal 3
+- disconnected pairs
+- disconnected triples
+- sparse corner shapes
+- offset shapes
+
+Do not assume pieces are contiguous.
+Do not assume pieces are orthogonally connected.
+Do not assume pieces fit a Tetris model.
+
+Piece generation:
+- Match has a server-generated seed
+- Piece sequence is generated from seed
+- Both players receive the same sequence
+- Each level has exactly 3 generated pieces
+- Generation should use weighted random selection from pieceLibrary
+- Use deterministic seeded RNG
+- Add rare multiplier-cell injection
+- Multiplier injection must also be deterministic from the seed
+- Do not use Math.random for gameplay generation
+
+Determinism:
+- Client can render and play locally
+- Server must validate submitted move log against seed
+- Do not trust client score
+- Server is the source of truth
+
+Move log format:
+Each move should include:
+- matchId
+- playerAddress or userId
+- level
+- pieceIndexWithinLevel
+- selectedPieceId
+- rotation
+- x
+- y
+- clientTimestamp
+
+Validation:
+Server replays the move log from an empty board using the match seed.
+Server confirms:
+- Every piece was actually available
+- Placement was legal
+- Rotation was legal
+- Disconnected pieces were handled correctly
+- Diagonal pieces were handled correctly
+- Score calculation is correct
+- Multiplier calculation is correct
+- Final submitted score matches server score
+- Game ended correctly or reached level cap
+
+Game engine files:
+Create:
+src/game/types.ts
+src/game/pieceLibrary.ts
+src/game/rng.ts
+src/game/pieces.ts
+src/game/scoring.ts
+src/game/board.ts
+src/game/validator.ts
+
+Game engine requirements:
+- Pure functions
+- Full TypeScript types
+- Unit tests for placement, clearing, scoring, multiplier, deterministic piece generation, diagonal pieces, and disconnected pieces
+- No React dependencies inside game engine
+- No database dependencies inside game engine
+- No wallet dependencies inside game engine
+
+Testing:
+Add unit tests with Vitest.
+
+Test cases:
+1. Same seed creates same piece sequence
+2. Illegal placement is rejected
+3. Row clear works
+4. Column clear works
+5. 3x3 square clear works
+6. Multiple clear combo scores correctly
+7. Multiplier increases only when multiplier block is cleared
+8. Server validation rejects fake claimed score
+9. Server validation accepts honest move log
+10. Diagonal pieces can be placed
+11. Disconnected pieces can be placed
+12. Sparse pieces clear rows/columns correctly
+13. Multiplier cells inside sparse pieces work
+14. Piece rotation preserves sparse/disconnected cell geometry correctly
+15. Rake math is correct for each stake tier
+
+Database schema:
+Create Prisma schema or Supabase SQL migration.
+
+Tables/models:
+
+users
+- id
+- wallet_address unique
+- username nullable
+- created_at
+
+matches
+- id
+- seed
+- status: waiting, active, submitted, completed, cancelled
+- mode: practice, free_pvp, staked_pvp
+- stake_amount_sats nullable
+- gross_pot_sats nullable
+- platform_rake_bps default 1000
+- rake_amount_sats nullable
+- winner_payout_sats nullable
+- created_by_user_id
+- player_a_user_id
+- player_b_user_id nullable
+- player_a_score nullable
+- player_b_score nullable
+- winner_user_id nullable
+- escrow_status: none, pending, funded, released, refunded, failed
+- escrow_tx_hash nullable
+- payout_tx_hash nullable
+- fee_tx_hash nullable
+- created_at
+- completed_at nullable
+
+match_submissions
+- id
+- match_id
+- user_id
+- move_log jsonb
+- claimed_score
+- validated_score
+- valid boolean
+- validation_error nullable
+- created_at
+
+escrow_ledger
+- id
+- match_id
+- user_id
+- wallet_address
+- asset_symbol: BTC
+- stake_amount_sats
+- status: pending, funded, refunded, released, failed
+- deposit_tx_hash nullable
+- payout_tx_hash nullable
+- fee_tx_hash nullable
+- created_at
+- updated_at
+
+platform_fee_ledger
+- id
+- match_id
+- asset_symbol: BTC
+- rake_amount_sats
+- platform_fee_bps
+- status: pending, collected, failed
+- tx_hash nullable
+- created_at
+- collected_at nullable
+
+ad_events
+- id
+- user_id nullable
+- wallet_address nullable
+- match_id nullable
+- placement
+- event_type
+- created_at
+
+API routes:
+POST /api/matches/create
+- creates practice or free pvp match
+- returns match id and seed
+- rejects staked_pvp unless explicitly mock-enabled
+
+POST /api/matches/join
+- joins waiting free pvp match
+
+GET /api/matches/:id
+- returns match state
+
+POST /api/matches/:id/submit
+- accepts move log
+- validates score
+- stores submission
+- updates match if both players submitted
+- calculates winner
+- for staked matches, calculates rake and winner payout
+
+POST /api/ad-events
+- records mock ad event
+
+GET /api/leaderboard
+- returns top validated scores
+
+GET /api/admin/economics
+- returns mock totals:
+  - total matches
+  - total gross pot sats
+  - total rake sats
+  - total winner payouts sats
+  - total ad impressions
+
+Mezo integration:
+Add wallet connect using wagmi/viem.
+Include Mezo network config placeholders.
+
+Use:
+- Mezo mainnet chainId: 31612
+- Mezo testnet chainId: 31611
+
+Create:
+src/lib/chains.ts
+
+Include:
+- mezoTestnet
+- mezoMainnet
+- RPC URL env vars:
+  NEXT_PUBLIC_MEZO_TESTNET_RPC_URL
+  NEXT_PUBLIC_MEZO_MAINNET_RPC_URL
+
+Mezo BTC escrow integration:
+For MVP:
+- Wallet address is user identity
+- Real escrow is stubbed
+- Staked tiers are disabled
+- Free PvP works end-to-end without funds
+- Code should be structured so Mezo BTC escrow can be added later
+
+Create:
+src/lib/onchain/mezoEscrow.ts
+
+Expose typed stubs:
+- createEscrowMatchStub(matchId: string, stakeAmountSats: bigint, platformRakeBps: number): Promise<void>
+- fundEscrowStub(matchId: string, playerAddress: string, amountSats: bigint): Promise<{ txHash?: string }>
+- releasePotToWinnerStub(matchId: string, winnerAddress: string, winnerPayoutSats: bigint, rakeSats: bigint): Promise<{ payoutTxHash?: string; feeTxHash?: string }>
+- refundPlayerStub(matchId: string, playerAddress: string, amountSats: bigint): Promise<{ txHash?: string }>
+
+Add TODO comments for:
+- Mezo BTC deposit flow
+- escrow contract address
+- verifying both players funded
+- calculating rake onchain
+- releasing winner payout
+- releasing platform fee
+- refunding cancelled matches
+- handling disputes
+- handling ties
+
+Economics utilities:
+Create:
+src/lib/economics/rake.ts
+
+Expose:
+- calculateGrossPot(stakeAmountSats: bigint, playerCount: number): bigint
+- calculateRake(grossPotSats: bigint, platformRakeBps: number): bigint
+- calculateWinnerPayout(grossPotSats: bigint, rakeSats: bigint): bigint
+- formatSats(amountSats: bigint): string
+
+Add tests for these functions.
+
+Slice Ads integration:
+Slice Ads are a monetization layer around the PvP experience.
+
+For MVP:
+- Use mock Slice Ads only
+- Ads do not fund payouts
+- Ads do not modify pot size
+- Ads do not modify gameplay
+- Ads do not affect match results
+
+Create:
+src/lib/ads/types.ts
+src/lib/ads/mockSliceAds.ts
+src/components/AdSlot.tsx
+
+Ad slots:
+- lobby_top
+- match_start_interstitial
+- between_levels
+- match_result
+- leaderboard_sidebar
+
+Mock ad cards should say:
+“Slice Ad”
+“Sponsored placement”
+“Slice Ads help keep the arcade running”
+
+Track mock ad events:
+- impression
+- click
+- completed
+
+Game UI:
+- Top bar: score, timer, level, multiplier
+- 9x9 board centered
+- 3 selectable pieces below board
+- On desktop, click piece then click board
+- On mobile, tap piece then tap board
+- Ghost preview before placement
+- Highlight invalid placement in red
+- Highlight valid placement in green
+- Highlight rows/columns/squares that will clear
+- Result screen with both scores
+- Show “You” vs “Opponent” in PvP result screen
+- Show waiting state if opponent has not submitted yet
+- For staked preview, show stake, gross pot, rake, winner payout
+
+Implement click-to-place first.
+Drag and drop can be TODO.
+
+UX copy:
+Rules modal:
+“Place blocks on the board to complete rows, columns, or 3x3 squares. Cleared zones score points and create space.”
+
+Multiplier modal:
+“Clear orange multiplier blocks to increase your multiplier. Future points are worth more.”
+
+PvP modal:
+“You and your opponent receive the same shapes. Highest validated score wins.”
+
+Staked match modal:
+“Each player stakes the same amount. The winner receives the pot after platform fee.”
+
+Admin/debug page:
+Create /admin/debug
+
+Show:
+- latest matches
+- match seed
+- generated piece sequence
+- submissions
+- claimed score
+- validated score
+- validation status
+- validation error
+- winner
+- stake amount
+- gross pot
+- rake
+- winner payout
+- escrow status
+
+Security and fairness:
+- Never trust client scores
+- Never use Math.random for gameplay
+- Never let players submit a piece that was not in their generated sequence
+- Never let paid/staked matches run as real funds in MVP
+- Keep escrow and payout logic separate from game score logic
+- Add TODO notes where real anti-fraud, KYC, compliance, and redemption systems would plug in
+
+Tie handling:
+For MVP:
+- If scores tie in free PvP, mark match as tie
+- For future staked PvP, refund both players minus no rake
+- Add TODO for tie-break rules if desired later
+
+Anti-fraud placeholders:
+Add basic structures for:
+- session duration sanity checks
+- impossible score detection
+- duplicate submission detection
+- wallet-level rate limits
+- suspicious replay flags
+
+Suggested folders:
+src/app
+src/app/api
+src/components
+src/game
+src/lib
+src/lib/ads
+src/lib/onchain
+src/lib/db
+src/lib/fraud
+src/lib/economics
+src/styles
+tests/game
+tests/economics
+
+README:
+Include:
+- what this is
+- what it is not
+- setup instructions
+- env vars
+- how to run tests
+- how to run dev server
+- how to play practice
+- how to test free PvP in two browser windows
+- how PvP stake + rake economics work
+- where Slice Ads integration should be replaced
+- where Mezo BTC escrow should be added later
+
+.env.example:
+NEXT_PUBLIC_MEZO_TESTNET_RPC_URL=
+NEXT_PUBLIC_MEZO_MAINNET_RPC_URL=
+DATABASE_URL=
+NEXT_PUBLIC_APP_URL=
+
+Deliverables:
+- Complete Next.js app
+- Clean folder structure
+- README with setup instructions
+- .env.example
+- Database migration/schema
+- Game engine tests
+- Economics/rake tests
+- Mock ads working
+- Wallet connect working
+- Practice mode playable
+- Free PvP flow playable locally with two browser windows
+- Staked PvP preview with correct rake math
+
+Implementation priority:
+1. Deterministic game engine correctness
+2. Rake/economics correctness
+3. Practice gameplay
+4. Server-side validation
+5. Free PvP flow
+6. Staked PvP preview
+7. Mock Slice Ads
+8. Wallet connect
+9. Admin/debug page
+10. Visual polish
+
+Build this now.
