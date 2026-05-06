@@ -78,6 +78,7 @@ export type GameState = {
     platformFeeBps: number;
     playerA: string;
     playerB: string | null;
+    chainId: number;
     winner: string | null;
     playDeadline: string;
     settlementTxHash: string | null;

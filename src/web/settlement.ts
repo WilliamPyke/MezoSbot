@@ -53,6 +53,19 @@ export async function settleOrRefundOnChain(input: {
       txHash: tx.hash,
       status: "submitted",
     });
+
+    const receipt = await tx.wait(1);
+    if (!receipt || receipt.status !== 1) {
+      throw new Error(`Settlement transaction ${tx.hash} did not confirm successfully`);
+    }
+
+    await recordSettlementAttempt({
+      sessionId: input.session.id,
+      action: input.action,
+      resultHash: input.resultHash,
+      txHash: tx.hash,
+      status: "confirmed",
+    });
     return tx.hash as string;
   } catch (err) {
     const message = (err as Error)?.message ?? String(err);

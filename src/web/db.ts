@@ -231,7 +231,7 @@ export async function recordSettlementAttempt(input: {
   action: "settle" | "refund";
   resultHash: string;
   txHash?: string | null;
-  status: "pending" | "submitted" | "failed" | "skipped";
+  status: "pending" | "submitted" | "confirmed" | "failed" | "skipped";
   error?: string | null;
 }) {
   await supabase.from("web_arcade_settlement_attempts").insert({

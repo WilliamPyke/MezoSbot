@@ -10,7 +10,7 @@ import {
   verifyLogin,
 } from "./auth.js";
 import { createSessionDraft, getWebSession, markCreated, markJoined, type WebArcadeSessionRow } from "./db.js";
-import { applyWebMove, buildGameState, buildWalletArcadePlayState, submitWebScore } from "./game.js";
+import { applyWebMove, buildGameState, buildWalletArcadePlayState, submitWebScore, walletArcadePlayStateFromGameState } from "./game.js";
 import { chainConfigForId, webChainsConfig } from "./chains.js";
 import type { Move } from "../arcade/types.js";
 
@@ -165,8 +165,8 @@ export async function handleWalletWebRequest(
           row: numberField(body, "row"),
           col: numberField(body, "col"),
         };
-        await applyWebMove(sessionId, wallet.address, move);
-        return sendJson(res, 200, await buildWalletArcadePlayState(sessionId, wallet.address));
+        const state = await applyWebMove(sessionId, wallet.address, move);
+        return sendJson(res, 200, walletArcadePlayStateFromGameState(state));
       }
 
       if (method === "POST" && parts[4] === "submit") {

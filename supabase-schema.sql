@@ -324,7 +324,7 @@ CREATE TABLE IF NOT EXISTS web_arcade_settlement_attempts (
   action TEXT NOT NULL,                          -- settle | refund
   result_hash TEXT NOT NULL,
   tx_hash TEXT,
-  status TEXT NOT NULL,                          -- pending | submitted | failed | skipped
+  status TEXT NOT NULL,                          -- pending | submitted | confirmed | failed | skipped
   error TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );

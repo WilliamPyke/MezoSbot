@@ -173,6 +173,8 @@ type StateResponse = {
     aScore: number | null;
     bScore: number | null;
     payoutFormatted: string | null;
+    settlementTxHash?: string | null;
+    settlementExplorerUrl?: string | null;
   };
   boardSize: number;
 };
@@ -680,6 +682,7 @@ export function renderArcadePlayPage(options: {
   let selected = { pieceIndex: null, rotation: 0, hoverRow: 0, hoverCol: 0 };
   let serverOffsetMs = 0;
   let timeoutRefreshPending = false;
+  let movePending = false;
 
   // Build empty 9x9 grid
   const cellNodes = [];
@@ -915,6 +918,7 @@ export function renderArcadePlayPage(options: {
 
   async function placeAt(r, c) {
     if (!state) return;
+    if (movePending) return;
     if (state.result.completed) return;
     if (state.self.phase === 'finished') return;
     if (isTimeExpired()) {
@@ -931,26 +935,55 @@ export function renderArcadePlayPage(options: {
       showToast("That doesn't fit");
       return;
     }
-    const next = await api('POST', CONFIG.movePath, {
+    const move = {
       level: state.self.level,
       pieceIndex: selected.pieceIndex,
       rotation: selected.rotation,
       row: r,
       col: c,
-    });
-    if (!next) return;
-    state = next;
-    // Auto-pick next unplaced piece if any
-    if (state.self.phase === 'playing') {
-      const idx = state.self.pieces.findIndex(p => !p.placed);
-      selected.pieceIndex = idx >= 0 ? idx : null;
-    } else {
-      selected.pieceIndex = null;
+    };
+    const previous = cloneState(state);
+    applyOptimisticPlacement(cells, r, c, selected.pieceIndex);
+    render();
+    movePending = true;
+    try {
+      const next = await api('POST', CONFIG.movePath, move);
+      if (!next) {
+        state = previous;
+        render();
+        return;
+      }
+      state = next;
+      // Auto-pick next unplaced piece if any
+      if (state.self.phase === 'playing') {
+        const idx = state.self.pieces.findIndex(p => !p.placed);
+        selected.pieceIndex = idx >= 0 ? idx : null;
+      } else {
+        selected.pieceIndex = null;
+      }
+      selected.rotation = 0;
+      selected.hoverRow = r;
+      selected.hoverCol = c;
+      render();
+    } finally {
+      movePending = false;
     }
+  }
+
+  function cloneState(value) {
+    return JSON.parse(JSON.stringify(value));
+  }
+
+  function applyOptimisticPlacement(cells, r, c, pieceIndex) {
+    for (const cell of cells) {
+      state.self.board[r + cell.y][c + cell.x] = cell.kind === 'multiplier' ? 2 : 1;
+    }
+    state.self.pieces[pieceIndex].placed = true;
+    const idx = state.self.pieces.findIndex(p => !p.placed);
+    selected.pieceIndex = idx >= 0 ? idx : null;
     selected.rotation = 0;
     selected.hoverRow = r;
     selected.hoverCol = c;
-    render();
   }
 
   function paintBoard() {
@@ -1116,6 +1149,11 @@ export function renderArcadePlayPage(options: {
       } else {
         html += '<div class="row">Final score</div>';
         html += '<div class="row"><span>You</span><span>' + state.self.score.toLocaleString() + '</span></div>';
+      }
+      if (state.result.settlementExplorerUrl) {
+        html += '<div class="row"><span>Settlement tx</span><a href="' + state.result.settlementExplorerUrl + '" target="_blank" rel="noopener noreferrer">' +
+          String(state.result.settlementTxHash || '').slice(0, 10) + '…' + String(state.result.settlementTxHash || '').slice(-8) +
+          '</a></div>';
       }
       html += '<div class="row" style="margin-top:6px;">' + CONFIG.doneMessage + '</div>';
       $end.innerHTML = html;

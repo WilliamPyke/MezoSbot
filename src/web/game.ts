@@ -27,6 +27,8 @@ import {
 import { settleOrRefundOnChain } from "./settlement.js";
 import { chainConfigForId } from "./chains.js";
 
+const settlementLocks = new Set<string>();
+
 export type WebGameState = {
   session: {
     id: string;
@@ -35,6 +37,7 @@ export type WebGameState = {
     assetAddress: string;
     stakeAmountUnits: string;
     platformFeeBps: number;
+    chainId: number;
     playerA: string;
     playerB: string | null;
     invitedPlayer: string | null;
@@ -119,13 +122,15 @@ export type WalletArcadePlayState = {
     aScore: number | null;
     bScore: number | null;
     payoutFormatted: string | null;
+    settlementTxHash: string | null;
+    settlementExplorerUrl: string | null;
   };
 };
 
 export async function buildGameState(sessionId: string, wallet: string): Promise<WebGameState> {
   const session = await getWebSession(sessionId);
   if (!session) throw new Error("Session not found");
-  await settleExpiredIfNeeded(session);
+  await finalizeReadySessionIfNeeded(session);
   const freshSession = (await getWebSession(sessionId)) ?? session;
 
   const address = normalizeWalletAddress(wallet);
@@ -158,6 +163,7 @@ export async function buildGameState(sessionId: string, wallet: string): Promise
       assetAddress: freshSession.asset_address,
       stakeAmountUnits: freshSession.stake_amount_units,
       platformFeeBps: freshSession.platform_fee_bps,
+      chainId: freshSession.chain_id,
       playerA: freshSession.player_a_address,
       playerB: freshSession.player_b_address,
       invitedPlayer: freshSession.invited_player_address,
@@ -208,15 +214,20 @@ export async function buildWalletArcadePlayState(
   wallet: string
 ): Promise<WalletArcadePlayState> {
   const state = await buildGameState(sessionId, wallet);
+  return walletArcadePlayStateFromGameState(state);
+}
+
+export function walletArcadePlayStateFromGameState(state: WebGameState): WalletArcadePlayState {
   if (!state.self) throw new Error("Wallet is not a player in this session");
 
-  const session = await getWebSession(sessionId);
-  if (!session) throw new Error("Session not found");
-  const asset = assetForSession(session);
+  const asset = assetForState(state);
   const stake = BigInt(state.session.stakeAmountUnits);
   const grossPot = stake * 2n;
   const fee = (grossPot * BigInt(state.session.platformFeeBps)) / 10000n;
   const winnerPayout = grossPot - fee;
+  const settlementExplorerUrl = state.session.settlementTxHash
+    ? `${state.session.explorerUrl}/tx/${state.session.settlementTxHash}`
+    : null;
 
   return {
     boardSize: state.boardSize,
@@ -265,13 +276,15 @@ export async function buildWalletArcadePlayState(
       payoutFormatted: state.result.completed && state.result.isWinner
         ? `${ethers.formatUnits(winnerPayout, asset.decimals)} ${asset.symbol}`
         : null,
+      settlementTxHash: state.session.settlementTxHash,
+      settlementExplorerUrl,
     },
   };
 }
 
 export async function applyWebMove(sessionId: string, wallet: string, move: Move) {
   const session = await requireActivePlayer(sessionId, wallet);
-  await settleExpiredIfNeeded(session);
+  await finalizeReadySessionIfNeeded(session);
   const fresh = await requireActivePlayer(sessionId, wallet);
   const current = await playerState(fresh, wallet);
   if (current.phase !== "playing") throw new Error("Player is already finished");
@@ -303,38 +316,47 @@ export async function submitWebScore(sessionId: string, wallet: string) {
 }
 
 export async function tryFinalizeSession(sessionId: string) {
-  const session = await getWebSession(sessionId);
-  if (!session || ["completed", "refunded", "cancelled"].includes(session.status)) return session;
-  if (!session.player_b_address || session.status !== "active") return session;
+  if (settlementLocks.has(sessionId)) return getWebSession(sessionId);
+  settlementLocks.add(sessionId);
+  try {
+    const session = await getWebSession(sessionId);
+    if (!session || ["completed", "refunded", "cancelled"].includes(session.status)) return session;
+    if (!session.player_b_address || session.status !== "active") return session;
 
-  const expired = Date.now() >= settlementCutoffMs(session);
-  const bothSubmitted = session.player_a_submitted && session.player_b_submitted;
-  if (!expired && !bothSubmitted) return session;
+    const expired = Date.now() >= settlementCutoffMs(session);
+    const bothSubmitted = session.player_a_submitted && session.player_b_submitted;
+    if (!expired && !bothSubmitted) return session;
 
-  const aState = await playerState(session, session.player_a_address);
-  const bState = await playerState(session, session.player_b_address);
-  const aScore = session.player_a_submitted || expired ? aState.score : 0;
-  const bScore = session.player_b_submitted || expired ? bState.score : 0;
+    const aState = await playerState(session, session.player_a_address);
+    const bState = await playerState(session, session.player_b_address);
+    const aScore = session.player_a_submitted || expired ? aState.score : 0;
+    const bScore = session.player_b_submitted || expired ? bState.score : 0;
 
-  if (aScore === bScore) {
-    const resultHash = resultHashFor(session.id, null, aScore, bScore);
-    const txHash = await settleOrRefundOnChain({
-      session,
-      action: "refund",
-      resultHash,
-      reasonHash: ethers.id("tie"),
-    });
-    return completeSession({ sessionId: session.id, winner: null, resultHash, settlementTxHash: txHash, refunded: true });
+    if (aScore === bScore) {
+      const resultHash = resultHashFor(session.id, null, aScore, bScore);
+      const txHash = await settleOrRefundOnChain({
+        session,
+        action: "refund",
+        resultHash,
+        reasonHash: ethers.id("tie"),
+      });
+      return completeSession({ sessionId: session.id, winner: null, resultHash, settlementTxHash: txHash, refunded: true });
+    }
+
+    const winner = aScore > bScore ? session.player_a_address : session.player_b_address;
+    const resultHash = resultHashFor(session.id, winner, aScore, bScore);
+    const txHash = await settleOrRefundOnChain({ session, action: "settle", resultHash, winner });
+    return completeSession({ sessionId: session.id, winner, resultHash, settlementTxHash: txHash });
+  } finally {
+    settlementLocks.delete(sessionId);
   }
-
-  const winner = aScore > bScore ? session.player_a_address : session.player_b_address;
-  const resultHash = resultHashFor(session.id, winner, aScore, bScore);
-  const txHash = await settleOrRefundOnChain({ session, action: "settle", resultHash, winner });
-  return completeSession({ sessionId: session.id, winner, resultHash, settlementTxHash: txHash });
 }
 
-async function settleExpiredIfNeeded(session: WebArcadeSessionRow) {
-  if (session.status === "active" && Date.now() >= settlementCutoffMs(session)) {
+async function finalizeReadySessionIfNeeded(session: WebArcadeSessionRow) {
+  if (session.status !== "active") return;
+  const expired = Date.now() >= settlementCutoffMs(session);
+  const bothSubmitted = session.player_a_submitted && session.player_b_submitted;
+  if (expired || bothSubmitted) {
     await tryFinalizeSession(session.id);
   }
 }
@@ -379,6 +401,20 @@ function opponentScore(session: WebArcadeSessionRow, opponent: string) {
   return opponent === session.player_a_address ? session.player_a_score : session.player_b_score;
 }
 
+function assetForState(state: WebGameState) {
+  return {
+    symbol: state.session.assetSymbol,
+    decimals: assetForAddressDecimals(state.session.assetAddress, state.session.chainId),
+  };
+}
+
+function assetForAddressDecimals(address: string, chainId: number) {
+  const chain = chainConfigForId(chainId);
+  const asset = chain.assets.find((entry) => entry.address.toLowerCase() === address.toLowerCase());
+  if (!asset) return 18;
+  return asset.decimals;
+}
+
 function resultHashFor(sessionId: string, winner: string | null, aScore: number, bScore: number) {
   return ethers.keccak256(
     ethers.AbiCoder.defaultAbiCoder().encode(
@@ -386,14 +422,6 @@ function resultHashFor(sessionId: string, winner: string | null, aScore: number,
       [sessionId, winner ?? ethers.ZeroAddress, BigInt(aScore), BigInt(bScore)]
     )
   );
-}
-
-function assetForSession(session: WebArcadeSessionRow) {
-  const chain = chainConfigForId(session.chain_id);
-  return chain.assets.find((asset) => ethers.getAddress(asset.address) === ethers.getAddress(session.asset_address)) ?? {
-    symbol: session.asset_symbol,
-    decimals: 18,
-  };
 }
 
 function shortSessionId(id: string) {
