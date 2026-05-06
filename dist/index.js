@@ -68,6 +68,39 @@ client.on("invalidated", () => {
     discordState = "invalidated";
     console.error("[Discord] Session invalidated");
 });
+/* ── Process-level diagnostics ────────────────────────────────────── */
+// Event-loop lag: fires a setImmediate every 1s and measures how late it
+// runs. >100ms = the loop is starved (heavy sync work is blocking, or CPU
+// is throttled). This is the smoking gun for gateway heartbeat failures.
+{
+    const SAMPLE_MS = 1000;
+    const WARN_LAG_MS = 200;
+    let lastTick = Date.now();
+    setInterval(() => {
+        const now = Date.now();
+        const lag = now - lastTick - SAMPLE_MS;
+        lastTick = now;
+        if (lag > WARN_LAG_MS) {
+            console.warn(`[Diag] Event loop lag ${lag}ms (sample=${SAMPLE_MS}ms) — process is CPU-starved`);
+        }
+    }, SAMPLE_MS);
+}
+// Gateway ping: log every 30s. Healthy is ~50–200ms; >500ms or "-1" means
+// heartbeat acks are missing and the connection is on its way to dropping.
+setInterval(() => {
+    if (!client.isReady())
+        return;
+    const ping = client.ws.ping;
+    if (ping < 0) {
+        console.warn("[Diag] Gateway ping unavailable (no recent heartbeat ack) — gateway likely reconnecting");
+    }
+    else if (ping > 500) {
+        console.warn(`[Diag] Gateway ping ${ping}ms — heartbeat is slow, interactions may time out`);
+    }
+    else {
+        console.log(`[Diag] Gateway ping ${ping}ms (healthy)`);
+    }
+}, 30_000);
 function timeoutAfter(ms, label) {
     return new Promise((_, reject) => {
         setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
@@ -211,22 +244,34 @@ client.once(discord_js_1.Events.ClientReady, async (c) => {
     }
 });
 client.on(discord_js_1.Events.InteractionCreate, async (interaction) => {
+    // Arrival latency = how long Discord took to deliver this to us. If this is
+    // consistently >500ms, the gateway connection is unhealthy (we're behind on
+    // events, often due to event-loop starvation or a recent reconnect).
+    const arrivalLagMs = Date.now() - interaction.createdTimestamp;
+    const startMs = Date.now();
+    const tag = interaction.user.tag;
     if ((0, interactions_js_1.isArcadeInteraction)(interaction)) {
-        console.log(`[Discord] Arcade interaction ${("customId" in interaction && interaction.customId) || ""} from ${interaction.user.tag}`);
+        const cid = ("customId" in interaction && interaction.customId) || "";
+        console.log(`[Discord] Arcade interaction ${cid} from ${tag} (arrivalLag=${arrivalLagMs}ms)`);
         await (0, interactions_js_1.handleArcadeInteraction)(interaction);
+        console.log(`[Discord] Arcade ${cid} done in ${Date.now() - startMs}ms`);
         return;
     }
     if (interaction.isButton()) {
-        console.log(`[Discord] Button interaction ${interaction.customId} from ${interaction.user.tag}`);
+        console.log(`[Discord] Button interaction ${interaction.customId} from ${tag} (arrivalLag=${arrivalLagMs}ms)`);
         const customId = interaction.customId;
         if (customId.startsWith("claim_drop_")) {
             await handleDropButton(interaction);
         }
+        console.log(`[Discord] Button ${customId} done in ${Date.now() - startMs}ms`);
         return;
     }
     if (!interaction.isChatInputCommand())
         return;
-    console.log(`[Discord] Command /${interaction.commandName} from ${interaction.user.tag}`);
+    console.log(`[Discord] Command /${interaction.commandName} from ${tag} (arrivalLag=${arrivalLagMs}ms)`);
+    if (arrivalLagMs > 1500) {
+        console.warn(`[Discord] HIGH ARRIVAL LAG ${arrivalLagMs}ms for /${interaction.commandName} — gateway is behind, expect "did not respond"`);
+    }
     const handler = commandMap.get(interaction.commandName);
     if (!handler) {
         console.warn(`[Discord] No handler registered for /${interaction.commandName}`);
@@ -237,12 +282,13 @@ client.on(discord_js_1.Events.InteractionCreate, async (interaction) => {
     (0, profile_js_1.updateUserProfile)(interaction.user.id, username, displayName, avatarUrl).catch(() => { });
     try {
         await handler(interaction);
+        console.log(`[Discord] /${interaction.commandName} done in ${Date.now() - startMs}ms (arrivalLag=${arrivalLagMs}ms)`);
     }
     catch (err) {
-        // 10062 = Unknown Interaction: interaction token expired, typically from
-        // pre-restart interactions re-delivered to the new instance. Not a real error.
-        if (err?.code === 10062)
+        if (err?.code === 10062) {
+            console.warn(`[Discord] /${interaction.commandName} token expired (arrivalLag=${arrivalLagMs}ms, totalMs=${Date.now() - startMs}) — interaction was likely stale on arrival`);
             return;
+        }
         console.error(`Command /${interaction.commandName} error:`, err?.message ?? err);
         const msg = { content: "❌ Something went wrong.", ephemeral: true };
         if (interaction.replied || interaction.deferred) {
