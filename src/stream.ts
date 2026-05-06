@@ -4,6 +4,8 @@
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { URL } from "node:url";
+import { readFile, stat } from "node:fs/promises";
+import { join, normalize } from "node:path";
 import { WebSocketServer, WebSocket } from "ws";
 import { deflate } from "node:zlib";
 import { promisify } from "node:util";
@@ -16,6 +18,7 @@ import {
 } from "./emulator.js";
 import { config } from "./config.js";
 import { handleArcadeWebRequest } from "./arcade/web.js";
+import { handleWalletWebRequest } from "./web/routes.js";
 
 const deflateAsync = promisify(deflate);
 
@@ -223,6 +226,53 @@ function sendHtml(res: ServerResponse, html: string): void {
   res.end(html);
 }
 
+async function tryServeWebApp(req: IncomingMessage, res: ServerResponse, url: URL): Promise<boolean> {
+  if ((req.method ?? "GET").toUpperCase() !== "GET") return false;
+  if (url.pathname.startsWith("/api/") || url.pathname === "/healthz" || url.pathname === "/metrics") return false;
+  if (url.pathname === "/stream" || url.pathname.startsWith("/arcade")) return false;
+
+  const webRoot = join(process.cwd(), "web", "dist");
+  const requestedPath = url.pathname === "/" ? "index.html" : decodeURIComponent(url.pathname.slice(1));
+  const normalized = normalize(requestedPath).replace(/^(\.\.[/\\])+/, "");
+  const candidate = join(webRoot, normalized);
+
+  try {
+    const fileStat = await stat(candidate);
+    if (fileStat.isFile()) {
+      const body = await readFile(candidate);
+      res.statusCode = 200;
+      res.setHeader("Content-Type", contentType(candidate));
+      if (!candidate.endsWith("index.html")) res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+      res.end(body);
+      return true;
+    }
+  } catch {
+    // Fall through to SPA fallback.
+  }
+
+  try {
+    const index = await readFile(join(webRoot, "index.html"));
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache");
+    res.end(index);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function contentType(path: string): string {
+  if (path.endsWith(".html")) return "text/html; charset=utf-8";
+  if (path.endsWith(".js")) return "text/javascript; charset=utf-8";
+  if (path.endsWith(".css")) return "text/css; charset=utf-8";
+  if (path.endsWith(".svg")) return "image/svg+xml";
+  if (path.endsWith(".png")) return "image/png";
+  if (path.endsWith(".ico")) return "image/x-icon";
+  if (path.endsWith(".json")) return "application/json; charset=utf-8";
+  return "application/octet-stream";
+}
+
 export function setHealthStatusProvider(provider: () => HealthStatus): void {
   healthStatusProvider = provider;
 }
@@ -282,12 +332,17 @@ async function handleHttpRequest(req: IncomingMessage, res: ServerResponse): Pro
   const method = req.method ?? "GET";
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
 
+  if (url.pathname.startsWith("/api/web")) {
+    const handled = await handleWalletWebRequest(req, res, url);
+    if (handled) return;
+  }
+
   if (url.pathname.startsWith("/arcade")) {
     const handled = await handleArcadeWebRequest(req, res, url);
     if (handled) return;
   }
 
-  if (method === "GET" && url.pathname === "/") {
+  if (method === "GET" && url.pathname === "/gb-stream") {
     sendHtml(res, buildViewerHtml());
     return;
   }
@@ -319,6 +374,8 @@ async function handleHttpRequest(req: IncomingMessage, res: ServerResponse): Pro
     });
     return;
   }
+
+  if (await tryServeWebApp(req, res, url)) return;
 
   sendJson(res, 404, { error: "not_found" });
 }

@@ -115,6 +115,38 @@ A 9×9 block puzzle PvP game. **Matchmaking happens in Discord; the match itself
 
 The deterministic engine and scoring live in `src/arcade/`. Match runtime state is reconstructible from a seed + move log, so a bot restart can recover any in-progress match. Set `PUBLIC_BASE_URL` (e.g. `https://your-bot.example.com`) so the bot can build absolute browser-play URLs; defaults to `http://localhost:<STREAM_PORT>` for local dev.
 
+## Wallet Arcade Escrow
+
+`play.mallard.sh` is implemented as a wallet-first web app in `web/` and served by the existing Node HTTP server after `npm run build`. Discord arcade sessions remain separate from wallet sessions; wallet play uses `/api/web/*` routes and the `web_arcade_*` Supabase tables.
+
+- New sessions can be created on Mezo mainnet chain `31612` or testnet chain `31611`; each session stores its own chain and escrow contract address.
+- Supported escrow assets are native BTC, BTC precompile/ERC-20 path, MUSD, and MEZO.
+- The frontend uses RainbowKit, wagmi, viem, and React Query for wallet connection, login signatures, session creation, joins, approvals, gameplay, and settlement links.
+- The backend signer settles validated matches through `MallardGameEscrow`; ties and approved refunds call the refund path.
+
+Additional environment:
+
+| Variable | Description |
+|----------|-------------|
+| `MEZO_DEFAULT_NETWORK` | Default network selected by the wallet arcade UI: `mainnet` or `testnet` |
+| `MEZO_MAINNET_RPC_URL` / `MEZO_TESTNET_RPC_URL` | RPC URLs used by the backend settlement signer |
+| `ESCROW_MAINNET_CONTRACT_ADDRESS` / `ESCROW_TESTNET_CONTRACT_ADDRESS` | Deployed `MallardGameEscrow` address for each network |
+| `ESCROW_CONTRACT_ADDRESS` | Backward-compatible fallback for single-network deployments |
+| `ESCROW_ADMIN_ADDRESS` | Deploy-time admin address that can update contract config and roles |
+| `ESCROW_SETTLER_ADDRESS` | Deploy-time public address for the backend settlement signer |
+| `ESCROW_SETTLER_PRIVATE_KEY` | Private key with `SETTLER_ROLE` for validated settlement |
+| `ESCROW_TREASURY_ADDRESS` | Treasury address receiving platform fees |
+| `ESCROW_PLATFORM_FEE_BPS` | Platform fee in basis points, default `1000` |
+| `WALLETCONNECT_PROJECT_ID` | WalletConnect project ID for RainbowKit |
+| `WEB_SESSION_SECRET` | HMAC secret for wallet login cookies |
+
+Contract package:
+
+```bash
+npm run test:contracts
+npm run deploy:contracts -- --network mezoTestnet
+```
+
 ## How Deposits Work
 
 1. User runs `/link 0xYourAddress` to link their wallet

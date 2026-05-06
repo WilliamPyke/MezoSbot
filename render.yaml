@@ -37,6 +37,30 @@ services:
         sync: false
       - key: EXPLORER_URL
         value: "https://explorer.mezo.org"
+      - key: PUBLIC_BASE_URL
+        value: "https://play.mallard.sh"
+      - key: MEZO_DEFAULT_NETWORK
+        value: "mainnet"
+      - key: MEZO_MAINNET_RPC_URL
+        value: "https://rpc-http.mezo.boar.network"
+      - key: MEZO_TESTNET_RPC_URL
+        value: "https://rpc.test.mezo.org"
+      - key: ESCROW_MAINNET_CONTRACT_ADDRESS
+        sync: false
+      - key: ESCROW_TESTNET_CONTRACT_ADDRESS
+        sync: false
+      - key: ESCROW_CONTRACT_ADDRESS
+        sync: false
+      - key: ESCROW_SETTLER_PRIVATE_KEY
+        sync: false
+      - key: ESCROW_TREASURY_ADDRESS
+        sync: false
+      - key: ESCROW_PLATFORM_FEE_BPS
+        value: "1000"
+      - key: WALLETCONNECT_PROJECT_ID
+        sync: false
+      - key: WEB_SESSION_SECRET
+        sync: false
       - key: MIN_WITHDRAWAL_SATS
         value: "50"
       - key: SKIP_WITHDRAWAL_MIN

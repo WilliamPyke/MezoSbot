@@ -9,12 +9,15 @@ exports.stopStream = stopStream;
  */
 const node_http_1 = require("node:http");
 const node_url_1 = require("node:url");
+const promises_1 = require("node:fs/promises");
+const node_path_1 = require("node:path");
 const ws_1 = require("ws");
 const node_zlib_1 = require("node:zlib");
 const node_util_1 = require("node:util");
 const emulator_js_1 = require("./emulator.js");
 const config_js_1 = require("./config.js");
 const web_js_1 = require("./arcade/web.js");
+const routes_js_1 = require("./web/routes.js");
 const deflateAsync = (0, node_util_1.promisify)(node_zlib_1.deflate);
 const streamClients = new Map();
 let httpServer = null;
@@ -186,6 +189,61 @@ function sendHtml(res, html) {
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.end(html);
 }
+async function tryServeWebApp(req, res, url) {
+    if ((req.method ?? "GET").toUpperCase() !== "GET")
+        return false;
+    if (url.pathname.startsWith("/api/") || url.pathname === "/healthz" || url.pathname === "/metrics")
+        return false;
+    if (url.pathname === "/stream" || url.pathname.startsWith("/arcade"))
+        return false;
+    const webRoot = (0, node_path_1.join)(process.cwd(), "web", "dist");
+    const requestedPath = url.pathname === "/" ? "index.html" : decodeURIComponent(url.pathname.slice(1));
+    const normalized = (0, node_path_1.normalize)(requestedPath).replace(/^(\.\.[/\\])+/, "");
+    const candidate = (0, node_path_1.join)(webRoot, normalized);
+    try {
+        const fileStat = await (0, promises_1.stat)(candidate);
+        if (fileStat.isFile()) {
+            const body = await (0, promises_1.readFile)(candidate);
+            res.statusCode = 200;
+            res.setHeader("Content-Type", contentType(candidate));
+            if (!candidate.endsWith("index.html"))
+                res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+            res.end(body);
+            return true;
+        }
+    }
+    catch {
+        // Fall through to SPA fallback.
+    }
+    try {
+        const index = await (0, promises_1.readFile)((0, node_path_1.join)(webRoot, "index.html"));
+        res.statusCode = 200;
+        res.setHeader("Content-Type", "text/html; charset=utf-8");
+        res.setHeader("Cache-Control", "no-cache");
+        res.end(index);
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
+function contentType(path) {
+    if (path.endsWith(".html"))
+        return "text/html; charset=utf-8";
+    if (path.endsWith(".js"))
+        return "text/javascript; charset=utf-8";
+    if (path.endsWith(".css"))
+        return "text/css; charset=utf-8";
+    if (path.endsWith(".svg"))
+        return "image/svg+xml";
+    if (path.endsWith(".png"))
+        return "image/png";
+    if (path.endsWith(".ico"))
+        return "image/x-icon";
+    if (path.endsWith(".json"))
+        return "application/json; charset=utf-8";
+    return "application/octet-stream";
+}
 function setHealthStatusProvider(provider) {
     healthStatusProvider = provider;
 }
@@ -238,12 +296,17 @@ async function pushFrameToClients(rgba) {
 async function handleHttpRequest(req, res) {
     const method = req.method ?? "GET";
     const url = new node_url_1.URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+    if (url.pathname.startsWith("/api/web")) {
+        const handled = await (0, routes_js_1.handleWalletWebRequest)(req, res, url);
+        if (handled)
+            return;
+    }
     if (url.pathname.startsWith("/arcade")) {
         const handled = await (0, web_js_1.handleArcadeWebRequest)(req, res, url);
         if (handled)
             return;
     }
-    if (method === "GET" && url.pathname === "/") {
+    if (method === "GET" && url.pathname === "/gb-stream") {
         sendHtml(res, buildViewerHtml());
         return;
     }
@@ -272,6 +335,8 @@ async function handleHttpRequest(req, res) {
         });
         return;
     }
+    if (await tryServeWebApp(req, res, url))
+        return;
     sendJson(res, 404, { error: "not_found" });
 }
 async function startStream() {

@@ -51,6 +51,22 @@ exports.config = {
         explorerUrl: optional("EXPLORER_URL", "https://explorer.mezo.org"),
         skipWithdrawalMin: process.env.SKIP_WITHDRAWAL_MIN === "1" || process.env.SKIP_WITHDRAWAL_MIN === "true",
     },
+    web: {
+        mezoDefaultNetwork: optional("MEZO_DEFAULT_NETWORK", optional("MEZO_NETWORK", optional("CHAIN_ID", "31612") === "31611" ? "testnet" : "mainnet")),
+        mainnetRpcUrl: optional("MEZO_MAINNET_RPC_URL", optional("RPC_URL", "https://rpc-http.mezo.boar.network")),
+        testnetRpcUrl: optional("MEZO_TESTNET_RPC_URL", "https://rpc.test.mezo.org"),
+        escrowContractAddress: optional("ESCROW_CONTRACT_ADDRESS", ""),
+        escrowMainnetContractAddress: optional("ESCROW_MAINNET_CONTRACT_ADDRESS", ""),
+        escrowTestnetContractAddress: optional("ESCROW_TESTNET_CONTRACT_ADDRESS", ""),
+        escrowSettlerPrivateKey: optional("ESCROW_SETTLER_PRIVATE_KEY", ""),
+        escrowTreasuryAddress: optional("ESCROW_TREASURY_ADDRESS", ""),
+        escrowPlatformFeeBps: parseInt(optional("ESCROW_PLATFORM_FEE_BPS", "1000"), 10),
+        walletConnectProjectId: optional("WALLETCONNECT_PROJECT_ID", ""),
+        sessionSecret: optional("WEB_SESSION_SECRET", process.env.ARCADE_TOKEN_SECRET ?? process.env.TREASURY_PRIVATE_KEY ?? ""),
+        joinWindowSeconds: parseInt(optional("WEB_JOIN_WINDOW_SECONDS", "900"), 10),
+        playWindowSeconds: parseInt(optional("WEB_PLAY_WINDOW_SECONDS", "180"), 10),
+        settlementGraceSeconds: parseInt(optional("WEB_SETTLEMENT_GRACE_SECONDS", "30"), 10),
+    },
     depositWebUrl: optional("DEPOSIT_WEB_URL", "https://deposit.mallard.sh/sbot"),
     /**
      * Public base URL of this bot's HTTP server (no trailing slash).

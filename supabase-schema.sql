@@ -250,3 +250,90 @@ CREATE INDEX IF NOT EXISTS idx_arcade_matches_target ON arcade_matches(target_pl
 CREATE INDEX IF NOT EXISTS idx_arcade_matches_open_offers ON arcade_matches(status, created_at) WHERE target_player_id IS NULL;
 CREATE INDEX IF NOT EXISTS idx_arcade_submissions_match ON arcade_submissions(match_id);
 CREATE INDEX IF NOT EXISTS idx_arcade_escrow_match ON arcade_escrow(match_id);
+
+-- Wallet-first Mallard Arcade sessions. These are intentionally separate from
+-- Discord arcade tables so Discord sessions remain independent.
+CREATE TABLE IF NOT EXISTS web_auth_nonces (
+  nonce TEXT PRIMARY KEY,
+  wallet_address TEXT NOT NULL,
+  chain_id INTEGER NOT NULL,
+  message TEXT NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  used_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS web_arcade_sessions (
+  id TEXT PRIMARY KEY,                           -- bytes32 hex session id
+  seed TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'draft',          -- draft | created | active | submitted | completed | refunded | cancelled | settlement_failed
+  chain_id INTEGER NOT NULL,
+  escrow_contract_address TEXT NOT NULL,
+  asset_symbol TEXT NOT NULL,
+  asset_address TEXT NOT NULL,
+  stake_amount_units TEXT NOT NULL,              -- raw token units as decimal string
+  platform_fee_bps INTEGER NOT NULL DEFAULT 1000,
+  player_a_address TEXT NOT NULL,
+  player_b_address TEXT,
+  invited_player_address TEXT,
+  winner_address TEXT,
+  player_a_score DOUBLE PRECISION,
+  player_b_score DOUBLE PRECISION,
+  player_a_submitted BOOLEAN NOT NULL DEFAULT FALSE,
+  player_b_submitted BOOLEAN NOT NULL DEFAULT FALSE,
+  create_tx_hash TEXT,
+  join_tx_hash TEXT,
+  settlement_tx_hash TEXT,
+  result_hash TEXT,
+  join_deadline TIMESTAMPTZ NOT NULL,
+  play_deadline TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  completed_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS web_arcade_submissions (
+  id BIGSERIAL PRIMARY KEY,
+  session_id TEXT NOT NULL REFERENCES web_arcade_sessions(id) ON DELETE CASCADE,
+  wallet_address TEXT NOT NULL,
+  move_log JSONB NOT NULL DEFAULT '[]'::jsonb,
+  claimed_score DOUBLE PRECISION NOT NULL DEFAULT 0,
+  validated_score DOUBLE PRECISION,
+  valid BOOLEAN,
+  submitted BOOLEAN NOT NULL DEFAULT FALSE,
+  validation_error TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(session_id, wallet_address)
+);
+
+CREATE TABLE IF NOT EXISTS web_arcade_escrow_events (
+  id BIGSERIAL PRIMARY KEY,
+  session_id TEXT NOT NULL REFERENCES web_arcade_sessions(id) ON DELETE CASCADE,
+  event_type TEXT NOT NULL,
+  tx_hash TEXT,
+  log_index INTEGER,
+  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(tx_hash, log_index)
+);
+
+CREATE TABLE IF NOT EXISTS web_arcade_settlement_attempts (
+  id BIGSERIAL PRIMARY KEY,
+  session_id TEXT NOT NULL REFERENCES web_arcade_sessions(id) ON DELETE CASCADE,
+  action TEXT NOT NULL,                          -- settle | refund
+  result_hash TEXT NOT NULL,
+  tx_hash TEXT,
+  status TEXT NOT NULL,                          -- pending | submitted | failed | skipped
+  error TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_web_auth_nonces_wallet ON web_auth_nonces(wallet_address);
+CREATE INDEX IF NOT EXISTS idx_web_arcade_sessions_status ON web_arcade_sessions(status);
+CREATE INDEX IF NOT EXISTS idx_web_arcade_sessions_player_a ON web_arcade_sessions(player_a_address);
+CREATE INDEX IF NOT EXISTS idx_web_arcade_sessions_player_b ON web_arcade_sessions(player_b_address);
+CREATE INDEX IF NOT EXISTS idx_web_arcade_sessions_invited ON web_arcade_sessions(invited_player_address);
+CREATE INDEX IF NOT EXISTS idx_web_arcade_sessions_deadline ON web_arcade_sessions(play_deadline);
+CREATE INDEX IF NOT EXISTS idx_web_arcade_submissions_session ON web_arcade_submissions(session_id);
+CREATE INDEX IF NOT EXISTS idx_web_arcade_settlement_attempts_session ON web_arcade_settlement_attempts(session_id);

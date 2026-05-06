@@ -4,7 +4,12 @@
   "description": "Discord bot for depositing sats from EVM, tipping, distributing, and dropping",
   "main": "dist/index.js",
   "scripts": {
-    "build": "tsc",
+    "build": "npm run build:web && tsc",
+    "build:server": "tsc",
+    "build:web": "vite build --config web/vite.config.ts",
+    "dev:web": "vite dev --config web/vite.config.ts",
+    "test:contracts": "hardhat test --config contracts/hardhat.config.ts",
+    "deploy:contracts": "hardhat run --config contracts/hardhat.config.ts contracts/scripts/deployMallardEscrow.ts",
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts"
   },
@@ -19,6 +24,8 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
+    "@rainbow-me/rainbowkit": "^2.2.8",
+    "@tanstack/react-query": "^5.90.12",
     "@koush/wrtc": "^0.5.3",
     "@roamhq/wrtc": "^0.9.1",
     "@supabase/supabase-js": "^2.95.3",
@@ -26,13 +33,24 @@
     "dotenv": "^16.4.5",
     "ethers": "^6.13.4",
     "qrcode": "^1.5.4",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
     "serverboy": "^0.0.7",
+    "viem": "^2.38.6",
+    "vite": "^5.4.21",
+    "wagmi": "^2.19.2",
     "ws": "^8.18.0"
   },
   "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^6.1.0",
+    "@openzeppelin/contracts": "^5.4.0",
+    "@types/react": "^18.3.27",
+    "@types/react-dom": "^18.3.7",
     "@types/node": "^22.10.1",
     "@types/qrcode": "^1.5.6",
     "@types/ws": "^8.5.13",
+    "@vitejs/plugin-react": "^4.7.0",
+    "hardhat": "^2.27.1",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2"
   },

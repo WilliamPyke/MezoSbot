@@ -5,3 +5,7 @@ mezosbot.db
 *.log
 .DS_Store
 saves/
+contracts/artifacts/
+contracts/cache/
+contracts/typechain-types/
+contracts/contracts/cache/
