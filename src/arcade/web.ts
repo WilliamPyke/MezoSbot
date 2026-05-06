@@ -20,7 +20,6 @@ import {
   ensureRuntime,
   getRuntime,
   rebuildState,
-  type MatchRuntime,
 } from "./runtime.js";
 import { rotateCells } from "./pieces.js";
 import {
@@ -71,6 +70,10 @@ export async function handleArcadeWebRequest(
         col: numField(body, "col"),
       };
       await ensureMatchRuntimeLoaded(claim.matchId);
+      const expired = await settleExpiredMatchIfNeeded(claim.matchId);
+      if (expired && expired.status !== "active" && expired.status !== "submitted") {
+        return { status: 200, body: await buildStateResponse(claim.matchId, claim.userId) };
+      }
       const result = applyMoveForPlayer(claim.matchId, claim.userId, move);
       if (!("ok" in result) || !result.ok) {
         return { status: 400, body: { error: (result as { error: string }).error } };
@@ -85,6 +88,10 @@ export async function handleArcadeWebRequest(
   if (method === "POST" && path === "/arcade/api/submit") {
     await respondWithBody(req, res, async (claim) => {
       await ensureMatchRuntimeLoaded(claim.matchId);
+      const expired = await settleExpiredMatchIfNeeded(claim.matchId);
+      if (expired && expired.status !== "active" && expired.status !== "submitted") {
+        return { status: 200, body: await buildStateResponse(claim.matchId, claim.userId) };
+      }
       const runtime = getRuntime(claim.matchId);
       if (!runtime) return { status: 404, body: { error: "Match not found" } };
       const playerState = runtime.players.get(claim.userId);
@@ -123,13 +130,14 @@ type StateResponse = {
     status: ArcadeMatchRow["status"];
     stakeSats: number | null;
     grossPotSats: number | null;
-    rakeSats: number | null;
     winnerPayoutSats: number | null;
-    rakeBps: number;
     stakeFormatted: string | null;
     grossPotFormatted: string | null;
-    rakeFormatted: string | null;
     winnerPayoutFormatted: string | null;
+    durationSeconds: number;
+    startedAt: string | null;
+    deadlineAt: string | null;
+    serverNow: string;
   };
   self: {
     userId: string;
@@ -165,8 +173,9 @@ async function buildStateResponse(
   matchId: number,
   userId: string
 ): Promise<StateResponse | { error: string }> {
-  const match = await getMatch(matchId);
+  let match = await getMatch(matchId);
   if (!match) return { error: "Match not found" };
+  match = (await settleExpiredMatchIfNeeded(matchId)) ?? match;
 
   const isPracticeOrPlayer =
     match.mode === "practice"
@@ -222,14 +231,15 @@ async function buildStateResponse(
       status: match.status,
       stakeSats: match.stake_amount_sats,
       grossPotSats: match.gross_pot_sats,
-      rakeSats: match.rake_amount_sats,
       winnerPayoutSats: match.winner_payout_sats,
-      rakeBps: match.platform_rake_bps,
       stakeFormatted: match.stake_amount_sats != null ? formatSats(match.stake_amount_sats) : null,
       grossPotFormatted: match.gross_pot_sats != null ? formatSats(match.gross_pot_sats) : null,
-      rakeFormatted: match.rake_amount_sats != null ? formatSats(match.rake_amount_sats) : null,
       winnerPayoutFormatted:
         match.winner_payout_sats != null ? formatSats(match.winner_payout_sats) : null,
+      durationSeconds: match.duration_seconds ?? 180,
+      startedAt: match.started_at,
+      deadlineAt: deadlineAt(match)?.toISOString() ?? null,
+      serverNow: new Date().toISOString(),
     },
     self: {
       userId,
@@ -265,6 +275,53 @@ async function buildStateResponse(
           : null,
     },
   };
+}
+
+function deadlineAt(match: ArcadeMatchRow): Date | null {
+  if (!["active", "submitted"].includes(match.status)) return null;
+  const start = match.started_at ?? match.created_at;
+  if (!start) return null;
+  const durationSeconds = match.duration_seconds ?? 180;
+  return new Date(new Date(start).getTime() + durationSeconds * 1000);
+}
+
+async function settleExpiredMatchIfNeeded(matchId: number): Promise<ArcadeMatchRow | null> {
+  const match = await getMatch(matchId);
+  if (!match || match.status === "completed" || match.status === "cancelled") return match;
+  const deadline = deadlineAt(match);
+  if (!deadline || Date.now() < deadline.getTime()) return match;
+
+  await ensureMatchRuntimeLoaded(matchId);
+  const runtime = getRuntime(matchId);
+  if (!runtime) return match;
+
+  const playerIds =
+    match.mode === "practice"
+      ? [match.player_a_id]
+      : [match.player_a_id, match.player_b_id].filter(Boolean) as string[];
+  const submitted = new Set<string>();
+  if (match.player_a_submitted) submitted.add(match.player_a_id);
+  if (match.player_b_id && match.player_b_submitted) submitted.add(match.player_b_id);
+
+  for (const playerId of playerIds) {
+    if (submitted.has(playerId)) continue;
+    const playerState = runtime.players.get(playerId);
+    await recordSubmission({
+      matchId,
+      userId: playerId,
+      moveLog: playerState?.moves ?? [],
+      claimedScore: playerState?.score ?? 0,
+      validatedScore: playerState?.score ?? 0,
+      valid: true,
+    });
+  }
+
+  const settlement = await trySettleMatch(matchId);
+  if (settlement.status !== "waiting") {
+    clearRuntime(matchId);
+    onMatchSettled(matchId);
+  }
+  return settlement.match;
 }
 
 async function ensureMatchRuntimeLoaded(matchId: number): Promise<void> {
@@ -436,11 +493,13 @@ function renderPlayPage(): string {
   .topbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 14px; }
   .badge { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; border: 1px solid var(--line); border-radius: 999px; background: var(--bg-2); color: var(--muted); font-size: 12px; font-weight: 500; }
   .badge.live { color: var(--neon-2); border-color: rgba(30,232,129,.35); background: rgba(30,232,129,.08); }
-  .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 12px; }
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 12px; }
   .stat { background: var(--bg-2); border: 1px solid var(--line); border-radius: 14px; padding: 10px 12px; }
   .stat .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
   .stat .value { font-weight: 700; font-size: 20px; margin-top: 2px; }
   .stat.mult .value { color: var(--orange-2); }
+  .stat.time .value { color: var(--neon-2); }
+  .stat.time.low .value { color: var(--red); }
   .pot { background: var(--bg-2); border: 1px solid var(--line); border-radius: 14px; padding: 10px 12px; margin-bottom: 12px; font-size: 13px; color: var(--muted); }
   .pot strong { color: var(--text); }
   .board { display: grid; grid-template-columns: repeat(9, 1fr); gap: 4px; padding: 8px; background: var(--bg-2); border: 1px solid var(--line); border-radius: 16px; aspect-ratio: 1 / 1; user-select: none; touch-action: manipulation; }
@@ -487,7 +546,7 @@ function renderPlayPage(): string {
   .end .row.lose { color: #ffb0bb; }
   .footer { color: var(--muted); font-size: 12px; text-align: center; margin-top: 22px; }
   @media (max-width: 480px) {
-    .stats { grid-template-columns: repeat(3, 1fr); }
+    .stats { grid-template-columns: repeat(2, 1fr); }
     .stat .value { font-size: 17px; }
   }
 </style>
@@ -508,6 +567,7 @@ function renderPlayPage(): string {
     <div class="stat"><div class="label">Score</div><div id="score" class="value">0</div></div>
     <div class="stat mult"><div class="label">Multiplier</div><div id="mult" class="value">1×</div></div>
     <div class="stat"><div class="label">Level</div><div id="level" class="value">1/12</div></div>
+    <div id="timeStat" class="stat time"><div class="label">Time</div><div id="time" class="value">3:00</div></div>
   </div>
 
   <div id="board" class="board" aria-label="Game board"></div>
@@ -545,6 +605,8 @@ function renderPlayPage(): string {
   const $score = document.getElementById('score');
   const $mult = document.getElementById('mult');
   const $level = document.getElementById('level');
+  const $time = document.getElementById('time');
+  const $timeStat = document.getElementById('timeStat');
   const $mode = document.getElementById('modeLabel');
   const $live = document.getElementById('liveBadge');
   const $rotate = document.getElementById('rotateBtn');
@@ -557,6 +619,8 @@ function renderPlayPage(): string {
 
   let state = null;
   let selected = { pieceIndex: null, rotation: 0, hoverRow: null, hoverCol: null };
+  let serverOffsetMs = 0;
+  let timeoutRefreshPending = false;
 
   // Build empty 9x9 grid
   const cellNodes = [];
@@ -574,10 +638,12 @@ function renderPlayPage(): string {
     }
   }
 
-  $rotate.addEventListener('click', () => {
+  $rotate.addEventListener('click', rotateSelected);
+  function rotateSelected() {
+    if (!state || state.result.completed || state.self.phase === 'finished' || isTimeExpired()) return;
     selected.rotation = (selected.rotation + 1) % 4;
     render();
-  });
+  }
   $clear.addEventListener('click', () => {
     selected = { pieceIndex: null, rotation: 0, hoverRow: null, hoverCol: null };
     render();
@@ -589,12 +655,69 @@ function renderPlayPage(): string {
     selected.pieceIndex = null;
     render();
   });
+  window.addEventListener('keydown', (event) => {
+    if (event.ctrlKey || event.metaKey || event.altKey || event.repeat) return;
+    const key = event.key.toLowerCase();
+    if (key === 'r') {
+      event.preventDefault();
+      rotateSelected();
+    } else if (key === 'escape' || key === 'c') {
+      event.preventDefault();
+      selected = { pieceIndex: null, rotation: 0, hoverRow: null, hoverCol: null };
+      render();
+    } else if (key >= '1' && key <= '3') {
+      const idx = Number(key) - 1;
+      if (state?.self?.pieces?.[idx] && !state.self.pieces[idx].placed) {
+        event.preventDefault();
+        selected.pieceIndex = idx;
+        selected.rotation = 0;
+        render();
+      }
+    } else if (key === 'enter' && $submit.style.display !== 'none' && !$submit.disabled) {
+      event.preventDefault();
+      $submit.click();
+    }
+  });
 
   function showToast(msg) {
     $toast.textContent = msg;
     $toast.classList.add('show');
     clearTimeout(showToast._t);
     showToast._t = setTimeout(() => $toast.classList.remove('show'), 2200);
+  }
+
+  function remainingMs() {
+    if (!state?.match?.deadlineAt || state.result.completed) return null;
+    return Math.max(0, Date.parse(state.match.deadlineAt) - (Date.now() + serverOffsetMs));
+  }
+
+  function isTimeExpired() {
+    const remaining = remainingMs();
+    return remaining != null && remaining <= 0;
+  }
+
+  function formatClock(ms) {
+    const total = Math.max(0, Math.ceil(ms / 1000));
+    const mins = Math.floor(total / 60);
+    const secs = total % 60;
+    return mins + ':' + String(secs).padStart(2, '0');
+  }
+
+  function paintTimer() {
+    const remaining = remainingMs();
+    if (remaining == null) {
+      $time.textContent = state?.match?.durationSeconds ? formatClock(state.match.durationSeconds * 1000) : '3:00';
+      $timeStat.classList.remove('low');
+      return;
+    }
+    $time.textContent = formatClock(remaining);
+    $timeStat.classList.toggle('low', remaining <= 30000);
+    if (remaining <= 0 && state && !state.result.completed && !timeoutRefreshPending) {
+      timeoutRefreshPending = true;
+      refresh().finally(() => {
+        timeoutRefreshPending = false;
+      });
+    }
   }
 
   async function api(method, path, body) {
@@ -654,7 +777,13 @@ function renderPlayPage(): string {
 
   async function placeAt(r, c) {
     if (!state) return;
+    if (state.result.completed) return;
     if (state.self.phase === 'finished') return;
+    if (isTimeExpired()) {
+      showToast('Time is up');
+      await refresh();
+      return;
+    }
     if (selected.pieceIndex == null) {
       showToast('Pick a piece first');
       return;
@@ -754,7 +883,7 @@ function renderPlayPage(): string {
       }
       card.appendChild(grid);
       card.addEventListener('click', () => {
-        if (p.placed) return;
+        if (p.placed || state.result.completed || isTimeExpired() || state.self.phase === 'finished') return;
         selected.pieceIndex = i;
         selected.rotation = 0;
         render();
@@ -765,9 +894,11 @@ function renderPlayPage(): string {
 
   function paintHud() {
     if (!state) return;
+    if (state.match.serverNow) serverOffsetMs = Date.parse(state.match.serverNow) - Date.now();
     $score.textContent = state.self.score.toLocaleString();
     $mult.textContent = state.self.multiplier + '×';
     $level.textContent = state.self.levelDisplay + '/' + state.self.maxLevels;
+    paintTimer();
 
     const m = state.match;
     let label;
@@ -781,13 +912,14 @@ function renderPlayPage(): string {
     } else {
       $live.style.display = 'none';
     }
+    $rotate.disabled = state.self.phase === 'finished' || state.result.completed || isTimeExpired();
+    $clear.disabled = state.result.completed;
 
     if (m.mode === 'staked_pvp' && m.grossPotFormatted) {
       $pot.style.display = '';
       $pot.innerHTML =
         'Gross pot <strong>' + m.grossPotFormatted + '</strong> • ' +
-        'Platform fee <strong>' + (m.rakeFormatted || '0') + '</strong> • ' +
-        'Winner receives <strong>' + (m.winnerPayoutFormatted || '0') + '</strong>';
+        'Winner payout <strong>' + (m.winnerPayoutFormatted || '0') + '</strong>';
     } else {
       $pot.style.display = 'none';
     }
@@ -869,6 +1001,7 @@ function renderPlayPage(): string {
 
   // Initial load + opponent polling
   refresh();
+  setInterval(paintTimer, 500);
   setInterval(() => {
     // Only poll when we've submitted and are waiting on opponent, OR when match is still active.
     if (!state) return;

@@ -31,6 +31,7 @@ export type ArcadeMatchRow = {
   rake_amount_sats: number | null;
   winner_payout_sats: number | null;
   created_by_id: string;
+  target_player_id: string | null;
   player_a_id: string;
   player_b_id: string | null;
   player_a_score: number | null;
@@ -39,6 +40,8 @@ export type ArcadeMatchRow = {
   player_b_submitted: boolean;
   winner_id: string | null;
   escrow_status: EscrowStatus;
+  duration_seconds: number;
+  started_at: string | null;
   created_at: string;
   completed_at: string | null;
 };
@@ -48,9 +51,11 @@ export type CreateMatchInput = {
   createdById: string;
   playerAId: string;
   playerBId?: string | null;
+  targetPlayerId?: string | null;
   stakeAmountSats?: number;
   channelId?: string;
   rakeBps?: number;
+  durationSeconds?: number;
 };
 
 export async function createMatch(input: CreateMatchInput): Promise<ArcadeMatchRow> {
@@ -68,6 +73,8 @@ export async function createMatch(input: CreateMatchInput): Promise<ArcadeMatchR
 
   const initialStatus: MatchStatus =
     input.mode === "practice" ? "active" : input.playerBId ? "active" : "waiting";
+  const durationSeconds = input.durationSeconds ?? 180;
+  const startedAt = initialStatus === "active" ? new Date().toISOString() : null;
 
   const { data, error } = await supabase
     .from("arcade_matches")
@@ -82,9 +89,12 @@ export async function createMatch(input: CreateMatchInput): Promise<ArcadeMatchR
       rake_amount_sats: rake,
       winner_payout_sats: winnerPayout,
       created_by_id: input.createdById,
+      target_player_id: input.targetPlayerId ?? null,
       player_a_id: input.playerAId,
       player_b_id: input.playerBId ?? null,
       escrow_status: input.mode === "staked_pvp" ? "pending" : "none",
+      duration_seconds: durationSeconds,
+      started_at: startedAt,
     })
     .select("*")
     .single();
@@ -107,11 +117,14 @@ export async function joinMatch(matchId: number, userId: string): Promise<{ ok: 
   if (!match) return { ok: false, error: "Match not found" };
   if (match.status !== "waiting") return { ok: false, error: "Match is not waiting for opponents" };
   if (match.player_a_id === userId) return { ok: false, error: "You created this match — wait for an opponent" };
+  if (match.target_player_id && match.target_player_id !== userId) {
+    return { ok: false, error: "This challenge is for another player" };
+  }
   if (match.player_b_id) return { ok: false, error: "Match already full" };
 
   const { data, error } = await supabase
     .from("arcade_matches")
-    .update({ player_b_id: userId, status: "active" })
+    .update({ player_b_id: userId, status: "active", started_at: new Date().toISOString() })
     .eq("id", matchId)
     .eq("status", "waiting")
     .is("player_b_id", null)
@@ -350,6 +363,17 @@ export async function topValidatedScores(limit = 10) {
     .order("validated_score", { ascending: false })
     .limit(limit);
   return data ?? [];
+}
+
+export async function openOffers(limit = 5): Promise<ArcadeMatchRow[]> {
+  const { data } = await supabase
+    .from("arcade_matches")
+    .select("*")
+    .eq("status", "waiting")
+    .is("target_player_id", null)
+    .order("created_at", { ascending: false })
+    .limit(limit);
+  return (data as ArcadeMatchRow[] | null) ?? [];
 }
 
 /* ─────────── Helpers ─────────── */

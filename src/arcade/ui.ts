@@ -39,6 +39,7 @@ export function buildMatchFeedEmbed(match: ArcadeMatchRow): EmbedBuilder {
     .addFields(
       { name: "Mode", value: tier, inline: true },
       { name: "Status", value: humanStatus(match), inline: true },
+      { name: "Timer", value: formatDuration(match.duration_seconds ?? 180), inline: true },
       { name: "Where", value: "Plays in your browser", inline: true }
     );
 
@@ -46,14 +47,16 @@ export function buildMatchFeedEmbed(match: ArcadeMatchRow): EmbedBuilder {
     embed.addFields(
       { name: "Stake (each)", value: formatSats(match.stake_amount_sats), inline: true },
       { name: "Gross pot", value: formatSats(match.gross_pot_sats ?? 0), inline: true },
-      { name: "Platform fee", value: `${formatSats(match.rake_amount_sats ?? 0)} (${(match.platform_rake_bps / 100).toFixed(1)}%)`, inline: true },
-      { name: "Winner receives", value: formatSats(match.winner_payout_sats ?? 0), inline: true }
+      { name: "Winner payout", value: formatSats(match.winner_payout_sats ?? 0), inline: true }
     );
   }
 
+  const waitingLine = match.target_player_id
+    ? `\nchallenged <@${match.target_player_id}>`
+    : "\n*open offer*";
   embed.addFields({
     name: "Players",
-    value: `<@${match.player_a_id}>${match.player_b_id ? `\nvs <@${match.player_b_id}>` : "\n*waiting for opponent*"}`,
+    value: `<@${match.player_a_id}>${match.player_b_id ? `\nvs <@${match.player_b_id}>` : waitingLine}`,
   });
 
   if (match.status === "completed") {
@@ -76,6 +79,13 @@ export function buildMatchFeedEmbed(match: ArcadeMatchRow): EmbedBuilder {
   return embed;
 }
 
+function formatDuration(seconds: number): string {
+  const minutes = seconds / 60;
+  return Number.isInteger(minutes)
+    ? `${minutes} minute${minutes === 1 ? "" : "s"}`
+    : `${seconds} seconds`;
+}
+
 export function buildMatchFeedComponents(
   match: ArcadeMatchRow
 ): ActionRowJSON[] | undefined {
@@ -91,7 +101,9 @@ export function buildMatchFeedComponents(
           .setLabel(
             match.mode === "staked_pvp"
               ? `Accept (stake ${formatSats(match.stake_amount_sats ?? 0)})`
-              : "Accept challenge"
+              : match.target_player_id
+                ? "Accept challenge"
+                : "Accept offer"
           )
           .setStyle(acceptStyle),
         new ButtonBuilder()

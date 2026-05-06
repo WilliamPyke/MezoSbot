@@ -16,6 +16,18 @@ function optionalBool(key: string, def: boolean): boolean {
   return val === "1" || val.toLowerCase() === "true";
 }
 
+function publicBaseUrl(): string {
+  const fallback = `http://localhost:${process.env.STREAM_PORT ?? process.env.PORT ?? "8787"}`;
+  const raw = (process.env.PUBLIC_BASE_URL ?? fallback).trim().replace(/\/+$/, "");
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) return raw;
+
+  const host = raw.split("/")[0].toLowerCase();
+  const local = host === "localhost" || host.startsWith("localhost:") ||
+    host === "127.0.0.1" || host.startsWith("127.0.0.1:") ||
+    host === "0.0.0.0" || host.startsWith("0.0.0.0:");
+  return `${local ? "http" : "https"}://${raw}`;
+}
+
 export const config = {
   discord: {
     token: required("DISCORD_TOKEN"),
@@ -43,7 +55,7 @@ export const config = {
    * Used to build the Slice Arcade browser-play links posted in Discord.
    * Falls back to local dev address if unset.
    */
-  publicBaseUrl: (process.env.PUBLIC_BASE_URL ?? `http://localhost:${process.env.STREAM_PORT ?? process.env.PORT ?? "8787"}`).replace(/\/+$/, ""),
+  publicBaseUrl: publicBaseUrl(),
   arcadeTokenSecret: process.env.ARCADE_TOKEN_SECRET ?? process.env.TREASURY_PRIVATE_KEY ?? "",
   depositAdminOnly: process.env.DEPOSIT_ADMIN_ONLY === "1" || process.env.DEPOSIT_ADMIN_ONLY === "true",
   deposits: {

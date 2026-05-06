@@ -98,6 +98,8 @@ async function handleAccept(interaction: ButtonInteraction, matchId: number) {
   if (match.status !== "waiting") return reply(interaction, "Match is no longer waiting.");
   if (match.player_a_id === interaction.user.id)
     return reply(interaction, "You created this match — wait for someone else to accept.");
+  if (match.target_player_id && match.target_player_id !== interaction.user.id)
+    return reply(interaction, "This challenge is for another player.");
 
   if (match.mode === "staked_pvp" && match.stake_amount_sats != null) {
     const fund = await fundEscrowFromBalance(matchId, interaction.user.id, match.stake_amount_sats);
@@ -119,6 +121,7 @@ async function handleAccept(interaction: ButtonInteraction, matchId: number) {
     components: buildMatchFeedComponents(updated),
     allowedMentions: { users: [updated.player_a_id, updated.player_b_id!] },
   });
+  await refreshStoredMatchMessage(interaction.client, updated, interaction.message.id);
 
   // DM each player a personal play link so they don't have to click the public
   // button. Best-effort — fall back to the public button if DMs are closed.
@@ -130,7 +133,7 @@ async function handleCancel(interaction: ButtonInteraction, matchId: number) {
   const match = await getMatch(matchId);
   if (!match) return reply(interaction, "Match not found.");
   if (match.created_by_id !== interaction.user.id)
-    return reply(interaction, "Only the challenger can cancel.");
+    return reply(interaction, "Only the creator can cancel.");
   if (match.status !== "waiting")
     return reply(interaction, "Match cannot be cancelled — already in progress.");
 
@@ -173,7 +176,7 @@ async function handlePlay(interaction: ButtonInteraction, matchId: number) {
     await interaction.editReply({ embeds: [embed], components: [row] });
   } else {
     await interaction.editReply({
-      content: `⚠️ The bot is missing \`PUBLIC_BASE_URL\` — set it to the bot's public HTTPS URL on the host and redeploy.\n\nLink for this match (testing only):\n\`${url}\``,
+      content: `⚠️ The bot is missing \`PUBLIC_BASE_URL\` — set it to the bot's public HTTPS URL on the host and redeploy.\n\nLink for this match (testing only):\n<${url}>`,
       embeds: [embed],
     });
   }
@@ -214,7 +217,7 @@ async function sendPlayLinkDm(client: Client, matchId: number, userId: string) {
       );
       await user.send({ embeds: [embed], components: [row] });
     } else {
-      await user.send({ content: `Match #${matchId} is ready. Link: \`${url}\``, embeds: [embed] });
+      await user.send({ content: `Match #${matchId} is ready. Link: <${url}>`, embeds: [embed] });
     }
   } catch {
     // DMs closed or fetch failed — ignore. The user can still click the
@@ -231,7 +234,16 @@ async function reply(interaction: ArcadeInteraction, content: string) {
 /* ─────────── Match feed updater (used by web settle hook) ─────────── */
 
 export async function updateMatchFeed(client: Client, match: ArcadeMatchRow): Promise<void> {
+  await refreshStoredMatchMessage(client, match);
+}
+
+async function refreshStoredMatchMessage(
+  client: Client,
+  match: ArcadeMatchRow,
+  skipMessageId?: string
+): Promise<void> {
   if (!match.channel_id || !match.message_id) return;
+  if (skipMessageId && match.message_id === skipMessageId) return;
   try {
     const channel = (await client.channels.fetch(match.channel_id)) as TextChannel | null;
     if (!channel || !("messages" in channel)) return;

@@ -12,6 +12,7 @@ import { getBalance } from "../balance.js";
 import {
   createMatch,
   fundEscrowFromBalance,
+  openOffers,
   setMatchMessage,
   topValidatedScores,
 } from "../arcade/db.js";
@@ -22,9 +23,11 @@ import {
 } from "../arcade/ui.js";
 import {
   STAKE_TIERS,
-  describeRakeTier,
   DEFAULT_PLATFORM_RAKE_BPS,
 } from "../arcade/economics.js";
+
+const DEFAULT_ARCADE_DURATION_MINUTES = 3;
+const MAX_ARCADE_DURATION_MINUTES = 5;
 
 export const data = {
   name: "arcade",
@@ -34,6 +37,16 @@ export const data = {
       type: 1 as const,
       name: "practice",
       description: "Play a solo match in your browser (no stake)",
+      options: [
+        {
+          type: 10 as const,
+          name: "minutes",
+          description: "Match length in minutes (1-5, default 3)",
+          required: false,
+          minValue: 1,
+          maxValue: MAX_ARCADE_DURATION_MINUTES,
+        },
+      ],
     },
     {
       type: 1 as const,
@@ -53,7 +66,42 @@ export const data = {
           required: false,
           minValue: 0,
         },
+        {
+          type: 10 as const,
+          name: "minutes",
+          description: "Match length in minutes (1-5, default 3)",
+          required: false,
+          minValue: 1,
+          maxValue: MAX_ARCADE_DURATION_MINUTES,
+        },
       ],
+    },
+    {
+      type: 1 as const,
+      name: "offer",
+      description: "Post an open match offer anyone can accept",
+      options: [
+        {
+          type: 10 as const,
+          name: "stake",
+          description: "Sats to stake (omit for a free offer)",
+          required: false,
+          minValue: 0,
+        },
+        {
+          type: 10 as const,
+          name: "minutes",
+          description: "Match length in minutes (1-5, default 3)",
+          required: false,
+          minValue: 1,
+          maxValue: MAX_ARCADE_DURATION_MINUTES,
+        },
+      ],
+    },
+    {
+      type: 1 as const,
+      name: "offers",
+      description: "Browse open Slice Arcade match offers",
     },
     {
       type: 1 as const,
@@ -63,7 +111,7 @@ export const data = {
     {
       type: 1 as const,
       name: "tiers",
-      description: "Show stake tiers and rake math",
+      description: "Show common stake tiers",
     },
     {
       type: 1 as const,
@@ -80,6 +128,10 @@ export async function execute(interaction: ChatInputCommandInteraction) {
       return runPractice(interaction);
     case "challenge":
       return runChallenge(interaction);
+    case "offer":
+      return runOffer(interaction);
+    case "offers":
+      return runOffers(interaction);
     case "rules":
       return runRules(interaction);
     case "tiers":
@@ -134,14 +186,29 @@ function describeBadUrl(): string {
 
 /* ────────────────────────────────────────────────────────────────── */
 
+function durationSeconds(interaction: ChatInputCommandInteraction): number {
+  const minutes = interaction.options.getNumber("minutes") ?? DEFAULT_ARCADE_DURATION_MINUTES;
+  const clamped = Math.max(1, Math.min(MAX_ARCADE_DURATION_MINUTES, minutes));
+  return Math.round(clamped * 60);
+}
+
+function formatDuration(seconds: number): string {
+  const minutes = seconds / 60;
+  return Number.isInteger(minutes)
+    ? `${minutes} minute${minutes === 1 ? "" : "s"}`
+    : `${seconds} seconds`;
+}
+
 async function runPractice(interaction: ChatInputCommandInteraction) {
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   let match;
+  const matchDurationSeconds = durationSeconds(interaction);
   try {
     match = await createMatch({
       mode: "practice",
       createdById: interaction.user.id,
       playerAId: interaction.user.id,
+      durationSeconds: matchDurationSeconds,
     });
   } catch (err) {
     const msg = (err as Error)?.message ?? String(err);
@@ -155,7 +222,7 @@ async function runPractice(interaction: ChatInputCommandInteraction) {
     .setColor(0x00cc6a)
     .setTitle("Practice match ready")
     .setDescription(
-      `Match #${match.id} — open the link to play in your browser.\n\nThis link is for you only and expires in a few hours.`
+      `Match #${match.id} — open the link to play in your browser.\n\nTime limit: **${formatDuration(matchDurationSeconds)}**. This link is for you only and expires in a few hours.`
     );
 
   if (isPublicHttpsUrl(url)) {
@@ -164,7 +231,7 @@ async function runPractice(interaction: ChatInputCommandInteraction) {
     // Discord rejects http:// or localhost URLs in Link buttons. Fall back to
     // a plain-text URL so the operator can still test and see what's wrong.
     await interaction.editReply({
-      content: `${describeBadUrl()}\n\nLink for this match (testing only):\n\`${url}\``,
+      content: `${describeBadUrl()}\n\nLink for this match (testing only):\n<${url}>`,
       embeds: [embed],
     });
   }
@@ -173,6 +240,7 @@ async function runPractice(interaction: ChatInputCommandInteraction) {
 async function runChallenge(interaction: ChatInputCommandInteraction) {
   const target = interaction.options.getUser("user", true);
   const stake = interaction.options.getNumber("stake") ?? 0;
+  const matchDurationSeconds = durationSeconds(interaction);
 
   if (target.id === interaction.user.id) {
     return interaction.reply({ content: "❌ You can't challenge yourself.", flags: MessageFlags.Ephemeral });
@@ -196,11 +264,13 @@ async function runChallenge(interaction: ChatInputCommandInteraction) {
   const match = await createMatch({
     mode: isStaked ? "staked_pvp" : "free_pvp",
     createdById: interaction.user.id,
+    targetPlayerId: target.id,
     playerAId: interaction.user.id,
     playerBId: null,
     stakeAmountSats: isStaked ? stake : undefined,
     rakeBps: isStaked ? DEFAULT_PLATFORM_RAKE_BPS : 0,
     channelId: interaction.channelId ?? undefined,
+    durationSeconds: matchDurationSeconds,
   });
 
   if (isStaked) {
@@ -211,7 +281,7 @@ async function runChallenge(interaction: ChatInputCommandInteraction) {
   }
 
   const reply = await interaction.editReply({
-    content: `<@${target.id}> — you've been challenged! Click **Accept** to start; the match will open in your browser.`,
+    content: `<@${target.id}> — you've been challenged! Click **Accept** to start; the match will open in your browser. Time limit: **${formatDuration(matchDurationSeconds)}**.`,
     embeds: [buildMatchFeedEmbed(match)],
     components: buildMatchFeedComponents(match),
     allowedMentions: { users: [target.id] },
@@ -222,6 +292,91 @@ async function runChallenge(interaction: ChatInputCommandInteraction) {
   if (channelId && messageId) {
     await setMatchMessage(match.id, channelId, messageId);
   }
+}
+
+async function runOffer(interaction: ChatInputCommandInteraction) {
+  const stake = interaction.options.getNumber("stake") ?? 0;
+  const matchDurationSeconds = durationSeconds(interaction);
+
+  await interaction.deferReply();
+
+  const isStaked = stake > 0;
+  if (isStaked) {
+    const balance = await getBalance(interaction.user.id);
+    if (balance < stake) {
+      return interaction.editReply({
+        content: `❌ Insufficient balance. You need **${formatSats(stake)}** to post this offer.`,
+      });
+    }
+  }
+
+  const match = await createMatch({
+    mode: isStaked ? "staked_pvp" : "free_pvp",
+    createdById: interaction.user.id,
+    playerAId: interaction.user.id,
+    playerBId: null,
+    targetPlayerId: null,
+    stakeAmountSats: isStaked ? stake : undefined,
+    rakeBps: isStaked ? DEFAULT_PLATFORM_RAKE_BPS : 0,
+    channelId: interaction.channelId ?? undefined,
+    durationSeconds: matchDurationSeconds,
+  });
+
+  if (isStaked) {
+    const fund = await fundEscrowFromBalance(match.id, interaction.user.id, stake);
+    if (!fund.ok) {
+      return interaction.editReply({ content: `❌ ${fund.error}` });
+    }
+  }
+
+  const reply = await interaction.editReply({
+    content: `Open Slice Arcade offer posted. First player to accept gets matched. Time limit: **${formatDuration(matchDurationSeconds)}**.`,
+    embeds: [buildMatchFeedEmbed(match)],
+    components: buildMatchFeedComponents(match),
+  });
+
+  const channelId = interaction.channelId ?? "";
+  const messageId = (reply as { id?: string }).id ?? "";
+  if (channelId && messageId) {
+    await setMatchMessage(match.id, channelId, messageId);
+  }
+}
+
+async function runOffers(interaction: ChatInputCommandInteraction) {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const offers = (await openOffers(10))
+    .filter((offer) => offer.player_a_id !== interaction.user.id)
+    .slice(0, 5);
+
+  if (offers.length === 0) {
+    await interaction.editReply({
+      content: "No open Slice Arcade offers right now. Post one with `/arcade offer stake:<amount>`.",
+    });
+    return;
+  }
+
+  const lines = offers.map((offer, i) => {
+    const stake =
+      offer.mode === "staked_pvp" && offer.stake_amount_sats != null
+        ? formatSats(offer.stake_amount_sats)
+        : "Free";
+    return `**${i + 1}. Match #${offer.id}** — ${stake} • ${formatDuration(offer.duration_seconds ?? 180)} • by <@${offer.player_a_id}>`;
+  });
+  const embed = new EmbedBuilder()
+    .setColor(0x00cc6a)
+    .setTitle("Open Slice Arcade Offers")
+    .setDescription(lines.join("\n"));
+
+  const components = offers.map((offer, i) =>
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`arcade:accept:${offer.id}`)
+        .setLabel(`Accept #${offer.id}`)
+        .setStyle(i === 0 ? ButtonStyle.Success : ButtonStyle.Secondary)
+    )
+  );
+
+  await interaction.editReply({ embeds: [embed], components });
 }
 
 async function runRules(interaction: ChatInputCommandInteraction) {
@@ -238,11 +393,13 @@ async function runRules(interaction: ChatInputCommandInteraction) {
         "",
         "**Levels** — 12 levels per match. Each level deals 3 pieces; place them in any order. Match ends if no remaining piece fits.",
         "",
+        "**Timer** — matches default to 3 minutes. The best validated score wins when time expires. Use `/arcade practice minutes:5` or `/arcade challenge ... minutes:5` for longer games, up to 5 minutes.",
+        "",
         "**Scoring** — +10 per placed cell, +25 per cleared row/column/3×3 square, +25 per extra zone in a combo.",
         "",
         "**Multiplier** — 🟧 multiplier blocks raise your multiplier when you *clear* them (not just place them). Cap is 5×.",
         "",
-        "**Stakes** — for staked matches, both players put in the same sats. Winner receives gross pot minus 10% platform fee. Tie refunds both stakes.",
+        "**Stakes** — for staked matches, both players put in the same sats. The winner receives the listed payout. Tie refunds both stakes.",
       ].join("\n")
     );
   await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
@@ -250,19 +407,19 @@ async function runRules(interaction: ChatInputCommandInteraction) {
 
 async function runTiers(interaction: ChatInputCommandInteraction) {
   const lines = STAKE_TIERS.map((stake) => {
-    const t = describeRakeTier(stake);
-    return `**${formatSats(t.stakeSats)}** stake → pot ${formatSats(t.grossPot)} • fee ${formatSats(t.rake)} • winner ${formatSats(t.winnerPayout)}`;
+    const grossPot = stake * 2;
+    return `**${formatSats(stake)}** stake → pot ${formatSats(grossPot)}`;
   });
   const embed = new EmbedBuilder()
     .setColor(0x00cc6a)
     .setTitle("Stake tiers")
     .setDescription(
       [
-        "Each player stakes the same amount. The winner receives the full pot minus a 10% platform fee. Ties refund both stakes.",
+        "Each player stakes the same amount. Ties refund both stakes.",
         "",
         ...lines,
         "",
-        "Use `/arcade challenge @user stake:<amount>` to start a staked match. Any stake above 0 is allowed (these are convenience tiers).",
+        "Use `/arcade challenge @user stake:<amount>` or `/arcade offer stake:<amount>` to start a staked match. Any stake above 0 is allowed (these are convenience tiers).",
       ].join("\n")
     );
   await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });

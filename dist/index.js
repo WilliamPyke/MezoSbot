@@ -470,6 +470,23 @@ async function handleDropButton(interaction) {
 async function main() {
     // ── Web canvas server (start first — Render needs an open port quickly) ──
     await (0, stream_js_1.startStream)();
+    // Slice Arcade browser flow needs a public HTTPS URL to put in Discord
+    // Link buttons. Surface a loud warning on startup if the operator hasn't
+    // set PUBLIC_BASE_URL — otherwise /arcade practice will look broken.
+    try {
+        const u = new URL(config_js_1.config.publicBaseUrl);
+        const localish = u.hostname === "localhost" || u.hostname === "127.0.0.1" || u.hostname === "0.0.0.0";
+        if (u.protocol !== "https:" || localish) {
+            console.warn(`[Arcade] PUBLIC_BASE_URL is "${config_js_1.config.publicBaseUrl}" — Discord Link buttons require https:// and a public host. ` +
+                `Set PUBLIC_BASE_URL on the host (e.g. https://your-bot.example.com) and redeploy.`);
+        }
+        else {
+            console.log(`[Arcade] PUBLIC_BASE_URL = ${config_js_1.config.publicBaseUrl}`);
+        }
+    }
+    catch {
+        console.warn(`[Arcade] PUBLIC_BASE_URL is not a valid URL: "${config_js_1.config.publicBaseUrl}"`);
+    }
     // When a Slice Arcade match settles via the browser flow, refresh the
     // public match card in Discord so spectators see the result.
     (0, notify_js_1.setMatchSettledHandler)(async (matchId) => {

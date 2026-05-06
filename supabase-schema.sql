@@ -170,6 +170,7 @@ CREATE TABLE IF NOT EXISTS arcade_matches (
   rake_amount_sats DOUBLE PRECISION,
   winner_payout_sats DOUBLE PRECISION,
   created_by_id TEXT NOT NULL,
+  target_player_id TEXT,
   player_a_id TEXT NOT NULL,
   player_b_id TEXT,
   player_a_score DOUBLE PRECISION,
@@ -178,9 +179,22 @@ CREATE TABLE IF NOT EXISTS arcade_matches (
   player_b_submitted BOOLEAN NOT NULL DEFAULT FALSE,
   winner_id TEXT,
   escrow_status TEXT NOT NULL DEFAULT 'none',  -- none | pending | funded | released | refunded
+  duration_seconds INTEGER NOT NULL DEFAULT 180,
+  started_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   completed_at TIMESTAMPTZ
 );
+
+ALTER TABLE arcade_matches
+  ADD COLUMN IF NOT EXISTS duration_seconds INTEGER NOT NULL DEFAULT 180;
+ALTER TABLE arcade_matches
+  ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ;
+ALTER TABLE arcade_matches
+  ADD COLUMN IF NOT EXISTS target_player_id TEXT;
+UPDATE arcade_matches
+  SET started_at = created_at
+  WHERE started_at IS NULL
+    AND status IN ('active', 'submitted', 'completed');
 
 CREATE TABLE IF NOT EXISTS arcade_submissions (
   id BIGSERIAL PRIMARY KEY,
@@ -215,6 +229,13 @@ CREATE TABLE IF NOT EXISTS arcade_fees (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE OR REPLACE VIEW arcade_fee_totals AS
+SELECT
+  COALESCE(SUM(rake_amount_sats), 0)::DOUBLE PRECISION AS total_collected_sats,
+  COUNT(*)::BIGINT AS collected_match_count
+FROM arcade_fees
+WHERE status = 'collected';
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_links_discord ON links(discord_id);
 CREATE INDEX IF NOT EXISTS idx_links_wallet ON links(wallet_address);
@@ -225,5 +246,7 @@ CREATE INDEX IF NOT EXISTS idx_drops_channel ON drops(channel_id);
 CREATE INDEX IF NOT EXISTS idx_arcade_matches_status ON arcade_matches(status);
 CREATE INDEX IF NOT EXISTS idx_arcade_matches_player_a ON arcade_matches(player_a_id);
 CREATE INDEX IF NOT EXISTS idx_arcade_matches_player_b ON arcade_matches(player_b_id);
+CREATE INDEX IF NOT EXISTS idx_arcade_matches_target ON arcade_matches(target_player_id);
+CREATE INDEX IF NOT EXISTS idx_arcade_matches_open_offers ON arcade_matches(status, created_at) WHERE target_player_id IS NULL;
 CREATE INDEX IF NOT EXISTS idx_arcade_submissions_match ON arcade_submissions(match_id);
 CREATE INDEX IF NOT EXISTS idx_arcade_escrow_match ON arcade_escrow(match_id);
