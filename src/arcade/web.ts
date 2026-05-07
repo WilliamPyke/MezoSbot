@@ -566,6 +566,11 @@ export function renderArcadePlayPage(options: {
   @keyframes titleGradient { from { background-position: 0% 0; } to { background-position: 200% 0; } }
   .badge { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; border: 1px solid var(--line); border-radius: 999px; background: rgba(20,26,40,.55); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); color: var(--muted); font-size: 12px; font-weight: 600; }
   .badge.live { color: var(--neon-2); border-color: rgba(30,232,129,.45); background: rgba(30,232,129,.1); animation: liveBlink 1.6s ease-in-out infinite; }
+  .topRight { display: flex; align-items: center; gap: 10px; }
+  .iconBtn { width: 38px; height: 38px; border-radius: 999px; border: 1px solid var(--line); background: rgba(20,26,40,.6); color: var(--text); font-size: 18px; line-height: 1; cursor: pointer; transition: transform .12s, border-color .15s, background .15s, box-shadow .2s; backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); display: inline-flex; align-items: center; justify-content: center; }
+  .iconBtn:hover { transform: translateY(-1px) scale(1.06); border-color: rgba(255,255,255,.3); background: rgba(30,38,56,.7); box-shadow: 0 6px 18px -6px rgba(0,0,0,.5); }
+  .iconBtn:active { transform: scale(.94); }
+  .iconBtn.muted { color: var(--muted); border-color: rgba(255,77,109,.35); }
   @keyframes liveBlink { 0%,100% { box-shadow: 0 0 0 0 rgba(30,232,129,.6); } 50% { box-shadow: 0 0 0 6px rgba(30,232,129,0); } }
 
   .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 14px; }
@@ -703,7 +708,10 @@ export function renderArcadePlayPage(options: {
       <div class="title">SLICE ARCADE</div>
       <div id="modeLabel" class="badge" style="margin-top:6px;">Loading…</div>
     </div>
-    <div id="liveBadge" class="badge live" style="display:none;">● Live</div>
+    <div class="topRight">
+      <button id="muteBtn" class="iconBtn" type="button" title="Toggle sound" aria-label="Toggle sound">🔊</button>
+      <div id="liveBadge" class="badge live" style="display:none;">● Live</div>
+    </div>
   </div>
 
   <div id="potBox" class="pot" style="display:none;"></div>
@@ -795,6 +803,148 @@ export function renderArcadePlayPage(options: {
   const $banner = document.getElementById('banner');
   const $fx = document.getElementById('fx');
   const fxCtx = $fx.getContext('2d');
+  const $mute = document.getElementById('muteBtn');
+
+  /* ---- Sound engine (Web Audio synth) ---- */
+  const Sound = {
+    ctx: null,
+    master: null,
+    muted: (function () { try { return localStorage.getItem('arcade.muted') === '1'; } catch (e) { return false; } })(),
+    init: function () {
+      if (this.ctx) return;
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return;
+      this.ctx = new Ctx();
+      this.master = this.ctx.createGain();
+      this.master.gain.value = 0.42;
+      this.master.connect(this.ctx.destination);
+    },
+    resume: function () {
+      if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume();
+    },
+    setMuted: function (m) {
+      this.muted = !!m;
+      try { localStorage.setItem('arcade.muted', this.muted ? '1' : '0'); } catch (e) {}
+    },
+    tone: function (opts) {
+      if (this.muted || !this.ctx) return;
+      const o = opts || {};
+      const ctx = this.ctx;
+      const t0 = ctx.currentTime + (o.delay || 0);
+      const dur = o.dur || 0.12;
+      const release = o.release != null ? o.release : 0.06;
+      const attack = o.attack != null ? o.attack : 0.005;
+      const osc = ctx.createOscillator();
+      osc.type = o.type || 'sine';
+      osc.frequency.setValueAtTime(o.freq || 440, t0);
+      if (o.freqEnd != null) {
+        osc.frequency.exponentialRampToValueAtTime(Math.max(20, o.freqEnd), t0 + dur);
+      }
+      const gain = ctx.createGain();
+      gain.gain.setValueAtTime(0, t0);
+      gain.gain.linearRampToValueAtTime(o.vol || 0.25, t0 + attack);
+      gain.gain.linearRampToValueAtTime(0, t0 + dur + release);
+      osc.connect(gain);
+      gain.connect(this.master);
+      osc.start(t0);
+      osc.stop(t0 + dur + release + 0.05);
+    },
+    noise: function (opts) {
+      if (this.muted || !this.ctx) return;
+      const o = opts || {};
+      const ctx = this.ctx;
+      const t0 = ctx.currentTime + (o.delay || 0);
+      const dur = o.dur || 0.15;
+      const buf = ctx.createBuffer(1, Math.max(1, Math.floor(ctx.sampleRate * dur)), ctx.sampleRate);
+      const d = buf.getChannelData(0);
+      for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      const filt = ctx.createBiquadFilter();
+      filt.type = o.filter || 'highpass';
+      filt.frequency.value = o.freq || 1500;
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0, t0);
+      g.gain.linearRampToValueAtTime(o.vol || 0.18, t0 + 0.005);
+      g.gain.linearRampToValueAtTime(0, t0 + dur);
+      src.connect(filt); filt.connect(g); g.connect(this.master);
+      src.start(t0);
+      src.stop(t0 + dur + 0.05);
+    },
+    place: function () {
+      this.tone({ freq: 520, freqEnd: 760, dur: 0.08, type: 'triangle', vol: 0.32 });
+      this.tone({ freq: 1040, freqEnd: 1480, dur: 0.06, type: 'sine', vol: 0.16, delay: 0.005 });
+    },
+    placeMult: function () {
+      [440, 660, 880, 1320].forEach((f, i) => this.tone({ freq: f, dur: 0.13, type: 'triangle', vol: 0.24, delay: i * 0.04 }));
+      this.noise({ dur: 0.2, vol: 0.07, freq: 4000 });
+    },
+    rotate: function () {
+      this.tone({ freq: 360, freqEnd: 500, dur: 0.05, type: 'square', vol: 0.16 });
+    },
+    select: function () {
+      this.tone({ freq: 720, dur: 0.04, type: 'sine', vol: 0.14 });
+    },
+    invalid: function () {
+      this.tone({ freq: 200, freqEnd: 110, dur: 0.18, type: 'sawtooth', vol: 0.22 });
+    },
+    scoreUp: function (big) {
+      this.tone({ freq: big ? 1320 : 980, dur: 0.06, type: 'sine', vol: 0.24 });
+      this.tone({ freq: big ? 1760 : 1240, dur: 0.06, type: 'sine', vol: 0.18, delay: 0.04 });
+    },
+    multUp: function () {
+      [660, 880, 1100, 1320].forEach((f, i) => this.tone({ freq: f, dur: 0.1, type: 'triangle', vol: 0.22, delay: i * 0.035 }));
+    },
+    clear: function (intensity) {
+      const notes = [523.25, 659.25, 783.99, 1046.5];
+      notes.forEach((f, i) => this.tone({ freq: f, dur: 0.22, type: 'triangle', vol: 0.22, delay: i * 0.03 }));
+      this.tone({ freq: 200, freqEnd: 1500, dur: 0.32, type: 'sawtooth', vol: 0.12 });
+      this.noise({ dur: 0.28, vol: 0.08, freq: 3000 });
+      if (intensity > 1) this.tone({ freq: 1320, freqEnd: 2640, dur: 0.4, type: 'sine', vol: 0.18, delay: 0.1 });
+    },
+    levelUp: function () {
+      const arp = [523.25, 659.25, 783.99, 1046.5, 1318.51, 1567.98];
+      arp.forEach((f, i) => this.tone({ freq: f, dur: 0.18, type: 'triangle', vol: 0.28, delay: i * 0.06 }));
+      this.tone({ freq: 110, freqEnd: 220, dur: 0.55, type: 'sawtooth', vol: 0.14 });
+    },
+    victory: function () {
+      const fanfare = [523.25, 659.25, 783.99, 1046.5, 1046.5, 1318.51, 1567.98, 2093];
+      fanfare.forEach((f, i) => this.tone({ freq: f, dur: 0.22, type: 'triangle', vol: 0.3, delay: i * 0.1 }));
+      this.tone({ freq: 130, dur: 1.6, type: 'sawtooth', vol: 0.08 });
+    },
+    defeat: function () {
+      [440, 392, 349.23, 293.66].forEach((f, i) => this.tone({ freq: f, dur: 0.32, type: 'triangle', vol: 0.22, delay: i * 0.16 }));
+    },
+    tie: function () {
+      [440, 523.25].forEach((f, i) => this.tone({ freq: f, dur: 0.24, type: 'sine', vol: 0.22, delay: i * 0.1 }));
+    },
+  };
+
+  function refreshMuteUi() {
+    if (!$mute) return;
+    $mute.textContent = Sound.muted ? '🔇' : '🔊';
+    $mute.classList.toggle('muted', Sound.muted);
+    $mute.title = Sound.muted ? 'Sound off — click to enable' : 'Sound on — click to mute';
+  }
+  refreshMuteUi();
+
+  if ($mute) {
+    $mute.addEventListener('click', () => {
+      Sound.init();
+      Sound.resume();
+      Sound.setMuted(!Sound.muted);
+      refreshMuteUi();
+      if (!Sound.muted) Sound.select();
+    });
+  }
+
+  function unlockAudio() {
+    Sound.init();
+    Sound.resume();
+  }
+  ['click', 'keydown', 'touchstart'].forEach((ev) => {
+    window.addEventListener(ev, unlockAudio, { once: true });
+  });
 
   let state = null;
   let selected = { pieceIndex: null, rotation: 0, hoverRow: 0, hoverCol: 0 };
@@ -994,6 +1144,7 @@ export function renderArcadePlayPage(options: {
   function rotateSelected() {
     if (!state || state.result.completed || state.self.phase === 'finished' || isTimeExpired()) return;
     selected.rotation = (selected.rotation + 1) % 4;
+    Sound.rotate();
     render();
   }
   $clear.addEventListener('click', () => {
@@ -1047,6 +1198,7 @@ export function renderArcadePlayPage(options: {
         event.preventDefault();
         selected.pieceIndex = idx;
         selected.rotation = 0;
+        Sound.select();
         ensureCursor();
         render();
       }
@@ -1083,6 +1235,7 @@ export function renderArcadePlayPage(options: {
     const next = indexes[(base + direction + indexes.length) % indexes.length];
     selected.pieceIndex = next;
     selected.rotation = 0;
+    Sound.select();
     ensureCursor();
     render();
   }
@@ -1251,6 +1404,7 @@ export function renderArcadePlayPage(options: {
     }
     if (!isValidPlacement(cells, r, c)) {
       showToast("That doesn't fit");
+      Sound.invalid();
       shake(false);
       return;
     }
@@ -1285,7 +1439,12 @@ export function renderArcadePlayPage(options: {
         speed: hasMult ? 7.5 : 5.5,
         size: hasMult ? 3.4 : 2.6,
       });
-      if (hasMult) shake(false);
+      if (hasMult) {
+        Sound.placeMult();
+        shake(false);
+      } else {
+        Sound.place();
+      }
     });
 
     movePending = true;
@@ -1351,6 +1510,7 @@ export function renderArcadePlayPage(options: {
       }
       const big = delta >= 200;
       flyText(x, y, '+' + delta.toLocaleString(), big ? 'big' : '');
+      Sound.scoreUp(big);
     }
 
     /* Multiplier change */
@@ -1364,6 +1524,7 @@ export function renderArcadePlayPage(options: {
       flyText(cx, cy, newMult + '×!', 'big');
       spawnBurst(cx, cy, { count: 32, colors: ['#ffb04a', '#ff8a1a', '#ffd86b', '#ffffff'], speed: 6.5, size: 3 });
       spawnRing(cx, cy, '#ffb04a');
+      Sound.multUp();
     }
 
     /* Level up */
@@ -1378,6 +1539,7 @@ export function renderArcadePlayPage(options: {
       setTimeout(() => spawnRing(cx, cy, '#4ff7ff'), 80);
       setTimeout(() => spawnRing(cx, cy, '#ffd86b'), 160);
       spawnBurst(cx, cy, { count: 90, colors: ['#4ff7ff', '#1ee881', '#ffd86b', '#ff5fa3', '#a06bff', '#ffffff'], speed: 9, size: 3.5, life: 100 });
+      Sound.levelUp();
     }
 
     /* Line clears: cells that went non-zero -> zero between prev (post-optimistic) and new */
@@ -1423,6 +1585,7 @@ export function renderArcadePlayPage(options: {
       }, i * 12);
     });
     const lines = Math.max(1, Math.floor(cells.length / 9));
+    Sound.clear(lines);
     setTimeout(() => {
       const text = lines >= 3 ? 'TRIPLE CLEAR!' : lines === 2 ? 'DOUBLE CLEAR!' : 'CLEAR!';
       flyText(window.innerWidth / 2, window.innerHeight / 2 - 40, text, 'big cyan');
@@ -1438,11 +1601,14 @@ export function renderArcadePlayPage(options: {
       const cx = window.innerWidth / 2, cy = window.innerHeight / 2;
       spawnRing(cx, cy, '#ffd86b');
       spawnBurst(cx, cy, { count: 120, colors: ['#ffd86b', '#1ee881', '#4ff7ff', '#ff5fa3', '#ffffff'], speed: 10, size: 4, life: 110 });
+      Sound.victory();
     } else if (state.result.isTie) {
       showBanner('TIE');
+      Sound.tie();
     } else {
       showBanner('DEFEAT');
       shake(false);
+      Sound.defeat();
     }
   }
 
@@ -1524,6 +1690,7 @@ export function renderArcadePlayPage(options: {
         if (p.placed || state.result.completed || isTimeExpired() || state.self.phase === 'finished') return;
         selected.pieceIndex = i;
         selected.rotation = 0;
+        Sound.select();
         render();
       });
       $pieces.appendChild(card);
