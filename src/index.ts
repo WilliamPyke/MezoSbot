@@ -45,6 +45,7 @@ import {
 } from "./arcade/interactions.js";
 import { setMatchSettledHandler } from "./arcade/notify.js";
 import { getMatch as getArcadeMatch } from "./arcade/db.js";
+import { expireStaleQueueEntries } from "./arcade/matchmaking.js";
 
 process.on("unhandledRejection", (err) => {
   console.error("Unhandled rejection:", (err as Error)?.message ?? err);
@@ -601,6 +602,14 @@ async function main() {
     const match = await getArcadeMatch(matchId);
     if (match) await updateMatchFeed(client, match);
   });
+
+  // Sweep stale matchmaking-queue entries. Pairing happens on enqueue, so
+  // this only handles expiry of waiting entries whose owners walked away.
+  setInterval(() => {
+    expireStaleQueueEntries().catch((err) =>
+      console.warn("[Arcade] queue sweeper failed:", (err as Error)?.message ?? err)
+    );
+  }, 60_000);
 
   initEVM();
   console.log(`Treasury: ${getTreasuryAddress()}`);

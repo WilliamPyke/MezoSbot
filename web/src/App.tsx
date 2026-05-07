@@ -10,7 +10,17 @@ import {
   useWriteContract,
 } from "wagmi";
 import { formatUnits, isAddress, parseUnits } from "viem";
-import { api, type AppConfig, type AssetConfig, type ChainConfig, type GameState, type SessionRow, type WalletSession } from "./api";
+import {
+  api,
+  type AppConfig,
+  type AssetConfig,
+  type ChainConfig,
+  type GameState,
+  type QueueEnqueueResponse,
+  type QueueStatusResponse,
+  type SessionRow,
+  type WalletSession,
+} from "./api";
 import { erc20Abi, escrowAbi } from "./abi";
 
 type Route = { name: "home" } | { name: "session"; id: `0x${string}` };
@@ -75,13 +85,22 @@ export function App() {
         </aside>
 
         {route.name === "home" ? (
-          <CreateSession
-            config={config}
-            selectedChainId={selectedChainId}
-            walletSession={walletSession}
-            onCreated={(id) => navigate({ name: "session", id })}
-            setStatus={setStatus}
-          />
+          <>
+            <QuickMatch
+              config={config}
+              selectedChainId={selectedChainId}
+              walletSession={walletSession}
+              onPaired={(id) => navigate({ name: "session", id })}
+              setStatus={setStatus}
+            />
+            <CreateSession
+              config={config}
+              selectedChainId={selectedChainId}
+              walletSession={walletSession}
+              onCreated={(id) => navigate({ name: "session", id })}
+              setStatus={setStatus}
+            />
+          </>
         ) : (
           <SessionView config={config} walletSession={walletSession} sessionId={route.id} setStatus={setStatus} />
         )}
@@ -172,6 +191,150 @@ function NetworkPanel({
         <p className="hint">Connect a wallet to create or join sessions.</p>
       )}
     </div>
+  );
+}
+
+function QuickMatch({
+  config,
+  selectedChainId,
+  walletSession,
+  onPaired,
+  setStatus,
+}: {
+  config: AppConfig | null;
+  selectedChainId: 31612 | 31611;
+  walletSession: WalletSession | null;
+  onPaired: (id: `0x${string}`) => void;
+  setStatus: (status: string) => void;
+}) {
+  const [assetAddress, setAssetAddress] = useState<string>("");
+  const [stake, setStake] = useState("0.001");
+  const [busy, setBusy] = useState(false);
+  const [queueState, setQueueState] = useState<
+    | { status: "idle" }
+    | { status: "waiting"; bucket: string; since: number }
+  >({ status: "idle" });
+  const selectedChain = config?.chains.find((entry) => entry.chainId === selectedChainId) ?? null;
+  const asset = selectedChain?.assets.find((entry) => entry.address.toLowerCase() === assetAddress.toLowerCase()) ?? null;
+
+  useEffect(() => {
+    if (selectedChain) setAssetAddress(selectedChain.assets[0].address);
+  }, [selectedChainId, selectedChain]);
+
+  // Poll queue status while waiting. As soon as the server sees us paired
+  // (because the *other* player joined the queue and triggered match
+  // creation), navigate to the session page so the player can escrow.
+  useEffect(() => {
+    if (queueState.status !== "waiting") return;
+    const timer = window.setInterval(async () => {
+      try {
+        const res = await api<QueueStatusResponse>("/api/web/queue");
+        if (res.status === "paired" && res.session) {
+          setQueueState({ status: "idle" });
+          setStatus(
+            res.role === "creator"
+              ? "Match found! You'll create the escrow session."
+              : "Match found! Joining the escrow your opponent created."
+          );
+          onPaired(res.session.id);
+        } else if (res.status === "cancelled" || res.status === "expired" || res.status === "idle") {
+          setQueueState({ status: "idle" });
+        }
+      } catch {
+        // ignore transient poll errors
+      }
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [queueState, onPaired, setStatus]);
+
+  async function joinQueue() {
+    if (!selectedChain || !walletSession || !asset) return;
+    if (walletSession.chainId !== selectedChain.chainId) {
+      throw new Error("Sign in on the selected network first");
+    }
+    const stakeUnits = safeParse(stake, asset.decimals);
+    if (stakeUnits == null || stakeUnits <= 0n) throw new Error("Enter a valid stake");
+
+    setBusy(true);
+    setStatus("");
+    try {
+      const res = await api<QueueEnqueueResponse>("/api/web/queue", {
+        method: "POST",
+        body: JSON.stringify({
+          chainId: selectedChain.chainId,
+          assetAddress: asset.address,
+          stakeAmountUnits: stakeUnits.toString(),
+        }),
+      });
+      if (res.status === "paired" && res.session) {
+        setStatus(
+          res.role === "creator"
+            ? "Match found! You'll create the escrow session."
+            : "Match found! Joining the escrow your opponent created."
+        );
+        onPaired(res.session.id);
+      } else {
+        setQueueState({
+          status: "waiting",
+          bucket: `${asset.symbol} ${stake}`,
+          since: Date.now(),
+        });
+        setStatus("Searching for an opponent...");
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function leave() {
+    setBusy(true);
+    try {
+      await api("/api/web/queue", { method: "DELETE" });
+      setQueueState({ status: "idle" });
+      setStatus("Left the matchmaking queue.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (queueState.status === "waiting") {
+    const elapsed = Math.floor((Date.now() - queueState.since) / 1000);
+    return (
+      <section className="mainPanel">
+        <h2>Quick Match</h2>
+        <p>Looking for an opponent at <strong>{queueState.bucket}</strong>...</p>
+        <p className="hint">Waiting {elapsed}s. The queue auto-expires after 5 minutes.</p>
+        <button className="button secondary" disabled={busy} onClick={() => leave().catch((err) => setStatus(err.message))}>
+          {busy ? "Leaving..." : "Leave queue"}
+        </button>
+      </section>
+    );
+  }
+
+  return (
+    <section className="mainPanel">
+      <h2>Quick Match</h2>
+      <p>Get auto-paired with the next available wallet at the same stake. The older queued player creates the escrow; you'll know which side you are when paired.</p>
+      <label>
+        Asset
+        <select value={assetAddress} onChange={(event) => setAssetAddress(event.target.value)}>
+          {selectedChain?.assets.map((entry) => (
+            <option key={entry.symbol} value={entry.address}>{entry.label}</option>
+          ))}
+        </select>
+      </label>
+      <label>
+        Stake per player
+        <input value={stake} onChange={(event) => setStake(event.target.value)} inputMode="decimal" />
+      </label>
+      <button
+        className="button primary"
+        disabled={!walletSession || !selectedChain || busy}
+        onClick={() => joinQueue().catch((err) => setStatus(err.message))}
+      >
+        {busy ? "Joining..." : "Find match"}
+      </button>
+    </section>
   );
 }
 

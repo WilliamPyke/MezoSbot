@@ -12,6 +12,11 @@ import {
 import { createSessionDraft, getWebSession, markCreated, markJoined, type WebArcadeSessionRow } from "./db.js";
 import { applyWebMove, buildGameState, buildWalletArcadePlayState, submitWebScore, walletArcadePlayStateFromGameState } from "./game.js";
 import { chainConfigForId, webChainsConfig } from "./chains.js";
+import {
+  enqueueWallet,
+  getMyQueueEntry,
+  leaveQueue,
+} from "../arcade/matchmaking.js";
 import type { Move } from "../arcade/types.js";
 
 const MAX_BODY_BYTES = 128 * 1024;
@@ -144,6 +149,61 @@ export async function handleWalletWebRequest(
       if (method === "POST" && parts[4] === "submit") {
         const wallet = requireSession(req);
         return sendJson(res, 200, await submitWebScore(sessionId, wallet.address));
+      }
+    }
+
+    if (parts[2] === "queue") {
+      if (method === "POST" && parts.length === 3) {
+        const session = requireSession(req);
+        const body = await readJsonBody(req);
+        const chainId = numberField(body, "chainId");
+        if (session.chainId !== chainId) {
+          throw new Error("Sign in on the selected network before joining the queue");
+        }
+        const result = await enqueueWallet({
+          walletAddress: session.address,
+          chainId,
+          assetAddress: stringField(body, "assetAddress"),
+          stakeAmountUnits: stringField(body, "stakeAmountUnits"),
+        });
+        if (!result.ok) return sendJson(res, 400, { error: result.error });
+        if (result.status === "paired") {
+          return sendJson(res, 200, {
+            status: "paired",
+            session: withContractArgs(result.session),
+            opponent: result.opponent,
+            role: result.role,
+          });
+        }
+        return sendJson(res, 200, { status: "waiting", entry: result.entry });
+      }
+
+      if (method === "GET" && parts.length === 3) {
+        const session = requireSession(req);
+        const entry = await getMyQueueEntry("wallet", session.address);
+        if (!entry) return sendJson(res, 200, { status: "idle" });
+        if (entry.status === "paired" && entry.session_id) {
+          const row = await getWebSession(entry.session_id);
+          if (row) {
+            return sendJson(res, 200, {
+              status: "paired",
+              session: withContractArgs(row),
+              opponent: entry.paired_with,
+              // The waiter (player A on the resulting session) is the
+              // creator; the joiner is invited.
+              role: row.player_a_address.toLowerCase() === session.address.toLowerCase()
+                ? "creator"
+                : "joiner",
+            });
+          }
+        }
+        return sendJson(res, 200, { status: entry.status, entry });
+      }
+
+      if (method === "DELETE" && parts.length === 3) {
+        const session = requireSession(req);
+        const left = await leaveQueue("wallet", session.address);
+        return sendJson(res, 200, { ok: true, left });
       }
     }
 

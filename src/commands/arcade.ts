@@ -16,6 +16,11 @@ import {
   setMatchMessage,
   topValidatedScores,
 } from "../arcade/db.js";
+import {
+  enqueueDiscord,
+  getMyQueueEntry,
+  leaveQueue,
+} from "../arcade/matchmaking.js";
 import { issueMatchToken } from "../arcade/tokens.js";
 import {
   buildMatchFeedComponents,
@@ -105,6 +110,26 @@ export const data = {
     },
     {
       type: 1 as const,
+      name: "matchmake",
+      description: "Join the global free PvP queue and play the next available opponent",
+      options: [
+        {
+          type: 10 as const,
+          name: "minutes",
+          description: "Match length in minutes (1-5, default 3)",
+          required: false,
+          minValue: 1,
+          maxValue: MAX_ARCADE_DURATION_MINUTES,
+        },
+      ],
+    },
+    {
+      type: 1 as const,
+      name: "leave-queue",
+      description: "Leave the matchmaking queue",
+    },
+    {
+      type: 1 as const,
       name: "rules",
       description: "How Slice Arcade works",
     },
@@ -132,6 +157,10 @@ export async function execute(interaction: ChatInputCommandInteraction) {
       return runOffer(interaction);
     case "offers":
       return runOffers(interaction);
+    case "matchmake":
+      return runMatchmake(interaction);
+    case "leave-queue":
+      return runLeaveQueue(interaction);
     case "rules":
       return runRules(interaction);
     case "tiers":
@@ -423,6 +452,120 @@ async function runTiers(interaction: ChatInputCommandInteraction) {
       ].join("\n")
     );
   await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+}
+
+async function runMatchmake(interaction: ChatInputCommandInteraction) {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const matchDurationSeconds = durationSeconds(interaction);
+
+  const existing = await getMyQueueEntry("discord", interaction.user.id);
+  if (existing && existing.status === "waiting") {
+    return interaction.editReply({
+      content: "You're already in the matchmaking queue. Use `/arcade leave-queue` to cancel.",
+    });
+  }
+
+  let result;
+  try {
+    result = await enqueueDiscord({
+      userId: interaction.user.id,
+      durationSeconds: matchDurationSeconds,
+    });
+  } catch (err) {
+    const msg = (err as Error)?.message ?? String(err);
+    console.error("[Arcade] matchmake enqueue failed:", msg);
+    return interaction.editReply({ content: `❌ Could not join queue: ${msg}` });
+  }
+
+  if (!result.ok) {
+    return interaction.editReply({ content: `❌ ${result.error}` });
+  }
+
+  if (result.status === "waiting") {
+    const embed = new EmbedBuilder()
+      .setColor(0x00cc6a)
+      .setTitle("In matchmaking queue")
+      .setDescription(
+        [
+          "You'll be DM'd a private play link as soon as another player joins.",
+          "",
+          `Match length when paired: **${formatDuration(matchDurationSeconds)}**.`,
+          "Your queue entry expires after 5 minutes — re-run `/arcade matchmake` to keep waiting.",
+          "",
+          "Want to bail? Run `/arcade leave-queue`.",
+        ].join("\n")
+      );
+    return interaction.editReply({ embeds: [embed] });
+  }
+
+  // status === "paired" — both players just got matched. Reply to the joiner
+  // (the user) with their play link, and DM the opponent (the original
+  // waiter) theirs.
+  const { match, opponentId } = result;
+  const url = buildPlayUrl(match.id, interaction.user.id);
+  const embed = new EmbedBuilder()
+    .setColor(0x00cc6a)
+    .setTitle("Match found!")
+    .setDescription(
+      [
+        `You vs <@${opponentId}> — match #${match.id} starts now.`,
+        "",
+        `Time limit: **${formatDuration(match.duration_seconds ?? matchDurationSeconds)}**.`,
+        "Open the link below to play in your browser. *This link is for you only.*",
+      ].join("\n")
+    );
+
+  if (isPublicHttpsUrl(url)) {
+    await interaction.editReply({ embeds: [embed], components: [playLinkRow(url, "Open browser playfield")] });
+  } else {
+    await interaction.editReply({
+      content: `${describeBadUrl()}\n\nLink for this match (testing only):\n<${url}>`,
+      embeds: [embed],
+    });
+  }
+
+  // Best-effort DM to the opponent. If DMs are closed they can run /arcade
+  // matchmake again to re-find the match (it's already created in the DB,
+  // but we only surface it via the DM right now). Worth improving later.
+  void sendMatchmakeDm(interaction.client, match.id, opponentId, interaction.user.id);
+}
+
+async function runLeaveQueue(interaction: ChatInputCommandInteraction) {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const left = await leaveQueue("discord", interaction.user.id);
+  await interaction.editReply({
+    content: left
+      ? "✅ Left the matchmaking queue."
+      : "You weren't in the queue.",
+  });
+}
+
+async function sendMatchmakeDm(
+  client: ChatInputCommandInteraction["client"],
+  matchId: number,
+  recipientId: string,
+  opponentId: string
+) {
+  try {
+    const user = await client.users.fetch(recipientId);
+    const url = buildPlayUrl(matchId, recipientId);
+    const embed = new EmbedBuilder()
+      .setColor(0x00cc6a)
+      .setTitle(`Slice Arcade — Match #${matchId} found!`)
+      .setDescription(
+        `Matched with <@${opponentId}>. Open the link to play in your browser. *This link is for you only.*`
+      );
+    if (isPublicHttpsUrl(url)) {
+      const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder().setLabel("Open browser playfield").setStyle(ButtonStyle.Link).setURL(url)
+      );
+      await user.send({ embeds: [embed], components: [row] });
+    } else {
+      await user.send({ content: `Match #${matchId} is ready. Link: <${url}>`, embeds: [embed] });
+    }
+  } catch {
+    // DMs closed — opponent can re-queue or check /arcade matchmake again.
+  }
 }
 
 async function runLeaderboard(interaction: ChatInputCommandInteraction) {

@@ -101,6 +101,26 @@ export type GameState = {
   result: { completed: boolean; isWinner: boolean | null; isTie: boolean; aScore: number | null; bScore: number | null };
 };
 
+export type QueueEntry = {
+  id: number;
+  surface: "discord" | "wallet";
+  user_id: string;
+  status: "waiting" | "paired" | "cancelled" | "expired";
+  joined_at: string;
+  expires_at: string;
+};
+
+export type QueueEnqueueResponse =
+  | { status: "waiting"; entry: QueueEntry }
+  | { status: "paired"; session: SessionRow; opponent: string; role: "creator" | "joiner" };
+
+export type QueueStatusResponse =
+  | { status: "idle" }
+  | { status: "waiting"; entry: QueueEntry }
+  | { status: "cancelled"; entry: QueueEntry }
+  | { status: "expired"; entry: QueueEntry }
+  | { status: "paired"; session: SessionRow; opponent: string; role: "creator" | "joiner" };
+
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     ...init,

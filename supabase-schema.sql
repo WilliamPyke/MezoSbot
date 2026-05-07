@@ -337,3 +337,61 @@ CREATE INDEX IF NOT EXISTS idx_web_arcade_sessions_invited ON web_arcade_session
 CREATE INDEX IF NOT EXISTS idx_web_arcade_sessions_deadline ON web_arcade_sessions(play_deadline);
 CREATE INDEX IF NOT EXISTS idx_web_arcade_submissions_session ON web_arcade_submissions(session_id);
 CREATE INDEX IF NOT EXISTS idx_web_arcade_settlement_attempts_session ON web_arcade_settlement_attempts(session_id);
+
+-- Global matchmaking queue. One row per pending match request from either
+-- surface. user_id holds a Discord snowflake for surface='discord' and a
+-- lowercase wallet address for surface='wallet'. Pairing only happens within
+-- the same surface — Discord-vs-Discord and wallet-vs-wallet — so no
+-- bridging between internal sats and on-chain stakes is needed.
+CREATE TABLE IF NOT EXISTS arcade_queue (
+  id BIGSERIAL PRIMARY KEY,
+  surface TEXT NOT NULL,                          -- 'discord' | 'wallet'
+  user_id TEXT NOT NULL,                          -- discord id OR lowercase wallet address
+  status TEXT NOT NULL DEFAULT 'waiting',         -- waiting | paired | cancelled | expired
+  -- Discord-only:
+  duration_seconds INTEGER,
+  -- Wallet-only:
+  chain_id INTEGER,
+  asset_address TEXT,
+  stake_amount_units TEXT,
+  -- Result:
+  match_id BIGINT,                                -- arcade_matches.id  (discord)
+  session_id TEXT,                                -- web_arcade_sessions.id (wallet)
+  paired_with TEXT,                               -- the other queue user_id
+  joined_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  paired_at TIMESTAMPTZ,
+  expires_at TIMESTAMPTZ NOT NULL
+);
+
+-- A user can only have one waiting entry per surface at a time.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_arcade_queue_active
+  ON arcade_queue (surface, user_id) WHERE status = 'waiting';
+
+-- Pairing scans the oldest waiting entries within a bucket. For Discord that's
+-- just (surface='discord'); for wallet it's (surface, chain_id, asset_address,
+-- stake_amount_units). Both fit this composite index.
+CREATE INDEX IF NOT EXISTS idx_arcade_queue_waiting
+  ON arcade_queue (surface, chain_id, asset_address, stake_amount_units, joined_at)
+  WHERE status = 'waiting';
+
+-- Race-safe Discord pairing: atomically pick the oldest waiting Discord entry
+-- (excluding the caller) and mark it 'paired' in one statement. Without this
+-- two simultaneous matchmake calls could both think they paired with the
+-- same row.
+CREATE OR REPLACE FUNCTION claim_oldest_discord_queue_entry(p_exclude_user_id TEXT)
+RETURNS SETOF arcade_queue AS $$
+  UPDATE arcade_queue
+  SET status = 'paired',
+      paired_at = now()
+  WHERE id = (
+    SELECT id FROM arcade_queue
+    WHERE surface = 'discord'
+      AND status = 'waiting'
+      AND user_id <> p_exclude_user_id
+      AND expires_at >= now()
+    ORDER BY joined_at ASC
+    LIMIT 1
+    FOR UPDATE SKIP LOCKED
+  )
+  RETURNING *;
+$$ LANGUAGE sql;
