@@ -885,6 +885,11 @@ export function renderArcadePlayPage(options: {
     select: function () {
       this.tone({ freq: 720, dur: 0.04, type: 'sine', vol: 0.14 });
     },
+    cursor: function () {
+      this.tone({ freq: 140, freqEnd: 95, dur: 0.07, type: 'triangle', vol: 0.32, attack: 0.001, release: 0.04 });
+      this.tone({ freq: 70, freqEnd: 50, dur: 0.09, type: 'sine', vol: 0.22, attack: 0.001, release: 0.05 });
+      this.noise({ dur: 0.04, vol: 0.05, freq: 200, filter: 'lowpass' });
+    },
     invalid: function () {
       this.tone({ freq: 200, freqEnd: 110, dur: 0.18, type: 'sawtooth', vol: 0.22 });
     },
@@ -1254,6 +1259,9 @@ export function renderArcadePlayPage(options: {
     const nextC = Math.max(0, Math.min(8, selected.hoverCol + colDelta));
     const cells = selectedCells();
     const clamped = clampAnchor(cells, nextR, nextC);
+    if (clamped.r !== selected.hoverRow || clamped.c !== selected.hoverCol) {
+      Sound.cursor();
+    }
     selected.hoverRow = clamped.r;
     selected.hoverCol = clamped.c;
     paintBoard();
