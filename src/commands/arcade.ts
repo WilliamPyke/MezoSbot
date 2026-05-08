@@ -173,6 +173,11 @@ export const data = {
     },
     {
       type: 1 as const,
+      name: "help",
+      description: "Slice Arcade command manual — all /arcade subcommands, with examples",
+    },
+    {
+      type: 1 as const,
       name: "rules",
       description: "How Slice Arcade works",
     },
@@ -208,6 +213,8 @@ export async function execute(interaction: ChatInputCommandInteraction) {
       return runMatchmake(interaction);
     case "leave-queue":
       return runLeaveQueue(interaction);
+    case "help":
+      return runHelp(interaction);
     case "rules":
       return runRules(interaction);
     case "tiers":
@@ -560,6 +567,104 @@ async function runOffers(interaction: ChatInputCommandInteraction) {
   );
 
   await interaction.editReply({ embeds: [embed], components });
+}
+
+async function runHelp(interaction: ChatInputCommandInteraction) {
+  const overview = new EmbedBuilder()
+    .setColor(0x00cc6a)
+    .setTitle("Slice Arcade — Command Manual")
+    .setDescription(
+      [
+        "Block puzzle PvP for sats, played in your browser. Discord posts the match card; the game opens in a private link.",
+        "",
+        "**Quick start**",
+        "• `/arcade practice` — solo, no stake. Best way to learn the controls.",
+        "• `/arcade matchmake` — auto-pair with the next free PvP opponent.",
+        "• `/arcade challenge user:@someone stake:100` — pick a fight (free or staked).",
+        "• `/arcade tipfight stake:100` — *you* stake; opponent must beat you to win it.",
+      ].join("\n")
+    );
+
+  const lobby = new EmbedBuilder()
+    .setColor(0x00cc6a)
+    .setTitle("Lobby & matchmaking")
+    .addFields(
+      {
+        name: "/arcade practice [minutes]",
+        value: "Solo browser match. `minutes` 1–5, default 3. No stake.",
+      },
+      {
+        name: "/arcade challenge user:@x [stake] [minutes]",
+        value: "Direct challenge. Omit `stake` for free PvP. Both players stake the same amount when staked; winner takes the pot minus rake.",
+      },
+      {
+        name: "/arcade offer [stake] [minutes]",
+        value: "Open lobby — first acceptor takes the match. Same stake rules as challenge.",
+      },
+      {
+        name: "/arcade tipfight stake:<sats> [user] [minutes]",
+        value:
+          "**Fight for your tip.** Only you stake. Opponent plays free; they must **strictly beat** your score to win the stake. Tie or loss → full refund. Pass `user` to target someone, or omit for an open lobby.",
+      },
+      {
+        name: "/arcade matchmake [minutes]",
+        value: "Join the global free PvP queue. You'll be DM'd a play link as soon as a partner shows up.",
+      },
+      {
+        name: "/arcade leave-queue",
+        value: "Bail from the matchmaking queue.",
+      },
+      {
+        name: "/arcade offers",
+        value: "Browse the 5 most recent open offers and accept one.",
+      }
+    );
+
+  const spectate = new EmbedBuilder()
+    .setColor(0x00cc6a)
+    .setTitle("Spectate, info & stats")
+    .addFields(
+      {
+        name: "/arcade watch match-id:<id>",
+        value: "Get a live spectator URL — both boards side-by-side, updating in real time. Active match cards also expose a 👁️ Watch button.",
+      },
+      {
+        name: "/arcade rules",
+        value: "How scoring, multipliers, levels, and combos work.",
+      },
+      {
+        name: "/arcade tiers",
+        value: "Common stake tiers + rake breakdown.",
+      },
+      {
+        name: "/arcade leaderboard",
+        value: "Top validated scores across all matches.",
+      },
+      {
+        name: "/arcade help",
+        value: "This page.",
+      }
+    );
+
+  const supporting = new EmbedBuilder()
+    .setColor(0x444c5a)
+    .setTitle("Wallet & tipping (related commands)")
+    .setDescription(
+      [
+        "Stakes and payouts settle through your MezoSBot sats balance.",
+        "",
+        "• `/balance` — check your sats balance.",
+        "• `/deposit` — top up.",
+        "• `/withdraw` — pull sats out.",
+        "• `/tip @user amount` — send sats to another user.",
+        "• `/history` — recent transactions.",
+      ].join("\n")
+    );
+
+  await interaction.reply({
+    embeds: [overview, lobby, spectate, supporting],
+    flags: MessageFlags.Ephemeral,
+  });
 }
 
 async function runRules(interaction: ChatInputCommandInteraction) {
