@@ -9,7 +9,7 @@ import {
 } from "./economics.js";
 import type { Move } from "./types.js";
 
-export type MatchMode = "practice" | "free_pvp" | "staked_pvp";
+export type MatchMode = "practice" | "free_pvp" | "staked_pvp" | "tipfight";
 export type MatchStatus =
   | "waiting"
   | "active"
@@ -71,12 +71,15 @@ export async function createMatch(input: CreateMatchInput): Promise<ArcadeMatchR
   const seed = randomSeed();
   const stake = input.stakeAmountSats ?? null;
   const rakeBps = input.rakeBps ?? DEFAULT_PLATFORM_RAKE_BPS;
+  // staked_pvp pools both players' stakes; tipfight is one-sided (challenger only).
+  const playerCount = input.mode === "tipfight" ? 1 : 2;
+  const isStakedMode = input.mode === "staked_pvp" || input.mode === "tipfight";
   const grossPot =
-    input.mode === "staked_pvp" && stake != null ? calculateGrossPot(stake, 2) : null;
+    isStakedMode && stake != null ? calculateGrossPot(stake, playerCount) : null;
   const rake =
-    input.mode === "staked_pvp" && grossPot != null ? calculateRake(grossPot, rakeBps) : null;
+    isStakedMode && grossPot != null ? calculateRake(grossPot, rakeBps) : null;
   const winnerPayout =
-    input.mode === "staked_pvp" && grossPot != null && rake != null
+    isStakedMode && grossPot != null && rake != null
       ? calculateWinnerPayout(grossPot, rake)
       : null;
 
@@ -108,7 +111,7 @@ export async function createMatch(input: CreateMatchInput): Promise<ArcadeMatchR
       target_player_id: input.targetPlayerId ?? null,
       player_a_id: input.playerAId,
       player_b_id: input.playerBId ?? null,
-      escrow_status: input.mode === "staked_pvp" ? "pending" : "none",
+      escrow_status: isStakedMode ? "pending" : "none",
       duration_seconds: durationSeconds,
       started_at: startedAt,
       rematch_of_match_id: input.rematchOfMatchId ?? null,
@@ -215,13 +218,16 @@ export async function fundEscrowFromBalance(
     return { ok: false, error: error.message };
   }
 
-  // If both sides funded, mark match escrow_status=funded
+  // Mark match escrow_status=funded once required side(s) have paid.
+  // staked_pvp needs both players; tipfight only needs the challenger.
+  const matchRow = await getMatch(matchId);
+  const requiredCount = matchRow?.mode === "tipfight" ? 1 : 2;
   const { data: rows } = await supabase
     .from("arcade_escrow")
     .select("status")
     .eq("match_id", matchId);
   const fundedCount = (rows ?? []).filter((r) => r.status === "funded").length;
-  if (fundedCount >= 2) {
+  if (fundedCount >= requiredCount) {
     await supabase
       .from("arcade_matches")
       .update({ escrow_status: "funded" })
@@ -231,7 +237,11 @@ export async function fundEscrowFromBalance(
   return { ok: true };
 }
 
-export async function refundAllEscrow(matchId: number): Promise<void> {
+export async function refundAllEscrow(
+  matchId: number,
+  options: { markCancelled?: boolean } = {}
+): Promise<void> {
+  const markCancelled = options.markCancelled ?? true;
   const { data: rows } = await supabase
     .from("arcade_escrow")
     .select("*")
@@ -246,7 +256,11 @@ export async function refundAllEscrow(matchId: number): Promise<void> {
   }
   await supabase
     .from("arcade_matches")
-    .update({ status: "cancelled", escrow_status: "refunded" })
+    .update(
+      markCancelled
+        ? { status: "cancelled", escrow_status: "refunded" }
+        : { escrow_status: "refunded" }
+    )
     .eq("id", matchId);
 }
 
@@ -322,10 +336,45 @@ export async function trySettleMatch(matchId: number): Promise<SettlementResult>
   const aScore = match.player_a_score ?? 0;
   const bScore = match.player_b_score ?? 0;
 
+  // Tipfight: one-sided stake. Opponent (B) must STRICTLY BEAT challenger (A)
+  // to win the stake. Tie or A-wins → refund the challenger.
+  if (match.mode === "tipfight") {
+    if (bScore > aScore) {
+      const rake = match.rake_amount_sats ?? 0;
+      const payout = match.winner_payout_sats ?? 0;
+      if (payout > 0) await addBalance(match.player_b_id!, payout);
+
+      await supabase
+        .from("arcade_escrow")
+        .update({ status: "released", updated_at: new Date().toISOString() })
+        .eq("match_id", matchId);
+
+      await supabase.from("arcade_fees").insert({
+        match_id: matchId,
+        rake_amount_sats: rake,
+        platform_rake_bps: match.platform_rake_bps,
+        status: "collected",
+      });
+
+      await supabase
+        .from("arcade_matches")
+        .update({ escrow_status: "released" })
+        .eq("id", matchId);
+
+      const updated = await completeMatch(matchId, match.player_b_id!);
+      return { status: "completed", match: updated, winnerId: match.player_b_id!, payoutSats: payout, rakeSats: rake };
+    }
+    // Refund the challenger; mark match completed with A as winner
+    // (defense held). Don't flip status to 'cancelled' — the match was played.
+    await refundAllEscrow(matchId, { markCancelled: false });
+    const updated = await completeMatch(matchId, match.player_a_id);
+    return { status: "completed", match: updated, winnerId: match.player_a_id };
+  }
+
   if (aScore === bScore) {
     // Tie — refund staked matches; mark free_pvp completed with no winner.
     if (match.mode === "staked_pvp") {
-      await refundAllEscrow(matchId);
+      await refundAllEscrow(matchId, { markCancelled: false });
     }
     const updated = await completeMatch(matchId, null, "tie");
     return { status: "tie", match: updated };
@@ -454,6 +503,12 @@ export async function requestRematch(matchId: number, userId: string): Promise<R
   }
   if (parent.mode === "practice" && parent.player_a_id !== userId) {
     return { status: "error", error: "Not your match" };
+  }
+  if (parent.mode === "tipfight") {
+    return {
+      status: "error",
+      error: "Rematch isn't supported for tipfights yet — start a new one with /arcade tipfight.",
+    };
   }
 
   // Already created next match — just hand back the existing one.

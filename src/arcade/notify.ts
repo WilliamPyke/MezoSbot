@@ -8,6 +8,8 @@
  * `setMatchSettledHandler` at startup; the web layer just fires the event.
  */
 
+import { closeMatchSpectators } from "./spectate.js";
+
 type MatchSettledHandler = (matchId: number) => void | Promise<void>;
 
 let handler: MatchSettledHandler | null = null;
@@ -17,6 +19,10 @@ export function setMatchSettledHandler(h: MatchSettledHandler): void {
 }
 
 export function onMatchSettled(matchId: number): void {
+  // Push final snapshot to spectators and close their sockets.
+  closeMatchSpectators(matchId).catch((err) =>
+    console.warn("[Spectate] close failed:", (err as Error)?.message ?? err)
+  );
   if (!handler) return;
   Promise.resolve(handler(matchId)).catch((err) =>
     console.error("[Arcade] match-settled handler error:", (err as Error)?.message ?? err)

@@ -160,7 +160,7 @@ CREATE TABLE IF NOT EXISTS game_saves (
 CREATE TABLE IF NOT EXISTS arcade_matches (
   id BIGSERIAL PRIMARY KEY,
   seed TEXT NOT NULL,
-  mode TEXT NOT NULL,                          -- 'practice' | 'free_pvp' | 'staked_pvp'
+  mode TEXT NOT NULL,                          -- 'practice' | 'free_pvp' | 'staked_pvp' | 'tipfight'
   status TEXT NOT NULL DEFAULT 'waiting',      -- waiting | active | submitted | completed | cancelled
   channel_id TEXT,
   message_id TEXT,

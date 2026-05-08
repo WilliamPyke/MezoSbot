@@ -44,6 +44,7 @@ import {
   updateMatchFeed,
 } from "./arcade/interactions.js";
 import { setMatchSettledHandler } from "./arcade/notify.js";
+import { setDisplayNameResolver } from "./arcade/spectate.js";
 import { getMatch as getArcadeMatch } from "./arcade/db.js";
 import { expireStaleQueueEntries } from "./arcade/matchmaking.js";
 
@@ -601,6 +602,16 @@ async function main() {
   setMatchSettledHandler(async (matchId) => {
     const match = await getArcadeMatch(matchId);
     if (match) await updateMatchFeed(client, match);
+  });
+
+  // Resolve discord display names for spectator panels.
+  setDisplayNameResolver(async (userId) => {
+    try {
+      const user = await client.users.fetch(userId);
+      return user.globalName ?? user.username ?? null;
+    } catch {
+      return null;
+    }
   });
 
   // Sweep stale matchmaking-queue entries. Pairing happens on enqueue, so

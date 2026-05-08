@@ -35,6 +35,7 @@ import {
 } from "./types.js";
 import { issueMatchToken, verifyMatchToken } from "./tokens.js";
 import { onMatchSettled } from "./notify.js";
+import { buildSpectatorSnapshot } from "./spectate.js";
 import { supabase } from "../db.js";
 import { formatSats } from "../format.js";
 
@@ -135,6 +136,39 @@ export async function handleArcadeWebRequest(
     });
     return true;
   }
+  if (method === "GET" && path === "/arcade/watch") {
+    sendHtml(res, 200, renderArcadeWatchPage());
+    return true;
+  }
+  if (method === "GET" && path === "/arcade/api/spectate-state") {
+    const matchIdRaw = url.searchParams.get("match");
+    const matchId = matchIdRaw ? parseInt(matchIdRaw, 10) : NaN;
+    if (!Number.isFinite(matchId) || matchId <= 0) {
+      sendJson(res, 400, { error: "Missing or invalid match id" });
+      return true;
+    }
+    const m = await getMatch(matchId);
+    if (!m) {
+      sendJson(res, 404, { error: "Match not found" });
+      return true;
+    }
+    if (m.mode === "practice") {
+      sendJson(res, 403, { error: "Practice matches can't be spectated" });
+      return true;
+    }
+    if (m.status === "waiting") {
+      sendJson(res, 200, { type: "waiting", matchId, mode: m.mode });
+      return true;
+    }
+    await ensureMatchRuntimeLoaded(matchId);
+    const snapshot = await buildSpectatorSnapshot(matchId);
+    if (!snapshot) {
+      sendJson(res, 404, { error: "Snapshot unavailable" });
+      return true;
+    }
+    sendJson(res, 200, snapshot);
+    return true;
+  }
   if (method === "POST" && path === "/arcade/api/submit") {
     await respondWithBody(req, res, async (claim) => {
       await ensureMatchRuntimeLoaded(claim.matchId);
@@ -161,9 +195,14 @@ export async function handleArcadeWebRequest(
       });
 
       const settlement = await trySettleMatch(claim.matchId);
-      if (settlement.status !== "waiting") clearRuntime(claim.matchId);
-      // Fire-and-forget: let Discord refresh the public match card.
+      // Fire spectator close + Discord card refresh BEFORE clearing the
+      // runtime, so the final spectator snapshot still has board state.
       onMatchSettled(claim.matchId);
+      if (settlement.status !== "waiting") {
+        // Defer runtime clear to next tick so onMatchSettled (async)
+        // can read the runtime while building the final snapshot.
+        setImmediate(() => clearRuntime(claim.matchId));
+      }
 
       return { status: 200, body: await buildStateResponse(claim.matchId, claim.userId) };
     });
@@ -422,7 +461,7 @@ async function settleExpiredMatchIfNeeded(matchId: number): Promise<ArcadeMatchR
   return settlement.match;
 }
 
-async function ensureMatchRuntimeLoaded(matchId: number): Promise<void> {
+export async function ensureMatchRuntimeLoaded(matchId: number): Promise<void> {
   const existing = getRuntime(matchId);
   if (existing && existing.players.size > 0) return;
 
@@ -556,6 +595,195 @@ function sendHtml(res: ServerResponse, status: number, html: string): void {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "no-store");
   res.end(html);
+}
+
+/* ────────────────────────────────────────────────────────────────── */
+/*  Spectator HTML page                                                */
+/* ────────────────────────────────────────────────────────────────── */
+
+export function renderArcadeWatchPage(): string {
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<title>Slice Arcade — Watch</title>
+<style>
+  :root {
+    --bg: #0c0f14;
+    --panel: #161b22;
+    --border: #2a313c;
+    --text: #e8edf2;
+    --muted: #8a94a4;
+    --accent: #00cc6a;
+    --tip: #ffaa00;
+    --cell-empty: #1f2630;
+    --cell-normal: #00cc6a;
+    --cell-mult: #ffaa00;
+  }
+  * { box-sizing: border-box; }
+  html, body { background: var(--bg); color: var(--text); margin: 0; min-height: 100vh; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  body { padding: 16px; }
+  h1 { font-size: 18px; margin: 0 0 12px; color: var(--muted); font-weight: 500; }
+  h1 .id { color: var(--text); }
+  .status-bar { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; flex-wrap: wrap; }
+  .pill { background: var(--panel); border: 1px solid var(--border); border-radius: 999px; padding: 4px 12px; font-size: 13px; color: var(--muted); }
+  .pill.live { color: var(--accent); border-color: var(--accent); }
+  .pill.tipfight { color: var(--tip); border-color: var(--tip); }
+  .boards { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 700px) { .boards { grid-template-columns: 1fr; } }
+  .player-panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
+  .player-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px; gap: 12px; flex-wrap: wrap; }
+  .player-name { font-size: 16px; font-weight: 600; word-break: break-word; }
+  .player-id { font-size: 11px; color: var(--muted); font-family: ui-monospace, monospace; }
+  .player-stats { font-size: 13px; color: var(--muted); }
+  .player-score { font-size: 24px; font-weight: 700; color: var(--accent); margin: 4px 0 12px; }
+  .player-score.tipfight-staker { color: var(--tip); }
+  .submitted-tag { display: inline-block; margin-left: 8px; font-size: 11px; padding: 2px 6px; border-radius: 4px; background: var(--accent); color: #000; vertical-align: middle; }
+  .board { display: grid; grid-template-columns: repeat(9, 1fr); gap: 2px; aspect-ratio: 1/1; background: var(--border); padding: 2px; border-radius: 6px; }
+  .cell { background: var(--cell-empty); border-radius: 2px; aspect-ratio: 1/1; transition: background 0.1s; }
+  .cell.normal { background: var(--cell-normal); }
+  .cell.mult { background: var(--cell-mult); }
+  .pieces { display: flex; gap: 6px; margin-top: 12px; align-items: flex-start; flex-wrap: wrap; }
+  .piece { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 6px; }
+  .piece.placed { opacity: 0.3; }
+  .mini-grid { display: grid; gap: 1px; background: var(--border); padding: 1px; border-radius: 3px; }
+  .mini-cell { width: 10px; height: 10px; }
+  .mini-cell.normal { background: var(--cell-normal); }
+  .mini-cell.mult { background: var(--cell-mult); }
+  .mini-cell.empty { background: transparent; }
+  .conn { position: fixed; bottom: 12px; right: 12px; font-size: 11px; color: var(--muted); padding: 4px 10px; background: var(--panel); border: 1px solid var(--border); border-radius: 999px; }
+  .conn.connected { color: var(--accent); border-color: var(--accent); }
+  .empty-state { padding: 32px; text-align: center; color: var(--muted); }
+</style>
+</head>
+<body>
+<h1>Slice Arcade — Match <span class="id" id="match-id">…</span></h1>
+<div class="status-bar" id="status-bar"></div>
+<div id="content"><div class="empty-state">Loading match…</div></div>
+<div class="conn" id="conn">connecting…</div>
+<script>
+(() => {
+  const params = new URLSearchParams(location.search);
+  const matchId = params.get("match");
+  document.getElementById("match-id").textContent = "#" + (matchId ?? "?");
+  if (!matchId) {
+    document.getElementById("content").innerHTML = '<div class="empty-state">Missing match id. Use the Watch link from Discord.</div>';
+    return;
+  }
+
+  const conn = document.getElementById("conn");
+  const content = document.getElementById("content");
+  const statusBar = document.getElementById("status-bar");
+
+  function renderPiece(piece) {
+    if (!piece || !piece.cells || piece.cells.length === 0) {
+      return '<div class="piece placed" style="width:32px;height:32px"></div>';
+    }
+    const xs = piece.cells.map(c => c.x);
+    const ys = piece.cells.map(c => c.y);
+    const w = Math.max(...xs) + 1;
+    const h = Math.max(...ys) + 1;
+    let cellsHtml = '';
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const c = piece.cells.find(c2 => c2.x === x && c2.y === y);
+        const cls = c ? (c.kind === "multiplier" ? "mult" : "normal") : "empty";
+        cellsHtml += '<div class="mini-cell ' + cls + '"></div>';
+      }
+    }
+    return '<div class="mini-grid" style="grid-template-columns:repeat(' + w + ',10px)">' + cellsHtml + '</div>';
+  }
+
+  function renderPlayer(p, isStaker, mode) {
+    const board = p.board || Array.from({length:9}, () => Array(9).fill(0));
+    let cellsHtml = '';
+    for (let r = 0; r < 9; r++) {
+      for (let c = 0; c < 9; c++) {
+        const v = board[r] && board[r][c];
+        const cls = v === 1 ? "normal" : v === 2 ? "mult" : "";
+        cellsHtml += '<div class="cell ' + cls + '"></div>';
+      }
+    }
+    const piecesHtml = (p.currentPieces || []).map((piece, i) => {
+      const placed = (p.placedThisLevel || [])[i];
+      return '<div class="piece ' + (placed ? "placed" : "") + '">' + renderPiece(piece) + '</div>';
+    }).join("");
+    const submittedTag = p.submitted ? '<span class="submitted-tag">submitted</span>' : '';
+    const scoreClass = (mode === "tipfight" && isStaker) ? "tipfight-staker" : "";
+    const stakerLabel = (mode === "tipfight" && isStaker) ? ' 💰 Staker' : (mode === "tipfight" && !isStaker ? ' ⚔️ Challenger' : '');
+    return '' +
+      '<div class="player-panel">' +
+        '<div class="player-head">' +
+          '<div>' +
+            '<div class="player-name">' + escapeHtml(p.displayName) + stakerLabel + submittedTag + '</div>' +
+            '<div class="player-id">' + escapeHtml(p.id) + '</div>' +
+          '</div>' +
+          '<div class="player-stats">Lvl ' + (p.level + 1) + ' · ×' + p.multiplier.toFixed(1) + '</div>' +
+        '</div>' +
+        '<div class="player-score ' + scoreClass + '">' + p.score.toLocaleString() + '</div>' +
+        '<div class="board">' + cellsHtml + '</div>' +
+        '<div class="pieces">' + piecesHtml + '</div>' +
+      '</div>';
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+  }
+
+  function render(snap) {
+    if (snap.type === "waiting") {
+      content.innerHTML = '<div class="empty-state">Match #' + snap.matchId + ' is waiting for an opponent. Refresh once the match starts.</div>';
+      statusBar.innerHTML = '<div class="pill">Waiting</div>';
+      return;
+    }
+    const modeClass = snap.mode === "tipfight" ? "tipfight" : "live";
+    const modeLabel = snap.mode === "tipfight" ? "💰 Fight for tip" : snap.mode === "staked_pvp" ? "Staked PvP" : "Free PvP";
+    const statusLabel = snap.status === "completed" ? "🏁 Final" : snap.status === "submitted" ? "📝 Awaiting submission" : "🎮 Live";
+    const stakeLine = snap.stake ? '<div class="pill ' + modeClass + '">' + snap.stake.toLocaleString() + ' sats</div>' : '';
+    statusBar.innerHTML =
+      '<div class="pill ' + modeClass + '">' + modeLabel + '</div>' +
+      '<div class="pill live">' + statusLabel + '</div>' + stakeLine;
+    const players = snap.players || [];
+    if (players.length === 0) {
+      content.innerHTML = '<div class="empty-state">No players in this match.</div>';
+      return;
+    }
+    content.innerHTML = '<div class="boards">' +
+      players.map((p, i) => renderPlayer(p, i === 0, snap.mode)).join("") +
+      '</div>';
+  }
+
+  // Initial paint via JSON
+  fetch("/arcade/api/spectate-state?match=" + encodeURIComponent(matchId), { cache: "no-store" })
+    .then(r => r.ok ? r.json() : Promise.reject(r.statusText))
+    .then(render)
+    .catch(err => { content.innerHTML = '<div class="empty-state">Could not load match: ' + escapeHtml(String(err)) + '</div>'; });
+
+  // Live updates via WebSocket
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  const url = proto + "//" + location.host + "/arcade/spectate?match=" + encodeURIComponent(matchId);
+  let ws;
+  let reconnectDelay = 1000;
+  function connect() {
+    ws = new WebSocket(url);
+    ws.onopen = () => { conn.textContent = "live"; conn.classList.add("connected"); reconnectDelay = 1000; };
+    ws.onmessage = (ev) => {
+      try { render(JSON.parse(ev.data)); } catch {}
+    };
+    ws.onclose = (ev) => {
+      conn.textContent = "disconnected"; conn.classList.remove("connected");
+      if (ev.code === 1000) return; // match completed normally
+      setTimeout(connect, reconnectDelay);
+      reconnectDelay = Math.min(reconnectDelay * 2, 30000);
+    };
+    ws.onerror = () => { try { ws.close(); } catch {} };
+  }
+  connect();
+})();
+</script>
+</body>
+</html>`;
 }
 
 /* ────────────────────────────────────────────────────────────────── */

@@ -137,12 +137,14 @@ async function handleCancel(interaction: ButtonInteraction, matchId: number) {
   if (match.status !== "waiting")
     return reply(interaction, "Match cannot be cancelled — already in progress.");
 
-  if (match.mode === "staked_pvp") await refundAllEscrow(matchId);
-  else
+  if (match.mode === "staked_pvp" || match.mode === "tipfight") {
+    await refundAllEscrow(matchId);
+  } else {
     await supabase
       .from("arcade_matches")
       .update({ status: "cancelled" })
       .eq("id", matchId);
+  }
 
   const refreshed = (await getMatch(matchId))!;
   await interaction.editReply({

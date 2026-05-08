@@ -9,6 +9,7 @@ import { generatePieceSequence } from "./pieces.js";
 import { hashSeed } from "./rng.js";
 import { applyMove, createPlayerState, replayMoves } from "./match.js";
 import type { GeneratedPiece, Move, PlayerState } from "./types.js";
+import { broadcastMatchState } from "./spectate.js";
 
 export type MatchRuntime = {
   matchId: number;
@@ -66,7 +67,13 @@ export function applyMoveForPlayer(
   const state = runtime.players.get(userId);
   if (!state) return { ok: false, error: "Player not in match" };
   const result = applyMove(state, runtime.sequence, move);
-  if (result.ok) runtime.players.set(userId, result.state);
+  if (result.ok) {
+    runtime.players.set(userId, result.state);
+    // Fire-and-forget spectator broadcast.
+    broadcastMatchState(matchId).catch((err) => {
+      console.warn("[Spectate] broadcast failed:", (err as Error)?.message ?? err);
+    });
+  }
   return result;
 }
 

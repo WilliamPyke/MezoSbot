@@ -8,6 +8,7 @@ import {
 type ActionRowJSON = ReturnType<ActionRowBuilder<ButtonBuilder>["toJSON"]>;
 import type { ArcadeMatchRow } from "./db.js";
 import { formatSats } from "../format.js";
+import { config } from "../config.js";
 
 export const CUSTOM_ID_PREFIX = "arcade";
 
@@ -31,10 +32,12 @@ export function buildMatchFeedEmbed(match: ArcadeMatchRow): EmbedBuilder {
       ? "Practice (solo)"
       : match.mode === "free_pvp"
         ? "Free PvP"
-        : `Stake ${formatSats(match.stake_amount_sats ?? 0)}`;
+        : match.mode === "tipfight"
+          ? `Fight for tip — ${formatSats(match.stake_amount_sats ?? 0)}`
+          : `Stake ${formatSats(match.stake_amount_sats ?? 0)}`;
 
   const embed = new EmbedBuilder()
-    .setColor(0x00cc6a)
+    .setColor(match.mode === "tipfight" ? 0xffaa00 : 0x00cc6a)
     .setTitle(`Slice Arcade — Match #${match.id}`)
     .addFields(
       { name: "Mode", value: tier, inline: true },
@@ -49,6 +52,17 @@ export function buildMatchFeedEmbed(match: ArcadeMatchRow): EmbedBuilder {
       { name: "Gross pot", value: formatSats(match.gross_pot_sats ?? 0), inline: true },
       { name: "Winner payout", value: formatSats(match.winner_payout_sats ?? 0), inline: true }
     );
+  } else if (match.mode === "tipfight" && match.stake_amount_sats != null) {
+    embed.addFields(
+      { name: "Challenger stake", value: formatSats(match.stake_amount_sats), inline: true },
+      { name: "Opponent pays", value: "Free", inline: true },
+      { name: "Win payout", value: formatSats(match.winner_payout_sats ?? 0), inline: true },
+      {
+        name: "Rules",
+        value:
+          `<@${match.player_a_id}> staked. To win the tip, the opponent must **strictly beat** their score. Tie or loss → full refund to challenger.`,
+      }
+    );
   }
 
   const waitingLine = match.target_player_id
@@ -62,9 +76,18 @@ export function buildMatchFeedEmbed(match: ArcadeMatchRow): EmbedBuilder {
   if (match.status === "completed") {
     const aScore = match.player_a_score ?? 0;
     const bScore = match.player_b_score ?? 0;
-    const result = match.winner_id
-      ? `🏆 <@${match.winner_id}> wins`
-      : "🤝 Tie";
+    let result: string;
+    if (match.mode === "tipfight") {
+      if (match.winner_id === match.player_b_id) {
+        result = `💰 <@${match.winner_id}> beat the staker — wins ${formatSats(match.winner_payout_sats ?? 0)}`;
+      } else if (match.winner_id === match.player_a_id) {
+        result = `🛡️ <@${match.player_a_id}> defended — stake refunded`;
+      } else {
+        result = "🤝 Tie — stake refunded";
+      }
+    } else {
+      result = match.winner_id ? `🏆 <@${match.winner_id}> wins` : "🤝 Tie";
+    }
     embed.addFields({
       name: "Result",
       value: `${result}\n<@${match.player_a_id}>: **${aScore.toLocaleString()}** vs <@${match.player_b_id}>: **${bScore.toLocaleString()}**`,
@@ -93,18 +116,22 @@ export function buildMatchFeedComponents(
 
   if (match.status === "waiting") {
     const acceptStyle =
-      match.mode === "staked_pvp" ? ButtonStyle.Primary : ButtonStyle.Success;
+      match.mode === "staked_pvp" ? ButtonStyle.Primary :
+      match.mode === "tipfight" ? ButtonStyle.Primary :
+      ButtonStyle.Success;
+    const acceptLabel =
+      match.mode === "staked_pvp"
+        ? `Accept (stake ${formatSats(match.stake_amount_sats ?? 0)})`
+        : match.mode === "tipfight"
+          ? `Take the challenge (free)`
+          : match.target_player_id
+            ? "Accept challenge"
+            : "Accept offer";
     rows.push(
       new ActionRowBuilder<ButtonBuilder>().addComponents(
         new ButtonBuilder()
           .setCustomId(cid("accept", match.id))
-          .setLabel(
-            match.mode === "staked_pvp"
-              ? `Accept (stake ${formatSats(match.stake_amount_sats ?? 0)})`
-              : match.target_player_id
-                ? "Accept challenge"
-                : "Accept offer"
-          )
+          .setLabel(acceptLabel)
           .setStyle(acceptStyle),
         new ButtonBuilder()
           .setCustomId(cid("cancel", match.id))
@@ -113,18 +140,40 @@ export function buildMatchFeedComponents(
       )
     );
   } else if (match.status === "active" || match.status === "submitted") {
-    rows.push(
-      new ActionRowBuilder<ButtonBuilder>().addComponents(
-        new ButtonBuilder()
-          .setCustomId(cid("play", match.id))
-          .setLabel("Open browser playfield")
-          .setStyle(ButtonStyle.Primary)
-      )
+    const playRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(cid("play", match.id))
+        .setLabel("Open browser playfield")
+        .setStyle(ButtonStyle.Primary)
     );
+    const watchUrl = buildWatchUrl(match.id);
+    if (watchUrl && match.mode !== "practice") {
+      playRow.addComponents(
+        new ButtonBuilder()
+          .setLabel("👁️ Watch live")
+          .setStyle(ButtonStyle.Link)
+          .setURL(watchUrl)
+      );
+    }
+    rows.push(playRow);
   }
 
   if (rows.length === 0) return undefined;
   return rows.map((r) => r.toJSON() as ActionRowJSON);
+}
+
+function buildWatchUrl(matchId: number): string | null {
+  const base = config.publicBaseUrl;
+  if (!base) return null;
+  try {
+    const u = new URL(`${base}/arcade/watch?match=${matchId}`);
+    if (u.protocol !== "https:") return null;
+    const host = u.hostname.toLowerCase();
+    if (host === "localhost" || host === "127.0.0.1" || host === "0.0.0.0") return null;
+    return u.toString();
+  } catch {
+    return null;
+  }
 }
 
 function humanStatus(match: ArcadeMatchRow): string {

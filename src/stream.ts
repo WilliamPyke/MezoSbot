@@ -17,8 +17,10 @@ import {
   type FrameMeta,
 } from "./emulator.js";
 import { config } from "./config.js";
-import { handleArcadeWebRequest } from "./arcade/web.js";
+import { handleArcadeWebRequest, ensureMatchRuntimeLoaded } from "./arcade/web.js";
 import { handleWalletWebRequest } from "./web/routes.js";
+import { addSpectator, buildSpectatorSnapshot } from "./arcade/spectate.js";
+import { getMatch } from "./arcade/db.js";
 
 const deflateAsync = promisify(deflate);
 
@@ -406,6 +408,46 @@ export async function startStream(): Promise<void> {
         console.error("[Stream] HTTP handler error:", (err as Error)?.message ?? err);
         sendJson(res, 500, { error: "internal_error" });
       });
+    });
+
+    // Spectator WebSocket server for live arcade match viewing.
+    const spectateWss = new WebSocketServer({
+      server: httpServer,
+      path: "/arcade/spectate",
+    });
+    spectateWss.on("connection", async (ws: WebSocket, req: IncomingMessage) => {
+      try {
+        const reqUrl = new URL(req.url ?? "", `http://${req.headers.host ?? "localhost"}`);
+        const matchIdRaw = reqUrl.searchParams.get("match");
+        const matchId = matchIdRaw ? parseInt(matchIdRaw, 10) : NaN;
+        if (!Number.isFinite(matchId) || matchId <= 0) {
+          ws.close(1008, "missing match id");
+          return;
+        }
+        const match = await getMatch(matchId);
+        if (!match) {
+          ws.close(1008, "match not found");
+          return;
+        }
+        if (match.mode === "practice") {
+          ws.close(1008, "practice not spectatable");
+          return;
+        }
+        if (match.status === "completed" || match.status === "cancelled") {
+          // Send the final snapshot once and close.
+          const snap = await buildSpectatorSnapshot(matchId);
+          if (snap) ws.send(JSON.stringify(snap));
+          ws.close(1000, "match completed");
+          return;
+        }
+        await ensureMatchRuntimeLoaded(matchId);
+        addSpectator(matchId, ws);
+        const snap = await buildSpectatorSnapshot(matchId);
+        if (snap) ws.send(JSON.stringify(snap));
+      } catch (err) {
+        console.error("[Spectate] connect error:", (err as Error)?.message ?? err);
+        try { ws.close(1011, "internal error"); } catch {}
+      }
     });
 
     if (config.gameboy.enabled) {

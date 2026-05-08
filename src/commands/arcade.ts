@@ -12,6 +12,7 @@ import { getBalance } from "../balance.js";
 import {
   createMatch,
   fundEscrowFromBalance,
+  getMatch,
   openOffers,
   setMatchMessage,
   topValidatedScores,
@@ -105,6 +106,48 @@ export const data = {
     },
     {
       type: 1 as const,
+      name: "tipfight",
+      description: "Fight for your tip — only you stake; opponent must beat your score to win it",
+      options: [
+        {
+          type: 10 as const,
+          name: "stake",
+          description: "Sats you stake (refunded if opponent doesn't beat you)",
+          required: true,
+          minValue: 1,
+        },
+        {
+          type: 6 as const,
+          name: "user",
+          description: "Optional: challenge a specific player (omit for open lobby)",
+          required: false,
+        },
+        {
+          type: 10 as const,
+          name: "minutes",
+          description: "Match length in minutes (1-5, default 3)",
+          required: false,
+          minValue: 1,
+          maxValue: MAX_ARCADE_DURATION_MINUTES,
+        },
+      ],
+    },
+    {
+      type: 1 as const,
+      name: "watch",
+      description: "Get a live spectator link for an active arcade match",
+      options: [
+        {
+          type: 4 as const,
+          name: "match-id",
+          description: "ID of the match to watch",
+          required: true,
+          minValue: 1,
+        },
+      ],
+    },
+    {
+      type: 1 as const,
       name: "offers",
       description: "Browse open Slice Arcade match offers",
     },
@@ -155,6 +198,10 @@ export async function execute(interaction: ChatInputCommandInteraction) {
       return runChallenge(interaction);
     case "offer":
       return runOffer(interaction);
+    case "tipfight":
+      return runTipfight(interaction);
+    case "watch":
+      return runWatch(interaction);
     case "offers":
       return runOffers(interaction);
     case "matchmake":
@@ -371,6 +418,111 @@ async function runOffer(interaction: ChatInputCommandInteraction) {
   }
 }
 
+async function runTipfight(interaction: ChatInputCommandInteraction) {
+  const stake = interaction.options.getNumber("stake", true);
+  const target = interaction.options.getUser("user");
+  const matchDurationSeconds = durationSeconds(interaction);
+
+  if (stake <= 0) {
+    return interaction.reply({ content: "❌ Stake must be greater than 0.", flags: MessageFlags.Ephemeral });
+  }
+  if (target) {
+    if (target.id === interaction.user.id) {
+      return interaction.reply({ content: "❌ You can't challenge yourself.", flags: MessageFlags.Ephemeral });
+    }
+    if (target.bot) {
+      return interaction.reply({ content: "❌ Bots can't play.", flags: MessageFlags.Ephemeral });
+    }
+  }
+
+  await interaction.deferReply();
+
+  const balance = await getBalance(interaction.user.id);
+  if (balance < stake) {
+    return interaction.editReply({
+      content: `❌ Insufficient balance. You need **${formatSats(stake)}** to post this tipfight.`,
+    });
+  }
+
+  const match = await createMatch({
+    mode: "tipfight",
+    createdById: interaction.user.id,
+    playerAId: interaction.user.id,
+    playerBId: null,
+    targetPlayerId: target?.id ?? null,
+    stakeAmountSats: stake,
+    rakeBps: DEFAULT_PLATFORM_RAKE_BPS,
+    channelId: interaction.channelId ?? undefined,
+    durationSeconds: matchDurationSeconds,
+  });
+
+  const fund = await fundEscrowFromBalance(match.id, interaction.user.id, stake);
+  if (!fund.ok) {
+    return interaction.editReply({ content: `❌ ${fund.error}` });
+  }
+
+  const content = target
+    ? `<@${target.id}> — **fight for the tip!** <@${interaction.user.id}> staked **${formatSats(stake)}**. Beat their score to win it; they get refunded if you don't. Time limit: **${formatDuration(matchDurationSeconds)}**.`
+    : `**Fight for the tip posted!** <@${interaction.user.id}> staked **${formatSats(stake)}** — first player to accept and beat their score wins it. Refunded otherwise. Time limit: **${formatDuration(matchDurationSeconds)}**.`;
+
+  const reply = await interaction.editReply({
+    content,
+    embeds: [buildMatchFeedEmbed(match)],
+    components: buildMatchFeedComponents(match),
+    allowedMentions: target ? { users: [target.id] } : undefined,
+  });
+
+  const channelId = interaction.channelId ?? "";
+  const messageId = (reply as { id?: string }).id ?? "";
+  if (channelId && messageId) {
+    await setMatchMessage(match.id, channelId, messageId);
+  }
+}
+
+export function buildWatchUrl(matchId: number): string {
+  const base = config.publicBaseUrl;
+  return `${base}/arcade/watch?match=${matchId}`;
+}
+
+async function runWatch(interaction: ChatInputCommandInteraction) {
+  const matchId = interaction.options.getInteger("match-id", true);
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  const match = await getMatch(matchId);
+  if (!match) {
+    return interaction.editReply({ content: `❌ Match #${matchId} not found.` });
+  }
+  if (match.mode === "practice") {
+    return interaction.editReply({ content: "❌ Practice matches can't be spectated." });
+  }
+  if (match.status === "waiting") {
+    return interaction.editReply({ content: "⏳ That match hasn't started yet — wait for both players to be in." });
+  }
+  if (match.status === "cancelled") {
+    return interaction.editReply({ content: "❌ That match was cancelled." });
+  }
+
+  const url = buildWatchUrl(matchId);
+  const aId = match.player_a_id;
+  const bId = match.player_b_id ?? "?";
+  const aScore = match.player_a_score ?? 0;
+  const bScore = match.player_b_score ?? 0;
+  const summary = match.status === "completed"
+    ? `Match #${matchId} (final): <@${aId}> ${aScore} vs <@${bId}> ${bScore}`
+    : `Match #${matchId} live: <@${aId}> ${aScore} vs <@${bId}> ${bScore}`;
+
+  if (isPublicHttpsUrl(url)) {
+    await interaction.editReply({
+      content: `${summary}\n\nWatch live in your browser:`,
+      components: [playLinkRow(url, `Watch match #${matchId}`)],
+    });
+  } else {
+    await interaction.editReply({
+      content: `${describeBadUrl()}\n\n${summary}\nLink (testing only): <${url}>`,
+    });
+  }
+}
+
 async function runOffers(interaction: ChatInputCommandInteraction) {
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   const offers = (await openOffers(10))
@@ -386,9 +538,11 @@ async function runOffers(interaction: ChatInputCommandInteraction) {
 
   const lines = offers.map((offer, i) => {
     const stake =
-      offer.mode === "staked_pvp" && offer.stake_amount_sats != null
-        ? formatSats(offer.stake_amount_sats)
-        : "Free";
+      offer.mode === "tipfight" && offer.stake_amount_sats != null
+        ? `💰 Tipfight ${formatSats(offer.stake_amount_sats)}`
+        : offer.mode === "staked_pvp" && offer.stake_amount_sats != null
+          ? formatSats(offer.stake_amount_sats)
+          : "Free";
     return `**${i + 1}. Match #${offer.id}** — ${stake} • ${formatDuration(offer.duration_seconds ?? 180)} • by <@${offer.player_a_id}>`;
   });
   const embed = new EmbedBuilder()
