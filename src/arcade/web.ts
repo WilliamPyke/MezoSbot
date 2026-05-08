@@ -1630,7 +1630,7 @@ export function renderArcadePlayPage(options: {
   function rematchPath(suffix) {
     // movePath is either /arcade/api/move or /api/web/play/<id>/move.
     // Replace the trailing /move with /rematch (or /rematch/cancel).
-    const base = CONFIG.movePath.replace(/\/move$/, '');
+    const base = CONFIG.movePath.replace(/\\/move$/, '');
     return base + '/rematch' + (suffix ? suffix : '');
   }
 
