@@ -9,8 +9,11 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { URL } from "node:url";
 import {
+  cancelRematch,
   getMatch,
+  getSeriesScore,
   recordSubmission,
+  requestRematch,
   trySettleMatch,
   type ArcadeMatchRow,
 } from "./db.js";
@@ -21,16 +24,16 @@ import {
   getRuntime,
   rebuildState,
 } from "./runtime.js";
+import { pieceForSlot } from "./match.js";
 import { rotateCells } from "./pieces.js";
 import {
   BOARD_SIZE,
-  MAX_LEVELS,
   PIECES_PER_LEVEL,
   type Move,
   type PieceCell,
   type PlayerState,
 } from "./types.js";
-import { verifyMatchToken } from "./tokens.js";
+import { issueMatchToken, verifyMatchToken } from "./tokens.js";
 import { onMatchSettled } from "./notify.js";
 import { supabase } from "../db.js";
 import { formatSats } from "../format.js";
@@ -70,14 +73,26 @@ export async function handleArcadeWebRequest(
   }
   if (method === "POST" && path === "/arcade/api/move") {
     await respondWithBody(req, res, async (claim, body) => {
-      const move: Move = {
-        level: numField(body, "level"),
-        pieceIndex: numField(body, "pieceIndex"),
-        rotation: (numField(body, "rotation") % 4) as 0 | 1 | 2 | 3,
-        row: numField(body, "row"),
-        col: numField(body, "col"),
-      };
+      const kind = typeof body.kind === "string" ? body.kind : "place";
+      const move: Move =
+        kind === "bank"
+          ? {
+              kind: "bank",
+              level: numField(body, "level"),
+              pieceIndex: numField(body, "pieceIndex"),
+            }
+          : {
+              level: numField(body, "level"),
+              pieceIndex: numField(body, "pieceIndex"),
+              rotation: (numField(body, "rotation") % 4) as 0 | 1 | 2 | 3,
+              row: numField(body, "row"),
+              col: numField(body, "col"),
+            };
       await ensureMatchRuntimeLoaded(claim.matchId);
+      const current = await getMatch(claim.matchId);
+      if (current && current.status === "waiting") {
+        return { status: 409, body: { error: "Waiting for opponent" } };
+      }
       const expired = await settleExpiredMatchIfNeeded(claim.matchId);
       if (expired && expired.status !== "active" && expired.status !== "submitted") {
         return { status: 200, body: await buildStateResponse(claim.matchId, claim.userId) };
@@ -93,9 +108,40 @@ export async function handleArcadeWebRequest(
     });
     return true;
   }
+  if (method === "POST" && path === "/arcade/api/rematch") {
+    await respondWithBody(req, res, async (claim) => {
+      const result = await requestRematch(claim.matchId, claim.userId);
+      if (result.status === "error") {
+        return { status: 400, body: { error: result.error } };
+      }
+      const body: Record<string, unknown> = {
+        status: result.status,
+        match: { id: claim.matchId },
+      };
+      if (result.status === "created") {
+        body.nextMatchId = result.nextMatchId;
+        body.nextToken = issueMatchToken(result.nextMatchId, claim.userId);
+        body.redirect = `/arcade/play?t=${encodeURIComponent(body.nextToken as string)}`;
+      }
+      return { status: 200, body };
+    });
+    return true;
+  }
+  if (method === "POST" && path === "/arcade/api/rematch/cancel") {
+    await respondWithBody(req, res, async (claim) => {
+      const result = await cancelRematch(claim.matchId, claim.userId);
+      if (!result.ok) return { status: 400, body: { error: result.error ?? "Cancel failed" } };
+      return { status: 200, body: { ok: true } };
+    });
+    return true;
+  }
   if (method === "POST" && path === "/arcade/api/submit") {
     await respondWithBody(req, res, async (claim) => {
       await ensureMatchRuntimeLoaded(claim.matchId);
+      const current = await getMatch(claim.matchId);
+      if (current && current.status === "waiting") {
+        return { status: 409, body: { error: "Waiting for opponent" } };
+      }
       const expired = await settleExpiredMatchIfNeeded(claim.matchId);
       if (expired && expired.status !== "active" && expired.status !== "submitted") {
         return { status: 200, body: await buildStateResponse(claim.matchId, claim.userId) };
@@ -153,11 +199,12 @@ type StateResponse = {
     multiplier: number;
     level: number;
     levelDisplay: number;
-    maxLevels: number;
+    maxLevels: number | null;
     phase: "playing" | "finished";
     endReason?: string;
     submitted: boolean;
-    pieces: Array<{ cells: PieceCell[]; placed: boolean }>;
+    pieces: Array<{ cells: PieceCell[] | null; placed: boolean }>;
+    bank: { cells: PieceCell[] } | null;
     board: number[][];
   };
   opponent: {
@@ -175,6 +222,12 @@ type StateResponse = {
     payoutFormatted: string | null;
     settlementTxHash?: string | null;
     settlementExplorerUrl?: string | null;
+    rematchRequestedBySelf: boolean;
+    rematchRequestedByOpponent: boolean;
+    nextMatchId: number | null;
+    nextSessionId: string | null;
+    redirect: string | null;
+    series: { youWins: number; opponentWins: number; ties: number; total: number };
   };
   boardSize: number;
 };
@@ -199,11 +252,12 @@ async function buildStateResponse(
   const state = runtime.players.get(userId);
   if (!state) return { error: "Player state not found" };
 
-  const levelIdx = Math.min(state.level, MAX_LEVELS - 1);
-  const pieces = runtime.sequence[levelIdx].map((p, i) => ({
-    cells: p.cells,
-    placed: state.placedThisLevel[i],
-  }));
+  const pieces: Array<{ cells: PieceCell[] | null; placed: boolean }> = [];
+  for (let i = 0; i < PIECES_PER_LEVEL; i++) {
+    const slot = pieceForSlot(state, runtime.sequence, state.level, i);
+    pieces.push({ cells: slot ? slot.cells : null, placed: state.placedThisLevel[i] });
+  }
+  const bank = state.bank ? { cells: state.bank.cells } : null;
 
   const opponentId =
     match.mode === "practice"
@@ -233,6 +287,28 @@ async function buildStateResponse(
   const isTie = completed && match.winner_id == null;
   const isWinner = completed ? match.winner_id === userId : null;
 
+  const isPlayerA = match.player_a_id === userId;
+  const rematchSelf = isPlayerA ? match.rematch_requested_by_a : match.rematch_requested_by_b;
+  const rematchOpp = match.mode === "practice"
+    ? false
+    : isPlayerA
+      ? match.rematch_requested_by_b
+      : match.rematch_requested_by_a;
+  const series = (await getSeriesScore(matchId, userId)) ?? {
+    rootId: matchId,
+    totalCompleted: 0,
+    youWins: 0,
+    opponentWins: 0,
+    ties: 0,
+  };
+  let redirect: string | null = null;
+  if (match.next_match_id) {
+    const nextToken = issueMatchToken(match.next_match_id, userId);
+    redirect = `/arcade/play?t=${encodeURIComponent(nextToken)}`;
+  } else if (match.next_session_id) {
+    redirect = `/session/${match.next_session_id}`;
+  }
+
   return {
     boardSize: BOARD_SIZE,
     match: {
@@ -256,12 +332,13 @@ async function buildStateResponse(
       score: state.score,
       multiplier: state.multiplier,
       level: state.level,
-      levelDisplay: Math.min(state.level + 1, MAX_LEVELS),
-      maxLevels: MAX_LEVELS,
+      levelDisplay: state.level + 1,
+      maxLevels: null,
       phase: state.phase,
       endReason: state.endReason,
       submitted: submittedSelf,
       pieces,
+      bank,
       board: state.board,
     },
     opponent:
@@ -283,6 +360,17 @@ async function buildStateResponse(
         completed && isWinner && match.winner_payout_sats != null
           ? formatSats(match.winner_payout_sats)
           : null,
+      rematchRequestedBySelf: !!rematchSelf,
+      rematchRequestedByOpponent: !!rematchOpp,
+      nextMatchId: match.next_match_id,
+      nextSessionId: match.next_session_id,
+      redirect,
+      series: {
+        youWins: series.youWins,
+        opponentWins: series.opponentWins,
+        ties: series.ties,
+        total: series.totalCompleted,
+      },
     },
   };
 }
@@ -560,9 +648,9 @@ export function renderArcadePlayPage(options: {
   /* Particle canvas overlay */
   #fx { position: fixed; inset: 0; pointer-events: none; z-index: 50; }
 
-  .wrap { position: relative; z-index: 2; max-width: 720px; margin: 0 auto; padding: 18px 14px 80px; }
+  .wrap { position: relative; z-index: 2; max-width: min(960px, 96vw); margin: 0 auto; padding: clamp(14px, 2vw, 32px) clamp(12px, 2.5vw, 36px) 80px; }
   .topbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 14px; }
-  .title { font-family: "Orbitron", "Space Grotesk", sans-serif; font-weight: 900; font-size: 24px; letter-spacing: .14em; background: linear-gradient(90deg, #4ff7ff, #1ee881 35%, #ffd86b 65%, #ff5fa3); background-size: 200% 100%; -webkit-background-clip: text; background-clip: text; color: transparent; text-shadow: 0 0 30px rgba(79,247,255,.25); animation: titleGradient 6s linear infinite; }
+  .title { font-family: "Orbitron", "Space Grotesk", sans-serif; font-weight: 900; font-size: clamp(20px, 2.6vw, 32px); letter-spacing: .14em; background: linear-gradient(90deg, #4ff7ff, #1ee881 35%, #ffd86b 65%, #ff5fa3); background-size: 200% 100%; -webkit-background-clip: text; background-clip: text; color: transparent; text-shadow: 0 0 30px rgba(79,247,255,.25); animation: titleGradient 6s linear infinite; }
   @keyframes titleGradient { from { background-position: 0% 0; } to { background-position: 200% 0; } }
   .badge { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; border: 1px solid var(--line); border-radius: 999px; background: rgba(20,26,40,.55); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); color: var(--muted); font-size: 12px; font-weight: 600; }
   .badge.live { color: var(--neon-2); border-color: rgba(30,232,129,.45); background: rgba(30,232,129,.1); animation: liveBlink 1.6s ease-in-out infinite; }
@@ -577,7 +665,7 @@ export function renderArcadePlayPage(options: {
   .stat { background: linear-gradient(135deg, rgba(20,26,40,.6), rgba(13,18,30,.6)); border: 1px solid var(--line); border-radius: 16px; padding: 10px 12px; backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); position: relative; overflow: hidden; }
   .stat::before { content: ""; position: absolute; inset: 0; background: linear-gradient(180deg, rgba(255,255,255,.06), transparent 50%); pointer-events: none; }
   .stat .label { font-family: "Orbitron", "Space Grotesk", sans-serif; color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .18em; font-weight: 700; }
-  .stat .value { font-family: "Orbitron", "Space Grotesk", sans-serif; font-weight: 800; font-size: 22px; margin-top: 2px; font-variant-numeric: tabular-nums; letter-spacing: .02em; transition: color .25s, text-shadow .25s; position: relative; }
+  .stat .value { font-family: "Orbitron", "Space Grotesk", sans-serif; font-weight: 800; font-size: clamp(18px, 2.2vw, 26px); margin-top: 2px; font-variant-numeric: tabular-nums; letter-spacing: .02em; transition: color .25s, text-shadow .25s; position: relative; }
   .stat.bump .value { animation: bump .45s cubic-bezier(.34,1.56,.64,1); }
   @keyframes bump { 0% { transform: scale(1); } 40% { transform: scale(1.45); } 100% { transform: scale(1); } }
   .stat.glow .value { text-shadow: 0 0 18px currentColor, 0 0 32px currentColor; }
@@ -614,8 +702,21 @@ export function renderArcadePlayPage(options: {
   @keyframes ghostShake { 0%,100% { transform: translateX(0); } 25% { transform: translateX(-1.5px); } 75% { transform: translateX(1.5px); } }
   .cell.keyboard-cursor { outline: 2px solid var(--neon); outline-offset: -2px; box-shadow: 0 0 0 3px rgba(0,255,157,.3); }
 
-  /* Pieces */
-  .pieces { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 14px; }
+  /* Pieces + bank */
+  .pieces-row { display: grid; grid-template-columns: 1fr minmax(120px, 0.5fr); gap: 10px; margin-top: 14px; align-items: stretch; }
+  @media (max-width: 600px) { .pieces-row { grid-template-columns: 1fr; } }
+  .pieces { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+  .bank { background: linear-gradient(135deg, rgba(255,216,107,.08), rgba(160,107,255,.08)); border: 1px solid rgba(255,216,107,.3); border-radius: 16px; padding: 12px; min-height: 120px; display: flex; flex-direction: column; gap: 8px; backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); position: relative; overflow: hidden; }
+  .bank.empty { opacity: .55; border-style: dashed; }
+  .bank.active { border-color: var(--gold); box-shadow: 0 0 0 2px rgba(255,216,107,.3), 0 12px 30px -10px rgba(255,216,107,.45); }
+  .bank .ptitle { font-size: 11px; color: var(--gold); text-transform: uppercase; letter-spacing: .1em; font-weight: 700; display: flex; justify-content: space-between; align-items: center; }
+  .bank .ptitle kbd { background: rgba(20,26,40,.7); border: 1px solid var(--line-strong); border-radius: 6px; padding: 2px 6px; font-size: 10px; }
+  .bank .pgrid { display: grid; gap: 3px; }
+  .bank .pcell { background: rgba(255,255,255,.04); border-radius: 4px; aspect-ratio: 1 / 1; }
+  .bank .pcell.kn { background: linear-gradient(135deg, #5a99ff, #2a55c6); box-shadow: inset 0 -2px 0 rgba(0,0,0,.3), inset 0 1px 0 rgba(255,255,255,.25); }
+  .bank .pcell.km { background: linear-gradient(135deg, #ffc274, #ff5a1a); box-shadow: inset 0 -2px 0 rgba(0,0,0,.3), inset 0 1px 0 rgba(255,255,255,.35); animation: multShimmer 2.4s linear infinite; }
+  .bank .empty-msg { color: var(--muted); font-size: 12px; align-self: center; text-align: center; flex: 1; display: flex; align-items: center; justify-content: center; }
+  .piece.empty-slot { opacity: .35; cursor: not-allowed; pointer-events: none; }
   .piece { background: linear-gradient(135deg, rgba(20,26,40,.65), rgba(13,18,30,.65)); border: 1px solid var(--line); border-radius: 16px; padding: 12px; cursor: pointer; transition: transform .18s, border-color .18s, box-shadow .25s; min-height: 120px; display: flex; flex-direction: column; gap: 8px; position: relative; overflow: hidden; backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); }
   .piece::before { content: ""; position: absolute; inset: -50%; background: conic-gradient(from 0deg, transparent 0%, rgba(0,255,157,.45), transparent 30%); opacity: 0; transition: opacity .25s; pointer-events: none; }
   .piece:hover { transform: translateY(-3px); border-color: rgba(255,255,255,.18); box-shadow: 0 12px 30px -10px rgba(0,0,0,.6); }
@@ -691,6 +792,28 @@ export function renderArcadePlayPage(options: {
     .banner .text { font-size: 44px; }
     .title { font-size: 18px; }
   }
+
+  /* Waiting overlay */
+  .waitOverlay { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; background: rgba(6,8,15,.78); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); z-index: 90; padding: 24px; }
+  .waitOverlay.show { display: flex; }
+  .waitCard { background: linear-gradient(135deg, rgba(20,26,40,.92), rgba(13,18,30,.92)); border: 1px solid var(--line-strong); border-radius: 20px; padding: 28px 32px; text-align: center; max-width: 420px; box-shadow: 0 30px 80px -20px rgba(0,0,0,.7); }
+  .waitCard h2 { margin: 0 0 8px; font-family: "Orbitron", sans-serif; font-size: 22px; letter-spacing: .12em; color: var(--neon-2); }
+  .waitCard p { margin: 6px 0; color: var(--muted); font-size: 14px; line-height: 1.5; }
+  .waitCard .pulse-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: var(--neon); margin-right: 8px; box-shadow: 0 0 14px var(--neon); animation: liveBlink 1.4s ease-in-out infinite; }
+
+  /* Series chip */
+  .series-chip { display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px; border: 1px solid rgba(255,216,107,.4); border-radius: 999px; background: linear-gradient(135deg, rgba(255,216,107,.12), rgba(255,95,163,.12)); color: var(--gold); font-family: "Orbitron", sans-serif; font-weight: 800; font-size: 12px; letter-spacing: .1em; backdrop-filter: blur(6px); }
+
+  /* Rematch panel inside endBox */
+  .rematch { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 10px; }
+  .rematch .status { font-size: 13px; color: var(--muted); }
+  .rematch .status.live { color: var(--neon-2); }
+  .rematch .actions { display: flex; gap: 10px; flex-wrap: wrap; }
+
+  @media (min-width: 1100px) {
+    .wrap { max-width: 1200px; }
+    .stats { grid-template-columns: repeat(4, 1fr); }
+  }
 </style>
 </head>
 <body>
@@ -709,6 +832,7 @@ export function renderArcadePlayPage(options: {
       <div id="modeLabel" class="badge" style="margin-top:6px;">Loading…</div>
     </div>
     <div class="topRight">
+      <div id="seriesChip" class="series-chip" style="display:none;"></div>
       <button id="muteBtn" class="iconBtn" type="button" title="Toggle sound" aria-label="Toggle sound">🔊</button>
       <div id="liveBadge" class="badge live" style="display:none;">● Live</div>
     </div>
@@ -727,7 +851,13 @@ export function renderArcadePlayPage(options: {
     <div id="board" class="board" aria-label="Game board"></div>
   </div>
 
-  <div id="pieces" class="pieces"></div>
+  <div class="pieces-row">
+    <div id="pieces" class="pieces"></div>
+    <div id="bank" class="bank empty">
+      <div class="ptitle"><span>Bank</span><kbd>E</kbd></div>
+      <div class="empty-msg">Press E with a piece selected to hold it for later.</div>
+    </div>
+  </div>
 
   <div class="controls">
     <button id="rotateBtn" class="btn">↻ Rotate</button>
@@ -749,6 +879,7 @@ export function renderArcadePlayPage(options: {
       <div class="shortcut"><span>Move piece</span><span class="keys"><kbd>↑</kbd><kbd>↓</kbd><kbd>←</kbd><kbd>→</kbd></span></div>
       <div class="shortcut"><span>Place piece</span><span class="keys"><kbd>Space</kbd><kbd>Enter</kbd></span></div>
       <div class="shortcut"><span>Rotate</span><span class="keys"><kbd>R</kbd></span></div>
+      <div class="shortcut"><span>Hold piece</span><span class="keys"><kbd>E</kbd></span></div>
       <div class="shortcut"><span>Clear selection</span><span class="keys"><kbd>C</kbd><kbd>Esc</kbd></span></div>
     </div>
   </div>
@@ -765,6 +896,13 @@ export function renderArcadePlayPage(options: {
 <div id="popups" class="popups"></div>
 <div id="banner" class="banner"></div>
 <div id="toast" class="toast"></div>
+<div id="waitOverlay" class="waitOverlay">
+  <div class="waitCard">
+    <h2><span class="pulse-dot"></span>Waiting for opponent</h2>
+    <p>The match starts as soon as both players are in.</p>
+    <p>Your timer will not start counting down until then.</p>
+  </div>
+</div>
 
 <script>
 (() => {
@@ -804,6 +942,9 @@ export function renderArcadePlayPage(options: {
   const $fx = document.getElementById('fx');
   const fxCtx = $fx.getContext('2d');
   const $mute = document.getElementById('muteBtn');
+  const $bank = document.getElementById('bank');
+  const $waitOverlay = document.getElementById('waitOverlay');
+  const $seriesChip = document.getElementById('seriesChip');
 
   /* ---- Sound engine (Web Audio synth) ---- */
   const Sound = {
@@ -1148,6 +1289,7 @@ export function renderArcadePlayPage(options: {
   $rotate.addEventListener('click', rotateSelected);
   function rotateSelected() {
     if (!state || state.result.completed || state.self.phase === 'finished' || isTimeExpired()) return;
+    if (isWaitingForOpponent()) return;
     selected.rotation = (selected.rotation + 1) % 4;
     Sound.rotate();
     render();
@@ -1172,9 +1314,13 @@ export function renderArcadePlayPage(options: {
   window.addEventListener('keydown', (event) => {
     if (event.ctrlKey || event.metaKey || event.altKey || event.repeat) return;
     const key = event.key.toLowerCase();
+    if (isWaitingForOpponent()) return;
     if (key === 'r') {
       event.preventDefault();
       rotateSelected();
+    } else if (key === 'e') {
+      event.preventDefault();
+      bankSelected();
     } else if (key === 'tab') {
       event.preventDefault();
       cyclePiece(event.shiftKey ? -1 : 1);
@@ -1213,6 +1359,67 @@ export function renderArcadePlayPage(options: {
       else placeAtCursor();
     }
   });
+
+  function isWaitingForOpponent() {
+    return !!(state && state.match && state.match.status === 'waiting');
+  }
+
+  function formatMultiplier(m) {
+    if (typeof m !== 'number' || !isFinite(m)) return '1';
+    return m % 1 === 0 ? String(Math.round(m)) : m.toFixed(1);
+  }
+
+  function formatLevel(state) {
+    if (!state || !state.self) return '1';
+    const display = state.self.levelDisplay || (state.self.level + 1);
+    if (state.self.maxLevels) return display + '/' + state.self.maxLevels;
+    return 'Lv ' + display;
+  }
+
+  async function bankSelected() {
+    if (!state || state.result.completed || state.self.phase === 'finished' || isTimeExpired()) return;
+    if (isWaitingForOpponent()) return;
+    if (selected.pieceIndex == null) {
+      showToast('Select a piece first');
+      return;
+    }
+    const move = { kind: 'bank', level: state.self.level, pieceIndex: selected.pieceIndex };
+    const next = await api('POST', CONFIG.movePath, move);
+    if (!next) return;
+    const beforeServer = state;
+    state = next;
+    onStateUpdate(beforeServer, null);
+    // After a bank, prefer the slot we banked into (bank had something) or the
+    // first remaining playable piece (bank was empty).
+    const idx = state.self.pieces.findIndex((p) => p && p.cells && !p.placed);
+    selected.pieceIndex = idx >= 0 ? idx : null;
+    selected.rotation = 0;
+    Sound.select();
+    render();
+  }
+
+  function rematchPath(suffix) {
+    // movePath is either /arcade/api/move or /api/web/play/<id>/move.
+    // Replace the trailing /move with /rematch (or /rematch/cancel).
+    const base = CONFIG.movePath.replace(/\/move$/, '');
+    return base + '/rematch' + (suffix ? suffix : '');
+  }
+
+  async function requestRematch() {
+    const next = await api('POST', rematchPath(''), {});
+    if (!next) return;
+    if (next.redirect) {
+      window.location.href = next.redirect;
+      return;
+    }
+    refresh();
+  }
+
+  async function cancelRematchRequest() {
+    const next = await api('POST', rematchPath('/cancel'), {});
+    if (!next) return;
+    refresh();
+  }
 
   function setInfoTab(name) {
     const shortcuts = name === 'shortcuts';
@@ -1395,6 +1602,7 @@ export function renderArcadePlayPage(options: {
     if (movePending) return;
     if (state.result.completed) return;
     if (state.self.phase === 'finished') return;
+    if (isWaitingForOpponent()) return;
     if (isTimeExpired()) {
       showToast('Time is up');
       await refresh();
@@ -1571,6 +1779,15 @@ export function renderArcadePlayPage(options: {
     if ((!prev.result || !prev.result.completed) && state.result && state.result.completed) {
       onMatchComplete();
     }
+
+    /* Auto-redirect to rematch as soon as both sides have accepted */
+    if (state.result && state.result.redirect) {
+      const prevRedirect = prev.result && prev.result.redirect;
+      if (!prevRedirect) {
+        // Slight delay so the user sees the "Both accepted" status
+        setTimeout(() => { window.location.href = state.result.redirect; }, 600);
+      }
+    }
   }
 
   function triggerLineClear(cells) {
@@ -1668,11 +1885,17 @@ export function renderArcadePlayPage(options: {
     const pieces = state ? state.self.pieces : [];
     pieces.forEach((p, i) => {
       const card = document.createElement('div');
-      card.className = 'piece' + (selected.pieceIndex === i ? ' selected' : '') + (p.placed ? ' placed' : '');
+      const isEmpty = !p.cells;
+      card.className = 'piece' + (selected.pieceIndex === i ? ' selected' : '') + (p.placed ? ' placed' : '') + (isEmpty ? ' empty-slot' : '');
       const title = document.createElement('div');
       title.className = 'ptitle';
-      title.textContent = 'Piece ' + (i + 1) + (p.placed ? ' • placed' : '');
+      title.textContent = 'Piece ' + (i + 1) + (p.placed ? ' • placed' : isEmpty ? ' • banked' : '');
       card.appendChild(title);
+
+      if (isEmpty) {
+        $pieces.appendChild(card);
+        return;
+      }
 
       const previewCells = selected.pieceIndex === i ? rotateCells(p.cells, selected.rotation) : p.cells;
       const w = Math.max.apply(null, previewCells.map(c => c.x)) + 1;
@@ -1695,7 +1918,8 @@ export function renderArcadePlayPage(options: {
       }
       card.appendChild(grid);
       card.addEventListener('click', () => {
-        if (p.placed || state.result.completed || isTimeExpired() || state.self.phase === 'finished') return;
+        if (p.placed || state.result.completed || isTimeExpired() || state.self.phase === 'finished' || isWaitingForOpponent()) return;
+        if (!p.cells) return;
         selected.pieceIndex = i;
         selected.rotation = 0;
         Sound.select();
@@ -1709,13 +1933,31 @@ export function renderArcadePlayPage(options: {
     if (!state) return;
     if (state.match.serverNow) serverOffsetMs = Date.parse(state.match.serverNow) - Date.now();
     $score.textContent = state.self.score.toLocaleString();
-    $mult.textContent = state.self.multiplier + '×';
-    $level.textContent = state.self.levelDisplay + '/' + state.self.maxLevels;
+    $mult.textContent = formatMultiplier(state.self.multiplier) + '×';
+    $level.textContent = formatLevel(state);
     paintTimer();
+
+    // Series chip (rematch chain win counter)
+    const series = state.result && state.result.series;
+    if ($seriesChip) {
+      if (series && series.total > 0) {
+        $seriesChip.style.display = '';
+        $seriesChip.textContent = 'You ' + series.youWins + ' — Opp ' + series.opponentWins +
+          (series.ties > 0 ? ' • ' + series.ties + ' tie' + (series.ties === 1 ? '' : 's') : '');
+      } else {
+        $seriesChip.style.display = 'none';
+      }
+    }
+
+    // Waiting-for-opponent overlay
+    if ($waitOverlay) {
+      $waitOverlay.classList.toggle('show', isWaitingForOpponent());
+    }
 
     const m = state.match;
     let label;
-    if (m.mode === 'practice') label = 'Practice • Match #' + m.id;
+    if (isWaitingForOpponent()) label = 'Waiting for opponent';
+    else if (m.mode === 'practice') label = 'Practice • Match #' + m.id;
     else if (m.mode === 'free_pvp') label = 'Free PvP • Match #' + m.id;
     else label = 'Stake ' + (m.stakeFormatted || '?') + ' • Match #' + m.id;
     $mode.textContent = label;
@@ -1791,15 +2033,97 @@ export function renderArcadePlayPage(options: {
           '</a></div>';
       }
       html += '<div class="row" style="margin-top:6px;">' + CONFIG.doneMessage + '</div>';
+      html += rematchPanelHtml(state);
       $end.innerHTML = html;
+      attachRematchHandlers();
     } else {
       $end.style.display = 'none';
     }
   }
 
+  function rematchPanelHtml(s) {
+    const r = s.result || {};
+    if (r.redirect) {
+      return '<div class="rematch"><div class="status live">Rematch ready — heading there now…</div></div>';
+    }
+    const self = !!r.rematchRequestedBySelf;
+    const opp = !!r.rematchRequestedByOpponent;
+    const isPractice = s.match && s.match.mode === 'practice';
+    let body = '<div class="rematch">';
+    if (isPractice) {
+      body += '<div class="actions"><button class="btn primary" data-rematch="request">Play again</button></div>';
+    } else if (self && !opp) {
+      body += '<div class="status live">Waiting for opponent to accept rematch…</div>';
+      body += '<div class="actions"><button class="btn" data-rematch="cancel">Cancel rematch</button></div>';
+    } else if (opp && !self) {
+      body += '<div class="status live">Opponent wants a rematch.</div>';
+      body += '<div class="actions"><button class="btn primary" data-rematch="request">Accept rematch</button></div>';
+    } else if (self && opp) {
+      body += '<div class="status live">Both players accepted — preparing match…</div>';
+    } else {
+      body += '<div class="actions"><button class="btn primary" data-rematch="request">Request rematch</button></div>';
+    }
+    body += '</div>';
+    return body;
+  }
+
+  function attachRematchHandlers() {
+    const buttons = $end.querySelectorAll('[data-rematch]');
+    buttons.forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const action = btn.getAttribute('data-rematch');
+        btn.disabled = true;
+        if (action === 'request') requestRematch().finally(() => { btn.disabled = false; });
+        else if (action === 'cancel') cancelRematchRequest().finally(() => { btn.disabled = false; });
+      });
+    });
+  }
+
+  function paintBank() {
+    if (!$bank) return;
+    const bank = state && state.self ? state.self.bank : null;
+    $bank.innerHTML = '';
+    const title = document.createElement('div');
+    title.className = 'ptitle';
+    title.innerHTML = '<span>Bank</span><kbd>E</kbd>';
+    $bank.appendChild(title);
+    if (!bank || !bank.cells) {
+      $bank.classList.add('empty');
+      $bank.classList.remove('active');
+      const msg = document.createElement('div');
+      msg.className = 'empty-msg';
+      msg.textContent = 'Press E with a piece selected to hold it for later.';
+      $bank.appendChild(msg);
+      return;
+    }
+    $bank.classList.remove('empty');
+    $bank.classList.add('active');
+    const cells = bank.cells;
+    const w = Math.max.apply(null, cells.map(c => c.x)) + 1;
+    const h = Math.max.apply(null, cells.map(c => c.y)) + 1;
+    const grid = document.createElement('div');
+    grid.className = 'pgrid';
+    grid.style.gridTemplateColumns = 'repeat(' + w + ', 1fr)';
+    grid.style.width = Math.min(140, 26 * w) + 'px';
+    const filled = new Map();
+    for (const cell of cells) filled.set(cell.y * w + cell.x, cell.kind);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const dot = document.createElement('div');
+        dot.className = 'pcell';
+        const kind = filled.get(y * w + x);
+        if (kind === 'normal') dot.classList.add('kn');
+        else if (kind === 'multiplier') dot.classList.add('km');
+        grid.appendChild(dot);
+      }
+    }
+    $bank.appendChild(grid);
+  }
+
   function render() {
     paintHud();
     paintPieces();
+    paintBank();
     paintBoard();
   }
 
@@ -1821,9 +2145,13 @@ export function renderArcadePlayPage(options: {
   setInterval(paintTimer, 500);
   setInterval(() => {
     if (!state) return;
-    if (state.result.completed) return;
+    // Poll continuously while waiting (so we catch the opponent joining), and
+    // after match completion (so we catch rematch state changes from the
+    // opponent), and during play if the opponent has submitted.
+    if (isWaitingForOpponent()) { refresh(); return; }
+    if (state.result.completed) { refresh(); return; }
     if (state.self.submitted || state.opponent) refresh();
-  }, 2500);
+  }, 2000);
 })();
 </script>
 </body>

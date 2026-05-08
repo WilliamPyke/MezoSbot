@@ -91,10 +91,11 @@ export type GameState = {
     multiplier: number;
     level: number;
     levelDisplay: number;
-    maxLevels: number;
+    maxLevels: number | null;
     phase: "playing" | "finished";
     submitted: boolean;
-    pieces: Array<{ cells: Array<{ x: number; y: number; kind: "normal" | "multiplier" }>; placed: boolean }>;
+    pieces: Array<{ cells: Array<{ x: number; y: number; kind: "normal" | "multiplier" }> | null; placed: boolean }>;
+    bank: { cells: Array<{ x: number; y: number; kind: "normal" | "multiplier" }> } | null;
     board: number[][];
   };
   opponent: null | { address: string | null; submitted: boolean; score: number | null };

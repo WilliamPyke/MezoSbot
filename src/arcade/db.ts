@@ -44,6 +44,12 @@ export type ArcadeMatchRow = {
   started_at: string | null;
   created_at: string;
   completed_at: string | null;
+  rematch_of_match_id: number | null;
+  series_root_id: number | null;
+  rematch_requested_by_a: boolean;
+  rematch_requested_by_b: boolean;
+  next_match_id: number | null;
+  next_session_id: string | null;
 };
 
 export type CreateMatchInput = {
@@ -56,6 +62,9 @@ export type CreateMatchInput = {
   channelId?: string;
   rakeBps?: number;
   durationSeconds?: number;
+  rematchOfMatchId?: number;
+  /** Force initial status (used by Discord-staked rematch which funds-on-accept). */
+  initialStatus?: MatchStatus;
 };
 
 export async function createMatch(input: CreateMatchInput): Promise<ArcadeMatchRow> {
@@ -72,9 +81,16 @@ export async function createMatch(input: CreateMatchInput): Promise<ArcadeMatchR
       : null;
 
   const initialStatus: MatchStatus =
-    input.mode === "practice" ? "active" : input.playerBId ? "active" : "waiting";
+    input.initialStatus ??
+    (input.mode === "practice" ? "active" : input.playerBId ? "active" : "waiting");
   const durationSeconds = input.durationSeconds ?? 180;
   const startedAt = initialStatus === "active" ? new Date().toISOString() : null;
+
+  let seriesRootId: number | null = null;
+  if (input.rematchOfMatchId) {
+    const parent = await getMatch(input.rematchOfMatchId);
+    seriesRootId = parent?.series_root_id ?? input.rematchOfMatchId;
+  }
 
   const { data, error } = await supabase
     .from("arcade_matches")
@@ -95,12 +111,25 @@ export async function createMatch(input: CreateMatchInput): Promise<ArcadeMatchR
       escrow_status: input.mode === "staked_pvp" ? "pending" : "none",
       duration_seconds: durationSeconds,
       started_at: startedAt,
+      rematch_of_match_id: input.rematchOfMatchId ?? null,
+      series_root_id: seriesRootId,
     })
     .select("*")
     .single();
 
   if (error || !data) throw new Error(`createMatch failed: ${error?.message}`);
-  return data as ArcadeMatchRow;
+
+  const row = data as ArcadeMatchRow;
+  if (!row.series_root_id) {
+    // First-of-series: backfill series_root_id = id so the series chain is
+    // self-rooted from the start (avoids a NULL leaf).
+    await supabase
+      .from("arcade_matches")
+      .update({ series_root_id: row.id })
+      .eq("id", row.id);
+    row.series_root_id = row.id;
+  }
+  return row;
 }
 
 export async function getMatch(id: number): Promise<ArcadeMatchRow | null> {
@@ -374,6 +403,259 @@ export async function openOffers(limit = 5): Promise<ArcadeMatchRow[]> {
     .order("created_at", { ascending: false })
     .limit(limit);
   return (data as ArcadeMatchRow[] | null) ?? [];
+}
+
+/* ─────────── Rematch ─────────── */
+
+export type RematchResult =
+  | { status: "pending"; match: ArcadeMatchRow }
+  | { status: "created"; match: ArcadeMatchRow; nextMatchId: number }
+  | { status: "error"; error: string };
+
+/**
+ * Atomically toggle the requesting player's rematch flag on a completed match
+ * and re-read the row so we observe both flags at the same point in time.
+ */
+async function setRematchFlag(matchId: number, isPlayerA: boolean): Promise<ArcadeMatchRow | null> {
+  const col = isPlayerA ? "rematch_requested_by_a" : "rematch_requested_by_b";
+  const { data } = await supabase
+    .from("arcade_matches")
+    .update({ [col]: true })
+    .eq("id", matchId)
+    .eq(col, false)
+    .select("*")
+    .maybeSingle();
+  if (data) return data as ArcadeMatchRow;
+  // Already set — re-read.
+  return await getMatch(matchId);
+}
+
+async function clearRematchFlag(matchId: number, isPlayerA: boolean): Promise<void> {
+  const col = isPlayerA ? "rematch_requested_by_a" : "rematch_requested_by_b";
+  await supabase.from("arcade_matches").update({ [col]: false }).eq("id", matchId);
+}
+
+/**
+ * Player requests a rematch. For Discord-staked matches this immediately
+ * debits their MezoSBot balance into a freshly-created child match's escrow;
+ * if the other player has already done the same, the match starts. For
+ * unstaked PvP / practice the child match is created as soon as both players
+ * (or the lone player, in practice) have requested.
+ */
+export async function requestRematch(matchId: number, userId: string): Promise<RematchResult> {
+  const parent = await getMatch(matchId);
+  if (!parent) return { status: "error", error: "Match not found" };
+  if (parent.status !== "completed") return { status: "error", error: "Match is not completed" };
+
+  const isA = parent.player_a_id === userId;
+  const isB = parent.player_b_id === userId;
+  if (parent.mode !== "practice" && !isA && !isB) {
+    return { status: "error", error: "Not a player in this match" };
+  }
+  if (parent.mode === "practice" && parent.player_a_id !== userId) {
+    return { status: "error", error: "Not your match" };
+  }
+
+  // Already created next match — just hand back the existing one.
+  if (parent.next_match_id) {
+    const child = await getMatch(parent.next_match_id);
+    if (child) return { status: "created", match: child, nextMatchId: child.id };
+  }
+
+  // Practice: spawn child immediately, no opponent to wait on.
+  if (parent.mode === "practice") {
+    const child = await createMatch({
+      mode: "practice",
+      createdById: parent.created_by_id,
+      playerAId: parent.player_a_id,
+      durationSeconds: parent.duration_seconds,
+      rakeBps: parent.platform_rake_bps,
+      rematchOfMatchId: parent.id,
+    });
+    await supabase
+      .from("arcade_matches")
+      .update({ next_match_id: child.id, rematch_requested_by_a: true })
+      .eq("id", parent.id);
+    return { status: "created", match: child, nextMatchId: child.id };
+  }
+
+  // PvP: handle stake debit BEFORE setting flag for staked Discord, so a
+  // failed debit doesn't leave us in a half-accepted state.
+  if (parent.mode === "staked_pvp") {
+    const stake = parent.stake_amount_sats ?? 0;
+    if (stake <= 0) return { status: "error", error: "Stake configuration missing" };
+    // Provisionally create (or reuse) a child match in `waiting` so we have
+    // a match_id to attach the escrow row to. We only ever create one child
+    // per parent thanks to the next_match_id update guard below.
+    const child = await ensurePendingRematchChild(parent);
+    const fund = await fundEscrowFromBalance(child.id, userId, stake);
+    if (!fund.ok) {
+      // If we just created the child for the first time and the requester
+      // can't fund, abandon it so a later top-up retry creates fresh state.
+      // The opponent isn't on the hook because they never funded.
+      const escrowRows = await supabase.from("arcade_escrow").select("status").eq("match_id", child.id);
+      const anyFunded = (escrowRows.data ?? []).some((r) => (r as { status: string }).status === "funded");
+      if (!anyFunded) {
+        await supabase.from("arcade_matches").update({ status: "cancelled" }).eq("id", child.id);
+        await supabase.from("arcade_matches").update({ next_match_id: null }).eq("id", parent.id);
+      }
+      return { status: "error", error: fund.error ?? "Insufficient balance" };
+    }
+  }
+
+  const updated = await setRematchFlag(matchId, isA);
+  if (!updated) return { status: "error", error: "Match disappeared mid-update" };
+
+  const bothRequested = updated.rematch_requested_by_a && updated.rematch_requested_by_b;
+  if (!bothRequested) {
+    return { status: "pending", match: updated };
+  }
+
+  // Both have accepted. For staked, the child already exists (created above
+  // when each player funded). For free PvP, create now.
+  if (updated.mode === "free_pvp") {
+    const child = await createMatch({
+      mode: "free_pvp",
+      createdById: updated.created_by_id,
+      playerAId: updated.player_a_id,
+      playerBId: updated.player_b_id!,
+      durationSeconds: updated.duration_seconds,
+      rakeBps: updated.platform_rake_bps,
+      rematchOfMatchId: updated.id,
+    });
+    await supabase.from("arcade_matches").update({ next_match_id: child.id }).eq("id", updated.id);
+    return { status: "created", match: child, nextMatchId: child.id };
+  }
+
+  // Staked: flip the (already-funded) child to active.
+  const child = await ensurePendingRematchChild(updated);
+  const { data: activated } = await supabase
+    .from("arcade_matches")
+    .update({ status: "active", started_at: new Date().toISOString(), escrow_status: "funded" })
+    .eq("id", child.id)
+    .select("*")
+    .single();
+  return {
+    status: "created",
+    match: (activated as ArcadeMatchRow) ?? child,
+    nextMatchId: child.id,
+  };
+}
+
+async function ensurePendingRematchChild(parent: ArcadeMatchRow): Promise<ArcadeMatchRow> {
+  if (parent.next_match_id) {
+    const existing = await getMatch(parent.next_match_id);
+    if (existing) return existing;
+  }
+  const child = await createMatch({
+    mode: parent.mode,
+    createdById: parent.created_by_id,
+    playerAId: parent.player_a_id,
+    playerBId: parent.player_b_id ?? undefined,
+    stakeAmountSats: parent.stake_amount_sats ?? undefined,
+    durationSeconds: parent.duration_seconds,
+    rakeBps: parent.platform_rake_bps,
+    rematchOfMatchId: parent.id,
+    initialStatus: "waiting",
+  });
+  await supabase.from("arcade_matches").update({ next_match_id: child.id }).eq("id", parent.id);
+  return child;
+}
+
+/**
+ * Cancel a player's pending rematch request. For staked matches the player's
+ * escrow on the child match is refunded back to their balance.
+ */
+export async function cancelRematch(matchId: number, userId: string): Promise<{ ok: boolean; error?: string }> {
+  const parent = await getMatch(matchId);
+  if (!parent) return { ok: false, error: "Match not found" };
+  const isA = parent.player_a_id === userId;
+  const isB = parent.player_b_id === userId;
+  if (!isA && !isB) return { ok: false, error: "Not a player in this match" };
+
+  await clearRematchFlag(matchId, isA);
+
+  if (parent.mode === "staked_pvp" && parent.next_match_id) {
+    const child = await getMatch(parent.next_match_id);
+    if (child && child.status === "waiting") {
+      const stake = child.stake_amount_sats ?? 0;
+      // Refund this player's escrow if it was funded.
+      const { data: rows } = await supabase
+        .from("arcade_escrow")
+        .select("*")
+        .eq("match_id", child.id)
+        .eq("user_id", userId)
+        .eq("status", "funded");
+      for (const row of rows ?? []) {
+        await addBalance(userId, row.amount_sats);
+        await supabase
+          .from("arcade_escrow")
+          .update({ status: "refunded", updated_at: new Date().toISOString() })
+          .eq("id", row.id);
+      }
+      // If neither player still has funded escrow, cancel the child.
+      const { data: stillFunded } = await supabase
+        .from("arcade_escrow")
+        .select("id")
+        .eq("match_id", child.id)
+        .eq("status", "funded");
+      if ((stillFunded ?? []).length === 0) {
+        await supabase
+          .from("arcade_matches")
+          .update({ status: "cancelled", escrow_status: "refunded" })
+          .eq("id", child.id);
+        await supabase
+          .from("arcade_matches")
+          .update({ next_match_id: null })
+          .eq("id", parent.id);
+      }
+      void stake;
+    }
+  }
+
+  return { ok: true };
+}
+
+export type SeriesScore = {
+  rootId: number;
+  totalCompleted: number;
+  youWins: number;
+  opponentWins: number;
+  ties: number;
+};
+
+/**
+ * Walks all completed matches sharing the parent's series_root_id and counts
+ * head-to-head wins for the given user.
+ */
+export async function getSeriesScore(matchId: number, userId: string): Promise<SeriesScore | null> {
+  const match = await getMatch(matchId);
+  if (!match) return null;
+  const rootId = match.series_root_id ?? match.id;
+  const { data } = await supabase
+    .from("arcade_matches")
+    .select("id, winner_id, status, player_a_id, player_b_id")
+    .eq("series_root_id", rootId)
+    .eq("status", "completed");
+  let youWins = 0;
+  let opponentWins = 0;
+  let ties = 0;
+  for (const row of (data ?? []) as Array<{ winner_id: string | null; player_a_id: string; player_b_id: string | null }>) {
+    if (row.winner_id == null) {
+      ties += 1;
+    } else if (row.winner_id === userId) {
+      youWins += 1;
+    } else {
+      opponentWins += 1;
+    }
+  }
+  return {
+    rootId,
+    totalCompleted: youWins + opponentWins + ties,
+    youWins,
+    opponentWins,
+    ties,
+  };
 }
 
 /* ─────────── Helpers ─────────── */

@@ -1,9 +1,11 @@
 import {
   PIECES_PER_LEVEL,
-  MAX_LEVELS,
+  isBankMove,
   type PlayerState,
   type GeneratedPiece,
   type Move,
+  type BankMove,
+  type PlaceMove,
   type Board,
   type ScoreBreakdown,
 } from "./types.js";
@@ -22,12 +24,15 @@ export function createPlayerState(): PlayerState {
     score: 0,
     moves: [],
     phase: "playing",
+    bank: null,
+    slotOverrides: {},
   };
 }
 
 export type ApplyMoveResult =
   | {
       ok: true;
+      kind: "place";
       state: PlayerState;
       placementScore: number;
       multiplierBefore: number;
@@ -36,18 +41,43 @@ export type ApplyMoveResult =
       finished: boolean;
       endReason?: "completed_levels" | "no_moves";
     }
+  | { ok: true; kind: "bank"; state: PlayerState }
   | { ok: false; error: string };
 
+const slotKey = (level: number, pieceIndex: number) => `${level}:${pieceIndex}`;
+
 /**
- * Apply a single move to a player state.
- *
- * Validates: piece index is for the current level + cursor and not already used,
- * placement is in-bounds and non-overlapping. Mutates a fresh copy and returns it.
+ * Resolve which generated piece occupies the given slot for this player,
+ * accounting for any prior bank swaps. Returns null when the slot is empty
+ * (its piece was banked into the bank slot).
  */
+export function pieceForSlot(
+  state: PlayerState,
+  sequence: GeneratedPiece[][],
+  level: number,
+  pieceIndex: number
+): GeneratedPiece | null {
+  const key = slotKey(level, pieceIndex);
+  if (Object.prototype.hasOwnProperty.call(state.slotOverrides, key)) {
+    return state.slotOverrides[key];
+  }
+  return sequence[level]?.[pieceIndex] ?? null;
+}
+
+/** Dispatch on Move kind. Treats moves with no `kind` as place moves. */
 export function applyMove(
   state: PlayerState,
   sequence: GeneratedPiece[][],
   move: Move
+): ApplyMoveResult {
+  if (isBankMove(move)) return applyBank(state, sequence, move);
+  return applyPlace(state, sequence, move as PlaceMove);
+}
+
+function applyPlace(
+  state: PlayerState,
+  sequence: GeneratedPiece[][],
+  move: PlaceMove
 ): ApplyMoveResult {
   if (state.phase !== "playing") {
     return { ok: false, error: "Match is not in playing phase" };
@@ -62,7 +92,10 @@ export function applyMove(
     return { ok: false, error: "Piece already placed this level" };
   }
 
-  const generated = sequence[state.level][move.pieceIndex];
+  const generated = pieceForSlot(state, sequence, state.level, move.pieceIndex);
+  if (!generated) {
+    return { ok: false, error: "Slot is empty — bank a piece into it first" };
+  }
   const rotation = (move.rotation ?? 0) as 0 | 1 | 2 | 3;
   const cells = rotateCells(generated.cells, rotation);
 
@@ -91,36 +124,43 @@ export function applyMove(
   let phase: PlayerState["phase"] = "playing";
   let endReason: PlayerState["endReason"];
 
-  // Advance to next level if all 3 placed
-  if (placedThisLevel.every((p) => p)) {
+  // Treat slots that have been banked-out (override === null) as "consumed"
+  // for level-advance purposes — the player can't place from them again.
+  const allSlotsResolved = (() => {
+    for (let i = 0; i < PIECES_PER_LEVEL; i++) {
+      if (placedThisLevel[i]) continue;
+      const slot = pieceForSlot(state, sequence, level, i);
+      if (slot != null) return false;
+    }
+    return true;
+  })();
+
+  if (allSlotsResolved) {
     level += 1;
     pieceCursor = 0;
     placedThisLevelOut = new Array(PIECES_PER_LEVEL).fill(false);
-    if (level >= MAX_LEVELS) {
-      phase = "finished";
-      endReason = "completed_levels";
-    }
   }
 
-  // Check if remaining pieces this level (or next level start) have any legal move
-  if (phase === "playing") {
-    const remainingPieces: typeof cells[] = [];
-    if (placedThisLevelOut.every((p) => !p)) {
-      // Just advanced to a new level
-      for (let i = 0; i < PIECES_PER_LEVEL; i++) {
-        remainingPieces.push(sequence[level][i].cells);
-      }
-    } else {
-      for (let i = 0; i < PIECES_PER_LEVEL; i++) {
-        if (!placedThisLevelOut[i]) {
-          remainingPieces.push(sequence[level][i].cells);
-        }
-      }
+  // Build candidate piece set for the (possibly new) current level — every
+  // not-yet-placed slot whose piece is not null.
+  const remainingPieces: typeof cells[] = [];
+  if (placedThisLevelOut.every((p) => !p)) {
+    for (let i = 0; i < PIECES_PER_LEVEL; i++) {
+      const candidate = pieceForSlotForFutureLevel(level, i, sequence, state.slotOverrides);
+      if (candidate) remainingPieces.push(candidate.cells);
     }
-    if (!anyPiecePlaceable(clearResult.board, remainingPieces)) {
-      phase = "finished";
-      endReason = "no_moves";
+  } else {
+    for (let i = 0; i < PIECES_PER_LEVEL; i++) {
+      if (placedThisLevelOut[i]) continue;
+      const candidate = pieceForSlotForFutureLevel(level, i, sequence, state.slotOverrides);
+      if (candidate) remainingPieces.push(candidate.cells);
     }
+  }
+  if (state.bank) remainingPieces.push(state.bank.cells);
+
+  if (remainingPieces.length === 0 || !anyPiecePlaceable(clearResult.board, remainingPieces)) {
+    phase = "finished";
+    endReason = "no_moves";
   }
 
   const newState: PlayerState = {
@@ -133,10 +173,13 @@ export function applyMove(
     moves: [...state.moves, move],
     phase,
     endReason,
+    bank: state.bank,
+    slotOverrides: state.slotOverrides,
   };
 
   return {
     ok: true,
+    kind: "place",
     state: newState,
     placementScore: score.pointsGained,
     multiplierBefore: score.multiplierBefore,
@@ -150,6 +193,56 @@ export function applyMove(
     finished: phase === "finished",
     endReason,
   };
+}
+
+function pieceForSlotForFutureLevel(
+  level: number,
+  pieceIndex: number,
+  sequence: GeneratedPiece[][],
+  overrides: Record<string, GeneratedPiece | null>
+): GeneratedPiece | null {
+  const key = slotKey(level, pieceIndex);
+  if (Object.prototype.hasOwnProperty.call(overrides, key)) return overrides[key];
+  return sequence[level]?.[pieceIndex] ?? null;
+}
+
+function applyBank(
+  state: PlayerState,
+  sequence: GeneratedPiece[][],
+  move: BankMove
+): ApplyMoveResult {
+  if (state.phase !== "playing") {
+    return { ok: false, error: "Match is not in playing phase" };
+  }
+  if (move.level !== state.level) {
+    return { ok: false, error: `Wrong level (expected ${state.level}, got ${move.level})` };
+  }
+  if (move.pieceIndex < 0 || move.pieceIndex >= PIECES_PER_LEVEL) {
+    return { ok: false, error: "Piece index out of range" };
+  }
+  if (state.placedThisLevel[move.pieceIndex]) {
+    return { ok: false, error: "Piece already placed this level" };
+  }
+
+  const slotPiece = pieceForSlot(state, sequence, state.level, move.pieceIndex);
+  if (!slotPiece) {
+    return { ok: false, error: "Slot is empty" };
+  }
+
+  const overrides = { ...state.slotOverrides };
+  const newBank = slotPiece;
+  // If bank was empty, slot becomes empty (override = null). If bank had a
+  // piece, that piece moves into the slot (override = that piece).
+  overrides[slotKey(state.level, move.pieceIndex)] = state.bank ?? null;
+
+  const newState: PlayerState = {
+    ...state,
+    bank: newBank,
+    slotOverrides: overrides,
+    moves: [...state.moves, move],
+  };
+
+  return { ok: true, kind: "bank", state: newState };
 }
 
 /**

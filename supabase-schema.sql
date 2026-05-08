@@ -196,6 +196,21 @@ UPDATE arcade_matches
   WHERE started_at IS NULL
     AND status IN ('active', 'submitted', 'completed');
 
+-- Rematch chains and session score
+ALTER TABLE arcade_matches
+  ADD COLUMN IF NOT EXISTS rematch_of_match_id BIGINT REFERENCES arcade_matches(id);
+ALTER TABLE arcade_matches
+  ADD COLUMN IF NOT EXISTS series_root_id BIGINT;
+ALTER TABLE arcade_matches
+  ADD COLUMN IF NOT EXISTS rematch_requested_by_a BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE arcade_matches
+  ADD COLUMN IF NOT EXISTS rematch_requested_by_b BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE arcade_matches
+  ADD COLUMN IF NOT EXISTS next_match_id BIGINT REFERENCES arcade_matches(id);
+ALTER TABLE arcade_matches
+  ADD COLUMN IF NOT EXISTS next_session_id TEXT;
+UPDATE arcade_matches SET series_root_id = id WHERE series_root_id IS NULL;
+
 CREATE TABLE IF NOT EXISTS arcade_submissions (
   id BIGSERIAL PRIMARY KEY,
   match_id BIGINT NOT NULL REFERENCES arcade_matches(id) ON DELETE CASCADE,
@@ -248,6 +263,8 @@ CREATE INDEX IF NOT EXISTS idx_arcade_matches_player_a ON arcade_matches(player_
 CREATE INDEX IF NOT EXISTS idx_arcade_matches_player_b ON arcade_matches(player_b_id);
 CREATE INDEX IF NOT EXISTS idx_arcade_matches_target ON arcade_matches(target_player_id);
 CREATE INDEX IF NOT EXISTS idx_arcade_matches_open_offers ON arcade_matches(status, created_at) WHERE target_player_id IS NULL;
+CREATE INDEX IF NOT EXISTS idx_arcade_matches_series_root ON arcade_matches(series_root_id);
+CREATE INDEX IF NOT EXISTS idx_arcade_matches_rematch_of ON arcade_matches(rematch_of_match_id);
 CREATE INDEX IF NOT EXISTS idx_arcade_submissions_match ON arcade_submissions(match_id);
 CREATE INDEX IF NOT EXISTS idx_arcade_escrow_match ON arcade_escrow(match_id);
 
@@ -335,6 +352,20 @@ CREATE INDEX IF NOT EXISTS idx_web_arcade_sessions_player_a ON web_arcade_sessio
 CREATE INDEX IF NOT EXISTS idx_web_arcade_sessions_player_b ON web_arcade_sessions(player_b_address);
 CREATE INDEX IF NOT EXISTS idx_web_arcade_sessions_invited ON web_arcade_sessions(invited_player_address);
 CREATE INDEX IF NOT EXISTS idx_web_arcade_sessions_deadline ON web_arcade_sessions(play_deadline);
+
+-- Wallet rematch chain
+ALTER TABLE web_arcade_sessions
+  ADD COLUMN IF NOT EXISTS rematch_of_session_id TEXT REFERENCES web_arcade_sessions(id);
+ALTER TABLE web_arcade_sessions
+  ADD COLUMN IF NOT EXISTS series_root_session_id TEXT;
+ALTER TABLE web_arcade_sessions
+  ADD COLUMN IF NOT EXISTS rematch_requested_by_a BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE web_arcade_sessions
+  ADD COLUMN IF NOT EXISTS rematch_requested_by_b BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE web_arcade_sessions
+  ADD COLUMN IF NOT EXISTS next_session_id TEXT REFERENCES web_arcade_sessions(id);
+UPDATE web_arcade_sessions SET series_root_session_id = id WHERE series_root_session_id IS NULL;
+CREATE INDEX IF NOT EXISTS idx_web_arcade_sessions_series_root ON web_arcade_sessions(series_root_session_id);
 CREATE INDEX IF NOT EXISTS idx_web_arcade_submissions_session ON web_arcade_submissions(session_id);
 CREATE INDEX IF NOT EXISTS idx_web_arcade_settlement_attempts_session ON web_arcade_settlement_attempts(session_id);
 

@@ -22,11 +22,11 @@ body {
 }
 button, input, select { font: inherit; }
 
-.shell { max-width: 1180px; margin: 0 auto; padding: 20px; }
+.shell { max-width: clamp(960px, 92vw, 1440px); margin: 0 auto; padding: clamp(16px, 2vw, 32px); }
 .topbar { height: 64px; display: flex; justify-content: space-between; align-items: center; }
 .brand { display: inline-flex; gap: 10px; align-items: center; color: var(--text); background: transparent; border: 0; font-weight: 800; cursor: pointer; }
 .mark { display: grid; place-items: center; width: 32px; height: 32px; border-radius: 8px; background: var(--green); color: #061008; }
-.workspace { display: grid; grid-template-columns: minmax(280px, 360px) 1fr; gap: 20px; align-items: start; }
+.workspace { display: grid; grid-template-columns: minmax(280px, 360px) minmax(0, 1fr); gap: 20px; align-items: start; }
 .side h1 { font-size: 42px; line-height: 1; margin: 32px 0 16px; letter-spacing: 0; }
 .side p { color: var(--muted); line-height: 1.55; }
 .panel, .mainPanel { border: 1px solid var(--line); border-radius: 8px; background: var(--panel); padding: 18px; }
@@ -79,9 +79,9 @@ input, select {
 .hud { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
 .stat { padding: 12px; background: var(--panel-2); border-radius: 8px; }
 .stat span { display: block; color: var(--muted); font-size: 12px; }
-.stat strong { display: block; margin-top: 4px; font-size: 20px; }
+.stat strong { display: block; margin-top: 4px; font-size: clamp(16px, 1.6vw, 22px); }
 .board {
-  width: min(100%, 560px);
+  width: clamp(420px, min(60vw, 80vh), 760px);
   aspect-ratio: 1;
   display: grid;
   grid-template-columns: repeat(9, 1fr);

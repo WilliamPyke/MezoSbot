@@ -43,6 +43,11 @@ export type WebArcadeSessionRow = {
   created_at: string;
   updated_at: string;
   completed_at: string | null;
+  rematch_of_session_id: string | null;
+  series_root_session_id: string | null;
+  rematch_requested_by_a: boolean;
+  rematch_requested_by_b: boolean;
+  next_session_id: string | null;
 };
 
 export async function createSessionDraft(input: {
@@ -51,6 +56,7 @@ export async function createSessionDraft(input: {
   assetAddress: string;
   stakeAmountUnits: string;
   chainId: number;
+  rematchOfSessionId?: string;
 }) {
   const chain = chainConfigForId(input.chainId);
   if (!chain.escrowContractAddress) throw new Error(`Escrow contract is not configured for ${chain.chainName}`);
@@ -66,6 +72,12 @@ export async function createSessionDraft(input: {
   const seed = randomBytes(16).toString("hex");
   const playerA = normalizeWalletAddress(input.playerA);
   const invited = input.invitedPlayer ? normalizeWalletAddress(input.invitedPlayer) : null;
+
+  let seriesRoot: string | null = null;
+  if (input.rematchOfSessionId) {
+    const parent = await getWebSession(input.rematchOfSessionId);
+    seriesRoot = parent?.series_root_session_id ?? input.rematchOfSessionId;
+  }
 
   const { data, error } = await supabase
     .from("web_arcade_sessions")
@@ -83,11 +95,18 @@ export async function createSessionDraft(input: {
       invited_player_address: invited,
       join_deadline: joinDeadline.toISOString(),
       play_deadline: playDeadline.toISOString(),
+      rematch_of_session_id: input.rematchOfSessionId ?? null,
+      series_root_session_id: seriesRoot,
     })
     .select("*")
     .single();
   if (error || !data) throw new Error(`Could not create session draft: ${error?.message}`);
-  return data as WebArcadeSessionRow;
+  const row = data as WebArcadeSessionRow;
+  if (!row.series_root_session_id) {
+    await supabase.from("web_arcade_sessions").update({ series_root_session_id: row.id }).eq("id", row.id);
+    row.series_root_session_id = row.id;
+  }
+  return row;
 }
 
 export async function getWebSession(id: string): Promise<WebArcadeSessionRow | null> {
@@ -246,4 +265,92 @@ export async function recordSettlementAttempt(input: {
 
 export function sessionPlayers(session: WebArcadeSessionRow): string[] {
   return [session.player_a_address, session.player_b_address].filter(Boolean) as string[];
+}
+
+/* ─────────── Wallet rematch ─────────── */
+
+export type WebRematchResult =
+  | { status: "pending"; session: WebArcadeSessionRow }
+  | { status: "created"; session: WebArcadeSessionRow; nextSessionId: string }
+  | { status: "error"; error: string };
+
+export async function requestWebRematch(sessionId: string, wallet: string): Promise<WebRematchResult> {
+  const parent = await getWebSession(sessionId);
+  if (!parent) return { status: "error", error: "Session not found" };
+  const completed = parent.status === "completed" || parent.status === "refunded";
+  if (!completed) return { status: "error", error: "Session is not completed" };
+
+  const me = normalizeWalletAddress(wallet);
+  const isA = parent.player_a_address === me;
+  const isB = parent.player_b_address === me;
+  if (!isA && !isB) return { status: "error", error: "Not a player in this session" };
+
+  if (parent.next_session_id) {
+    const child = await getWebSession(parent.next_session_id);
+    if (child) return { status: "created", session: child, nextSessionId: child.id };
+  }
+
+  const col = isA ? "rematch_requested_by_a" : "rematch_requested_by_b";
+  await supabase.from("web_arcade_sessions").update({ [col]: true }).eq("id", sessionId);
+  const fresh = await getWebSession(sessionId);
+  if (!fresh) return { status: "error", error: "Session disappeared" };
+  if (!(fresh.rematch_requested_by_a && fresh.rematch_requested_by_b)) {
+    return { status: "pending", session: fresh };
+  }
+
+  const child = await createSessionDraft({
+    playerA: parent.player_a_address,
+    invitedPlayer: parent.player_b_address,
+    assetAddress: parent.asset_address,
+    stakeAmountUnits: parent.stake_amount_units,
+    chainId: parent.chain_id,
+    rematchOfSessionId: parent.id,
+  });
+  await supabase.from("web_arcade_sessions").update({ next_session_id: child.id }).eq("id", parent.id);
+  return { status: "created", session: child, nextSessionId: child.id };
+}
+
+export async function cancelWebRematch(sessionId: string, wallet: string): Promise<{ ok: boolean; error?: string }> {
+  const parent = await getWebSession(sessionId);
+  if (!parent) return { ok: false, error: "Session not found" };
+  const me = normalizeWalletAddress(wallet);
+  const isA = parent.player_a_address === me;
+  const isB = parent.player_b_address === me;
+  if (!isA && !isB) return { ok: false, error: "Not a player in this session" };
+  const col = isA ? "rematch_requested_by_a" : "rematch_requested_by_b";
+  await supabase.from("web_arcade_sessions").update({ [col]: false }).eq("id", sessionId);
+  return { ok: true };
+}
+
+export type WebSeriesScore = {
+  rootId: string;
+  totalCompleted: number;
+  youWins: number;
+  opponentWins: number;
+  ties: number;
+};
+
+export async function getWebSeriesScore(sessionId: string, wallet: string): Promise<WebSeriesScore | null> {
+  const session = await getWebSession(sessionId);
+  if (!session) return null;
+  const rootId = session.series_root_session_id ?? session.id;
+  const me = normalizeWalletAddress(wallet);
+  const { data } = await supabase
+    .from("web_arcade_sessions")
+    .select("id, winner_address, status, player_a_address, player_b_address")
+    .eq("series_root_session_id", rootId)
+    .in("status", ["completed", "refunded"]);
+  let youWins = 0;
+  let opponentWins = 0;
+  let ties = 0;
+  for (const row of (data ?? []) as Array<{ winner_address: string | null; status: string }>) {
+    if (row.status === "refunded" || row.winner_address == null) {
+      ties += 1;
+    } else if (row.winner_address === me) {
+      youWins += 1;
+    } else {
+      opponentWins += 1;
+    }
+  }
+  return { rootId, totalCompleted: youWins + opponentWins + ties, youWins, opponentWins, ties };
 }

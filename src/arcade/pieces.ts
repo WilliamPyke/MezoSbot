@@ -1,5 +1,5 @@
 import type { GeneratedPiece, PieceCell, PieceDefinition } from "./types.js";
-import { PIECES_PER_LEVEL, MAX_LEVELS } from "./types.js";
+import { PIECES_PER_LEVEL, LEVEL_POOL_SIZE } from "./types.js";
 import { PIECE_LIBRARY, PIECE_BY_ID } from "./pieceLibrary.js";
 import { createRng, type Rng, pickWeighted } from "./rng.js";
 
@@ -37,14 +37,14 @@ export function piecesBounds(cells: PieceCell[]): { width: number; height: numbe
 
 /**
  * Generate the full piece sequence for a match from a seed.
- * Returns `MAX_LEVELS` levels × `PIECES_PER_LEVEL` pieces.
+ * Returns `LEVEL_POOL_SIZE` levels × `PIECES_PER_LEVEL` pieces.
  * Both players in a PvP match get identical output for the same seed.
  */
 export function generatePieceSequence(seedNumber: number): GeneratedPiece[][] {
   const rng = createRng(seedNumber);
   const sequence: GeneratedPiece[][] = [];
 
-  for (let level = 0; level < MAX_LEVELS; level++) {
+  for (let level = 0; level < LEVEL_POOL_SIZE; level++) {
     const levelPieces: GeneratedPiece[] = [];
     for (let i = 0; i < PIECES_PER_LEVEL; i++) {
       const def = pickPieceForLevel(rng, level);
@@ -58,11 +58,17 @@ export function generatePieceSequence(seedNumber: number): GeneratedPiece[][] {
 }
 
 function pickPieceForLevel(rng: Rng, level: number): PieceDefinition {
-  const eligible = PIECE_LIBRARY.filter((p) => {
+  let eligible = PIECE_LIBRARY.filter((p) => {
     if (p.minLevel != null && level < p.minLevel) return false;
     if (p.maxLevel != null && level > p.maxLevel) return false;
     return true;
   });
+  // At very high levels every piece may be excluded by maxLevel constraints.
+  // Fall back to the unrestricted set so generation never fails.
+  if (eligible.length === 0) {
+    eligible = PIECE_LIBRARY.filter((p) => p.minLevel == null || level >= p.minLevel);
+  }
+  if (eligible.length === 0) eligible = PIECE_LIBRARY;
   return pickWeighted(
     rng,
     eligible.map((p) => ({ weight: p.weight, value: p }))

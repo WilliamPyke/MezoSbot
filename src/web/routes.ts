@@ -9,8 +9,16 @@ import {
   setSessionCookie,
   verifyLogin,
 } from "./auth.js";
-import { createSessionDraft, getWebSession, markCreated, markJoined, type WebArcadeSessionRow } from "./db.js";
-import { applyWebMove, buildGameState, buildWalletArcadePlayState, submitWebScore, walletArcadePlayStateFromGameState } from "./game.js";
+import {
+  cancelWebRematch,
+  createSessionDraft,
+  getWebSession,
+  markCreated,
+  markJoined,
+  requestWebRematch,
+  type WebArcadeSessionRow,
+} from "./db.js";
+import { applyWebMove, buildGameState, buildWalletArcadePlayState, submitWebScore } from "./game.js";
 import { chainConfigForId, webChainsConfig } from "./chains.js";
 import {
   enqueueWallet,
@@ -136,13 +144,7 @@ export async function handleWalletWebRequest(
       if (method === "POST" && parts[4] === "move") {
         const wallet = requireSession(req);
         const body = await readJsonBody(req);
-        const move: Move = {
-          level: numberField(body, "level"),
-          pieceIndex: numberField(body, "pieceIndex"),
-          rotation: (numberField(body, "rotation") % 4) as 0 | 1 | 2 | 3,
-          row: numberField(body, "row"),
-          col: numberField(body, "col"),
-        };
+        const move = readWalletMove(body);
         return sendJson(res, 200, await applyWebMove(sessionId, wallet.address, move));
       }
 
@@ -218,21 +220,34 @@ export async function handleWalletWebRequest(
       if (method === "POST" && parts[4] === "move") {
         const wallet = requireSession(req);
         const body = await readJsonBody(req);
-        const move: Move = {
-          level: numberField(body, "level"),
-          pieceIndex: numberField(body, "pieceIndex"),
-          rotation: (numberField(body, "rotation") % 4) as 0 | 1 | 2 | 3,
-          row: numberField(body, "row"),
-          col: numberField(body, "col"),
-        };
-        const state = await applyWebMove(sessionId, wallet.address, move);
-        return sendJson(res, 200, walletArcadePlayStateFromGameState(state));
+        const move = readWalletMove(body);
+        await applyWebMove(sessionId, wallet.address, move);
+        return sendJson(res, 200, await buildWalletArcadePlayState(sessionId, wallet.address));
       }
 
       if (method === "POST" && parts[4] === "submit") {
         const wallet = requireSession(req);
         await submitWebScore(sessionId, wallet.address);
         return sendJson(res, 200, await buildWalletArcadePlayState(sessionId, wallet.address));
+      }
+
+      if (method === "POST" && parts[4] === "rematch" && parts[5] === "cancel") {
+        const wallet = requireSession(req);
+        const result = await cancelWebRematch(sessionId, wallet.address);
+        if (!result.ok) return sendJson(res, 400, { error: result.error ?? "Cancel failed" });
+        return sendJson(res, 200, { ok: true });
+      }
+
+      if (method === "POST" && parts[4] === "rematch" && parts.length === 5) {
+        const wallet = requireSession(req);
+        const result = await requestWebRematch(sessionId, wallet.address);
+        if (result.status === "error") return sendJson(res, 400, { error: result.error });
+        const body: Record<string, unknown> = { status: result.status };
+        if (result.status === "created") {
+          body.nextSessionId = result.nextSessionId;
+          body.redirect = `/session/${result.nextSessionId}`;
+        }
+        return sendJson(res, 200, body);
       }
     }
 
@@ -303,6 +318,24 @@ function numberField(body: Record<string, unknown>, key: string): number {
   const value = body[key];
   if (typeof value !== "number" || !Number.isFinite(value)) throw new Error(`Bad field: ${key}`);
   return Math.trunc(value);
+}
+
+function readWalletMove(body: Record<string, unknown>): Move {
+  const kind = typeof body.kind === "string" ? body.kind : "place";
+  if (kind === "bank") {
+    return {
+      kind: "bank",
+      level: numberField(body, "level"),
+      pieceIndex: numberField(body, "pieceIndex"),
+    };
+  }
+  return {
+    level: numberField(body, "level"),
+    pieceIndex: numberField(body, "pieceIndex"),
+    rotation: (numberField(body, "rotation") % 4) as 0 | 1 | 2 | 3,
+    row: numberField(body, "row"),
+    col: numberField(body, "col"),
+  };
 }
 
 function normalizeSessionId(raw: string): string {

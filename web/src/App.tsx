@@ -614,7 +614,7 @@ function GameBoard({ game, reload, setStatus }: { game: GameState; reload: () =>
   const [rotation, setRotation] = useState(0);
   const pieces = game.self?.pieces ?? [];
   const activePiece = pieces[selected];
-  const cells = activePiece ? rotateCells(activePiece.cells, rotation) : [];
+  const cells = activePiece && activePiece.cells ? rotateCells(activePiece.cells, rotation) : [];
   const canPlay = game.self?.phase === "playing" && !game.self.submitted && !game.result.completed;
 
   async function place(row: number, col: number) {
@@ -637,7 +637,7 @@ function GameBoard({ game, reload, setStatus }: { game: GameState; reload: () =>
       <div className="hud">
         <Stat label="Score" value={game.self?.score.toLocaleString() ?? "0"} />
         <Stat label="Multiplier" value={`${game.self?.multiplier ?? 1}x`} />
-        <Stat label="Level" value={`${game.self?.levelDisplay ?? 1}/${game.self?.maxLevels ?? 12}`} />
+        <Stat label="Level" value={game.self?.maxLevels ? `${game.self.levelDisplay}/${game.self.maxLevels}` : `Lv ${game.self?.levelDisplay ?? 1}`} />
         <Stat label="Opponent" value={game.opponent?.submitted ? `Done ${game.opponent.score ?? 0}` : "Playing"} />
       </div>
       <div className="board">

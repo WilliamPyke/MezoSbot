@@ -2,13 +2,14 @@ import { ethers } from "ethers";
 import {
   applyMove,
   createPlayerState,
+  pieceForSlot,
   replayMoves,
 } from "../arcade/match.js";
 import { generatePieceSequence } from "../arcade/pieces.js";
 import { hashSeed } from "../arcade/rng.js";
 import {
   BOARD_SIZE,
-  MAX_LEVELS,
+  PIECES_PER_LEVEL,
   type GeneratedPiece,
   type Move,
   type PieceCell,
@@ -20,6 +21,7 @@ import {
   completeSession,
   getSubmission,
   getWebSession,
+  getWebSeriesScore,
   sessionPlayers,
   upsertSubmission,
   type WebArcadeSessionRow,
@@ -57,11 +59,12 @@ export type WebGameState = {
     multiplier: number;
     level: number;
     levelDisplay: number;
-    maxLevels: number;
+    maxLevels: number | null;
     phase: PlayerState["phase"];
     endReason?: PlayerState["endReason"];
     submitted: boolean;
-    pieces: Array<{ cells: PieceCell[]; placed: boolean }>;
+    pieces: Array<{ cells: PieceCell[] | null; placed: boolean }>;
+    bank: { cells: PieceCell[] } | null;
     board: number[][];
   } | null;
   opponent: {
@@ -102,11 +105,12 @@ export type WalletArcadePlayState = {
     multiplier: number;
     level: number;
     levelDisplay: number;
-    maxLevels: number;
+    maxLevels: number | null;
     phase: PlayerState["phase"];
     endReason?: PlayerState["endReason"];
     submitted: boolean;
-    pieces: Array<{ cells: PieceCell[]; placed: boolean }>;
+    pieces: Array<{ cells: PieceCell[] | null; placed: boolean }>;
+    bank: { cells: PieceCell[] } | null;
     board: number[][];
   };
   opponent: {
@@ -124,6 +128,12 @@ export type WalletArcadePlayState = {
     payoutFormatted: string | null;
     settlementTxHash: string | null;
     settlementExplorerUrl: string | null;
+    rematchRequestedBySelf: boolean;
+    rematchRequestedByOpponent: boolean;
+    nextMatchId: number | null;
+    nextSessionId: string | null;
+    redirect: string | null;
+    series: { youWins: number; opponentWins: number; ties: number; total: number };
   };
 };
 
@@ -183,12 +193,13 @@ export async function buildGameState(sessionId: string, wallet: string): Promise
           score: state.score,
           multiplier: state.multiplier,
           level: state.level,
-          levelDisplay: Math.min(state.level + 1, MAX_LEVELS),
-          maxLevels: MAX_LEVELS,
+          levelDisplay: state.level + 1,
+          maxLevels: null,
           phase: state.phase,
           endReason: state.endReason,
           submitted: selfSubmitted,
           pieces: currentPieces(freshSession.seed, state),
+          bank: state.bank ? { cells: state.bank.cells } : null,
           board: state.board,
         }
       : null,
@@ -214,10 +225,49 @@ export async function buildWalletArcadePlayState(
   wallet: string
 ): Promise<WalletArcadePlayState> {
   const state = await buildGameState(sessionId, wallet);
-  return walletArcadePlayStateFromGameState(state);
+  const session = await getWebSession(sessionId);
+  const series = (await getWebSeriesScore(sessionId, wallet)) ?? {
+    rootId: sessionId,
+    totalCompleted: 0,
+    youWins: 0,
+    opponentWins: 0,
+    ties: 0,
+  };
+  const me = normalizeWalletAddress(wallet);
+  const isA = session ? session.player_a_address === me : false;
+  const rematchSelf = !!(session && (isA ? session.rematch_requested_by_a : session.rematch_requested_by_b));
+  const rematchOpp = !!(session && (isA ? session.rematch_requested_by_b : session.rematch_requested_by_a));
+  const nextSessionId = session?.next_session_id ?? null;
+  const redirect = nextSessionId ? `/session/${nextSessionId}` : null;
+  return walletArcadePlayStateFromGameState(state, {
+    series,
+    rematchSelf,
+    rematchOpp,
+    nextSessionId,
+    redirect,
+  });
 }
 
-export function walletArcadePlayStateFromGameState(state: WebGameState): WalletArcadePlayState {
+type WalletPlayExtras = {
+  series: { youWins: number; opponentWins: number; ties: number; totalCompleted: number };
+  rematchSelf: boolean;
+  rematchOpp: boolean;
+  nextSessionId: string | null;
+  redirect: string | null;
+};
+
+const WALLET_PLAY_EXTRAS_DEFAULT: WalletPlayExtras = {
+  series: { youWins: 0, opponentWins: 0, ties: 0, totalCompleted: 0 },
+  rematchSelf: false,
+  rematchOpp: false,
+  nextSessionId: null,
+  redirect: null,
+};
+
+export function walletArcadePlayStateFromGameState(
+  state: WebGameState,
+  extras: WalletPlayExtras = WALLET_PLAY_EXTRAS_DEFAULT
+): WalletArcadePlayState {
   if (!state.self) throw new Error("Wallet is not a player in this session");
 
   const asset = assetForState(state);
@@ -257,6 +307,7 @@ export function walletArcadePlayStateFromGameState(state: WebGameState): WalletA
       endReason: state.self.endReason,
       submitted: state.self.submitted,
       pieces: state.self.pieces,
+      bank: state.self.bank,
       board: state.self.board,
     },
     opponent: state.opponent
@@ -278,6 +329,17 @@ export function walletArcadePlayStateFromGameState(state: WebGameState): WalletA
         : null,
       settlementTxHash: state.session.settlementTxHash,
       settlementExplorerUrl,
+      rematchRequestedBySelf: extras.rematchSelf,
+      rematchRequestedByOpponent: extras.rematchOpp,
+      nextMatchId: null,
+      nextSessionId: extras.nextSessionId,
+      redirect: extras.redirect,
+      series: {
+        youWins: extras.series.youWins,
+        opponentWins: extras.series.opponentWins,
+        ties: extras.series.ties,
+        total: extras.series.totalCompleted,
+      },
     },
   };
 }
@@ -386,11 +448,12 @@ async function playerState(session: WebArcadeSessionRow, wallet: string): Promis
 
 function currentPieces(seed: string, state: PlayerState) {
   const sequence = sequenceFor(seed);
-  const levelIdx = Math.min(state.level, MAX_LEVELS - 1);
-  return sequence[levelIdx].map((piece, index) => ({
-    cells: piece.cells,
-    placed: state.placedThisLevel[index],
-  }));
+  const out: Array<{ cells: PieceCell[] | null; placed: boolean }> = [];
+  for (let i = 0; i < PIECES_PER_LEVEL; i++) {
+    const piece = pieceForSlot(state, sequence, state.level, i);
+    out.push({ cells: piece ? piece.cells : null, placed: state.placedThisLevel[i] });
+  }
+  return out;
 }
 
 function sequenceFor(seed: string): GeneratedPiece[][] {
