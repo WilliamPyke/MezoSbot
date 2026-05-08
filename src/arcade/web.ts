@@ -141,32 +141,37 @@ export async function handleArcadeWebRequest(
     return true;
   }
   if (method === "GET" && path === "/arcade/api/spectate-state") {
-    const matchIdRaw = url.searchParams.get("match");
-    const matchId = matchIdRaw ? parseInt(matchIdRaw, 10) : NaN;
-    if (!Number.isFinite(matchId) || matchId <= 0) {
-      sendJson(res, 400, { error: "Missing or invalid match id" });
-      return true;
+    try {
+      const matchIdRaw = url.searchParams.get("match");
+      const matchId = matchIdRaw ? parseInt(matchIdRaw, 10) : NaN;
+      if (!Number.isFinite(matchId) || matchId <= 0) {
+        sendJson(res, 400, { error: "Missing or invalid match id" });
+        return true;
+      }
+      const m = await getMatch(matchId);
+      if (!m) {
+        sendJson(res, 404, { error: "Match not found" });
+        return true;
+      }
+      if (m.mode === "practice") {
+        sendJson(res, 403, { error: "Practice matches can't be spectated" });
+        return true;
+      }
+      if (m.status === "waiting") {
+        sendJson(res, 200, { type: "waiting", matchId, mode: m.mode });
+        return true;
+      }
+      await ensureMatchRuntimeLoaded(matchId);
+      const snapshot = await buildSpectatorSnapshot(matchId);
+      if (!snapshot) {
+        sendJson(res, 404, { error: "Snapshot unavailable" });
+        return true;
+      }
+      sendJson(res, 200, snapshot);
+    } catch (err) {
+      console.error("[Spectate] state route error:", (err as Error)?.message ?? err);
+      sendJson(res, 500, { error: "Internal error" });
     }
-    const m = await getMatch(matchId);
-    if (!m) {
-      sendJson(res, 404, { error: "Match not found" });
-      return true;
-    }
-    if (m.mode === "practice") {
-      sendJson(res, 403, { error: "Practice matches can't be spectated" });
-      return true;
-    }
-    if (m.status === "waiting") {
-      sendJson(res, 200, { type: "waiting", matchId, mode: m.mode });
-      return true;
-    }
-    await ensureMatchRuntimeLoaded(matchId);
-    const snapshot = await buildSpectatorSnapshot(matchId);
-    if (!snapshot) {
-      sendJson(res, 404, { error: "Snapshot unavailable" });
-      return true;
-    }
-    sendJson(res, 200, snapshot);
     return true;
   }
   if (method === "POST" && path === "/arcade/api/submit") {
@@ -195,14 +200,10 @@ export async function handleArcadeWebRequest(
       });
 
       const settlement = await trySettleMatch(claim.matchId);
-      // Fire spectator close + Discord card refresh BEFORE clearing the
-      // runtime, so the final spectator snapshot still has board state.
+      // Notify spectators + refresh Discord card BEFORE clearing the
+      // runtime so the final snapshot still has board state.
       onMatchSettled(claim.matchId);
-      if (settlement.status !== "waiting") {
-        // Defer runtime clear to next tick so onMatchSettled (async)
-        // can read the runtime while building the final snapshot.
-        setImmediate(() => clearRuntime(claim.matchId));
-      }
+      if (settlement.status !== "waiting") clearRuntime(claim.matchId);
 
       return { status: 200, body: await buildStateResponse(claim.matchId, claim.userId) };
     });
