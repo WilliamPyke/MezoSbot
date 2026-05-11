@@ -106,6 +106,29 @@ CREATE TABLE IF NOT EXISTS deposit_addresses (
   last_checked_balance TEXT DEFAULT '0'
 );
 
+CREATE TABLE IF NOT EXISTS wallet_verification_challenges (
+  id BIGSERIAL PRIMARY KEY,
+  discord_id TEXT NOT NULL,
+  deposit_address TEXT NOT NULL,
+  challenge_sats DOUBLE PRECISION NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  tx_hash TEXT,
+  wallet_address TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  expires_at TIMESTAMPTZ NOT NULL DEFAULT (now() + interval '24 hours'),
+  verified_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS verified_wallets (
+  id BIGSERIAL PRIMARY KEY,
+  discord_id TEXT NOT NULL,
+  wallet_address TEXT NOT NULL UNIQUE,
+  chain_id INTEGER NOT NULL,
+  verification_tx_hash TEXT NOT NULL UNIQUE,
+  verified_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- RPC functions for atomic balance updates
 CREATE OR REPLACE FUNCTION add_balance(p_discord_id TEXT, p_amount DOUBLE PRECISION)
 RETURNS void AS $$
@@ -375,6 +398,8 @@ CREATE INDEX IF NOT EXISTS idx_deposits_tx ON deposits(tx_hash);
 CREATE INDEX IF NOT EXISTS idx_deposits_discord ON deposits(discord_id);
 CREATE INDEX IF NOT EXISTS idx_withdrawals_discord ON withdrawals(discord_id);
 CREATE INDEX IF NOT EXISTS idx_drops_channel ON drops(channel_id);
+CREATE INDEX IF NOT EXISTS idx_wallet_verification_pending ON wallet_verification_challenges(discord_id, status, expires_at);
+CREATE INDEX IF NOT EXISTS idx_verified_wallets_discord ON verified_wallets(discord_id);
 CREATE INDEX IF NOT EXISTS idx_event_quests_active_channel ON event_quests(status, guild_id, event_channel_id);
 CREATE INDEX IF NOT EXISTS idx_event_quest_attendance_joined ON event_quest_attendance(quest_id, joined_at) WHERE rewarded_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_arcade_matches_status ON arcade_matches(status);

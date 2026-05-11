@@ -84,6 +84,11 @@ export const config = {
     balanceBatchSize: parseInt(optional("DEPOSIT_BALANCE_BATCH_SIZE", "25"), 10),
     initialPollDelayMs: parseInt(optional("DEPOSIT_INITIAL_POLL_DELAY_MS", "15000"), 10),
   },
+  walletVerification: {
+    challengeSats: parseFloat(optional("WALLET_VERIFY_CHALLENGE_SATS", "10")),
+    challengeHours: parseInt(optional("WALLET_VERIFY_CHALLENGE_HOURS", "24"), 10),
+    scanBlocks: parseInt(optional("WALLET_VERIFY_SCAN_BLOCKS", "300"), 10),
+  },
   gameboy: {
     enabled: optionalBool("POKEMON_ENABLED", true),
     textInputEnabled: optionalBool("POKEMON_TEXT_INPUT_ENABLED", false),

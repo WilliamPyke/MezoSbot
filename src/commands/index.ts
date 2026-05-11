@@ -16,6 +16,7 @@ import * as credit from "./credit.js";
 import * as sweep from "./sweep.js";
 import * as arcade from "./arcade.js";
 import * as quest from "./quest.js";
+import * as wallet from "./wallet.js";
 import { gameboyCommands } from "./gameboy.js";
 import { config } from "../config.js";
 
@@ -37,6 +38,7 @@ const baseCommands = [
   sweep,
   arcade,
   quest,
+  wallet,
 ];
 
 // Merge base commands + gameboy button commands into a single list

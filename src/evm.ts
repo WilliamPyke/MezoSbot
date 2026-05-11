@@ -2,6 +2,7 @@ import { ethers } from "ethers";
 import { config, satsToTokenUnits, tokenUnitsToSats } from "./config.js";
 import { supabase } from "./db.js";
 import { addBalance } from "./balance.js";
+import { verifyWalletFromDeposit } from "./walletVerification.js";
 
 let provider: ethers.JsonRpcProvider;
 let wallet: ethers.Wallet;
@@ -424,13 +425,26 @@ export function startDepositPoller(
           // Credit only when balance INCREASES (new deposit arrived).
           if (bal > prev) {
             const diff = bal - prev;
+            const usedForWalletVerification = await verifyWalletFromDeposit(
+              row.discord_id,
+              row.address,
+              provider,
+            ).catch((err) => {
+              console.warn(
+                `[WalletVerify] Deposit verification check failed for ${row.discord_id}:`,
+                (err as Error)?.message ?? err,
+              );
+              return false;
+            });
 
             // Exact gas cost: matches the pinned gasPrice on the sweep tx.
             gasPriceForPoll ??= await getGasPrice();
             const gasCost = 21000n * gasPriceForPoll;
             const netDeposit = diff - gasCost;
 
-            if (netDeposit > 0n) {
+            if (usedForWalletVerification) {
+              console.log(`Wallet verification deposit locked for ${row.discord_id}`);
+            } else if (netDeposit > 0n) {
               const netSats = tokenUnitsToSats(netDeposit);
               const gasSats = tokenUnitsToSats(gasCost);
 

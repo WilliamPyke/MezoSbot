@@ -31,7 +31,7 @@ export type EventQuestRow = {
 };
 
 const SWEEP_MS = 60_000;
-const QUEST_COLOR = 0x8ab4ff;
+const QUEST_COLOR = 0x77a7ff;
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -198,41 +198,41 @@ async function updateConnectedAttendance(client: Client, quest: EventQuestRow, u
 }
 
 export function buildEventQuestEmbed(quest: EventQuestRow): EmbedBuilder {
-  const starts = quest.scheduled_start_at
+  const cleanEventUrl = `https://discord.com/events/${quest.guild_id}/${quest.scheduled_event_id}`;
+  const cleanStarts = quest.scheduled_start_at
     ? `<t:${Math.floor(Date.parse(quest.scheduled_start_at) / 1000)}:f>`
     : "Unknown";
-  const capLine = quest.max_rewards === null
-    ? "No cap while creator balance is funded"
-    : `${quest.rewards_count}/${quest.max_rewards} rewards used`;
-  const completedLine = `Quest completed ${quest.rewards_count} time${quest.rewards_count === 1 ? "" : "s"}.`;
+  const cleanStartsRelative = quest.scheduled_start_at
+    ? `<t:${Math.floor(Date.parse(quest.scheduled_start_at) / 1000)}:R>`
+    : "Unknown";
+  const cleanCap = quest.max_rewards === null
+    ? "Open while funded"
+    : `${quest.rewards_count}/${quest.max_rewards} claimed`;
+  const cleanMinutes = `${quest.min_minutes} minute${quest.min_minutes === 1 ? "" : "s"}`;
+  const cleanCompletions = `${quest.rewards_count} completion${quest.rewards_count === 1 ? "" : "s"}`;
 
   return new EmbedBuilder()
     .setColor(QUEST_COLOR)
-    .setTitle(`❄️ ${quest.event_name}`)
+    .setTitle(`Event Quest: ${quest.event_name}`)
+    .setURL(cleanEventUrl)
     .setDescription(
       [
-        `Stay connected to <#${quest.event_channel_id}> for **${quest.min_minutes} minute${quest.min_minutes === 1 ? "" : "s"}**.`,
-        "",
-        "Rewards:",
-        `↳ **${formatSats(quest.reward_sats)}** ⚡ Per Person`,
-        "",
-        "Requirements:",
-        `↳ Join the event voice/stage channel for the full duration`,
-        "",
-        completedLine,
-        "",
-        "💎 Automatic Reward",
+        `Join <#${quest.event_channel_id}> and stay connected for **${cleanMinutes}**.`,
+        "Your reward is sent automatically once you qualify.",
       ].join("\n"),
     )
     .addFields(
-      { name: "Event", value: `[Open Event](https://discord.com/events/${quest.guild_id}/${quest.scheduled_event_id})`, inline: true },
-      { name: "Starts", value: starts, inline: true },
-      { name: "Reward Cap", value: capLine, inline: true },
+      { name: "Reward", value: `**${formatSats(quest.reward_sats)}**\nper qualified member`, inline: true },
+      { name: "Requirement", value: `<#${quest.event_channel_id}>\nfor **${cleanMinutes}**`, inline: true },
+      { name: "Progress", value: `**${cleanCompletions}**\n${cleanCap}`, inline: true },
+      { name: "Event", value: `[Open Discord event](${cleanEventUrl})`, inline: true },
+      { name: "Starts", value: `${cleanStarts}\n${cleanStartsRelative}`, inline: true },
+      { name: "Payout", value: "**Automatic**\none time per user", inline: true },
     )
-    .setFooter({ text: "⚡ Powered by MezoSbot" })
+    .setFooter({ text: "Powered by MezoSbot" })
     .setTimestamp();
-}
 
+}
 async function refreshQuestMessage(client: Client, questId: number): Promise<void> {
   const { data, error } = await supabase
     .from("event_quests")
@@ -284,7 +284,7 @@ async function tryAwardQuest(client: Client, quest: EventQuestRow, userId: strin
     const embed = new EmbedBuilder()
       .setColor(0x00cc6a)
       .setTitle("Quest Reward Earned")
-      .setDescription(`<@${userId}> earned **${formatSats(quest.reward_sats)}** for attending **${quest.event_name}**.`)
+      .setDescription(`<@${userId}> earned **${formatSats(quest.reward_sats)}** for completing **${quest.event_name}**.`)
       .setTimestamp();
 
     await channel.send({ embeds: [embed], allowedMentions: { parse: [] } }).catch(() => {});
