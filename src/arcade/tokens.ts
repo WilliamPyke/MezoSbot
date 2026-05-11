@@ -12,7 +12,7 @@ import { config } from "../config.js";
  */
 
 const SIG_LEN = 24;
-const DEFAULT_TTL_MS = 4 * 60 * 60 * 1000; // 4 hours — comfortably longer than a match.
+const DEFAULT_TTL_MS = 30 * 24 * 60 * 60 * 1000; // Keeps browser rematch chains alive without returning to Discord.
 
 function secret(): string {
   return config.arcadeTokenSecret || "mezosbot-arcade-default-secret-change-me";

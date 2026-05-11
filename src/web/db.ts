@@ -141,13 +141,16 @@ export async function markJoined(id: string, wallet: string, txHash: string) {
     throw new Error("This session is reserved for another wallet");
   }
 
+  const now = Date.now();
+
   const { data, error } = await supabase
     .from("web_arcade_sessions")
     .update({
       status: "active",
       player_b_address: normalized,
       join_tx_hash: txHash,
-      updated_at: new Date().toISOString(),
+      play_deadline: new Date(now + config.web.playWindowSeconds * 1000).toISOString(),
+      updated_at: new Date(now).toISOString(),
     })
     .eq("id", id)
     .eq("status", "created")

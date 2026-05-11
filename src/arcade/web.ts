@@ -368,8 +368,11 @@ async function buildStateResponse(
     : defaultSeries;
   let redirect: string | null = null;
   if (match.next_match_id) {
-    const nextToken = issueMatchToken(match.next_match_id, userId);
-    redirect = `/arcade/play?t=${encodeURIComponent(nextToken)}`;
+    const nextMatch = await getMatch(match.next_match_id);
+    if (nextMatch && nextMatch.status !== "waiting" && nextMatch.status !== "cancelled") {
+      const nextToken = issueMatchToken(match.next_match_id, userId);
+      redirect = `/arcade/play?t=${encodeURIComponent(nextToken)}`;
+    }
   } else if (match.next_session_id) {
     redirect = `/session/${match.next_session_id}`;
   }
@@ -864,7 +867,7 @@ export function renderArcadePlayPage(options: {
     --gold: #ffd86b;
   }
   * { box-sizing: border-box; }
-  html, body { margin: 0; padding: 0; color: var(--text); font-family: "Space Grotesk", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Inter, Roboto, "Helvetica Neue", Arial, sans-serif; background: #06080f; overflow-x: hidden; overscroll-behavior: none; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; padding: 0; color: var(--text); font-family: "Space Grotesk", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Inter, Roboto, "Helvetica Neue", Arial, sans-serif; background: #06080f; overflow-x: hidden; overscroll-behavior-x: none; -webkit-tap-highlight-color: transparent; }
   .display { font-family: "Orbitron", "Space Grotesk", ui-sans-serif, system-ui, sans-serif; }
   body { min-height: 100vh; position: relative; }
   body.shake { animation: shake .35s cubic-bezier(.36,.07,.19,.97); }
@@ -902,7 +905,7 @@ export function renderArcadePlayPage(options: {
   /* Particle canvas overlay */
   #fx { position: fixed; inset: 0; pointer-events: none; z-index: 50; }
 
-  .wrap { position: relative; z-index: 2; max-width: min(960px, 96vw); margin: 0 auto; padding: clamp(14px, 2vw, 32px) clamp(12px, 2.5vw, 36px) 80px; }
+  .wrap { position: relative; z-index: 2; max-width: min(1380px, 98vw); margin: 0 auto; padding: clamp(12px, 1.6vw, 24px) clamp(10px, 2vw, 28px) 80px; }
   .topbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 14px; }
   .title { font-family: "Orbitron", "Space Grotesk", sans-serif; font-weight: 900; font-size: clamp(20px, 2.6vw, 32px); letter-spacing: .14em; background: linear-gradient(90deg, #4ff7ff, #1ee881 35%, #ffd86b 65%, #ff5fa3); background-size: 200% 100%; -webkit-background-clip: text; background-clip: text; color: transparent; text-shadow: 0 0 30px rgba(79,247,255,.25); animation: titleGradient 6s linear infinite; }
   @keyframes titleGradient { from { background-position: 0% 0; } to { background-position: 200% 0; } }
@@ -935,8 +938,10 @@ export function renderArcadePlayPage(options: {
   .pot strong { color: var(--gold); text-shadow: 0 0 12px rgba(255,216,107,.55); }
 
   /* Board */
-  .board-wrap { position: relative; perspective: 1200px; }
-  .board { display: grid; grid-template-columns: repeat(9, 1fr); gap: 4px; padding: 10px; background: linear-gradient(135deg, rgba(20,26,40,.7), rgba(13,18,30,.85)); border: 1px solid var(--line-strong); border-radius: 20px; aspect-ratio: 1 / 1; user-select: none; touch-action: none; box-shadow: 0 30px 60px -20px rgba(0,0,0,.65), inset 0 0 0 1px rgba(255,255,255,.04); transition: transform .25s ease, box-shadow .3s ease; transform-style: preserve-3d; position: relative; overflow: hidden; }
+  .game-shell { display: grid; grid-template-columns: minmax(0, 1fr) minmax(270px, 340px); gap: clamp(12px, 2vw, 24px); align-items: start; }
+  .side-panel { display: flex; flex-direction: column; gap: 12px; position: sticky; top: 14px; max-height: calc(100vh - 28px); overflow-y: auto; padding-right: 2px; }
+  .board-wrap { position: relative; perspective: 1200px; display: flex; justify-content: center; }
+  .board { display: grid; grid-template-columns: repeat(9, 1fr); width: min(100%, 760px, calc(100vh - 170px)); max-width: 760px; min-width: 0; gap: 4px; padding: 10px; background: linear-gradient(135deg, rgba(20,26,40,.7), rgba(13,18,30,.85)); border: 1px solid var(--line-strong); border-radius: 20px; aspect-ratio: 1 / 1; user-select: none; touch-action: manipulation; box-shadow: 0 30px 60px -20px rgba(0,0,0,.65), inset 0 0 0 1px rgba(255,255,255,.04); transition: transform .25s ease, box-shadow .3s ease; transform-style: preserve-3d; position: relative; overflow: hidden; }
   .board::before { content: ""; position: absolute; inset: 0; background: radial-gradient(circle 320px at var(--mx, 50%) var(--my, 50%), rgba(79,247,255,.14), transparent 60%); pointer-events: none; transition: opacity .3s; opacity: 0; z-index: 0; }
   .board.active::before { opacity: 1; }
   .board > * { position: relative; z-index: 1; }
@@ -957,9 +962,8 @@ export function renderArcadePlayPage(options: {
   .cell.keyboard-cursor { outline: 2px solid var(--neon); outline-offset: -2px; box-shadow: 0 0 0 3px rgba(0,255,157,.3); }
 
   /* Pieces + bank */
-  .pieces-row { display: grid; grid-template-columns: 1fr minmax(120px, 0.5fr); gap: 10px; margin-top: 14px; align-items: stretch; }
-  @media (max-width: 600px) { .pieces-row { grid-template-columns: 1fr; } }
-  .pieces { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+  .pieces-row { display: grid; grid-template-columns: 1fr; gap: 10px; align-items: stretch; }
+  .pieces { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
   .bank { background: linear-gradient(135deg, rgba(255,216,107,.08), rgba(160,107,255,.08)); border: 1px solid rgba(255,216,107,.3); border-radius: 16px; padding: 12px; min-height: 120px; display: flex; flex-direction: column; gap: 8px; backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); position: relative; overflow: hidden; }
   .bank.empty { opacity: .55; border-style: dashed; }
   .bank.active { border-color: var(--gold); box-shadow: 0 0 0 2px rgba(255,216,107,.3), 0 12px 30px -10px rgba(255,216,107,.45); }
@@ -986,7 +990,7 @@ export function renderArcadePlayPage(options: {
   .piece .pcell.km { background: linear-gradient(135deg, #ffc274, #ff5a1a); box-shadow: inset 0 -2px 0 rgba(0,0,0,.3), inset 0 1px 0 rgba(255,255,255,.35); animation: multShimmer 2.4s linear infinite; }
 
   /* Buttons */
-  .controls { display: flex; gap: 10px; margin-top: 14px; flex-wrap: wrap; }
+  .controls { display: flex; gap: 10px; flex-wrap: wrap; }
   .btn { background: linear-gradient(135deg, rgba(20,26,40,.7), rgba(13,18,30,.7)); border: 1px solid var(--line-strong); color: var(--text); padding: 12px 16px; border-radius: 14px; font-weight: 700; font-size: 14px; cursor: pointer; transition: transform .1s, background .15s, border-color .15s, box-shadow .2s; flex: 1 1 auto; position: relative; overflow: hidden; backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); }
   .btn::after { content: ""; position: absolute; top: 0; bottom: 0; left: -120%; width: 60%; background: linear-gradient(90deg, transparent, rgba(255,255,255,.18), transparent); transform: skewX(-20deg); transition: left .6s ease; }
   .btn:hover { transform: translateY(-1px); border-color: rgba(255,255,255,.35); box-shadow: 0 8px 24px -8px rgba(0,0,0,.55); }
@@ -1041,6 +1045,8 @@ export function renderArcadePlayPage(options: {
   .footer { color: var(--muted); font-size: 12px; text-align: center; margin-top: 28px; opacity: .7; }
   @media (max-width: 760px) {
     .wrap { max-width: 100vw; padding: max(8px, env(safe-area-inset-top)) 8px calc(92px + env(safe-area-inset-bottom)); }
+    .game-shell { display: block; }
+    .side-panel { position: static; max-height: none; overflow: visible; padding-right: 0; margin-top: 10px; }
     .topbar { align-items: flex-start; margin-bottom: 10px; }
     .topRight { gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
     .badge, .series-chip { font-size: 11px; padding: 5px 8px; }
@@ -1126,10 +1132,12 @@ export function renderArcadePlayPage(options: {
     <div id="timeStat" class="stat time"><div class="label">Time</div><div id="time" class="value">3:00</div></div>
   </div>
 
+  <div class="game-shell">
   <div class="board-wrap">
     <div id="board" class="board" aria-label="Game board"></div>
   </div>
 
+  <div class="side-panel">
   <div class="pieces-row">
     <div id="pieces" class="pieces"></div>
     <div id="bank" class="bank empty">
@@ -1166,6 +1174,8 @@ export function renderArcadePlayPage(options: {
   <div id="opponentBox" class="opponent" style="display:none;"></div>
 
   <div id="endBox" class="end" style="display:none;"></div>
+  </div>
+  </div>
 
   <div class="footer">
     Same shapes for both players. Highest validated score wins. Server validates every move.
@@ -1187,7 +1197,15 @@ export function renderArcadePlayPage(options: {
 (() => {
   const CONFIG = ${clientConfig};
   const params = new URLSearchParams(location.search);
-  const TOKEN = CONFIG.requiresToken ? params.get(CONFIG.tokenParam || 't') : null;
+  const TOKEN_KEY = 'arcade.latestToken';
+  let TOKEN = CONFIG.requiresToken ? params.get(CONFIG.tokenParam || 't') : null;
+  if (CONFIG.requiresToken) {
+    if (TOKEN) {
+      try { localStorage.setItem(TOKEN_KEY, TOKEN); } catch (e) {}
+    } else {
+      try { TOKEN = localStorage.getItem(TOKEN_KEY); } catch (e) { TOKEN = null; }
+    }
+  }
   if (CONFIG.requiresToken && !TOKEN) {
     document.body.innerHTML = CONFIG.missingAccessHtml;
     return;
@@ -1798,6 +1816,11 @@ export function renderArcadePlayPage(options: {
   }
 
   function paintTimer() {
+    if (isWaitingForOpponent()) {
+      $time.textContent = 'WAIT';
+      $timeStat.classList.remove('low');
+      return;
+    }
     const remaining = remainingMs();
     if (remaining == null) {
       $time.textContent = state && state.match && state.match.durationSeconds ? formatClock(state.match.durationSeconds * 1000) : '3:00';
@@ -2256,13 +2279,13 @@ export function renderArcadePlayPage(options: {
     else label = 'Stake ' + (m.stakeFormatted || '?') + ' • Match #' + m.id;
     $mode.textContent = label;
 
-    if (state.self.phase === 'playing' && !state.result.completed) {
+    if (state.self.phase === 'playing' && !state.result.completed && !isWaitingForOpponent()) {
       $live.style.display = '';
     } else {
       $live.style.display = 'none';
     }
-    $rotate.disabled = state.self.phase === 'finished' || state.result.completed || isTimeExpired();
-    $clear.disabled = state.result.completed;
+    $rotate.disabled = isWaitingForOpponent() || state.self.phase === 'finished' || state.result.completed || isTimeExpired();
+    $clear.disabled = isWaitingForOpponent() || state.result.completed;
 
     if (m.mode === 'staked_pvp' && m.grossPotFormatted) {
       $pot.style.display = '';
@@ -2273,7 +2296,7 @@ export function renderArcadePlayPage(options: {
       $pot.style.display = 'none';
     }
 
-    if (state.self.phase === 'finished' && !state.self.submitted && !state.result.completed) {
+    if (!isWaitingForOpponent() && state.self.phase === 'finished' && !state.self.submitted && !state.result.completed) {
       $submit.style.display = '';
       $submit.disabled = false;
     } else {
@@ -2427,7 +2450,7 @@ export function renderArcadePlayPage(options: {
     const prev = state;
     state = next;
     onStateUpdate(prev, null);
-    if (selected.pieceIndex == null && state.self.phase === 'playing') {
+    if ((selected.pieceIndex == null || !isPlayablePiece(state.self.pieces[selected.pieceIndex])) && state.self.phase === 'playing') {
       const idx = firstPlayablePieceIndex();
       if (idx >= 0) selected.pieceIndex = idx;
     }

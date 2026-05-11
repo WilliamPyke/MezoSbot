@@ -235,8 +235,46 @@ function applyBank(
   // piece, that piece moves into the slot (override = that piece).
   overrides[slotKey(state.level, move.pieceIndex)] = state.bank ?? null;
 
+  let level = state.level;
+  let placedThisLevel = state.placedThisLevel;
+  let pieceCursor = state.pieceCursor;
+  let phase: PlayerState["phase"] = "playing";
+  let endReason: PlayerState["endReason"];
+
+  const allSlotsResolved = (() => {
+    for (let i = 0; i < PIECES_PER_LEVEL; i++) {
+      if (placedThisLevel[i]) continue;
+      const slot = pieceForSlotForFutureLevel(level, i, sequence, overrides);
+      if (slot != null) return false;
+    }
+    return true;
+  })();
+
+  if (allSlotsResolved) {
+    level += 1;
+    pieceCursor = 0;
+    placedThisLevel = new Array(PIECES_PER_LEVEL).fill(false);
+  }
+
+  const remainingPieces: GeneratedPiece["cells"][] = [];
+  for (let i = 0; i < PIECES_PER_LEVEL; i++) {
+    if (placedThisLevel[i]) continue;
+    const candidate = pieceForSlotForFutureLevel(level, i, sequence, overrides);
+    if (candidate) remainingPieces.push(candidate.cells);
+  }
+  remainingPieces.push(newBank.cells);
+  if (remainingPieces.length === 0 || !anyPiecePlaceable(state.board, remainingPieces)) {
+    phase = "finished";
+    endReason = "no_moves";
+  }
+
   const newState: PlayerState = {
     ...state,
+    level,
+    pieceCursor,
+    placedThisLevel,
+    phase,
+    endReason,
     bank: newBank,
     slotOverrides: overrides,
     moves: [...state.moves, move],
