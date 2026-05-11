@@ -19,6 +19,7 @@ type Subscriber = {
 };
 
 const subscribers = new Map<number, Set<Subscriber>>();
+const pendingBroadcasts = new Map<number, ReturnType<typeof setTimeout>>();
 
 /** display name cache: discord id → resolved label */
 const displayNameCache = new Map<string, string>();
@@ -146,8 +147,7 @@ async function buildSnapshotFromMatch(match: ArcadeMatchRow) {
   };
 }
 
-/** Push the latest snapshot to every subscriber for this match. */
-export async function broadcastMatchState(matchId: number): Promise<void> {
+async function sendBroadcastNow(matchId: number): Promise<void> {
   const set = subscribers.get(matchId);
   if (!set || set.size === 0) return;
   const snapshot = await buildSpectatorSnapshot(matchId);
@@ -162,10 +162,29 @@ export async function broadcastMatchState(matchId: number): Promise<void> {
   }
 }
 
+/** Schedule a coalesced snapshot push to every subscriber for this match. */
+export async function broadcastMatchState(matchId: number): Promise<void> {
+  const set = subscribers.get(matchId);
+  if (!set || set.size === 0 || pendingBroadcasts.has(matchId)) return;
+
+  const timer = setTimeout(() => {
+    pendingBroadcasts.delete(matchId);
+    sendBroadcastNow(matchId).catch((err) => {
+      console.error("[Spectate] broadcast error:", (err as Error)?.message ?? err);
+    });
+  }, 80);
+  pendingBroadcasts.set(matchId, timer);
+}
+
 /** Send final snapshot, then close all spectator sockets for this match. */
 export async function closeMatchSpectators(matchId: number): Promise<void> {
   const set = subscribers.get(matchId);
   if (!set || set.size === 0) return;
+  const pending = pendingBroadcasts.get(matchId);
+  if (pending) {
+    clearTimeout(pending);
+    pendingBroadcasts.delete(matchId);
+  }
   const snapshot = await buildSpectatorSnapshot(matchId);
   const payload = snapshot ? JSON.stringify(snapshot) : null;
   for (const sub of set) {

@@ -96,7 +96,13 @@ export async function handleArcadeWebRequest(
       }
       const expired = await settleExpiredMatchIfNeeded(claim.matchId);
       if (expired && expired.status !== "active" && expired.status !== "submitted") {
-        return { status: 200, body: await buildStateResponse(claim.matchId, claim.userId) };
+        return {
+          status: 200,
+          body: await buildStateResponse(claim.matchId, claim.userId, {
+            match: expired,
+            skipExpireCheck: true,
+          }),
+        };
       }
       const result = applyMoveForPlayer(claim.matchId, claim.userId, move);
       if (!("ok" in result) || !result.ok) {
@@ -105,7 +111,14 @@ export async function handleArcadeWebRequest(
       // Best-effort draft persist so a restart can recover.
       const state = result.state;
       persistDraft(claim.matchId, claim.userId, state).catch(() => {});
-      return { status: 200, body: await buildStateResponse(claim.matchId, claim.userId) };
+      return {
+        status: 200,
+        body: await buildStateResponse(claim.matchId, claim.userId, {
+          match: expired ?? current ?? undefined,
+          skipExpireCheck: true,
+          skipSeries: true,
+        }),
+      };
     });
     return true;
   }
@@ -274,11 +287,14 @@ type StateResponse = {
 
 async function buildStateResponse(
   matchId: number,
-  userId: string
+  userId: string,
+  options: { match?: ArcadeMatchRow; skipExpireCheck?: boolean; skipSeries?: boolean } = {}
 ): Promise<StateResponse | { error: string }> {
-  let match = await getMatch(matchId);
+  let match = options.match ?? await getMatch(matchId);
   if (!match) return { error: "Match not found" };
-  match = (await settleExpiredMatchIfNeeded(matchId)) ?? match;
+  if (!options.skipExpireCheck) {
+    match = (await settleExpiredMatchIfNeeded(matchId)) ?? match;
+  }
 
   const isPracticeOrPlayer =
     match.mode === "practice"
@@ -334,13 +350,22 @@ async function buildStateResponse(
     : isPlayerA
       ? match.rematch_requested_by_b
       : match.rematch_requested_by_a;
-  const series = (await getSeriesScore(matchId, userId)) ?? {
+  const defaultSeries = {
     rootId: matchId,
     totalCompleted: 0,
     youWins: 0,
     opponentWins: 0,
     ties: 0,
   };
+  const shouldLoadSeries =
+    !options.skipSeries ||
+    completed ||
+    (match.series_root_id != null && match.series_root_id !== match.id) ||
+    !!match.next_match_id ||
+    !!match.next_session_id;
+  const series = shouldLoadSeries
+    ? (await getSeriesScore(matchId, userId)) ?? defaultSeries
+    : defaultSeries;
   let redirect: string | null = null;
   if (match.next_match_id) {
     const nextToken = issueMatchToken(match.next_match_id, userId);
@@ -839,7 +864,7 @@ export function renderArcadePlayPage(options: {
     --gold: #ffd86b;
   }
   * { box-sizing: border-box; }
-  html, body { margin: 0; padding: 0; color: var(--text); font-family: "Space Grotesk", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Inter, Roboto, "Helvetica Neue", Arial, sans-serif; background: #06080f; overflow-x: hidden; }
+  html, body { margin: 0; padding: 0; color: var(--text); font-family: "Space Grotesk", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Inter, Roboto, "Helvetica Neue", Arial, sans-serif; background: #06080f; overflow-x: hidden; overscroll-behavior: none; -webkit-tap-highlight-color: transparent; }
   .display { font-family: "Orbitron", "Space Grotesk", ui-sans-serif, system-ui, sans-serif; }
   body { min-height: 100vh; position: relative; }
   body.shake { animation: shake .35s cubic-bezier(.36,.07,.19,.97); }
@@ -911,7 +936,7 @@ export function renderArcadePlayPage(options: {
 
   /* Board */
   .board-wrap { position: relative; perspective: 1200px; }
-  .board { display: grid; grid-template-columns: repeat(9, 1fr); gap: 4px; padding: 10px; background: linear-gradient(135deg, rgba(20,26,40,.7), rgba(13,18,30,.85)); border: 1px solid var(--line-strong); border-radius: 20px; aspect-ratio: 1 / 1; user-select: none; touch-action: manipulation; box-shadow: 0 30px 60px -20px rgba(0,0,0,.65), inset 0 0 0 1px rgba(255,255,255,.04); transition: transform .25s ease, box-shadow .3s ease; transform-style: preserve-3d; position: relative; overflow: hidden; }
+  .board { display: grid; grid-template-columns: repeat(9, 1fr); gap: 4px; padding: 10px; background: linear-gradient(135deg, rgba(20,26,40,.7), rgba(13,18,30,.85)); border: 1px solid var(--line-strong); border-radius: 20px; aspect-ratio: 1 / 1; user-select: none; touch-action: none; box-shadow: 0 30px 60px -20px rgba(0,0,0,.65), inset 0 0 0 1px rgba(255,255,255,.04); transition: transform .25s ease, box-shadow .3s ease; transform-style: preserve-3d; position: relative; overflow: hidden; }
   .board::before { content: ""; position: absolute; inset: 0; background: radial-gradient(circle 320px at var(--mx, 50%) var(--my, 50%), rgba(79,247,255,.14), transparent 60%); pointer-events: none; transition: opacity .3s; opacity: 0; z-index: 0; }
   .board.active::before { opacity: 1; }
   .board > * { position: relative; z-index: 1; }
@@ -1014,6 +1039,31 @@ export function renderArcadePlayPage(options: {
   .end .row.lose { color: #ffb0bb; font-weight: 600; }
 
   .footer { color: var(--muted); font-size: 12px; text-align: center; margin-top: 28px; opacity: .7; }
+  @media (max-width: 760px) {
+    .wrap { max-width: 100vw; padding: max(8px, env(safe-area-inset-top)) 8px calc(92px + env(safe-area-inset-bottom)); }
+    .topbar { align-items: flex-start; margin-bottom: 10px; }
+    .topRight { gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+    .badge, .series-chip { font-size: 11px; padding: 5px 8px; }
+    .iconBtn { width: 42px; height: 42px; }
+    .stats { gap: 7px; margin-bottom: 10px; }
+    .stat { border-radius: 12px; padding: 8px 9px; }
+    .stat .label { font-size: 9px; letter-spacing: .12em; }
+    .board { gap: clamp(2px, .7vw, 3px); padding: clamp(6px, 1.8vw, 9px); border-radius: 16px; }
+    .cell { border-radius: clamp(4px, 1.2vw, 7px); }
+    .pieces-row { grid-template-columns: 1fr; gap: 8px; margin-top: 10px; }
+    .pieces { gap: 8px; }
+    .piece, .bank { border-radius: 12px; padding: 8px; min-height: 88px; gap: 6px; }
+    .piece .ptitle, .bank .ptitle { font-size: 10px; letter-spacing: .08em; }
+    .controls { position: sticky; bottom: max(8px, env(safe-area-inset-bottom)); z-index: 30; margin-top: 10px; padding: 8px; border: 1px solid var(--line); border-radius: 16px; background: rgba(6,8,15,.72); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); box-shadow: 0 -10px 30px -18px rgba(0,0,0,.8); }
+    .btn { min-height: 44px; padding: 10px 12px; border-radius: 12px; font-size: 13px; }
+    .tabs { overflow-x: auto; scrollbar-width: none; }
+    .tabs::-webkit-scrollbar { display: none; }
+  }
+  @media (hover: none) {
+    .iconBtn:hover, .piece:hover, .btn:hover, .btn.primary:hover { transform: none; box-shadow: none; }
+    .cell:not(.fill-1):not(.fill-2):not(.ghost-ok):not(.ghost-mult):not(.ghost-bad):hover { background: linear-gradient(180deg, rgba(255,255,255,.03), rgba(0,0,0,.18)); }
+    .btn:hover::after { left: -120%; }
+  }
   @media (max-width: 480px) {
     .stats { grid-template-columns: repeat(2, 1fr); }
     .stat .value { font-size: 18px; }
@@ -1574,7 +1624,7 @@ export function renderArcadePlayPage(options: {
       render();
     } else if (key >= '1' && key <= '3') {
       const idx = Number(key) - 1;
-      if (state && state.self && state.self.pieces && state.self.pieces[idx] && !state.self.pieces[idx].placed) {
+      if (state && state.self && state.self.pieces && isPlayablePiece(state.self.pieces[idx])) {
         event.preventDefault();
         selected.pieceIndex = idx;
         selected.rotation = 0;
@@ -1606,25 +1656,31 @@ export function renderArcadePlayPage(options: {
   }
 
   async function bankSelected() {
+    if (movePending) return;
     if (!state || state.result.completed || state.self.phase === 'finished' || isTimeExpired()) return;
     if (isWaitingForOpponent()) return;
-    if (selected.pieceIndex == null) {
+    if (selected.pieceIndex == null || !isPlayablePiece(state.self.pieces[selected.pieceIndex])) {
       showToast('Select a piece first');
       return;
     }
     const move = { kind: 'bank', level: state.self.level, pieceIndex: selected.pieceIndex };
-    const next = await api('POST', CONFIG.movePath, move);
-    if (!next) return;
-    const beforeServer = state;
-    state = next;
-    onStateUpdate(beforeServer, null);
-    // After a bank, prefer the slot we banked into (bank had something) or the
-    // first remaining playable piece (bank was empty).
-    const idx = state.self.pieces.findIndex((p) => p && p.cells && !p.placed);
-    selected.pieceIndex = idx >= 0 ? idx : null;
-    selected.rotation = 0;
-    Sound.select();
-    render();
+    movePending = true;
+    try {
+      const next = await api('POST', CONFIG.movePath, move);
+      if (!next) return;
+      const beforeServer = state;
+      state = next;
+      onStateUpdate(beforeServer, null);
+      // After a bank, prefer the slot we banked into (bank had something) or the
+      // first remaining playable piece (bank was empty).
+      const idx = firstPlayablePieceIndex();
+      selected.pieceIndex = idx >= 0 ? idx : null;
+      selected.rotation = 0;
+      Sound.select();
+      render();
+    } finally {
+      movePending = false;
+    }
   }
 
   function rematchPath(suffix) {
@@ -1663,8 +1719,17 @@ export function renderArcadePlayPage(options: {
   function availablePieceIndexes() {
     if (!state || !state.self || !state.self.pieces) return [];
     return state.self.pieces
-      .map((piece, index) => piece.placed ? -1 : index)
+      .map((piece, index) => isPlayablePiece(piece) ? index : -1)
       .filter((index) => index >= 0);
+  }
+
+  function isPlayablePiece(piece) {
+    return !!(piece && piece.cells && !piece.placed);
+  }
+
+  function firstPlayablePieceIndex() {
+    if (!state || !state.self || !state.self.pieces) return -1;
+    return state.self.pieces.findIndex(isPlayablePiece);
   }
 
   function cyclePiece(direction) {
@@ -1786,7 +1851,7 @@ export function renderArcadePlayPage(options: {
   function selectedCells() {
     if (!state || selected.pieceIndex == null) return null;
     const piece = state.self.pieces[selected.pieceIndex];
-    if (!piece) return null;
+    if (!piece || !piece.cells) return null;
     return rotateCells(piece.cells, selected.rotation);
   }
 
@@ -1904,7 +1969,7 @@ export function renderArcadePlayPage(options: {
       state = next;
       onStateUpdate(beforeServer, { lastPlacement: { r: r, c: c, cells: placedCells } });
       if (state.self.phase === 'playing') {
-        const idx = state.self.pieces.findIndex(p => !p.placed);
+        const idx = firstPlayablePieceIndex();
         selected.pieceIndex = idx >= 0 ? idx : null;
       } else {
         selected.pieceIndex = null;
@@ -1927,7 +1992,7 @@ export function renderArcadePlayPage(options: {
       state.self.board[r + cell.y][c + cell.x] = cell.kind === 'multiplier' ? 2 : 1;
     }
     state.self.pieces[pieceIndex].placed = true;
-    const idx = state.self.pieces.findIndex(p => !p.placed);
+    const idx = firstPlayablePieceIndex();
     selected.pieceIndex = idx >= 0 ? idx : null;
     selected.rotation = 0;
     selected.hoverRow = r;
@@ -2363,7 +2428,7 @@ export function renderArcadePlayPage(options: {
     state = next;
     onStateUpdate(prev, null);
     if (selected.pieceIndex == null && state.self.phase === 'playing') {
-      const idx = state.self.pieces.findIndex(p => !p.placed);
+      const idx = firstPlayablePieceIndex();
       if (idx >= 0) selected.pieceIndex = idx;
     }
     ensureCursor();
