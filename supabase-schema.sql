@@ -69,6 +69,7 @@ CREATE TABLE IF NOT EXISTS event_quests (
   id BIGSERIAL PRIMARY KEY,
   guild_id TEXT NOT NULL,
   channel_id TEXT NOT NULL,
+  message_id TEXT,
   creator_id TEXT NOT NULL,
   scheduled_event_id TEXT NOT NULL,
   event_name TEXT NOT NULL,
@@ -83,6 +84,8 @@ CREATE TABLE IF NOT EXISTS event_quests (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   completed_at TIMESTAMPTZ
 );
+
+ALTER TABLE event_quests ADD COLUMN IF NOT EXISTS message_id TEXT;
 
 CREATE TABLE IF NOT EXISTS event_quest_attendance (
   id BIGSERIAL PRIMARY KEY,

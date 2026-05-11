@@ -1,5 +1,4 @@
 import {
-  EmbedBuilder,
   GuildScheduledEventEntityType,
   GuildScheduledEventStatus,
   MessageFlags,
@@ -10,6 +9,7 @@ import {
 import { getBalance } from "../balance.js";
 import { supabase } from "../db.js";
 import { formatSats, roundSats } from "../format.js";
+import { buildEventQuestEmbed, type EventQuestRow } from "../eventQuests.js";
 
 export const data = {
   name: "quest",
@@ -122,6 +122,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     .insert({
       guild_id: interaction.guild.id,
       channel_id: interaction.channelId,
+      message_id: null,
       creator_id: interaction.user.id,
       scheduled_event_id: event.id,
       event_name: event.name,
@@ -139,26 +140,32 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     return interaction.editReply({ content: "Failed to create the quest." });
   }
 
-  const capText = maxRewards === null
-    ? "No cap; rewards stop if the creator balance runs out."
-    : `${maxRewards} user${maxRewards === 1 ? "" : "s"} max`;
-  const starts = event.scheduledStartAt
-    ? `<t:${Math.floor(event.scheduledStartAt.getTime() / 1000)}:f>`
-    : "Unknown";
+  const quest: EventQuestRow = {
+    id: inserted.id,
+    guild_id: interaction.guild.id,
+    channel_id: interaction.channelId,
+    message_id: null,
+    creator_id: interaction.user.id,
+    scheduled_event_id: event.id,
+    event_name: event.name,
+    event_channel_id: event.channelId,
+    reward_sats: reward,
+    min_minutes: minMinutes,
+    max_rewards: maxRewards,
+    rewards_count: 0,
+    status: "active",
+    scheduled_start_at: event.scheduledStartAt?.toISOString() ?? null,
+    scheduled_end_at: event.scheduledEndAt?.toISOString() ?? null,
+  };
 
-  const embed = new EmbedBuilder()
-    .setColor(0xf0b232)
-    .setTitle("Event Quest Created")
-    .setDescription(`Attend **${event.name}** for at least **${minMinutes} minute${minMinutes === 1 ? "" : "s"}** to earn **${formatSats(reward)}**.`)
-    .addFields(
-      { name: "Event", value: `[Open Event](https://discord.com/events/${interaction.guild.id}/${event.id})`, inline: true },
-      { name: "Channel", value: `<#${event.channelId}>`, inline: true },
-      { name: "Starts", value: starts, inline: true },
-      { name: "Reward Cap", value: capText, inline: true },
-      { name: "Quest ID", value: String(inserted.id), inline: true },
-    )
-    .setFooter({ text: "Attendance is tracked while users are connected to the event voice/stage channel." })
-    .setTimestamp();
+  const thumbnail = event.coverImageURL({ size: 256 });
+  const embed = buildEventQuestEmbed(quest);
+  if (thumbnail) embed.setThumbnail(thumbnail);
 
-  await interaction.editReply({ embeds: [embed], allowedMentions: { parse: [] } });
+  const reply = await interaction.editReply({ embeds: [embed], allowedMentions: { parse: [] } });
+
+  await supabase
+    .from("event_quests")
+    .update({ message_id: reply.id })
+    .eq("id", quest.id);
 }

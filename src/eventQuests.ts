@@ -16,6 +16,7 @@ export type EventQuestRow = {
   id: number;
   guild_id: string;
   channel_id: string;
+  message_id: string | null;
   creator_id: string;
   scheduled_event_id: string;
   event_name: string;
@@ -30,6 +31,7 @@ export type EventQuestRow = {
 };
 
 const SWEEP_MS = 60_000;
+const QUEST_COLOR = 0x8ab4ff;
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -195,6 +197,66 @@ async function updateConnectedAttendance(client: Client, quest: EventQuestRow, u
   await tryAwardQuest(client, quest, userId);
 }
 
+export function buildEventQuestEmbed(quest: EventQuestRow): EmbedBuilder {
+  const starts = quest.scheduled_start_at
+    ? `<t:${Math.floor(Date.parse(quest.scheduled_start_at) / 1000)}:f>`
+    : "Unknown";
+  const capLine = quest.max_rewards === null
+    ? "No cap while creator balance is funded"
+    : `${quest.rewards_count}/${quest.max_rewards} rewards used`;
+  const completedLine = `Quest completed ${quest.rewards_count} time${quest.rewards_count === 1 ? "" : "s"}.`;
+
+  return new EmbedBuilder()
+    .setColor(QUEST_COLOR)
+    .setTitle(`❄️ ${quest.event_name}`)
+    .setDescription(
+      [
+        `Stay connected to <#${quest.event_channel_id}> for **${quest.min_minutes} minute${quest.min_minutes === 1 ? "" : "s"}**.`,
+        "",
+        "Rewards:",
+        `↳ **${formatSats(quest.reward_sats)}** ⚡ Per Person`,
+        "",
+        "Requirements:",
+        `↳ Join the event voice/stage channel for the full duration`,
+        "",
+        completedLine,
+        "",
+        "💎 Automatic Reward",
+      ].join("\n"),
+    )
+    .addFields(
+      { name: "Event", value: `[Open Event](https://discord.com/events/${quest.guild_id}/${quest.scheduled_event_id})`, inline: true },
+      { name: "Starts", value: starts, inline: true },
+      { name: "Reward Cap", value: capLine, inline: true },
+    )
+    .setFooter({ text: "⚡ Powered by MezoSbot" })
+    .setTimestamp();
+}
+
+async function refreshQuestMessage(client: Client, questId: number): Promise<void> {
+  const { data, error } = await supabase
+    .from("event_quests")
+    .select("*")
+    .eq("id", questId)
+    .maybeSingle();
+
+  if (error || !data?.message_id) return;
+
+  const quest = data as EventQuestRow;
+  const messageId = data.message_id as string;
+  const channel = await client.channels.fetch(quest.channel_id).catch(() => null);
+  if (!channel || !("messages" in channel)) return;
+
+  const embed = buildEventQuestEmbed(quest);
+  const guild = await client.guilds.fetch(quest.guild_id).catch(() => null);
+  const event = await guild?.scheduledEvents.fetch(quest.scheduled_event_id).catch(() => null);
+  const thumbnail = event?.coverImageURL({ size: 256 });
+  if (thumbnail) embed.setThumbnail(thumbnail);
+
+  const message = await channel.messages.fetch(messageId).catch(() => null);
+  await message?.edit({ embeds: [embed], allowedMentions: { parse: [] } }).catch(() => {});
+}
+
 async function tryAwardQuest(client: Client, quest: EventQuestRow, userId: string): Promise<void> {
   const { data: awarded, error } = await supabase.rpc("claim_event_quest_reward", {
     p_quest_id: quest.id,
@@ -227,6 +289,8 @@ async function tryAwardQuest(client: Client, quest: EventQuestRow, userId: strin
 
     await channel.send({ embeds: [embed], allowedMentions: { parse: [] } }).catch(() => {});
   }
+
+  await refreshQuestMessage(client, quest.id);
 }
 
 export async function handleQuestVoiceStateUpdate(
