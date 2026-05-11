@@ -1,13 +1,14 @@
 import { EmbedBuilder, type Client } from "discord.js";
 import { formatSats } from "./format.js";
 
-export type TransferNotificationKind = "tip" | "rain" | "distribute" | "drop";
+export type TransferNotificationKind = "tip" | "rain" | "distribute" | "drop" | "quest";
 
 const TITLES: Record<TransferNotificationKind, string> = {
   tip: "⚡ You Received a Tip!",
   rain: "🌧️ You Were Rained On!",
   distribute: "📤 You Received a Distribution!",
   drop: "🎁 You Claimed a Drop!",
+  quest: "Quest Reward Earned",
 };
 
 const LABELS: Record<TransferNotificationKind, string> = {
@@ -15,6 +16,7 @@ const LABELS: Record<TransferNotificationKind, string> = {
   rain: "Rain",
   distribute: "Distribution",
   drop: "Drop Claim",
+  quest: "Event Quest",
 };
 
 const COLORS: Record<TransferNotificationKind, number> = {
@@ -22,6 +24,7 @@ const COLORS: Record<TransferNotificationKind, number> = {
   rain: 0x3498db,
   distribute: 0x9b59b6,
   drop: 0xf0b232,
+  quest: 0x00cc6a,
 };
 
 type SendTransferReceivedDmParams = {

@@ -43,6 +43,10 @@ import {
   isArcadeInteraction,
   updateMatchFeed,
 } from "./arcade/interactions.js";
+import {
+  handleQuestVoiceStateUpdate,
+  startEventQuestSweeper,
+} from "./eventQuests.js";
 import { setMatchSettledHandler } from "./arcade/notify.js";
 import { setDisplayNameResolver } from "./arcade/spectate.js";
 import { getMatch as getArcadeMatch } from "./arcade/db.js";
@@ -61,6 +65,7 @@ console.log("[Network] DNS result order set to ipv4first");
 
 const intents = [
   GatewayIntentBits.Guilds,
+  GatewayIntentBits.GuildVoiceStates,
 ];
 
 if (config.discord.guildMembersIntent) {
@@ -91,6 +96,13 @@ setHealthStatusProvider(() => ({
 }));
 
 const commandMap = new Map(commands.map((c) => [c.data.name, c.execute]));
+const autocompleteMap = new Map(
+  commands
+    .filter((c): c is typeof c & { autocomplete: (interaction: import("discord.js").AutocompleteInteraction) => Promise<void> } =>
+      "autocomplete" in c && typeof c.autocomplete === "function"
+    )
+    .map((c) => [c.data.name, c.autocomplete])
+);
 const STALE_INTERACTION_SKIP_MS = 2_800;
 
 client.on("error", (err) => {
@@ -353,6 +365,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return;
   }
 
+  if (interaction.isAutocomplete()) {
+    const handler = autocompleteMap.get(interaction.commandName);
+    if (!handler) {
+      await interaction.respond([]).catch(() => {});
+      return;
+    }
+    await handler(interaction).catch((err) => {
+      console.warn(`[Discord] Autocomplete /${interaction.commandName} failed:`, (err as Error)?.message ?? err);
+      interaction.respond([]).catch(() => {});
+    });
+    return;
+  }
+
   if (interaction.isButton()) {
     console.log(`[Discord] Button interaction ${interaction.customId} from ${tag} (arrivalLag=${arrivalLagMs}ms)`);
     const customId = interaction.customId;
@@ -392,6 +417,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await interaction.reply(msg).catch(() => {});
     }
   }
+});
+
+client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
+  await handleQuestVoiceStateUpdate(client, oldState, newState).catch((err) =>
+    console.warn("[Quest] Voice state handler failed:", (err as Error)?.message ?? err)
+  );
 });
 
 /* ────────────────────────────────────────────────────────────────── */
@@ -621,6 +652,8 @@ async function main() {
       console.warn("[Arcade] queue sweeper failed:", (err as Error)?.message ?? err)
     );
   }, 60_000);
+
+  startEventQuestSweeper(client);
 
   initEVM();
   console.log(`Treasury: ${getTreasuryAddress()}`);
