@@ -370,7 +370,7 @@ CREATE OR REPLACE FUNCTION complete_quest_task_and_pay_delta(
   p_user_id TEXT,
   p_proof JSONB DEFAULT '{}'::jsonb
 )
-RETURNS JSONB AS $$
+RETURNS JSONB AS $quest_engine$
 DECLARE
   q quests%ROWTYPE;
   t quest_tasks%ROWTYPE;
@@ -461,7 +461,7 @@ BEGIN
 
   RETURN jsonb_build_object('ok', true, 'insertedCompletion', inserted_completion, 'completedTaskCount', completion_count, 'tierRewardSats', tier_reward, 'previousPaidSats', COALESCE(previous_paid, 0), 'rewardDeltaSats', reward_delta, 'totalPaidSats', COALESCE(previous_paid, 0) + reward_delta);
 END;
-$$ LANGUAGE plpgsql;
+$quest_engine$ LANGUAGE plpgsql;
 
 CREATE TABLE IF NOT EXISTS game_saves (
   rom_name   TEXT PRIMARY KEY,

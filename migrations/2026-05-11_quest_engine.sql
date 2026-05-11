@@ -93,7 +93,7 @@ CREATE OR REPLACE FUNCTION complete_quest_task_and_pay_delta(
   p_user_id TEXT,
   p_proof JSONB DEFAULT '{}'::jsonb
 )
-RETURNS JSONB AS $$
+RETURNS JSONB AS $quest_engine$
 DECLARE
   q quests%ROWTYPE;
   t quest_tasks%ROWTYPE;
@@ -251,4 +251,4 @@ BEGIN
     'totalPaidSats', COALESCE(previous_paid, 0) + reward_delta
   );
 END;
-$$ LANGUAGE plpgsql;
+$quest_engine$ LANGUAGE plpgsql;
