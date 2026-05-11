@@ -10,6 +10,7 @@ export type WebSessionStatus =
   | "draft"
   | "created"
   | "active"
+  | "settling"
   | "submitted"
   | "completed"
   | "refunded"
@@ -34,12 +35,15 @@ export type WebArcadeSessionRow = {
   player_b_score: number | null;
   player_a_submitted: boolean;
   player_b_submitted: boolean;
+  player_a_ready: boolean;
+  player_b_ready: boolean;
   create_tx_hash: string | null;
   join_tx_hash: string | null;
   settlement_tx_hash: string | null;
   result_hash: string | null;
   join_deadline: string;
   play_deadline: string;
+  countdown_started_at: string | null;
   created_at: string;
   updated_at: string;
   completed_at: string | null;
@@ -141,16 +145,16 @@ export async function markJoined(id: string, wallet: string, txHash: string) {
     throw new Error("This session is reserved for another wallet");
   }
 
-  const now = Date.now();
-
   const { data, error } = await supabase
     .from("web_arcade_sessions")
     .update({
       status: "active",
       player_b_address: normalized,
       join_tx_hash: txHash,
-      play_deadline: new Date(now + config.web.playWindowSeconds * 1000).toISOString(),
-      updated_at: new Date(now).toISOString(),
+      player_a_ready: false,
+      player_b_ready: false,
+      countdown_started_at: null,
+      updated_at: new Date().toISOString(),
     })
     .eq("id", id)
     .eq("status", "created")
@@ -158,6 +162,51 @@ export async function markJoined(id: string, wallet: string, txHash: string) {
     .select("*")
     .single();
   if (error || !data) throw new Error(`Could not mark session joined: ${error?.message}`);
+  return data as WebArcadeSessionRow;
+}
+
+export async function markWebPlayerReady(
+  id: string,
+  wallet: string,
+  countdownMs = 3000
+): Promise<WebArcadeSessionRow> {
+  const normalized = normalizeWalletAddress(wallet);
+  const session = await getWebSession(id);
+  if (!session) throw new Error("Session not found");
+  if (session.status !== "active") throw new Error("Session is not ready to start");
+  if (![session.player_a_address, session.player_b_address].includes(normalized)) {
+    throw new Error("Wallet is not a player in this session");
+  }
+
+  const isA = session.player_a_address === normalized;
+  const nextAReady = isA ? true : session.player_a_ready;
+  const nextBReady = isA ? session.player_b_ready : true;
+  const now = Date.now();
+  const startsAt =
+    nextAReady && nextBReady
+      ? session.countdown_started_at
+        ? Date.parse(session.countdown_started_at) + countdownMs
+        : now + countdownMs
+      : null;
+
+  const { data, error } = await supabase
+    .from("web_arcade_sessions")
+    .update({
+      player_a_ready: nextAReady,
+      player_b_ready: nextBReady,
+      countdown_started_at:
+        startsAt != null ? session.countdown_started_at ?? new Date(now).toISOString() : session.countdown_started_at,
+      play_deadline:
+        startsAt != null
+          ? new Date(startsAt + config.web.playWindowSeconds * 1000).toISOString()
+          : session.play_deadline,
+      updated_at: new Date(now).toISOString(),
+    })
+    .eq("id", id)
+    .eq("status", "active")
+    .select("*")
+    .single();
+  if (error || !data) throw new Error(`Could not mark ready: ${error?.message}`);
   return data as WebArcadeSessionRow;
 }
 
@@ -242,6 +291,7 @@ export async function completeSession(input: {
       updated_at: new Date().toISOString(),
     })
     .eq("id", input.sessionId)
+    .in("status", ["active", "settling"])
     .select("*")
     .single();
   if (error || !data) throw new Error(`Could not complete session: ${error?.message}`);

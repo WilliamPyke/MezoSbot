@@ -13,6 +13,7 @@ export type MatchMode = "practice" | "free_pvp" | "staked_pvp" | "tipfight";
 export type MatchStatus =
   | "waiting"
   | "active"
+  | "settling"
   | "submitted"
   | "completed"
   | "cancelled";
@@ -38,10 +39,13 @@ export type ArcadeMatchRow = {
   player_b_score: number | null;
   player_a_submitted: boolean;
   player_b_submitted: boolean;
+  player_a_ready: boolean;
+  player_b_ready: boolean;
   winner_id: string | null;
   escrow_status: EscrowStatus;
   duration_seconds: number;
   started_at: string | null;
+  countdown_started_at: string | null;
   created_at: string;
   completed_at: string | null;
   rematch_of_match_id: number | null;
@@ -87,7 +91,7 @@ export async function createMatch(input: CreateMatchInput): Promise<ArcadeMatchR
     input.initialStatus ??
     (input.mode === "practice" ? "active" : input.playerBId ? "active" : "waiting");
   const durationSeconds = input.durationSeconds ?? 180;
-  const startedAt = initialStatus === "active" ? new Date().toISOString() : null;
+  const startedAt = initialStatus === "active" && input.mode === "practice" ? new Date().toISOString() : null;
 
   let seriesRootId: number | null = null;
   if (input.rematchOfMatchId) {
@@ -156,7 +160,14 @@ export async function joinMatch(matchId: number, userId: string): Promise<{ ok: 
 
   const { data, error } = await supabase
     .from("arcade_matches")
-    .update({ player_b_id: userId, status: "active", started_at: new Date().toISOString() })
+    .update({
+      player_b_id: userId,
+      status: "active",
+      started_at: null,
+      countdown_started_at: null,
+      player_a_ready: false,
+      player_b_ready: false,
+    })
     .eq("id", matchId)
     .eq("status", "waiting")
     .is("player_b_id", null)
@@ -164,6 +175,43 @@ export async function joinMatch(matchId: number, userId: string): Promise<{ ok: 
     .single();
 
   if (error || !data) return { ok: false, error: "Failed to join (someone may have beaten you to it)" };
+  return { ok: true, match: data as ArcadeMatchRow };
+}
+
+export async function markPlayerReady(
+  matchId: number,
+  userId: string,
+  countdownMs = 3000
+): Promise<{ ok: boolean; error?: string; match?: ArcadeMatchRow }> {
+  const match = await getMatch(matchId);
+  if (!match) return { ok: false, error: "Match not found" };
+  if (match.status !== "active") return { ok: false, error: "Match is not ready to start" };
+
+  const isA = match.player_a_id === userId;
+  const isB = match.player_b_id === userId;
+  if (!isA && !isB) return { ok: false, error: "Not a player in this match" };
+
+  const nextAReady = isA ? true : match.player_a_ready;
+  const nextBReady = isB ? true : match.player_b_ready;
+  const startsAt =
+    nextAReady && (match.mode === "practice" || nextBReady)
+      ? match.started_at ?? new Date(Date.now() + countdownMs).toISOString()
+      : match.started_at;
+
+  const { data, error } = await supabase
+    .from("arcade_matches")
+    .update({
+      player_a_ready: nextAReady,
+      player_b_ready: nextBReady,
+      countdown_started_at: startsAt ? match.countdown_started_at ?? new Date().toISOString() : match.countdown_started_at,
+      started_at: startsAt,
+    })
+    .eq("id", matchId)
+    .eq("status", "active")
+    .select("*")
+    .single();
+
+  if (error || !data) return { ok: false, error: "Could not mark ready" };
   return { ok: true, match: data as ArcadeMatchRow };
 }
 
@@ -320,6 +368,12 @@ export type SettlementResult = {
 export async function trySettleMatch(matchId: number): Promise<SettlementResult> {
   const match = await getMatch(matchId);
   if (!match) throw new Error("Match not found");
+  if (match.status === "completed") {
+    return { status: match.winner_id ? "completed" : "tie", match, winnerId: match.winner_id };
+  }
+  if (match.status === "cancelled" || match.status === "settling") {
+    return { status: "waiting", match };
+  }
 
   if (match.mode === "practice") {
     if (match.player_a_submitted) {
@@ -331,6 +385,12 @@ export async function trySettleMatch(matchId: number): Promise<SettlementResult>
 
   if (!match.player_a_submitted || !match.player_b_submitted) {
     return { status: "waiting", match };
+  }
+
+  const locked = await lockMatchForSettlement(matchId);
+  if (!locked) {
+    const fresh = (await getMatch(matchId)) ?? match;
+    return { status: "waiting", match: fresh };
   }
 
   const aScore = match.player_a_score ?? 0;
@@ -411,6 +471,18 @@ export async function trySettleMatch(matchId: number): Promise<SettlementResult>
 
   const updated = await completeMatch(matchId, winnerId);
   return { status: "completed", match: updated, winnerId };
+}
+
+async function lockMatchForSettlement(matchId: number): Promise<boolean> {
+  const { data, error } = await supabase
+    .from("arcade_matches")
+    .update({ status: "settling" })
+    .eq("id", matchId)
+    .in("status", ["active", "submitted"])
+    .select("id")
+    .maybeSingle();
+  if (error) throw new Error(`Could not lock match settlement: ${error.message}`);
+  return !!data;
 }
 
 async function completeMatch(

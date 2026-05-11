@@ -490,10 +490,13 @@ CREATE TABLE IF NOT EXISTS arcade_matches (
   player_b_score DOUBLE PRECISION,
   player_a_submitted BOOLEAN NOT NULL DEFAULT FALSE,
   player_b_submitted BOOLEAN NOT NULL DEFAULT FALSE,
+  player_a_ready BOOLEAN NOT NULL DEFAULT FALSE,
+  player_b_ready BOOLEAN NOT NULL DEFAULT FALSE,
   winner_id TEXT,
   escrow_status TEXT NOT NULL DEFAULT 'none',  -- none | pending | funded | released | refunded
   duration_seconds INTEGER NOT NULL DEFAULT 180,
   started_at TIMESTAMPTZ,
+  countdown_started_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   completed_at TIMESTAMPTZ
 );
@@ -502,6 +505,12 @@ ALTER TABLE arcade_matches
   ADD COLUMN IF NOT EXISTS duration_seconds INTEGER NOT NULL DEFAULT 180;
 ALTER TABLE arcade_matches
   ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ;
+ALTER TABLE arcade_matches
+  ADD COLUMN IF NOT EXISTS countdown_started_at TIMESTAMPTZ;
+ALTER TABLE arcade_matches
+  ADD COLUMN IF NOT EXISTS player_a_ready BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE arcade_matches
+  ADD COLUMN IF NOT EXISTS player_b_ready BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE arcade_matches
   ADD COLUMN IF NOT EXISTS target_player_id TEXT;
 UPDATE arcade_matches
@@ -620,12 +629,15 @@ CREATE TABLE IF NOT EXISTS web_arcade_sessions (
   player_b_score DOUBLE PRECISION,
   player_a_submitted BOOLEAN NOT NULL DEFAULT FALSE,
   player_b_submitted BOOLEAN NOT NULL DEFAULT FALSE,
+  player_a_ready BOOLEAN NOT NULL DEFAULT FALSE,
+  player_b_ready BOOLEAN NOT NULL DEFAULT FALSE,
   create_tx_hash TEXT,
   join_tx_hash TEXT,
   settlement_tx_hash TEXT,
   result_hash TEXT,
   join_deadline TIMESTAMPTZ NOT NULL,
   play_deadline TIMESTAMPTZ NOT NULL,
+  countdown_started_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   completed_at TIMESTAMPTZ
@@ -686,6 +698,12 @@ ALTER TABLE web_arcade_sessions
   ADD COLUMN IF NOT EXISTS rematch_requested_by_b BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE web_arcade_sessions
   ADD COLUMN IF NOT EXISTS next_session_id TEXT REFERENCES web_arcade_sessions(id);
+ALTER TABLE web_arcade_sessions
+  ADD COLUMN IF NOT EXISTS countdown_started_at TIMESTAMPTZ;
+ALTER TABLE web_arcade_sessions
+  ADD COLUMN IF NOT EXISTS player_a_ready BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE web_arcade_sessions
+  ADD COLUMN IF NOT EXISTS player_b_ready BOOLEAN NOT NULL DEFAULT FALSE;
 UPDATE web_arcade_sessions SET series_root_session_id = id WHERE series_root_session_id IS NULL;
 CREATE INDEX IF NOT EXISTS idx_web_arcade_sessions_series_root ON web_arcade_sessions(series_root_session_id);
 CREATE INDEX IF NOT EXISTS idx_web_arcade_submissions_session ON web_arcade_submissions(session_id);

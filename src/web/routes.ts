@@ -18,7 +18,13 @@ import {
   requestWebRematch,
   type WebArcadeSessionRow,
 } from "./db.js";
-import { applyWebMove, buildGameState, buildWalletArcadePlayState, submitWebScore } from "./game.js";
+import {
+  applyWebMove,
+  buildGameState,
+  buildWalletArcadePlayState,
+  markWalletArcadeReady,
+  submitWebScore,
+} from "./game.js";
 import { chainConfigForId, webChainsConfig } from "./chains.js";
 import {
   enqueueWallet,
@@ -44,6 +50,7 @@ export async function handleWalletWebRequest(
       missingAccessHtml: '<div class="wrap"><h2>Sign in required.</h2><p>Return to the arcade lobby and sign in with your wallet.</p></div>',
       statePath: `/api/web/play/${sessionId}/state`,
       movePath: `/api/web/play/${sessionId}/move`,
+      readyPath: `/api/web/play/${sessionId}/ready`,
       submitPath: `/api/web/play/${sessionId}/submit`,
       doneMessage: "You can close this tab — escrow settlement is recorded on-chain.",
     }));
@@ -146,6 +153,11 @@ export async function handleWalletWebRequest(
         const body = await readJsonBody(req);
         const move = readWalletMove(body);
         return sendJson(res, 200, await applyWebMove(sessionId, wallet.address, move));
+      }
+
+      if (method === "POST" && parts[4] === "ready") {
+        const wallet = requireSession(req);
+        return sendJson(res, 200, await markWalletArcadeReady(sessionId, wallet.address));
       }
 
       if (method === "POST" && parts[4] === "submit") {

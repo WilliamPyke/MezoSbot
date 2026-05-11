@@ -22,6 +22,7 @@ import {
   getSubmission,
   getWebSession,
   getWebSeriesScore,
+  markWebPlayerReady,
   sessionPlayers,
   upsertSubmission,
   type WebArcadeSessionRow,
@@ -42,6 +43,9 @@ export type WebGameState = {
     chainId: number;
     playerA: string;
     playerB: string | null;
+    playerAReady: boolean;
+    playerBReady: boolean;
+    countdownStartedAt: string | null;
     invitedPlayer: string | null;
     winner: string | null;
     joinDeadline: string;
@@ -63,6 +67,7 @@ export type WebGameState = {
     phase: PlayerState["phase"];
     endReason?: PlayerState["endReason"];
     submitted: boolean;
+    ready: boolean;
     pieces: Array<{ cells: PieceCell[] | null; placed: boolean }>;
     bank: { cells: PieceCell[] } | null;
     board: number[][];
@@ -70,6 +75,7 @@ export type WebGameState = {
   opponent: {
     address: string | null;
     submitted: boolean;
+    ready: boolean;
     score: number | null;
   } | null;
   result: {
@@ -109,6 +115,7 @@ export type WalletArcadePlayState = {
     phase: PlayerState["phase"];
     endReason?: PlayerState["endReason"];
     submitted: boolean;
+    ready: boolean;
     pieces: Array<{ cells: PieceCell[] | null; placed: boolean }>;
     bank: { cells: PieceCell[] } | null;
     board: number[][];
@@ -116,6 +123,7 @@ export type WalletArcadePlayState = {
   opponent: {
     userId: string | null;
     submitted: boolean;
+    ready: boolean;
     score: number | null;
   } | null;
   result: {
@@ -176,6 +184,9 @@ export async function buildGameState(sessionId: string, wallet: string): Promise
       chainId: freshSession.chain_id,
       playerA: freshSession.player_a_address,
       playerB: freshSession.player_b_address,
+      playerAReady: freshSession.player_a_ready,
+      playerBReady: freshSession.player_b_ready,
+      countdownStartedAt: freshSession.countdown_started_at,
       invitedPlayer: freshSession.invited_player_address,
       winner: freshSession.winner_address,
       joinDeadline: freshSession.join_deadline,
@@ -198,6 +209,9 @@ export async function buildGameState(sessionId: string, wallet: string): Promise
           phase: state.phase,
           endReason: state.endReason,
           submitted: selfSubmitted,
+          ready: address === freshSession.player_a_address
+            ? freshSession.player_a_ready
+            : freshSession.player_b_ready,
           pieces: currentPieces(freshSession.seed, state),
           bank: state.bank ? { cells: state.bank.cells } : null,
           board: state.board,
@@ -207,6 +221,9 @@ export async function buildGameState(sessionId: string, wallet: string): Promise
       ? {
           address: opponentAddress,
           submitted: opponentSubmission?.submitted ?? false,
+          ready: opponentAddress === freshSession.player_a_address
+            ? freshSession.player_a_ready
+            : freshSession.player_b_ready,
           score: opponentScore(freshSession, opponentAddress),
         }
       : null,
@@ -292,8 +309,10 @@ export function walletArcadePlayStateFromGameState(
       grossPotFormatted: `${ethers.formatUnits(grossPot, asset.decimals)} ${asset.symbol}`,
       winnerPayoutFormatted: `${ethers.formatUnits(winnerPayout, asset.decimals)} ${asset.symbol}`,
       durationSeconds: Math.max(1, Math.round((Date.parse(state.session.playDeadline) - Date.parse(state.session.joinDeadline)) / 1000)),
-      startedAt: null,
-      deadlineAt: ["active", "submitted"].includes(state.session.status) ? state.session.playDeadline : null,
+      startedAt: walletPlayStartsAt(state.session),
+      deadlineAt: ["active", "submitted"].includes(state.session.status) && walletPlayHasStarted(state.session)
+        ? state.session.playDeadline
+        : null,
       serverNow: state.session.serverNow,
     },
     self: {
@@ -306,6 +325,7 @@ export function walletArcadePlayStateFromGameState(
       phase: state.self.phase,
       endReason: state.self.endReason,
       submitted: state.self.submitted,
+      ready: state.self.ready,
       pieces: state.self.pieces,
       bank: state.self.bank,
       board: state.self.board,
@@ -314,6 +334,7 @@ export function walletArcadePlayStateFromGameState(
       ? {
           userId: state.opponent.address ? shortAddress(state.opponent.address) : null,
           submitted: state.opponent.submitted,
+          ready: state.opponent.ready,
           score: state.opponent.score,
         }
       : null,
@@ -348,6 +369,7 @@ export async function applyWebMove(sessionId: string, wallet: string, move: Move
   const session = await requireActivePlayer(sessionId, wallet);
   await finalizeReadySessionIfNeeded(session);
   const fresh = await requireActivePlayer(sessionId, wallet);
+  requireSessionStarted(fresh);
   const current = await playerState(fresh, wallet);
   if (current.phase !== "playing") throw new Error("Player is already finished");
   const sequence = sequenceFor(fresh.seed);
@@ -365,6 +387,7 @@ export async function applyWebMove(sessionId: string, wallet: string, move: Move
 
 export async function submitWebScore(sessionId: string, wallet: string) {
   const session = await requireActivePlayer(sessionId, wallet);
+  requireSessionStarted(session);
   const state = await playerState(session, wallet);
   await upsertSubmission({
     sessionId,
@@ -388,6 +411,9 @@ export async function tryFinalizeSession(sessionId: string) {
     const expired = Date.now() >= settlementCutoffMs(session);
     const bothSubmitted = session.player_a_submitted && session.player_b_submitted;
     if (!expired && !bothSubmitted) return session;
+
+    const locked = await lockSessionForSettlement(session.id);
+    if (!locked) return getWebSession(session.id);
 
     const aState = await playerState(session, session.player_a_address);
     const bState = await playerState(session, session.player_b_address);
@@ -416,11 +442,52 @@ export async function tryFinalizeSession(sessionId: string) {
 
 async function finalizeReadySessionIfNeeded(session: WebArcadeSessionRow) {
   if (session.status !== "active") return;
+  if (!walletSessionReady(session)) return;
   const expired = Date.now() >= settlementCutoffMs(session);
   const bothSubmitted = session.player_a_submitted && session.player_b_submitted;
   if (expired || bothSubmitted) {
     await tryFinalizeSession(session.id);
   }
+}
+
+export async function markWalletArcadeReady(sessionId: string, wallet: string) {
+  await markWebPlayerReady(sessionId, wallet, 3000);
+  return buildWalletArcadePlayState(sessionId, wallet);
+}
+
+async function lockSessionForSettlement(sessionId: string): Promise<boolean> {
+  const { supabase } = await import("../db.js");
+  const { data, error } = await supabase
+    .from("web_arcade_sessions")
+    .update({ status: "settling", updated_at: new Date().toISOString() })
+    .eq("id", sessionId)
+    .eq("status", "active")
+    .select("id")
+    .maybeSingle();
+  if (error) throw new Error(`Could not lock settlement: ${error.message}`);
+  return !!data;
+}
+
+function walletSessionReady(session: WebArcadeSessionRow) {
+  return !!session.player_a_ready && !!session.player_b_ready && walletPlayHasStarted({
+    countdownStartedAt: session.countdown_started_at,
+  });
+}
+
+function walletPlayStartsAt(session: { countdownStartedAt?: string | null; countdown_started_at?: string | null }) {
+  const raw = session.countdownStartedAt ?? session.countdown_started_at ?? null;
+  if (!raw) return null;
+  return new Date(Date.parse(raw) + 3000).toISOString();
+}
+
+function walletPlayHasStarted(session: { countdownStartedAt?: string | null; countdown_started_at?: string | null }) {
+  const startsAt = walletPlayStartsAt(session);
+  return !!startsAt && Date.now() >= Date.parse(startsAt);
+}
+
+function requireSessionStarted(session: WebArcadeSessionRow) {
+  if (!session.player_a_ready || !session.player_b_ready) throw new Error("Both players must ready up first");
+  if (!walletPlayHasStarted(session)) throw new Error("Match countdown is still running");
 }
 
 function settlementCutoffMs(session: WebArcadeSessionRow) {

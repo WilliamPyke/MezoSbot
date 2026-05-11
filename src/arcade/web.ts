@@ -12,6 +12,7 @@ import {
   cancelRematch,
   getMatch,
   getSeriesScore,
+  markPlayerReady,
   recordSubmission,
   requestRematch,
   trySettleMatch,
@@ -63,6 +64,7 @@ export async function handleArcadeWebRequest(
       missingAccessHtml: '<div class="wrap"><h2>Missing token.</h2><p>Open this page from the link Discord gave you.</p></div>',
       statePath: "/arcade/api/state",
       movePath: "/arcade/api/move",
+      readyPath: "/arcade/api/ready",
       submitPath: "/arcade/api/submit",
       doneMessage: "You can close this tab — the result is posted in Discord.",
     }));
@@ -94,6 +96,9 @@ export async function handleArcadeWebRequest(
       if (current && current.status === "waiting") {
         return { status: 409, body: { error: "Waiting for opponent" } };
       }
+      if (current && !matchPlayHasStarted(current)) {
+        return { status: 409, body: { error: "Both players must ready up first" } };
+      }
       const expired = await settleExpiredMatchIfNeeded(claim.matchId);
       if (expired && expired.status !== "active" && expired.status !== "submitted") {
         return {
@@ -118,6 +123,17 @@ export async function handleArcadeWebRequest(
           skipExpireCheck: true,
           skipSeries: true,
         }),
+      };
+    });
+    return true;
+  }
+  if (method === "POST" && path === "/arcade/api/ready") {
+    await respondWithBody(req, res, async (claim) => {
+      const result = await markPlayerReady(claim.matchId, claim.userId, 3000);
+      if (!result.ok) return { status: 400, body: { error: result.error ?? "Could not ready up" } };
+      return {
+        status: 200,
+        body: await buildStateResponse(claim.matchId, claim.userId, { match: result.match }),
       };
     });
     return true;
@@ -194,6 +210,9 @@ export async function handleArcadeWebRequest(
       if (current && current.status === "waiting") {
         return { status: 409, body: { error: "Waiting for opponent" } };
       }
+      if (current && !matchPlayHasStarted(current)) {
+        return { status: 409, body: { error: "Both players must ready up first" } };
+      }
       const expired = await settleExpiredMatchIfNeeded(claim.matchId);
       if (expired && expired.status !== "active" && expired.status !== "submitted") {
         return { status: 200, body: await buildStateResponse(claim.matchId, claim.userId) };
@@ -243,6 +262,7 @@ type StateResponse = {
     winnerPayoutFormatted: string | null;
     durationSeconds: number;
     startedAt: string | null;
+    countdownStartedAt: string | null;
     deadlineAt: string | null;
     serverNow: string;
   };
@@ -256,6 +276,7 @@ type StateResponse = {
     phase: "playing" | "finished";
     endReason?: string;
     submitted: boolean;
+    ready: boolean;
     pieces: Array<{ cells: PieceCell[] | null; placed: boolean }>;
     bank: { cells: PieceCell[] } | null;
     board: number[][];
@@ -263,6 +284,7 @@ type StateResponse = {
   opponent: {
     userId: string | null;
     submitted: boolean;
+    ready: boolean;
     score: number | null;
   } | null;
   result: {
@@ -337,13 +359,20 @@ async function buildStateResponse(
       : match.player_b_score
     : null;
 
+  const isPlayerA = match.player_a_id === userId;
+  const readySelf = isPlayerA ? match.player_a_ready : match.player_b_ready;
+  const readyOpp = opponentId
+    ? opponentId === match.player_a_id
+      ? match.player_a_ready
+      : match.player_b_ready
+    : match.mode === "practice";
+
   const aScore = match.player_a_score ?? null;
   const bScore = match.player_b_score ?? null;
   const completed = match.status === "completed";
   const isTie = completed && match.winner_id == null;
   const isWinner = completed ? match.winner_id === userId : null;
 
-  const isPlayerA = match.player_a_id === userId;
   const rematchSelf = isPlayerA ? match.rematch_requested_by_a : match.rematch_requested_by_b;
   const rematchOpp = match.mode === "practice"
     ? false
@@ -392,6 +421,7 @@ async function buildStateResponse(
         match.winner_payout_sats != null ? formatSats(match.winner_payout_sats) : null,
       durationSeconds: match.duration_seconds ?? 180,
       startedAt: match.started_at,
+      countdownStartedAt: match.countdown_started_at,
       deadlineAt: deadlineAt(match)?.toISOString() ?? null,
       serverNow: new Date().toISOString(),
     },
@@ -405,6 +435,7 @@ async function buildStateResponse(
       phase: state.phase,
       endReason: state.endReason,
       submitted: submittedSelf,
+      ready: readySelf,
       pieces,
       bank,
       board: state.board,
@@ -415,6 +446,7 @@ async function buildStateResponse(
         : {
             userId: opponentId,
             submitted: submittedOpp,
+            ready: readyOpp,
             score: opponentScore,
           },
     result: {
@@ -445,10 +477,15 @@ async function buildStateResponse(
 
 function deadlineAt(match: ArcadeMatchRow): Date | null {
   if (!["active", "submitted"].includes(match.status)) return null;
-  const start = match.started_at ?? match.created_at;
+  const start = match.started_at;
   if (!start) return null;
   const durationSeconds = match.duration_seconds ?? 180;
   return new Date(new Date(start).getTime() + durationSeconds * 1000);
+}
+
+function matchPlayHasStarted(match: ArcadeMatchRow): boolean {
+  if (match.mode === "practice") return true;
+  return !!match.started_at && Date.now() >= new Date(match.started_at).getTime();
 }
 
 async function settleExpiredMatchIfNeeded(matchId: number): Promise<ArcadeMatchRow | null> {
@@ -825,6 +862,7 @@ export function renderArcadePlayPage(options: {
   missingAccessHtml: string;
   statePath: string;
   movePath: string;
+  readyPath?: string;
   submitPath: string;
   doneMessage: string;
 }): string {
@@ -834,6 +872,7 @@ export function renderArcadePlayPage(options: {
     missingAccessHtml: options.missingAccessHtml,
     statePath: options.statePath,
     movePath: options.movePath,
+    readyPath: options.readyPath ?? options.movePath.replace(/\/move$/, "/ready"),
     submitPath: options.submitPath,
     doneMessage: options.doneMessage,
   });
@@ -1147,6 +1186,7 @@ export function renderArcadePlayPage(options: {
   </div>
 
   <div class="controls">
+    <button id="readyBtn" class="btn primary">Ready</button>
     <button id="rotateBtn" class="btn">↻ Rotate</button>
     <button id="clearBtn" class="btn">Clear</button>
     <button id="submitBtn" class="btn primary" style="display:none;">Submit final score</button>
@@ -1224,6 +1264,7 @@ export function renderArcadePlayPage(options: {
   const $mode = document.getElementById('modeLabel');
   const $live = document.getElementById('liveBadge');
   const $rotate = document.getElementById('rotateBtn');
+  const $ready = document.getElementById('readyBtn');
   const $clear = document.getElementById('clearBtn');
   const $submit = document.getElementById('submitBtn');
   const $playTab = document.getElementById('playTab');
@@ -1584,9 +1625,10 @@ export function renderArcadePlayPage(options: {
   });
 
   $rotate.addEventListener('click', rotateSelected);
+  $ready.addEventListener('click', () => markReady());
   function rotateSelected() {
     if (!state || state.result.completed || state.self.phase === 'finished' || isTimeExpired()) return;
-    if (isWaitingForOpponent()) return;
+    if (isWaitingForOpponent() || isPregame()) return;
     selected.rotation = (selected.rotation + 1) % 4;
     Sound.rotate();
     render();
@@ -1661,6 +1703,27 @@ export function renderArcadePlayPage(options: {
     return !!(state && state.match && state.match.status === 'waiting');
   }
 
+  function startsAtMs() {
+    if (!state || !state.match || !state.match.startedAt) return null;
+    return Date.parse(state.match.startedAt) - serverOffsetMs;
+  }
+
+  function isCountdownRunning() {
+    const start = startsAtMs();
+    return start != null && Date.now() < start;
+  }
+
+  function hasGameStarted() {
+    if (!state || !state.match) return false;
+    if (state.match.mode === 'practice') return true;
+    const start = startsAtMs();
+    return start != null && Date.now() >= start;
+  }
+
+  function isPregame() {
+    return !!(state && !state.result.completed && !isWaitingForOpponent() && !hasGameStarted());
+  }
+
   function formatMultiplier(m) {
     if (typeof m !== 'number' || !isFinite(m)) return '1';
     return m % 1 === 0 ? String(Math.round(m)) : m.toFixed(1);
@@ -1676,7 +1739,7 @@ export function renderArcadePlayPage(options: {
   async function bankSelected() {
     if (movePending) return;
     if (!state || state.result.completed || state.self.phase === 'finished' || isTimeExpired()) return;
-    if (isWaitingForOpponent()) return;
+    if (isWaitingForOpponent() || isPregame()) return;
     if (selected.pieceIndex == null || !isPlayablePiece(state.self.pieces[selected.pieceIndex])) {
       showToast('Select a piece first');
       return;
@@ -1724,6 +1787,20 @@ export function renderArcadePlayPage(options: {
     refresh();
   }
 
+  async function markReady() {
+    if (!state || state.self.ready || state.result.completed || isWaitingForOpponent()) return;
+    $ready.disabled = true;
+    const next = await api('POST', CONFIG.readyPath, {});
+    if (next) {
+      const prev = state;
+      state = next;
+      onStateUpdate(prev, null);
+      render();
+    } else {
+      $ready.disabled = false;
+    }
+  }
+
   function setInfoTab(name) {
     const shortcuts = name === 'shortcuts';
     $playTab.classList.toggle('active', !shortcuts);
@@ -1751,7 +1828,7 @@ export function renderArcadePlayPage(options: {
   }
 
   function cyclePiece(direction) {
-    if (!state || state.result.completed || state.self.phase === 'finished' || isTimeExpired()) return;
+    if (!state || state.result.completed || state.self.phase === 'finished' || isTimeExpired() || isPregame()) return;
     const indexes = availablePieceIndexes();
     if (indexes.length === 0) return;
     const current = indexes.indexOf(selected.pieceIndex);
@@ -1772,7 +1849,7 @@ export function renderArcadePlayPage(options: {
   }
 
   function moveCursor(rowDelta, colDelta) {
-    if (!state || state.result.completed) return;
+    if (!state || state.result.completed || isPregame()) return;
     ensureCursor();
     const nextR = Math.max(0, Math.min(8, selected.hoverRow + rowDelta));
     const nextC = Math.max(0, Math.min(8, selected.hoverCol + colDelta));
@@ -1818,6 +1895,17 @@ export function renderArcadePlayPage(options: {
   function paintTimer() {
     if (isWaitingForOpponent()) {
       $time.textContent = 'WAIT';
+      $timeStat.classList.remove('low');
+      return;
+    }
+    if (isCountdownRunning()) {
+      const remaining = Math.max(0, startsAtMs() - Date.now());
+      $time.textContent = String(Math.max(1, Math.ceil(remaining / 1000)));
+      $timeStat.classList.remove('low');
+      return;
+    }
+    if (isPregame()) {
+      $time.textContent = state.self.ready ? 'READY' : 'READY?';
       $timeStat.classList.remove('low');
       return;
     }
@@ -1919,7 +2007,7 @@ export function renderArcadePlayPage(options: {
     if (movePending) return;
     if (state.result.completed) return;
     if (state.self.phase === 'finished') return;
-    if (isWaitingForOpponent()) return;
+    if (isWaitingForOpponent() || isPregame()) return;
     if (isTimeExpired()) {
       showToast('Time is up');
       await refresh();
@@ -2235,7 +2323,7 @@ export function renderArcadePlayPage(options: {
       }
       card.appendChild(grid);
       card.addEventListener('click', () => {
-        if (p.placed || state.result.completed || isTimeExpired() || state.self.phase === 'finished' || isWaitingForOpponent()) return;
+        if (p.placed || state.result.completed || isTimeExpired() || state.self.phase === 'finished' || isWaitingForOpponent() || isPregame()) return;
         if (!p.cells) return;
         selected.pieceIndex = i;
         selected.rotation = 0;
@@ -2274,18 +2362,24 @@ export function renderArcadePlayPage(options: {
     const m = state.match;
     let label;
     if (isWaitingForOpponent()) label = 'Waiting for opponent';
+    else if (isCountdownRunning()) label = 'Starting in ' + $time.textContent + ' - Match #' + m.id;
+    else if (isPregame()) label = state.self.ready ? 'Ready - waiting for opponent' : 'Ready up to start';
     else if (m.mode === 'practice') label = 'Practice • Match #' + m.id;
     else if (m.mode === 'free_pvp') label = 'Free PvP • Match #' + m.id;
     else label = 'Stake ' + (m.stakeFormatted || '?') + ' • Match #' + m.id;
     $mode.textContent = label;
 
-    if (state.self.phase === 'playing' && !state.result.completed && !isWaitingForOpponent()) {
+    if (state.self.phase === 'playing' && !state.result.completed && !isWaitingForOpponent() && !isPregame()) {
       $live.style.display = '';
     } else {
       $live.style.display = 'none';
     }
-    $rotate.disabled = isWaitingForOpponent() || state.self.phase === 'finished' || state.result.completed || isTimeExpired();
-    $clear.disabled = isWaitingForOpponent() || state.result.completed;
+    const lockedForStart = isWaitingForOpponent() || isPregame();
+    $ready.style.display = lockedForStart ? '' : 'none';
+    $ready.disabled = isWaitingForOpponent() || state.self.ready || state.result.completed || isCountdownRunning();
+    $ready.textContent = state.self.ready ? 'Ready' : 'Ready up';
+    $rotate.disabled = lockedForStart || state.self.phase === 'finished' || state.result.completed || isTimeExpired();
+    $clear.disabled = lockedForStart || state.result.completed;
 
     if (m.mode === 'staked_pvp' && m.grossPotFormatted) {
       $pot.style.display = '';
@@ -2296,7 +2390,7 @@ export function renderArcadePlayPage(options: {
       $pot.style.display = 'none';
     }
 
-    if (!isWaitingForOpponent() && state.self.phase === 'finished' && !state.self.submitted && !state.result.completed) {
+    if (!lockedForStart && state.self.phase === 'finished' && !state.self.submitted && !state.result.completed) {
       $submit.style.display = '';
       $submit.disabled = false;
     } else {
@@ -2314,7 +2408,7 @@ export function renderArcadePlayPage(options: {
               (op.score != null ? ' — score <strong>' + op.score.toLocaleString() + '</strong>' : '') + '</span>';
       } else if (op.userId) {
         $opponent.classList.add('live');
-        txt = '<span><span class="dot"></span>Opponent is playing…</span>';
+        txt = '<span><span class="dot"></span>' + (lockedForStart ? (op.ready ? 'Opponent is ready' : 'Opponent is not ready') : 'Opponent is playing') + '</span>';
       } else {
         txt = '<span><span class="dot"></span>Waiting for opponent to join</span>';
       }
