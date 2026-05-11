@@ -123,7 +123,6 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     .insert({
       guild_id: interaction.guild.id,
       channel_id: interaction.channelId,
-      message_id: null,
       creator_id: interaction.user.id,
       scheduled_event_id: event.id,
       event_name: event.name,
@@ -138,6 +137,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     .single();
 
   if (error || !inserted) {
+    if (error) console.warn("[Quest] Failed to insert event quest:", error.message);
     return interaction.editReply({ content: "Failed to create the quest." });
   }
 
@@ -200,8 +200,12 @@ export async function execute(interaction: ChatInputCommandInteraction) {
 
   const reply = await interaction.editReply({ embeds: [embed], allowedMentions: { parse: [] } });
 
-  await supabase
+  const { error: messageUpdateError } = await supabase
     .from("event_quests")
     .update({ message_id: reply.id })
     .eq("id", quest.id);
+
+  if (messageUpdateError) {
+    console.warn("[Quest] Failed to store quest message id:", messageUpdateError.message);
+  }
 }
