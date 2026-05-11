@@ -184,25 +184,35 @@ function buildQuestBuilderEmbed(snapshot: QuestSnapshot): EmbedBuilder {
     : snapshot.tasks.map((task, index) => {
       const definition = getQuestTaskDefinition(task.type);
       const requirement = definition?.renderRequirement(task.config) ?? task.description ?? task.title;
-      return `**${index + 1}. ${task.title}**\n${requirement}`;
+      return `↳ **${index + 1}. ${task.title}**\n${requirement}`;
     });
 
   const tierLines = snapshot.tiers.map((tier) =>
-    `${tier.completed_task_count} task${tier.completed_task_count === 1 ? "" : "s"} -> **${formatSats(tier.reward_sats)}**`
+    `↳ **${tier.completed_task_count} task${tier.completed_task_count === 1 ? "" : "s"}** → ${formatSats(tier.reward_sats)}`
   );
 
-  const statusLabel = snapshot.quest.status === "draft" ? "Draft" : "Published";
+  const isDraft = snapshot.quest.status === "draft";
+  const statusLine = isDraft
+    ? "Draft mode. Add tasks, preview, then publish."
+    : "Quest is live. Rewards are paid automatically as users complete tiers.";
   const embed = new EmbedBuilder()
-    .setColor(snapshot.quest.status === "draft" ? 0xf0b232 : 0x77a7ff)
-    .setTitle(`${statusLabel}: ${snapshot.quest.title}`)
-    .setDescription(snapshot.quest.description ?? "No description set.")
-    .addFields(
-      { name: "Quest ID", value: String(snapshot.quest.id), inline: true },
-      { name: "Max Reward", value: `**${formatSats(snapshot.quest.max_reward_sats)}**`, inline: true },
-      { name: "Tasks", value: taskLines.join("\n\n").slice(0, 1024), inline: false },
-      { name: "Reward Tiers", value: tierLines.join("\n") || "No tiers set.", inline: false },
+    .setColor(isDraft ? 0xf0b232 : 0x77a7ff)
+    .setTitle(`${isDraft ? "🛠️" : "❄️"} ${snapshot.quest.title}`)
+    .setDescription(
+      [
+        snapshot.quest.description ?? "A multistep sats quest.",
+        "",
+        statusLine,
+      ].join("\n"),
     )
-    .setFooter({ text: snapshot.quest.status === "draft" ? "Add tasks, preview, then publish." : "Quest is live." })
+    .addFields(
+      { name: "Rewards:", value: tierLines.join("\n") || "No reward tiers set.", inline: false },
+      { name: "Requirements:", value: taskLines.join("\n\n").slice(0, 1024), inline: false },
+      { name: "Quest ID", value: `\`${snapshot.quest.id}\``, inline: true },
+      { name: "Max Reward", value: `**${formatSats(snapshot.quest.max_reward_sats)}**`, inline: true },
+      { name: "💎 Payout", value: "Automatic tier upgrade rewards", inline: true },
+    )
+    .setFooter({ text: "⚡ Powered by matsFi" })
     .setTimestamp();
 
   return embed;

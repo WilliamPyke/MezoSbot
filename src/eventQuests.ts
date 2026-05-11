@@ -199,37 +199,35 @@ async function updateConnectedAttendance(client: Client, quest: EventQuestRow, u
 
 export function buildEventQuestEmbed(quest: EventQuestRow): EmbedBuilder {
   const cleanEventUrl = `https://discord.com/events/${quest.guild_id}/${quest.scheduled_event_id}`;
-  const cleanStarts = quest.scheduled_start_at
-    ? `<t:${Math.floor(Date.parse(quest.scheduled_start_at) / 1000)}:f>`
-    : "Unknown";
   const cleanStartsRelative = quest.scheduled_start_at
     ? `<t:${Math.floor(Date.parse(quest.scheduled_start_at) / 1000)}:R>`
     : "Unknown";
-  const cleanCap = quest.max_rewards === null
-    ? "Open while funded"
-    : `${quest.rewards_count}/${quest.max_rewards} claimed`;
   const cleanMinutes = `${quest.min_minutes} minute${quest.min_minutes === 1 ? "" : "s"}`;
-  const cleanCompletions = `${quest.rewards_count} completion${quest.rewards_count === 1 ? "" : "s"}`;
+  const claimLine = quest.max_rewards === null
+    ? "Automatic one time reward"
+    : `${quest.rewards_count}/${quest.max_rewards} rewards claimed`;
 
   return new EmbedBuilder()
     .setColor(QUEST_COLOR)
-    .setTitle(`Event Quest: ${quest.event_name}`)
+    .setTitle(`❄️ ${quest.event_name}`)
     .setURL(cleanEventUrl)
     .setDescription(
       [
-        `Join <#${quest.event_channel_id}> and stay connected for **${cleanMinutes}**.`,
-        "Your reward is sent automatically once you qualify.",
+        "A live event quest is open.",
+        "",
+        `Join the event voice channel, stay for **${cleanMinutes}**, and the sats land automatically.`,
+        "",
+        `Starts ${cleanStartsRelative}.`,
       ].join("\n"),
     )
     .addFields(
-      { name: "Reward", value: `**${formatSats(quest.reward_sats)}**\nper qualified member`, inline: true },
-      { name: "Requirement", value: `<#${quest.event_channel_id}>\nfor **${cleanMinutes}**`, inline: true },
-      { name: "Progress", value: `**${cleanCompletions}**\n${cleanCap}`, inline: true },
-      { name: "Event", value: `[Open Discord event](${cleanEventUrl})`, inline: true },
-      { name: "Starts", value: `${cleanStarts}\n${cleanStartsRelative}`, inline: true },
-      { name: "Payout", value: "**Automatic**\none time per user", inline: true },
+      { name: "Rewards:", value: `↳ **${formatSats(quest.reward_sats)}** ⚡ Per Person`, inline: false },
+      { name: "Requirements:", value: `↳ Join <#${quest.event_channel_id}> for **${cleanMinutes}**`, inline: false },
+      { name: "Progress", value: `Quest completed **${quest.rewards_count}** time${quest.rewards_count === 1 ? "" : "s"}.`, inline: false },
+      { name: "💎 Automatic Reward", value: claimLine, inline: false },
+      { name: "Event", value: `[Open Discord Event](${cleanEventUrl})`, inline: true },
     )
-    .setFooter({ text: "Powered by MezoSbot" })
+    .setFooter({ text: "⚡ Powered by matsFi" })
     .setTimestamp();
 
 }
