@@ -10,6 +10,7 @@ import { getBalance } from "../balance.js";
 import { supabase } from "../db.js";
 import { formatSats, roundSats } from "../format.js";
 import { buildEventQuestEmbed, type EventQuestRow } from "../eventQuests.js";
+import { createQuestDefinition } from "../quests/engine.js";
 
 export const data = {
   name: "quest",
@@ -139,6 +140,41 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   if (error || !inserted) {
     return interaction.editReply({ content: "Failed to create the quest." });
   }
+
+  createQuestDefinition({
+    guildId: interaction.guild.id,
+    channelId: interaction.channelId,
+    creatorId: interaction.user.id,
+    title: event.name,
+    description: `Attend ${event.name} for ${minMinutes} minute${minMinutes === 1 ? "" : "s"}.`,
+    startsAt: event.scheduledStartAt?.toISOString() ?? null,
+    endsAt: event.scheduledEndAt?.toISOString() ?? null,
+    metadata: {
+      legacyEventQuestId: inserted.id,
+      scheduledEventId: event.id,
+    },
+    tasks: [
+      {
+        taskKey: "event_attendance",
+        type: "event_attendance",
+        title: "Attend event",
+        description: `Stay connected to <#${event.channelId}> for ${minMinutes} minute${minMinutes === 1 ? "" : "s"}.`,
+        config: {
+          scheduledEventId: event.id,
+          eventChannelId: event.channelId,
+          minMinutes,
+        },
+      },
+    ],
+    rewardTiers: [
+      {
+        completedTaskCount: 1,
+        rewardSats: reward,
+      },
+    ],
+  }).catch((err) => {
+    console.warn("[QuestEngine] Failed to mirror event quest:", (err as Error)?.message ?? err);
+  });
 
   const quest: EventQuestRow = {
     id: inserted.id,
