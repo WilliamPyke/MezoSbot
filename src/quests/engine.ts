@@ -30,6 +30,21 @@ export type QuestDefinitionInput = {
   }>;
 };
 
+export type QuestDraftInput = {
+  guildId: string;
+  channelId: string;
+  creatorId: string;
+  title: string;
+  description?: string | null;
+  startsAt?: string | null;
+  endsAt?: string | null;
+  metadata?: Record<string, unknown>;
+  rewardTiers: Array<{
+    completedTaskCount: number;
+    rewardSats: number;
+  }>;
+};
+
 export type QuestCompletionResult = {
   ok: boolean;
   reason?: string;
@@ -42,7 +57,7 @@ export type QuestCompletionResult = {
 };
 
 export type QuestSnapshot = {
-  quest: Pick<QuestRow, "id" | "title" | "description" | "status" | "max_reward_sats" | "starts_at" | "ends_at" | "metadata">;
+  quest: Pick<QuestRow, "id" | "guild_id" | "channel_id" | "message_id" | "creator_id" | "title" | "description" | "status" | "max_reward_sats" | "starts_at" | "ends_at" | "metadata">;
   tasks: Array<Pick<QuestTaskRow, "id" | "task_key" | "type" | "title" | "description" | "config" | "sort_order" | "status">>;
   tiers: Array<Pick<QuestRewardTierRow, "completed_task_count" | "reward_sats">>;
 };
@@ -130,7 +145,7 @@ export async function createQuestDefinition(input: QuestDefinitionInput): Promis
       ends_at: input.endsAt ?? null,
       metadata: input.metadata ?? {},
     })
-    .select("id, title, description, status, max_reward_sats, starts_at, ends_at, metadata")
+    .select("id, guild_id, channel_id, message_id, creator_id, title, description, status, max_reward_sats, starts_at, ends_at, metadata")
     .single();
 
   if (questError || !quest) throw questError ?? new Error("Quest insert failed");
@@ -180,6 +195,10 @@ export async function getQuestSnapshot(questId: number): Promise<QuestSnapshot |
     .from("quests")
     .select(`
       id,
+      guild_id,
+      channel_id,
+      message_id,
+      creator_id,
       title,
       description,
       status,
@@ -216,6 +235,10 @@ export async function getQuestSnapshot(questId: number): Promise<QuestSnapshot |
   return {
     quest: {
       id: row.id,
+      guild_id: row.guild_id,
+      channel_id: row.channel_id,
+      message_id: row.message_id,
+      creator_id: row.creator_id,
       title: row.title,
       description: row.description,
       status: row.status,
@@ -227,6 +250,127 @@ export async function getQuestSnapshot(questId: number): Promise<QuestSnapshot |
     tasks: [...(row.quest_tasks ?? [])].sort((a, b) => a.sort_order - b.sort_order || a.id - b.id),
     tiers: [...(row.quest_reward_tiers ?? [])].sort((a, b) => a.completed_task_count - b.completed_task_count),
   };
+}
+
+export async function createQuestDraft(input: QuestDraftInput): Promise<QuestSnapshot> {
+  assertValidTierConfig(input.rewardTiers, Math.max(...input.rewardTiers.map((tier) => tier.completedTaskCount)));
+
+  const maxReward = Math.max(...input.rewardTiers.map((tier) => roundSats(tier.rewardSats)));
+  const { data: quest, error: questError } = await supabase
+    .from("quests")
+    .insert({
+      guild_id: input.guildId,
+      channel_id: input.channelId,
+      creator_id: input.creatorId,
+      title: input.title,
+      description: input.description ?? null,
+      status: "draft",
+      max_reward_sats: maxReward,
+      starts_at: input.startsAt ?? null,
+      ends_at: input.endsAt ?? null,
+      metadata: input.metadata ?? {},
+    })
+    .select("id, guild_id, channel_id, message_id, creator_id, title, description, status, max_reward_sats, starts_at, ends_at, metadata")
+    .single();
+
+  if (questError || !quest) throw questError ?? new Error("Quest draft insert failed");
+  const questId = (quest as { id: number }).id;
+
+  const tierRows = input.rewardTiers.map((tier) => ({
+    quest_id: questId,
+    completed_task_count: tier.completedTaskCount,
+    reward_sats: roundSats(tier.rewardSats),
+  }));
+
+  const { data: tiers, error: tiersError } = await supabase
+    .from("quest_reward_tiers")
+    .insert(tierRows)
+    .select("completed_task_count, reward_sats")
+    .order("completed_task_count", { ascending: true });
+
+  if (tiersError) throw tiersError;
+
+  return {
+    quest: quest as QuestSnapshot["quest"],
+    tasks: [],
+    tiers: (tiers ?? []) as QuestSnapshot["tiers"],
+  };
+}
+
+export async function addQuestTask(input: {
+  questId: number;
+  creatorId: string;
+  taskKey: string;
+  type: QuestTaskType;
+  title: string;
+  description?: string | null;
+  config?: Record<string, unknown>;
+}): Promise<QuestSnapshot> {
+  const definition = getQuestTaskDefinition(input.type);
+  if (!definition) throw new Error(`Unsupported quest task type: ${input.type}`);
+
+  const config = input.config ?? {};
+  const configError = definition.validateConfig(config);
+  if (configError) throw new Error(configError);
+
+  const snapshot = await getQuestSnapshot(input.questId);
+  if (!snapshot) throw new Error("Quest not found");
+  if (snapshot.quest.creator_id !== input.creatorId) throw new Error("Only the quest creator can edit this quest");
+  if (snapshot.quest.status !== "draft") throw new Error("Only draft quests can be edited");
+
+  const sortOrder = snapshot.tasks.length;
+  const { error } = await supabase
+    .from("quest_tasks")
+    .insert({
+      quest_id: input.questId,
+      task_key: input.taskKey,
+      type: input.type,
+      title: input.title,
+      description: input.description ?? null,
+      config,
+      sort_order: sortOrder,
+    });
+
+  if (error) throw error;
+
+  const updated = await getQuestSnapshot(input.questId);
+  if (!updated) throw new Error("Quest not found after task insert");
+  return updated;
+}
+
+export async function publishQuest(input: {
+  questId: number;
+  creatorId: string;
+  messageId?: string | null;
+}): Promise<QuestSnapshot> {
+  const snapshot = await getQuestSnapshot(input.questId);
+  if (!snapshot) throw new Error("Quest not found");
+  if (snapshot.quest.creator_id !== input.creatorId) throw new Error("Only the quest creator can publish this quest");
+  if (snapshot.quest.status !== "draft") throw new Error("Only draft quests can be published");
+  if (snapshot.tasks.length === 0) throw new Error("Add at least one task before publishing");
+  if (snapshot.tiers.length === 0) throw new Error("Add at least one reward tier before publishing");
+
+  const maxTierCount = Math.max(...snapshot.tiers.map((tier) => tier.completed_task_count));
+  if (maxTierCount > snapshot.tasks.length) {
+    throw new Error("A reward tier requires more completed tasks than this quest has");
+  }
+
+  const { error } = await supabase
+    .from("quests")
+    .update({
+      status: "active",
+      message_id: input.messageId ?? snapshot.quest.message_id,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", input.questId)
+    .eq("creator_id", input.creatorId)
+    .eq("status", "draft");
+
+  if (error) throw error;
+
+  const updated = await getQuestSnapshot(input.questId);
+  if (!updated) throw new Error("Quest not found after publish");
+  return updated;
 }
 
 export async function getActiveTasksByType<TConfig extends Record<string, unknown>>(
