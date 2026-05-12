@@ -8,18 +8,21 @@ const TITLES = {
     rain: "🌧️ You Were Rained On!",
     distribute: "📤 You Received a Distribution!",
     drop: "🎁 You Claimed a Drop!",
+    quest: "Quest Reward Earned",
 };
 const LABELS = {
     tip: "Tip",
     rain: "Rain",
     distribute: "Distribution",
     drop: "Drop Claim",
+    quest: "Event Quest",
 };
 const COLORS = {
     tip: 0x00cc6a,
     rain: 0x3498db,
     distribute: 0x9b59b6,
     drop: 0xf0b232,
+    quest: 0x00cc6a,
 };
 async function sendTransferReceivedDm({ client, recipientId, senderId, amountSats, kind, customMessage, }) {
     const embed = new discord_js_1.EmbedBuilder()

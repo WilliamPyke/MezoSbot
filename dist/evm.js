@@ -16,6 +16,7 @@ const ethers_1 = require("ethers");
 const config_js_1 = require("./config.js");
 const db_js_1 = require("./db.js");
 const balance_js_1 = require("./balance.js");
+const walletVerification_js_1 = require("./walletVerification.js");
 let provider;
 let wallet;
 function getProvider() {
@@ -352,11 +353,18 @@ function startDepositPoller(onDeposit) {
                     // Credit only when balance INCREASES (new deposit arrived).
                     if (bal > prev) {
                         const diff = bal - prev;
+                        const usedForWalletVerification = await (0, walletVerification_js_1.verifyWalletFromDeposit)(row.discord_id, row.address, provider).catch((err) => {
+                            console.warn(`[WalletVerify] Deposit verification check failed for ${row.discord_id}:`, err?.message ?? err);
+                            return false;
+                        });
                         // Exact gas cost: matches the pinned gasPrice on the sweep tx.
                         gasPriceForPoll ??= await getGasPrice();
                         const gasCost = 21000n * gasPriceForPoll;
                         const netDeposit = diff - gasCost;
-                        if (netDeposit > 0n) {
+                        if (usedForWalletVerification) {
+                            console.log(`Wallet verification deposit locked for ${row.discord_id}`);
+                        }
+                        else if (netDeposit > 0n) {
                             const netSats = (0, config_js_1.tokenUnitsToSats)(netDeposit);
                             const gasSats = (0, config_js_1.tokenUnitsToSats)(gasCost);
                             if (netSats > 0) {

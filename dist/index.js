@@ -14,8 +14,11 @@ const db_js_1 = require("./db.js");
 const profile_js_1 = require("./profile.js");
 const notifications_js_1 = require("./notifications.js");
 const interactions_js_1 = require("./arcade/interactions.js");
+const eventQuests_js_1 = require("./eventQuests.js");
 const notify_js_1 = require("./arcade/notify.js");
+const spectate_js_1 = require("./arcade/spectate.js");
 const db_js_2 = require("./arcade/db.js");
+const matchmaking_js_1 = require("./arcade/matchmaking.js");
 process.on("unhandledRejection", (err) => {
     console.error("Unhandled rejection:", err?.message ?? err);
 });
@@ -26,6 +29,7 @@ process.on("uncaughtException", (err) => {
 console.log("[Network] DNS result order set to ipv4first");
 const intents = [
     discord_js_1.GatewayIntentBits.Guilds,
+    discord_js_1.GatewayIntentBits.GuildVoiceStates,
 ];
 if (config_js_1.config.discord.guildMembersIntent) {
     intents.push(discord_js_1.GatewayIntentBits.GuildMembers);
@@ -47,6 +51,9 @@ const client = new discord_js_1.Client({
     discordState,
 }));
 const commandMap = new Map(index_js_1.commands.map((c) => [c.data.name, c.execute]));
+const autocompleteMap = new Map(index_js_1.commands
+    .filter((c) => "autocomplete" in c && typeof c.autocomplete === "function")
+    .map((c) => [c.data.name, c.autocomplete]));
 const STALE_INTERACTION_SKIP_MS = 2_800;
 client.on("error", (err) => {
     discordState = "client_error";
@@ -269,6 +276,18 @@ client.on(discord_js_1.Events.InteractionCreate, async (interaction) => {
         console.log(`[Discord] Arcade ${cid} done in ${Date.now() - startMs}ms`);
         return;
     }
+    if (interaction.isAutocomplete()) {
+        const handler = autocompleteMap.get(interaction.commandName);
+        if (!handler) {
+            await interaction.respond([]).catch(() => { });
+            return;
+        }
+        await handler(interaction).catch((err) => {
+            console.warn(`[Discord] Autocomplete /${interaction.commandName} failed:`, err?.message ?? err);
+            interaction.respond([]).catch(() => { });
+        });
+        return;
+    }
     if (interaction.isButton()) {
         console.log(`[Discord] Button interaction ${interaction.customId} from ${tag} (arrivalLag=${arrivalLagMs}ms)`);
         const customId = interaction.customId;
@@ -310,6 +329,9 @@ client.on(discord_js_1.Events.InteractionCreate, async (interaction) => {
             await interaction.reply(msg).catch(() => { });
         }
     }
+});
+client.on(discord_js_1.Events.VoiceStateUpdate, async (oldState, newState) => {
+    await (0, eventQuests_js_1.handleQuestVoiceStateUpdate)(client, oldState, newState).catch((err) => console.warn("[Quest] Voice state handler failed:", err?.message ?? err));
 });
 /* ────────────────────────────────────────────────────────────────── */
 /*  Game Boy text input listener                                      */
@@ -494,6 +516,22 @@ async function main() {
         if (match)
             await (0, interactions_js_1.updateMatchFeed)(client, match);
     });
+    // Resolve discord display names for spectator panels.
+    (0, spectate_js_1.setDisplayNameResolver)(async (userId) => {
+        try {
+            const user = await client.users.fetch(userId);
+            return user.globalName ?? user.username ?? null;
+        }
+        catch {
+            return null;
+        }
+    });
+    // Sweep stale matchmaking-queue entries. Pairing happens on enqueue, so
+    // this only handles expiry of waiting entries whose owners walked away.
+    setInterval(() => {
+        (0, matchmaking_js_1.expireStaleQueueEntries)().catch((err) => console.warn("[Arcade] queue sweeper failed:", err?.message ?? err));
+    }, 60_000);
+    (0, eventQuests_js_1.startEventQuestSweeper)(client);
     (0, evm_js_1.initEVM)();
     console.log(`Treasury: ${(0, evm_js_1.getTreasuryAddress)()}`);
     // Resolve any withdrawals left pending from a previous session

@@ -50,6 +50,23 @@ function eventWindowAllowsAttendance(quest: EventQuestRow, now = Date.now()): bo
   return true;
 }
 
+function eventWindowEndMs(quest: EventQuestRow, fallback = Date.now()): number {
+  const endMs = quest.scheduled_end_at ? Date.parse(quest.scheduled_end_at) : null;
+  return endMs != null && Number.isFinite(endMs) ? Math.min(fallback, endMs) : fallback;
+}
+
+function eventStatusAllowsAttendance(status: GuildScheduledEventStatus | null | undefined): boolean {
+  return status === GuildScheduledEventStatus.Active;
+}
+
+async function eventIsRunning(client: Client, quest: EventQuestRow): Promise<boolean> {
+  if (!eventWindowAllowsAttendance(quest)) return false;
+
+  const guild = await client.guilds.fetch(quest.guild_id).catch(() => null);
+  const event = await guild?.scheduledEvents.fetch(quest.scheduled_event_id).catch(() => null);
+  return eventStatusAllowsAttendance(event?.status);
+}
+
 async function getActiveQuestsForChannel(guildId: string, channelId: string): Promise<EventQuestRow[]> {
   const { data, error } = await supabase
     .from("event_quests")
@@ -115,7 +132,12 @@ async function startAttendance(quest: EventQuestRow, userId: string): Promise<vo
   }
 }
 
-async function stopAttendance(client: Client, quest: EventQuestRow, userId: string): Promise<void> {
+async function stopAttendance(
+  client: Client,
+  quest: EventQuestRow,
+  userId: string,
+  accrualEndMs = eventWindowEndMs(quest),
+): Promise<void> {
   const { data: row, error } = await supabase
     .from("event_quest_attendance")
     .select("joined_at, accumulated_seconds, rewarded_at")
@@ -127,7 +149,7 @@ async function stopAttendance(client: Client, quest: EventQuestRow, userId: stri
 
   const joinedMs = Date.parse(row.joined_at as string);
   const elapsedSeconds = Number.isFinite(joinedMs)
-    ? Math.max(0, Math.floor((Date.now() - joinedMs) / 1000))
+    ? Math.max(0, Math.floor((accrualEndMs - joinedMs) / 1000))
     : 0;
   const accumulated = Math.max(0, (row.accumulated_seconds as number) + elapsedSeconds);
 
@@ -145,9 +167,15 @@ async function stopAttendance(client: Client, quest: EventQuestRow, userId: stri
   await tryAwardQuest(client, quest, userId);
 }
 
-async function updateConnectedAttendance(client: Client, quest: EventQuestRow, userId: string): Promise<void> {
-  if (!eventWindowAllowsAttendance(quest)) {
-    await stopAttendance(client, quest, userId);
+async function updateConnectedAttendance(
+  client: Client,
+  quest: EventQuestRow,
+  userId: string,
+  options: { running: boolean; allowStart?: boolean; accrualEndMs?: number },
+): Promise<void> {
+  const accrualEndMs = eventWindowEndMs(quest, options.accrualEndMs ?? Date.now());
+  if (!options.running || !eventWindowAllowsAttendance(quest, accrualEndMs)) {
+    await stopAttendance(client, quest, userId, accrualEndMs);
     return;
   }
 
@@ -160,7 +188,7 @@ async function updateConnectedAttendance(client: Client, quest: EventQuestRow, u
 
   if (error || row?.rewarded_at) return;
   if (!row) {
-    await startAttendance(quest, userId);
+    if (options.allowStart !== false) await startAttendance(quest, userId);
     return;
   }
   if (!row.joined_at) return;
@@ -170,20 +198,10 @@ async function updateConnectedAttendance(client: Client, quest: EventQuestRow, u
 
   const accumulated = Math.max(
     0,
-    (row.accumulated_seconds as number) + Math.floor((Date.now() - joinedMs) / 1000),
+    (row.accumulated_seconds as number) + Math.floor((accrualEndMs - joinedMs) / 1000),
   );
 
-  if (accumulated < quest.min_minutes * 60) {
-    await supabase
-      .from("event_quest_attendance")
-      .update({ last_seen_at: nowIso() })
-      .eq("quest_id", quest.id)
-      .eq("user_id", userId)
-      .is("rewarded_at", null);
-    return;
-  }
-
-  await supabase
+  const { error: updateError } = await supabase
     .from("event_quest_attendance")
     .update({
       accumulated_seconds: accumulated,
@@ -194,7 +212,14 @@ async function updateConnectedAttendance(client: Client, quest: EventQuestRow, u
     .eq("user_id", userId)
     .is("rewarded_at", null);
 
-  await tryAwardQuest(client, quest, userId);
+  if (updateError) {
+    console.warn(`[Quest] Failed to update attendance for quest ${quest.id}:`, updateError.message);
+    return;
+  }
+
+  if (accumulated >= quest.min_minutes * 60) {
+    await tryAwardQuest(client, quest, userId);
+  }
 }
 
 export function buildEventQuestEmbed(quest: EventQuestRow): EmbedBuilder {
@@ -307,7 +332,11 @@ export async function handleQuestVoiceStateUpdate(
 
   if (newState.guild.id && newState.channelId) {
     const joiningQuests = await getActiveQuestsForChannel(newState.guild.id, newState.channelId);
-    await Promise.all(joiningQuests.map((quest) => startAttendance(quest, userId)));
+    await Promise.all(
+      joiningQuests.map(async (quest) => {
+        if (await eventIsRunning(client, quest)) await startAttendance(quest, userId);
+      }),
+    );
   }
 }
 
@@ -333,34 +362,46 @@ async function sweepEventQuests(client: Client): Promise<void> {
   const quests = (data ?? []) as EventQuestRow[];
 
   for (const quest of quests) {
-    if (quest.scheduled_end_at && Date.now() > Date.parse(quest.scheduled_end_at)) {
-      await supabase
-        .from("event_quests")
-        .update({ status: "completed", completed_at: nowIso() })
-        .eq("id", quest.id)
-        .eq("status", "active");
-      continue;
-    }
-
     const guild = await client.guilds.fetch(quest.guild_id).catch(() => null);
     if (!guild) continue;
 
     const freshEvent = await guild.scheduledEvents.fetch(quest.scheduled_event_id).catch(() => null);
-    if (freshEvent?.status === GuildScheduledEventStatus.Completed || freshEvent?.status === GuildScheduledEventStatus.Canceled) {
+    const channel = await guild.channels.fetch(quest.event_channel_id).catch(() => null);
+    const isVoiceChannel = channelIsVoiceLike(channel);
+    const scheduledEndMs = quest.scheduled_end_at ? Date.parse(quest.scheduled_end_at) : null;
+    const endedByTime = scheduledEndMs != null && Number.isFinite(scheduledEndMs) && Date.now() > scheduledEndMs;
+    const endedByStatus =
+      freshEvent?.status === GuildScheduledEventStatus.Completed ||
+      freshEvent?.status === GuildScheduledEventStatus.Canceled;
+
+    if (endedByTime || endedByStatus) {
+      if (isVoiceChannel) {
+        const accrualEndMs = eventWindowEndMs(quest);
+        for (const [userId, member] of channel.members) {
+          if (member.user.bot) continue;
+          await updateConnectedAttendance(client, quest, userId, {
+            running: true,
+            allowStart: false,
+            accrualEndMs,
+          });
+        }
+      }
+
       await supabase
         .from("event_quests")
         .update({ status: "completed", completed_at: nowIso() })
         .eq("id", quest.id)
         .eq("status", "active");
+      await refreshQuestMessage(client, quest.id);
       continue;
     }
 
-    const channel = await guild.channels.fetch(quest.event_channel_id).catch(() => null);
-    if (!channelIsVoiceLike(channel)) continue;
+    if (!eventStatusAllowsAttendance(freshEvent?.status) || !eventWindowAllowsAttendance(quest)) continue;
+    if (!isVoiceChannel) continue;
 
     for (const [userId, member] of channel.members) {
       if (member.user.bot) continue;
-      await updateConnectedAttendance(client, quest, userId);
+      await updateConnectedAttendance(client, quest, userId, { running: true });
     }
   }
 }

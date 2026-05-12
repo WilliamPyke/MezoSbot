@@ -18,6 +18,8 @@ const emulator_js_1 = require("./emulator.js");
 const config_js_1 = require("./config.js");
 const web_js_1 = require("./arcade/web.js");
 const routes_js_1 = require("./web/routes.js");
+const spectate_js_1 = require("./arcade/spectate.js");
+const db_js_1 = require("./arcade/db.js");
 const deflateAsync = (0, node_util_1.promisify)(node_zlib_1.deflate);
 const streamClients = new Map();
 let httpServer = null;
@@ -363,6 +365,51 @@ async function startStream() {
                 console.error("[Stream] HTTP handler error:", err?.message ?? err);
                 sendJson(res, 500, { error: "internal_error" });
             });
+        });
+        // Spectator WebSocket server for live arcade match viewing.
+        const spectateWss = new ws_1.WebSocketServer({
+            server: httpServer,
+            path: "/arcade/spectate",
+        });
+        spectateWss.on("connection", async (ws, req) => {
+            try {
+                const reqUrl = new node_url_1.URL(req.url ?? "", `http://${req.headers.host ?? "localhost"}`);
+                const matchIdRaw = reqUrl.searchParams.get("match");
+                const matchId = matchIdRaw ? parseInt(matchIdRaw, 10) : NaN;
+                if (!Number.isFinite(matchId) || matchId <= 0) {
+                    ws.close(1008, "missing match id");
+                    return;
+                }
+                const match = await (0, db_js_1.getMatch)(matchId);
+                if (!match) {
+                    ws.close(1008, "match not found");
+                    return;
+                }
+                if (match.mode === "practice") {
+                    ws.close(1008, "practice not spectatable");
+                    return;
+                }
+                if (match.status === "completed" || match.status === "cancelled") {
+                    // Send the final snapshot once and close.
+                    const snap = await (0, spectate_js_1.buildSpectatorSnapshot)(matchId);
+                    if (snap)
+                        ws.send(JSON.stringify(snap));
+                    ws.close(1000, "match completed");
+                    return;
+                }
+                await (0, web_js_1.ensureMatchRuntimeLoaded)(matchId);
+                (0, spectate_js_1.addSpectator)(matchId, ws);
+                const snap = await (0, spectate_js_1.buildSpectatorSnapshot)(matchId);
+                if (snap)
+                    ws.send(JSON.stringify(snap));
+            }
+            catch (err) {
+                console.error("[Spectate] connect error:", err?.message ?? err);
+                try {
+                    ws.close(1011, "internal error");
+                }
+                catch { }
+            }
         });
         if (config_js_1.config.gameboy.enabled) {
             // WebSocket server with optimized settings
