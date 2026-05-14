@@ -374,60 +374,10 @@ async function buildQuestCreatorView(interaction: Interaction, session: QuestBui
   }
 
   rows.push(
-    new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
-      new StringSelectMenuBuilder()
-        .setCustomId(builderId("reward", session.id))
-        .setPlaceholder("Choose reward per attendee")
-        .addOptions(
-          [100, 250, 500, 1000, 2500, 5000].map((sats) => ({
-            label: formatSats(sats),
-            value: String(sats),
-            default: session.rewardSats === sats,
-          })),
-        ),
-    ),
-    new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
-      new StringSelectMenuBuilder()
-        .setCustomId(builderId("minutes", session.id))
-        .setPlaceholder("Choose required attendance time")
-        .addOptions(
-          [1, 5, 10, 15, 30, 45, 60].map((minutes) => ({
-            label: `${minutes} minute${minutes === 1 ? "" : "s"}`,
-            value: String(minutes),
-            default: session.minMinutes === minutes,
-          })),
-        ),
-    ),
-    new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
-      new StringSelectMenuBuilder()
-        .setCustomId(builderId("cap", session.id))
-        .setPlaceholder("Choose max rewards")
-        .addOptions(
-          [
-            { label: "No cap", value: "none", default: session.maxRewards === null },
-            ...[10, 25, 50, 100, 250].map((cap) => ({
-              label: `${cap} attendees`,
-              value: String(cap),
-              default: session.maxRewards === cap,
-            })),
-          ],
-        ),
-    ),
-  );
-
-  rows.push(
     new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder()
-        .setCustomId(builderId("custom_reward", session.id))
-        .setLabel("Custom reward")
-        .setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder()
-        .setCustomId(builderId("custom_minutes", session.id))
-        .setLabel("Custom time")
-        .setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder()
-        .setCustomId(builderId("custom_cap", session.id))
-        .setLabel("Custom cap")
+        .setCustomId(builderId("details", session.id))
+        .setLabel("Set details")
         .setStyle(ButtonStyle.Secondary),
       new ButtonBuilder()
         .setCustomId(builderId("confirm", session.id))
@@ -505,9 +455,6 @@ async function handleQuestBuilderSelect(interaction: StringSelectMenuInteraction
 
   const value = interaction.values[0];
   if (parsed.action === "event") session.eventId = value;
-  if (parsed.action === "reward") session.rewardSats = roundSats(Number(value));
-  if (parsed.action === "minutes") session.minMinutes = Number(value);
-  if (parsed.action === "cap") session.maxRewards = value === "none" ? null : Number(value);
   touchBuilderSession(session);
 
   await interaction.deferUpdate();
@@ -525,9 +472,7 @@ async function handleQuestBuilderButton(interaction: ButtonInteraction): Promise
     return;
   }
 
-  if (parsed.action === "custom_reward") return showBuilderNumberModal(interaction, session, "reward_modal", "Custom reward", "Reward per attendee in sats", true);
-  if (parsed.action === "custom_minutes") return showBuilderNumberModal(interaction, session, "minutes_modal", "Custom time", "Required minutes in the event channel", true);
-  if (parsed.action === "custom_cap") return showBuilderNumberModal(interaction, session, "cap_modal", "Custom cap", "Maximum rewarded attendees, or leave blank for no cap", false);
+  if (parsed.action === "details") return showBuilderDetailsModal(interaction, session);
 
   if (parsed.action !== "confirm") return;
   await interaction.deferUpdate();
@@ -579,25 +524,37 @@ async function handleQuestBuilderButton(interaction: ButtonInteraction): Promise
   });
 }
 
-async function showBuilderNumberModal(
-  interaction: ButtonInteraction,
-  session: QuestBuilderSession,
-  action: string,
-  title: string,
-  label: string,
-  required: boolean,
-) {
+async function showBuilderDetailsModal(interaction: ButtonInteraction, session: QuestBuilderSession) {
   const modal = new ModalBuilder()
-    .setCustomId(builderId(action, session.id))
-    .setTitle(title)
+    .setCustomId(builderId("details_modal", session.id))
+    .setTitle("Event quest details")
     .addComponents(
       new ActionRowBuilder<TextInputBuilder>().addComponents(
         new TextInputBuilder()
-          .setCustomId("value")
-          .setLabel(label)
+          .setCustomId("reward")
+          .setLabel("Reward per attendee in sats")
           .setStyle(TextInputStyle.Short)
-          .setRequired(required)
-          .setPlaceholder(required ? "1000" : "Leave blank for no cap"),
+          .setRequired(true)
+          .setPlaceholder("1000")
+          .setValue(session.rewardSats == null ? "" : String(session.rewardSats)),
+      ),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("minutes")
+          .setLabel("Minutes required to attend")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setPlaceholder("10")
+          .setValue(session.minMinutes == null ? "" : String(session.minMinutes)),
+      ),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("cap")
+          .setLabel("Max rewarded attendees")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(false)
+          .setPlaceholder("Blank means no cap")
+          .setValue(session.maxRewards == null ? "" : String(session.maxRewards)),
       ),
     );
 
@@ -609,32 +566,36 @@ async function handleQuestBuilderModal(interaction: ModalSubmitInteraction): Pro
   if (!parsed || !session) return rejectBuilderInteraction(interaction, "This quest setup expired. Run `/quest create` again.");
   if (interaction.user.id !== session.creatorId) return rejectBuilderInteraction(interaction, "Only the person who opened this setup can edit it.");
 
-  const raw = interaction.fields.getTextInputValue("value").trim();
-  const value = Number(raw);
+  if (parsed.action !== "details_modal") return;
 
-  if (parsed.action === "cap_modal" && raw.length === 0) {
-    session.maxRewards = null;
-  } else if (!Number.isFinite(value) || value <= 0) {
-    await interaction.reply({ content: "Enter a positive number.", flags: MessageFlags.Ephemeral });
+  const rewardRaw = interaction.fields.getTextInputValue("reward").trim();
+  const minutesRaw = interaction.fields.getTextInputValue("minutes").trim();
+  const capRaw = interaction.fields.getTextInputValue("cap").trim();
+
+  const reward = Number(rewardRaw);
+  if (!Number.isFinite(reward) || reward <= 0) {
+    await interaction.reply({ content: "Reward must be a positive number of sats.", flags: MessageFlags.Ephemeral });
     return;
-  } else if (parsed.action === "reward_modal") {
-    session.rewardSats = roundSats(value);
-  } else if (parsed.action === "minutes_modal") {
-    const minutes = Math.floor(value);
-    if (minutes < 1 || minutes > 1440) {
-      await interaction.reply({ content: "Required time must be between 1 and 1440 minutes.", flags: MessageFlags.Ephemeral });
-      return;
-    }
-    session.minMinutes = minutes;
-  } else if (parsed.action === "cap_modal") {
-    const cap = Math.floor(value);
+  }
+
+  const minutes = Math.floor(Number(minutesRaw));
+  if (!Number.isFinite(minutes) || minutes < 1 || minutes > 1440) {
+    await interaction.reply({ content: "Required time must be between 1 and 1440 minutes.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  let cap: number | null = null;
+  if (capRaw.length > 0) {
+    cap = Math.floor(Number(capRaw));
     if (cap < 1 || cap > 10000) {
       await interaction.reply({ content: "Max rewards must be between 1 and 10000, or blank for no cap.", flags: MessageFlags.Ephemeral });
       return;
     }
-    session.maxRewards = cap;
   }
 
+  session.rewardSats = roundSats(reward);
+  session.minMinutes = minutes;
+  session.maxRewards = cap;
   touchBuilderSession(session);
   await interaction.deferUpdate();
   await updateBuilderMessage(interaction, session);
