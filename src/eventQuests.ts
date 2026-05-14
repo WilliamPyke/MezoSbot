@@ -3,7 +3,9 @@ import {
   EmbedBuilder,
   GuildScheduledEventStatus,
   type Client,
+  type Guild,
   type GuildScheduledEvent,
+  type PartialGuildScheduledEvent,
   type VoiceBasedChannel,
   type VoiceState,
 } from "discord.js";
@@ -32,6 +34,10 @@ export type EventQuestRow = {
 
 const SWEEP_MS = 60_000;
 const QUEST_COLOR = 0x77a7ff;
+
+type EventQuestEmbedOptions = {
+  confirmedParticipants?: number | null;
+};
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -82,13 +88,22 @@ function eventStatusAllowsAttendance(status: GuildScheduledEventStatus | null | 
 
 async function eventIsRunning(client: Client, quest: EventQuestRow): Promise<boolean> {
   const guild = await client.guilds.fetch(quest.guild_id).catch(() => null);
-  const event = await guild?.scheduledEvents.fetch(quest.scheduled_event_id).catch(() => null);
+  const event = guild ? await fetchScheduledEventWithUserCount(guild, quest.scheduled_event_id) : null;
   if (!event) return false;
 
   const syncedQuest = await syncQuestFromEvent(quest, event);
   Object.assign(quest, syncedQuest);
   const ignoreStart = event.status === GuildScheduledEventStatus.Active;
   return eventStatusAllowsAttendance(event.status) && eventWindowAllowsAttendance(syncedQuest, Date.now(), { ignoreStart });
+}
+
+async function fetchScheduledEventWithUserCount(
+  guild: Guild,
+  scheduledEventId: string,
+): Promise<GuildScheduledEvent | null> {
+  return guild.scheduledEvents
+    .fetch({ guildScheduledEvent: scheduledEventId, withUserCount: true })
+    .catch(() => null);
 }
 
 async function syncQuestFromEvent(quest: EventQuestRow, event: GuildScheduledEvent): Promise<EventQuestRow> {
@@ -282,7 +297,7 @@ async function updateConnectedAttendance(
   }
 }
 
-export function buildEventQuestEmbed(quest: EventQuestRow): EmbedBuilder {
+export function buildEventQuestEmbed(quest: EventQuestRow, options: EventQuestEmbedOptions = {}): EmbedBuilder {
   const cleanEventUrl = `https://discord.com/events/${quest.guild_id}/${quest.scheduled_event_id}`;
   const cleanStartsRelative = quest.scheduled_start_at
     ? `<t:${Math.floor(Date.parse(quest.scheduled_start_at) / 1000)}:R>`
@@ -291,6 +306,9 @@ export function buildEventQuestEmbed(quest: EventQuestRow): EmbedBuilder {
   const claimLine = quest.max_rewards === null
     ? "Automatic one time reward"
     : `${quest.rewards_count}/${quest.max_rewards} rewards claimed`;
+  const confirmedLine = options.confirmedParticipants == null
+    ? "Unknown"
+    : `${options.confirmedParticipants} confirmed`;
 
   return new EmbedBuilder()
     .setColor(QUEST_COLOR)
@@ -310,6 +328,7 @@ export function buildEventQuestEmbed(quest: EventQuestRow): EmbedBuilder {
       { name: "Requirements:", value: `↳ Join <#${quest.event_channel_id}> for **${cleanMinutes}**`, inline: false },
       { name: "Progress", value: `Quest completed **${quest.rewards_count}** time${quest.rewards_count === 1 ? "" : "s"}.`, inline: false },
       { name: "💎 Automatic Reward", value: claimLine, inline: false },
+      { name: "Confirmed Participants", value: confirmedLine, inline: true },
       { name: "Event", value: `[Open Discord Event](${cleanEventUrl})`, inline: true },
     )
     .setFooter({ text: "⚡ Powered by matsFi" })
@@ -330,9 +349,10 @@ async function refreshQuestMessage(client: Client, questId: number): Promise<voi
   const channel = await client.channels.fetch(quest.channel_id).catch(() => null);
   if (!channel || !("messages" in channel)) return;
 
-  const embed = buildEventQuestEmbed(quest);
   const guild = await client.guilds.fetch(quest.guild_id).catch(() => null);
-  const event = await guild?.scheduledEvents.fetch(quest.scheduled_event_id).catch(() => null);
+  const event = guild ? await fetchScheduledEventWithUserCount(guild, quest.scheduled_event_id) : null;
+  const syncedQuest = event ? await syncQuestFromEvent(quest, event) : quest;
+  const embed = buildEventQuestEmbed(syncedQuest, { confirmedParticipants: event?.userCount ?? null });
   const thumbnail = event?.coverImageURL({ size: 256 });
   if (thumbnail) embed.setThumbnail(thumbnail);
 
@@ -425,7 +445,7 @@ async function sweepEventQuests(client: Client): Promise<void> {
     const guild = await client.guilds.fetch(quest.guild_id).catch(() => null);
     if (!guild) continue;
 
-    const freshEvent = await guild.scheduledEvents.fetch(quest.scheduled_event_id).catch(() => null);
+    const freshEvent = await fetchScheduledEventWithUserCount(guild, quest.scheduled_event_id);
     const syncedQuest = freshEvent ? await syncQuestFromEvent(quest, freshEvent) : quest;
     const channel = await guild.channels.fetch(syncedQuest.event_channel_id).catch(() => null);
     const isVoiceChannel = channelIsVoiceLike(channel);
@@ -507,5 +527,27 @@ export async function handleEventQuestScheduledEventUpdate(
         accrualEndMs,
       });
     }
+    await refreshQuestMessage(client, syncedQuest.id);
   }
+}
+
+export async function handleEventQuestScheduledEventUserChange(
+  client: Client,
+  event: GuildScheduledEvent | PartialGuildScheduledEvent,
+): Promise<void> {
+  if (!event.guildId) return;
+
+  const { data, error } = await supabase
+    .from("event_quests")
+    .select("id")
+    .eq("status", "active")
+    .eq("guild_id", event.guildId)
+    .eq("scheduled_event_id", event.id);
+
+  if (error) {
+    console.warn("[Quest] Failed to load quests for event participant sync:", error.message);
+    return;
+  }
+
+  await Promise.all((data ?? []).map((quest) => refreshQuestMessage(client, quest.id as number)));
 }

@@ -503,7 +503,9 @@ async function handleQuestBuilderButton(interaction: ButtonInteraction): Promise
     return;
   }
 
-  const event = await interaction.guild?.scheduledEvents.fetch(session.eventId).catch(() => null);
+  const event = await interaction.guild?.scheduledEvents
+    .fetch({ guildScheduledEvent: session.eventId, withUserCount: true })
+    .catch(() => null);
   if (!event) {
     await interaction.editReply({ content: "I could not find that scheduled event anymore.", embeds: [], components: [] });
     return;
@@ -645,7 +647,9 @@ async function addEventTask(interaction: ChatInputCommandInteraction) {
 
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
-  const event = await interaction.guild!.scheduledEvents.fetch(eventId).catch(() => null);
+  const event = await interaction.guild!.scheduledEvents
+    .fetch({ guildScheduledEvent: eventId, withUserCount: true })
+    .catch(() => null);
   if (!event?.channelId || !eventIsVoiceLike(event)) {
     return interaction.editReply({ content: "That event is not attached to a voice or stage channel." });
   }
@@ -839,7 +843,9 @@ async function createEventQuest(interaction: ChatInputCommandInteraction) {
 
   await interaction.deferReply();
 
-  const event = await interaction.guild!.scheduledEvents.fetch(eventId).catch(() => null);
+  const event = await interaction.guild!.scheduledEvents
+    .fetch({ guildScheduledEvent: eventId, withUserCount: true })
+    .catch(() => null);
   if (!event) return interaction.editReply({ content: "I could not find that scheduled event." });
 
   const result = await createEventQuestFromSelection({
@@ -949,7 +955,7 @@ async function createEventQuestFromSelection(input: {
   };
 
   const thumbnail = input.event.coverImageURL({ size: 256 });
-  const embed = buildEventQuestEmbed(quest);
+  const embed = buildEventQuestEmbed(quest, { confirmedParticipants: input.event.userCount ?? null });
   if (thumbnail) embed.setThumbnail(thumbnail);
 
   return { ok: true, quest, embed };

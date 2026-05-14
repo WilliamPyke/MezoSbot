@@ -46,6 +46,7 @@ import {
 } from "./arcade/interactions.js";
 import {
   handleEventQuestScheduledEventUpdate,
+  handleEventQuestScheduledEventUserChange,
   handleQuestVoiceStateUpdate,
   startEventQuestSweeper,
 } from "./eventQuests.js";
@@ -466,6 +467,18 @@ client.on(Events.GuildScheduledEventUpdate, async (_oldEvent, newEvent) => {
   );
   await handleMultiStepScheduledEventUpdate(client, newEvent).catch((err) =>
     console.warn("[QuestEngine] Scheduled event sync failed:", (err as Error)?.message ?? err)
+  );
+});
+
+client.on(Events.GuildScheduledEventUserAdd, async (event) => {
+  await handleEventQuestScheduledEventUserChange(client, event).catch((err) =>
+    console.warn("[Quest] Scheduled event participant add sync failed:", (err as Error)?.message ?? err)
+  );
+});
+
+client.on(Events.GuildScheduledEventUserRemove, async (event) => {
+  await handleEventQuestScheduledEventUserChange(client, event).catch((err) =>
+    console.warn("[Quest] Scheduled event participant remove sync failed:", (err as Error)?.message ?? err)
   );
 });
 

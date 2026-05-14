@@ -366,6 +366,12 @@ client.on(discord_js_1.Events.GuildScheduledEventUpdate, async (_oldEvent, newEv
     await (0, eventQuests_js_1.handleEventQuestScheduledEventUpdate)(client, newEvent).catch((err) => console.warn("[Quest] Scheduled event sync failed:", err?.message ?? err));
     await (0, runtime_js_1.handleMultiStepScheduledEventUpdate)(client, newEvent).catch((err) => console.warn("[QuestEngine] Scheduled event sync failed:", err?.message ?? err));
 });
+client.on(discord_js_1.Events.GuildScheduledEventUserAdd, async (event) => {
+    await (0, eventQuests_js_1.handleEventQuestScheduledEventUserChange)(client, event).catch((err) => console.warn("[Quest] Scheduled event participant add sync failed:", err?.message ?? err));
+});
+client.on(discord_js_1.Events.GuildScheduledEventUserRemove, async (event) => {
+    await (0, eventQuests_js_1.handleEventQuestScheduledEventUserChange)(client, event).catch((err) => console.warn("[Quest] Scheduled event participant remove sync failed:", err?.message ?? err));
+});
 /* ────────────────────────────────────────────────────────────────── */
 /*  Game Boy text input listener                                      */
 /* ────────────────────────────────────────────────────────────────── */
