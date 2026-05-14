@@ -62,6 +62,12 @@ export type QuestSnapshot = {
   tiers: Array<Pick<QuestRewardTierRow, "completed_task_count" | "reward_sats">>;
 };
 
+export type ActiveQuestTask<TConfig extends Record<string, unknown> = Record<string, unknown>> =
+  QuestTaskRow & {
+    quest: Pick<QuestRow, "id" | "guild_id" | "channel_id" | "message_id" | "creator_id" | "title" | "description" | "status" | "max_reward_sats" | "starts_at" | "ends_at" | "metadata">;
+    config: TConfig;
+  };
+
 export type QuestTaskDefinition = {
   type: QuestTaskType;
   label: string;
@@ -376,7 +382,7 @@ export async function publishQuest(input: {
 export async function getActiveTasksByType<TConfig extends Record<string, unknown>>(
   guildId: string,
   type: QuestTaskType,
-): Promise<Array<QuestTaskRow & { quest: Pick<QuestRow, "id" | "guild_id" | "creator_id" | "status" | "starts_at" | "ends_at">; config: TConfig }>> {
+): Promise<Array<ActiveQuestTask<TConfig>>> {
   const { data, error } = await supabase
     .from("quest_tasks")
     .select(`
@@ -393,10 +399,16 @@ export async function getActiveTasksByType<TConfig extends Record<string, unknow
       quest:quests!inner (
         id,
         guild_id,
+        channel_id,
+        message_id,
         creator_id,
+        title,
+        description,
         status,
+        max_reward_sats,
         starts_at,
-        ends_at
+        ends_at,
+        metadata
       )
     `)
     .eq("type", type)
@@ -405,7 +417,7 @@ export async function getActiveTasksByType<TConfig extends Record<string, unknow
     .eq("quest.status", "active");
 
   if (error) throw error;
-  return (data ?? []) as unknown as Array<QuestTaskRow & { quest: Pick<QuestRow, "id" | "guild_id" | "creator_id" | "status" | "starts_at" | "ends_at">; config: TConfig }>;
+  return (data ?? []) as unknown as Array<ActiveQuestTask<TConfig>>;
 }
 
 export async function completeQuestTask(params: {

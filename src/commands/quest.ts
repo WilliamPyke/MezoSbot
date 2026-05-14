@@ -1,12 +1,23 @@
 import {
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
   ChannelType,
   EmbedBuilder,
   GuildScheduledEventEntityType,
   GuildScheduledEventStatus,
   MessageFlags,
+  ModalBuilder,
+  StringSelectMenuBuilder,
+  TextInputBuilder,
+  TextInputStyle,
   type AutocompleteInteraction,
+  type ButtonInteraction,
   type ChatInputCommandInteraction,
   type GuildScheduledEvent,
+  type Interaction,
+  type ModalSubmitInteraction,
+  type StringSelectMenuInteraction,
 } from "discord.js";
 import { getBalance } from "../balance.js";
 import { supabase } from "../db.js";
@@ -22,11 +33,17 @@ import {
   publishQuest,
   type QuestSnapshot,
 } from "../quests/engine.js";
+import { completeAndNotify } from "../quests/runtime.js";
 
 export const data = {
   name: "quest",
   description: "Create and manage sats quests",
   options: [
+    {
+      name: "create",
+      type: 1 as const,
+      description: "Open a guided event quest creator",
+    },
     {
       name: "create_event",
       type: 1 as const,
@@ -90,6 +107,17 @@ export const data = {
       ],
     },
     {
+      name: "complete_task",
+      type: 1 as const,
+      description: "Creator override: mark a quest task complete for a user",
+      options: [
+        { name: "quest_id", type: 4 as const, description: "Quest ID", required: true, minValue: 1 },
+        { name: "task_key", type: 3 as const, description: "Task key from the quest preview", required: true, maxLength: 64 },
+        { name: "user", type: 6 as const, description: "User who completed the task", required: true },
+        { name: "note", type: 3 as const, description: "Optional proof note", required: false, maxLength: 300 },
+      ],
+    },
+    {
       name: "publish",
       type: 1 as const,
       description: "Publish a draft quest to this channel",
@@ -104,6 +132,23 @@ export const data = {
     },
   ],
 };
+
+const BUILDER_PREFIX = "qcreate";
+const BUILDER_TTL_MS = 15 * 60_000;
+
+type QuestBuilderSession = {
+  id: string;
+  guildId: string;
+  channelId: string;
+  creatorId: string;
+  eventId: string | null;
+  rewardSats: number | null;
+  minMinutes: number | null;
+  maxRewards: number | null;
+  expiresAt: number;
+};
+
+const questBuilderSessions = new Map<string, QuestBuilderSession>();
 
 function eventIsVoiceLike(event: GuildScheduledEvent): boolean {
   return event.entityType === GuildScheduledEventEntityType.StageInstance ||
@@ -156,11 +201,13 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   }
 
   const subcommand = interaction.options.getSubcommand(true);
+  if (subcommand === "create") return startQuestBuilder(interaction);
   if (subcommand === "create_event") return createEventQuest(interaction);
   if (subcommand === "draft") return createDraft(interaction);
   if (subcommand === "add_event_task") return addEventTask(interaction);
   if (subcommand === "add_link_task") return addLinkTask(interaction);
   if (subcommand === "preview") return previewQuest(interaction, true);
+  if (subcommand === "complete_task") return completeTaskOverride(interaction);
   if (subcommand === "publish") return publishDraft(interaction);
   if (subcommand === "presets") return listPresets(interaction);
 
@@ -216,6 +263,380 @@ function buildQuestBuilderEmbed(snapshot: QuestSnapshot): EmbedBuilder {
     .setTimestamp();
 
   return embed;
+}
+
+function cleanupQuestBuilderSessions() {
+  const now = Date.now();
+  for (const [id, session] of questBuilderSessions) {
+    if (session.expiresAt <= now) questBuilderSessions.delete(id);
+  }
+}
+
+function createBuilderSession(interaction: ChatInputCommandInteraction): QuestBuilderSession {
+  cleanupQuestBuilderSessions();
+  const id = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+  const session: QuestBuilderSession = {
+    id,
+    guildId: interaction.guild!.id,
+    channelId: interaction.channelId,
+    creatorId: interaction.user.id,
+    eventId: null,
+    rewardSats: null,
+    minMinutes: null,
+    maxRewards: null,
+    expiresAt: Date.now() + BUILDER_TTL_MS,
+  };
+  questBuilderSessions.set(id, session);
+  return session;
+}
+
+function builderId(action: string, sessionId: string): string {
+  return `${BUILDER_PREFIX}:${action}:${sessionId}`;
+}
+
+function parseBuilderId(customId: string): { action: string; sessionId: string } | null {
+  const [prefix, action, sessionId] = customId.split(":");
+  if (prefix !== BUILDER_PREFIX || !action || !sessionId) return null;
+  return { action, sessionId };
+}
+
+function selectedLabel(value: string | number | null, fallback = "Not selected"): string {
+  return value == null ? fallback : String(value);
+}
+
+async function resolveBuilderEvent(interaction: Interaction, session: QuestBuilderSession): Promise<GuildScheduledEvent | null> {
+  if (!interaction.guild || !session.eventId) return null;
+  return interaction.guild.scheduledEvents.fetch(session.eventId).catch(() => null);
+}
+
+async function buildQuestCreatorView(interaction: Interaction, session: QuestBuilderSession) {
+  const event = await resolveBuilderEvent(interaction, session);
+  const rewardLabel = session.rewardSats == null ? "Not selected" : formatSats(session.rewardSats);
+  const maxLabel = session.maxRewards == null ? "No cap" : `${session.maxRewards} attendees`;
+  const totalLabel = session.rewardSats == null
+    ? "Set reward first"
+    : session.maxRewards == null
+      ? "Open-ended"
+      : formatSats(roundSats(session.rewardSats * session.maxRewards));
+
+  const embed = new EmbedBuilder()
+    .setColor(0x77a7ff)
+    .setTitle("Create Event Quest")
+    .setDescription("Pick the event and reward settings, then confirm when the preview looks right.")
+    .addFields(
+      { name: "Event", value: event ? `${event.name}\n<#${event.channelId}>` : "Not selected", inline: false },
+      { name: "Reward", value: rewardLabel, inline: true },
+      { name: "Required time", value: `${selectedLabel(session.minMinutes)} minute${session.minMinutes === 1 ? "" : "s"}`, inline: true },
+      { name: "Max rewards", value: maxLabel, inline: true },
+      { name: "Total possible spend", value: totalLabel, inline: true },
+    )
+    .setFooter({ text: "This setup expires after 15 minutes." });
+
+  if (event?.scheduledStartAt) {
+    embed.addFields({
+      name: "Scheduled start",
+      value: `<t:${Math.floor(event.scheduledStartAt.getTime() / 1000)}:F>`,
+      inline: false,
+    });
+  }
+
+  const rows: Array<ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>> = [];
+
+  const events = interaction.guild
+    ? await getSelectableEvents(interaction as ChatInputCommandInteraction).catch(() => [])
+    : [];
+  if (events.length > 0) {
+    rows.push(
+      new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+        new StringSelectMenuBuilder()
+          .setCustomId(builderId("event", session.id))
+          .setPlaceholder(event ? event.name.slice(0, 100) : "Choose a scheduled event")
+          .addOptions(
+            events.slice(0, 25).map((candidate) => {
+              const starts = candidate.scheduledStartAt
+                ? candidate.scheduledStartAt.toLocaleString("en-US", {
+                  month: "short",
+                  day: "numeric",
+                  hour: "numeric",
+                  minute: "2-digit",
+                })
+                : "unscheduled";
+              return {
+                label: candidate.name.slice(0, 100),
+                description: `${starts} in ${candidate.channel?.name ?? "event channel"}`.slice(0, 100),
+                value: candidate.id,
+                default: candidate.id === session.eventId,
+              };
+            }),
+          ),
+      ),
+    );
+  }
+
+  rows.push(
+    new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId(builderId("reward", session.id))
+        .setPlaceholder("Choose reward per attendee")
+        .addOptions(
+          [100, 250, 500, 1000, 2500, 5000].map((sats) => ({
+            label: formatSats(sats),
+            value: String(sats),
+            default: session.rewardSats === sats,
+          })),
+        ),
+    ),
+    new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId(builderId("minutes", session.id))
+        .setPlaceholder("Choose required attendance time")
+        .addOptions(
+          [1, 5, 10, 15, 30, 45, 60].map((minutes) => ({
+            label: `${minutes} minute${minutes === 1 ? "" : "s"}`,
+            value: String(minutes),
+            default: session.minMinutes === minutes,
+          })),
+        ),
+    ),
+    new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId(builderId("cap", session.id))
+        .setPlaceholder("Choose max rewards")
+        .addOptions(
+          [
+            { label: "No cap", value: "none", default: session.maxRewards === null },
+            ...[10, 25, 50, 100, 250].map((cap) => ({
+              label: `${cap} attendees`,
+              value: String(cap),
+              default: session.maxRewards === cap,
+            })),
+          ],
+        ),
+    ),
+  );
+
+  rows.push(
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(builderId("custom_reward", session.id))
+        .setLabel("Custom reward")
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId(builderId("custom_minutes", session.id))
+        .setLabel("Custom time")
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId(builderId("custom_cap", session.id))
+        .setLabel("Custom cap")
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId(builderId("confirm", session.id))
+        .setLabel("Create")
+        .setStyle(ButtonStyle.Success)
+        .setDisabled(!session.eventId || !session.rewardSats || !session.minMinutes),
+      new ButtonBuilder()
+        .setCustomId(builderId("cancel", session.id))
+        .setLabel("Cancel")
+        .setStyle(ButtonStyle.Danger),
+    ),
+  );
+
+  return { embeds: [embed], components: rows, allowedMentions: { parse: [] } };
+}
+
+async function startQuestBuilder(interaction: ChatInputCommandInteraction) {
+  const session = createBuilderSession(interaction);
+  await interaction.reply({
+    ...(await buildQuestCreatorView(interaction, session)),
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+export function isQuestBuilderInteraction(interaction: Interaction): boolean {
+  if (interaction.isButton() || interaction.isStringSelectMenu() || interaction.isModalSubmit()) {
+    return interaction.customId.startsWith(`${BUILDER_PREFIX}:`);
+  }
+  return false;
+}
+
+export async function handleQuestBuilderInteraction(interaction: Interaction): Promise<void> {
+  if (interaction.isStringSelectMenu()) return handleQuestBuilderSelect(interaction);
+  if (interaction.isButton()) return handleQuestBuilderButton(interaction);
+  if (interaction.isModalSubmit()) return handleQuestBuilderModal(interaction);
+}
+
+function getBuilderSession(interaction: ButtonInteraction | StringSelectMenuInteraction | ModalSubmitInteraction) {
+  const parsed = parseBuilderId(interaction.customId);
+  if (!parsed) return { parsed: null, session: null };
+
+  const session = questBuilderSessions.get(parsed.sessionId) ?? null;
+  if (!session || session.expiresAt <= Date.now()) {
+    if (session) questBuilderSessions.delete(parsed.sessionId);
+    return { parsed, session: null };
+  }
+  return { parsed, session };
+}
+
+async function rejectBuilderInteraction(interaction: ButtonInteraction | StringSelectMenuInteraction | ModalSubmitInteraction, message: string) {
+  if (interaction.isModalSubmit()) {
+    await interaction.reply({ content: message, flags: MessageFlags.Ephemeral }).catch(() => {});
+    return;
+  }
+  await interaction.reply({ content: message, flags: MessageFlags.Ephemeral }).catch(() => {});
+}
+
+function touchBuilderSession(session: QuestBuilderSession) {
+  session.expiresAt = Date.now() + BUILDER_TTL_MS;
+}
+
+async function updateBuilderMessage(interaction: ButtonInteraction | StringSelectMenuInteraction | ModalSubmitInteraction, session: QuestBuilderSession) {
+  const view = await buildQuestCreatorView(interaction, session);
+  if (interaction.isModalSubmit()) {
+    await interaction.editReply(view);
+  } else {
+    await interaction.update(view);
+  }
+}
+
+async function handleQuestBuilderSelect(interaction: StringSelectMenuInteraction): Promise<void> {
+  const { parsed, session } = getBuilderSession(interaction);
+  if (!parsed || !session) return rejectBuilderInteraction(interaction, "This quest setup expired. Run `/quest create` again.");
+  if (interaction.user.id !== session.creatorId) return rejectBuilderInteraction(interaction, "Only the person who opened this setup can edit it.");
+
+  const value = interaction.values[0];
+  if (parsed.action === "event") session.eventId = value;
+  if (parsed.action === "reward") session.rewardSats = roundSats(Number(value));
+  if (parsed.action === "minutes") session.minMinutes = Number(value);
+  if (parsed.action === "cap") session.maxRewards = value === "none" ? null : Number(value);
+  touchBuilderSession(session);
+
+  await updateBuilderMessage(interaction, session);
+}
+
+async function handleQuestBuilderButton(interaction: ButtonInteraction): Promise<void> {
+  const { parsed, session } = getBuilderSession(interaction);
+  if (!parsed || !session) return rejectBuilderInteraction(interaction, "This quest setup expired. Run `/quest create` again.");
+  if (interaction.user.id !== session.creatorId) return rejectBuilderInteraction(interaction, "Only the person who opened this setup can edit it.");
+
+  if (parsed.action === "cancel") {
+    questBuilderSessions.delete(session.id);
+    await interaction.update({ content: "Quest setup cancelled.", embeds: [], components: [] });
+    return;
+  }
+
+  if (parsed.action === "custom_reward") return showBuilderNumberModal(interaction, session, "reward_modal", "Custom reward", "Reward per attendee in sats", true);
+  if (parsed.action === "custom_minutes") return showBuilderNumberModal(interaction, session, "minutes_modal", "Custom time", "Required minutes in the event channel", true);
+  if (parsed.action === "custom_cap") return showBuilderNumberModal(interaction, session, "cap_modal", "Custom cap", "Maximum rewarded attendees, or leave blank for no cap", false);
+
+  if (parsed.action !== "confirm") return;
+  await interaction.deferUpdate();
+
+  if (!session.eventId || !session.rewardSats || !session.minMinutes) {
+    await interaction.editReply({
+      content: "Pick an event, reward, and required time before creating the quest.",
+      ...(await buildQuestCreatorView(interaction, session)),
+    });
+    return;
+  }
+
+  const event = await interaction.guild?.scheduledEvents.fetch(session.eventId).catch(() => null);
+  if (!event) {
+    await interaction.editReply({ content: "I could not find that scheduled event anymore.", embeds: [], components: [] });
+    return;
+  }
+
+  const targetChannel = await interaction.client.channels.fetch(session.channelId).catch(() => null);
+  if (!targetChannel || !("send" in targetChannel)) {
+    await interaction.editReply({ content: "I cannot post the quest in this channel.", embeds: [], components: [] });
+    return;
+  }
+
+  const result = await createEventQuestFromSelection({
+    guildId: session.guildId,
+    channelId: session.channelId,
+    creatorId: session.creatorId,
+    event,
+    reward: session.rewardSats,
+    minMinutes: session.minMinutes,
+    maxRewards: session.maxRewards,
+  });
+
+  if (!result.ok) {
+    await interaction.editReply({ content: result.error, ...(await buildQuestCreatorView(interaction, session)) });
+    return;
+  }
+
+  const message = await targetChannel.send({ embeds: [result.embed], allowedMentions: { parse: [] } });
+  await storeEventQuestMessageId(result.quest.id, message.id);
+  questBuilderSessions.delete(session.id);
+
+  await interaction.editReply({
+    content: `Created **${event.name}** event quest in <#${session.channelId}>.`,
+    embeds: [],
+    components: [],
+    allowedMentions: { parse: [] },
+  });
+}
+
+async function showBuilderNumberModal(
+  interaction: ButtonInteraction,
+  session: QuestBuilderSession,
+  action: string,
+  title: string,
+  label: string,
+  required: boolean,
+) {
+  const modal = new ModalBuilder()
+    .setCustomId(builderId(action, session.id))
+    .setTitle(title)
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("value")
+          .setLabel(label)
+          .setStyle(TextInputStyle.Short)
+          .setRequired(required)
+          .setPlaceholder(required ? "1000" : "Leave blank for no cap"),
+      ),
+    );
+
+  await interaction.showModal(modal);
+}
+
+async function handleQuestBuilderModal(interaction: ModalSubmitInteraction): Promise<void> {
+  const { parsed, session } = getBuilderSession(interaction);
+  if (!parsed || !session) return rejectBuilderInteraction(interaction, "This quest setup expired. Run `/quest create` again.");
+  if (interaction.user.id !== session.creatorId) return rejectBuilderInteraction(interaction, "Only the person who opened this setup can edit it.");
+
+  const raw = interaction.fields.getTextInputValue("value").trim();
+  const value = Number(raw);
+
+  if (parsed.action === "cap_modal" && raw.length === 0) {
+    session.maxRewards = null;
+  } else if (!Number.isFinite(value) || value <= 0) {
+    await interaction.reply({ content: "Enter a positive number.", flags: MessageFlags.Ephemeral });
+    return;
+  } else if (parsed.action === "reward_modal") {
+    session.rewardSats = roundSats(value);
+  } else if (parsed.action === "minutes_modal") {
+    const minutes = Math.floor(value);
+    if (minutes < 1 || minutes > 1440) {
+      await interaction.reply({ content: "Required time must be between 1 and 1440 minutes.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    session.minMinutes = minutes;
+  } else if (parsed.action === "cap_modal") {
+    const cap = Math.floor(value);
+    if (cap < 1 || cap > 10000) {
+      await interaction.reply({ content: "Max rewards must be between 1 and 10000, or blank for no cap.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    session.maxRewards = cap;
+  }
+
+  touchBuilderSession(session);
+  await interaction.deferUpdate();
+  await updateBuilderMessage(interaction, session);
 }
 
 async function createDraft(interaction: ChatInputCommandInteraction) {
@@ -318,6 +739,79 @@ async function previewQuest(interaction: ChatInputCommandInteraction, ephemeral:
   await interaction.editReply({ embeds: [buildQuestBuilderEmbed(snapshot)] });
 }
 
+async function completeTaskOverride(interaction: ChatInputCommandInteraction) {
+  const questId = interaction.options.getInteger("quest_id", true);
+  const taskKey = interaction.options.getString("task_key", true).trim();
+  const user = interaction.options.getUser("user", true);
+  const note = interaction.options.getString("note")?.trim() || null;
+
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  const snapshot = await getQuestSnapshot(questId).catch((err) => {
+    console.warn("[Quest] Manual completion failed:", (err as Error).message);
+    return null;
+  });
+  if (!snapshot) return interaction.editReply({ content: "Quest not found." });
+  if (snapshot.quest.creator_id !== interaction.user.id) {
+    return interaction.editReply({ content: "Only the quest creator can complete tasks manually." });
+  }
+  if (snapshot.quest.status !== "active") {
+    return interaction.editReply({ content: "Only active quests can receive completions." });
+  }
+
+  const task = snapshot.tasks.find((candidate) => candidate.task_key === taskKey);
+  if (!task) {
+    return interaction.editReply({
+      content: `Task \`${taskKey}\` was not found. Use \`/quest preview\` to see task keys.`,
+    });
+  }
+
+  const result = await completeAndNotify(
+    interaction.client,
+    {
+      id: task.id,
+      quest_id: snapshot.quest.id,
+      title: task.title,
+      quest: {
+        id: snapshot.quest.id,
+        guild_id: snapshot.quest.guild_id,
+        channel_id: snapshot.quest.channel_id,
+        message_id: snapshot.quest.message_id,
+        creator_id: snapshot.quest.creator_id,
+        title: snapshot.quest.title,
+        description: snapshot.quest.description,
+        status: snapshot.quest.status,
+        max_reward_sats: snapshot.quest.max_reward_sats,
+        starts_at: snapshot.quest.starts_at,
+        ends_at: snapshot.quest.ends_at,
+        metadata: snapshot.quest.metadata,
+      },
+    },
+    user.id,
+    {
+      kind: "manual_override",
+      completedBy: interaction.user.id,
+      note,
+    },
+  ).catch((err) => {
+    throw new Error(`Could not complete task: ${(err as Error).message}`);
+  });
+
+  if (!result.ok) {
+    return interaction.editReply({ content: `Task was not completed: ${result.reason ?? "unknown reason"}.` });
+  }
+
+  const rewardText = (result.rewardDeltaSats ?? 0) > 0
+    ? ` Paid **${formatSats(result.rewardDeltaSats ?? 0)}**.`
+    : " No new tier payout was due.";
+  const duplicateText = result.insertedCompletion === false ? " This user had already completed that task." : "";
+
+  await interaction.editReply({
+    content: `Marked **${task.title}** complete for ${user}.${rewardText}${duplicateText}`,
+    allowedMentions: { parse: [] },
+  });
+}
+
 async function publishDraft(interaction: ChatInputCommandInteraction) {
   const questId = interaction.options.getInteger("quest_id", true);
   await interaction.deferReply();
@@ -373,96 +867,125 @@ async function createEventQuest(interaction: ChatInputCommandInteraction) {
 
   const event = await interaction.guild!.scheduledEvents.fetch(eventId).catch(() => null);
   if (!event) return interaction.editReply({ content: "I could not find that scheduled event." });
-  if (!event.channelId || !eventIsVoiceLike(event)) {
-    return interaction.editReply({ content: "That event is not attached to a voice or stage channel." });
+
+  const result = await createEventQuestFromSelection({
+    guildId: interaction.guild!.id,
+    channelId: interaction.channelId,
+    creatorId: interaction.user.id,
+    event,
+    reward,
+    minMinutes,
+    maxRewards,
+  });
+
+  if (!result.ok) return interaction.editReply({ content: result.error });
+
+  const reply = await interaction.editReply({ embeds: [result.embed], allowedMentions: { parse: [] } });
+  await storeEventQuestMessageId(result.quest.id, reply.id);
+}
+
+async function createEventQuestFromSelection(input: {
+  guildId: string;
+  channelId: string;
+  creatorId: string;
+  event: GuildScheduledEvent;
+  reward: number;
+  minMinutes: number;
+  maxRewards: number | null;
+}): Promise<{ ok: true; quest: EventQuestRow; embed: EmbedBuilder } | { ok: false; error: string }> {
+  if (!input.event.channelId || !eventIsVoiceLike(input.event)) {
+    return { ok: false, error: "That event is not attached to a voice or stage channel." };
   }
-  if (event.status !== GuildScheduledEventStatus.Scheduled && event.status !== GuildScheduledEventStatus.Active) {
-    return interaction.editReply({ content: "That event is not scheduled or active anymore." });
+  if (input.event.status !== GuildScheduledEventStatus.Scheduled && input.event.status !== GuildScheduledEventStatus.Active) {
+    return { ok: false, error: "That event is not scheduled or active anymore." };
   }
 
-  const balance = await getBalance(interaction.user.id);
-  if (balance < reward) return interaction.editReply({ content: "Insufficient balance to fund even one quest reward." });
+  const balance = await getBalance(input.creatorId);
+  if (balance < input.reward) return { ok: false, error: "Insufficient balance to fund even one quest reward." };
 
-  if (maxRewards !== null && balance < roundSats(reward * maxRewards)) {
-    return interaction.editReply({
-      content: `Insufficient balance for ${maxRewards} rewards (${formatSats(roundSats(reward * maxRewards))}).`,
-    });
+  if (input.maxRewards !== null && balance < roundSats(input.reward * input.maxRewards)) {
+    return {
+      ok: false,
+      error: `Insufficient balance for ${input.maxRewards} rewards (${formatSats(roundSats(input.reward * input.maxRewards))}).`,
+    };
   }
 
   const { data: inserted, error } = await supabase
     .from("event_quests")
     .insert({
-      guild_id: interaction.guild!.id,
-      channel_id: interaction.channelId,
-      creator_id: interaction.user.id,
-      scheduled_event_id: event.id,
-      event_name: event.name,
-      event_channel_id: event.channelId,
-      reward_sats: reward,
-      min_minutes: minMinutes,
-      max_rewards: maxRewards,
-      scheduled_start_at: event.scheduledStartAt?.toISOString() ?? null,
-      scheduled_end_at: event.scheduledEndAt?.toISOString() ?? null,
+      guild_id: input.guildId,
+      channel_id: input.channelId,
+      creator_id: input.creatorId,
+      scheduled_event_id: input.event.id,
+      event_name: input.event.name,
+      event_channel_id: input.event.channelId,
+      reward_sats: input.reward,
+      min_minutes: input.minMinutes,
+      max_rewards: input.maxRewards,
+      scheduled_start_at: input.event.scheduledStartAt?.toISOString() ?? null,
+      scheduled_end_at: input.event.scheduledEndAt?.toISOString() ?? null,
     })
     .select("id")
     .single();
 
   if (error || !inserted) {
     if (error) console.warn("[Quest] Failed to insert event quest:", error.message);
-    return interaction.editReply({ content: "Failed to create the quest." });
+    return { ok: false, error: "Failed to create the quest." };
   }
 
   createQuestDefinition({
-    guildId: interaction.guild!.id,
-    channelId: interaction.channelId,
-    creatorId: interaction.user.id,
-    title: event.name,
-    description: `Attend ${event.name} for ${minMinutes} minute${minMinutes === 1 ? "" : "s"}.`,
-    startsAt: event.scheduledStartAt?.toISOString() ?? null,
-    endsAt: event.scheduledEndAt?.toISOString() ?? null,
-    metadata: { legacyEventQuestId: inserted.id, scheduledEventId: event.id },
+    guildId: input.guildId,
+    channelId: input.channelId,
+    creatorId: input.creatorId,
+    title: input.event.name,
+    description: `Attend ${input.event.name} for ${input.minMinutes} minute${input.minMinutes === 1 ? "" : "s"}.`,
+    startsAt: input.event.scheduledStartAt?.toISOString() ?? null,
+    endsAt: input.event.scheduledEndAt?.toISOString() ?? null,
+    metadata: { legacyEventQuestId: inserted.id, scheduledEventId: input.event.id },
     tasks: [
       {
         taskKey: "event_attendance",
         type: "event_attendance",
         title: "Attend event",
-        description: `Stay connected to <#${event.channelId}> for ${minMinutes} minute${minMinutes === 1 ? "" : "s"}.`,
-        config: { scheduledEventId: event.id, eventChannelId: event.channelId, minMinutes },
+        description: `Stay connected to <#${input.event.channelId}> for ${input.minMinutes} minute${input.minMinutes === 1 ? "" : "s"}.`,
+        config: { scheduledEventId: input.event.id, eventChannelId: input.event.channelId, minMinutes: input.minMinutes },
       },
     ],
-    rewardTiers: [{ completedTaskCount: 1, rewardSats: reward }],
+    rewardTiers: [{ completedTaskCount: 1, rewardSats: input.reward }],
   }).catch((err) => {
     console.warn("[QuestEngine] Failed to mirror event quest:", (err as Error)?.message ?? err);
   });
 
   const quest: EventQuestRow = {
     id: inserted.id,
-    guild_id: interaction.guild!.id,
-    channel_id: interaction.channelId,
+    guild_id: input.guildId,
+    channel_id: input.channelId,
     message_id: null,
-    creator_id: interaction.user.id,
-    scheduled_event_id: event.id,
-    event_name: event.name,
-    event_channel_id: event.channelId,
-    reward_sats: reward,
-    min_minutes: minMinutes,
-    max_rewards: maxRewards,
+    creator_id: input.creatorId,
+    scheduled_event_id: input.event.id,
+    event_name: input.event.name,
+    event_channel_id: input.event.channelId,
+    reward_sats: input.reward,
+    min_minutes: input.minMinutes,
+    max_rewards: input.maxRewards,
     rewards_count: 0,
     status: "active",
-    scheduled_start_at: event.scheduledStartAt?.toISOString() ?? null,
-    scheduled_end_at: event.scheduledEndAt?.toISOString() ?? null,
+    scheduled_start_at: input.event.scheduledStartAt?.toISOString() ?? null,
+    scheduled_end_at: input.event.scheduledEndAt?.toISOString() ?? null,
   };
 
-  const thumbnail = event.coverImageURL({ size: 256 });
+  const thumbnail = input.event.coverImageURL({ size: 256 });
   const embed = buildEventQuestEmbed(quest);
   if (thumbnail) embed.setThumbnail(thumbnail);
 
-  const reply = await interaction.editReply({ embeds: [embed], allowedMentions: { parse: [] } });
+  return { ok: true, quest, embed };
+}
 
-  const { error: messageUpdateError } = await supabase
+async function storeEventQuestMessageId(questId: number, messageId: string) {
+  const { error } = await supabase
     .from("event_quests")
-    .update({ message_id: reply.id })
-    .eq("id", quest.id);
+    .update({ message_id: messageId })
+    .eq("id", questId);
 
-  if (messageUpdateError) console.warn("[Quest] Failed to store quest message id:", messageUpdateError.message);
+  if (error) console.warn("[Quest] Failed to store quest message id:", error.message);
 }

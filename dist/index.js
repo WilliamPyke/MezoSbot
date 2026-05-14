@@ -6,6 +6,7 @@ const config_js_1 = require("./config.js");
 const format_js_1 = require("./format.js");
 const evm_js_1 = require("./evm.js");
 const index_js_1 = require("./commands/index.js");
+const quest_js_1 = require("./commands/quest.js");
 const emulator_js_1 = require("./emulator.js");
 const stream_js_1 = require("./stream.js");
 const balance_js_1 = require("./balance.js");
@@ -15,6 +16,7 @@ const profile_js_1 = require("./profile.js");
 const notifications_js_1 = require("./notifications.js");
 const interactions_js_1 = require("./arcade/interactions.js");
 const eventQuests_js_1 = require("./eventQuests.js");
+const runtime_js_1 = require("./quests/runtime.js");
 const notify_js_1 = require("./arcade/notify.js");
 const spectate_js_1 = require("./arcade/spectate.js");
 const db_js_2 = require("./arcade/db.js");
@@ -29,16 +31,23 @@ process.on("uncaughtException", (err) => {
 console.log("[Network] DNS result order set to ipv4first");
 const intents = [
     discord_js_1.GatewayIntentBits.Guilds,
+    discord_js_1.GatewayIntentBits.GuildScheduledEvents,
     discord_js_1.GatewayIntentBits.GuildVoiceStates,
 ];
 if (config_js_1.config.discord.guildMembersIntent) {
     intents.push(discord_js_1.GatewayIntentBits.GuildMembers);
 }
+if (config_js_1.config.discord.messageContentIntent) {
+    intents.push(discord_js_1.GatewayIntentBits.GuildMessages, discord_js_1.GatewayIntentBits.MessageContent);
+}
 if (config_js_1.config.gameboy.enabled &&
     config_js_1.config.gameboy.textInputEnabled &&
     config_js_1.config.gameboy.gameChannelId &&
     config_js_1.config.discord.messageContentIntent) {
-    intents.push(discord_js_1.GatewayIntentBits.GuildMessages, discord_js_1.GatewayIntentBits.MessageContent);
+    if (!intents.includes(discord_js_1.GatewayIntentBits.GuildMessages))
+        intents.push(discord_js_1.GatewayIntentBits.GuildMessages);
+    if (!intents.includes(discord_js_1.GatewayIntentBits.MessageContent))
+        intents.push(discord_js_1.GatewayIntentBits.MessageContent);
 }
 console.log(`[Discord] Gateway intents: ${intents.join(", ")}`);
 let discordState = "not_started";
@@ -276,6 +285,13 @@ client.on(discord_js_1.Events.InteractionCreate, async (interaction) => {
         console.log(`[Discord] Arcade ${cid} done in ${Date.now() - startMs}ms`);
         return;
     }
+    if ((0, quest_js_1.isQuestBuilderInteraction)(interaction)) {
+        const cid = ("customId" in interaction && interaction.customId) || "";
+        console.log(`[Discord] Quest builder interaction ${cid} from ${tag} (arrivalLag=${arrivalLagMs}ms)`);
+        await (0, quest_js_1.handleQuestBuilderInteraction)(interaction);
+        console.log(`[Discord] Quest builder ${cid} done in ${Date.now() - startMs}ms`);
+        return;
+    }
     if (interaction.isAutocomplete()) {
         const handler = autocompleteMap.get(interaction.commandName);
         if (!handler) {
@@ -332,6 +348,11 @@ client.on(discord_js_1.Events.InteractionCreate, async (interaction) => {
 });
 client.on(discord_js_1.Events.VoiceStateUpdate, async (oldState, newState) => {
     await (0, eventQuests_js_1.handleQuestVoiceStateUpdate)(client, oldState, newState).catch((err) => console.warn("[Quest] Voice state handler failed:", err?.message ?? err));
+    await (0, runtime_js_1.handleMultiStepQuestVoiceStateUpdate)(client, oldState, newState).catch((err) => console.warn("[QuestEngine] Voice state handler failed:", err?.message ?? err));
+});
+client.on(discord_js_1.Events.GuildScheduledEventUpdate, async (_oldEvent, newEvent) => {
+    await (0, eventQuests_js_1.handleEventQuestScheduledEventUpdate)(client, newEvent).catch((err) => console.warn("[Quest] Scheduled event sync failed:", err?.message ?? err));
+    await (0, runtime_js_1.handleMultiStepScheduledEventUpdate)(client, newEvent).catch((err) => console.warn("[QuestEngine] Scheduled event sync failed:", err?.message ?? err));
 });
 /* ────────────────────────────────────────────────────────────────── */
 /*  Game Boy text input listener                                      */
@@ -339,6 +360,7 @@ client.on(discord_js_1.Events.VoiceStateUpdate, async (oldState, newState) => {
 client.on(discord_js_1.Events.MessageCreate, async (message) => {
     if (message.author.bot)
         return;
+    await (0, runtime_js_1.handleMultiStepQuestMessage)(client, message).catch((err) => console.warn("[QuestEngine] Message handler failed:", err?.message ?? err));
     if (!config_js_1.config.gameboy.enabled)
         return;
     if (!config_js_1.config.gameboy.textInputEnabled)
@@ -532,6 +554,7 @@ async function main() {
         (0, matchmaking_js_1.expireStaleQueueEntries)().catch((err) => console.warn("[Arcade] queue sweeper failed:", err?.message ?? err));
     }, 60_000);
     (0, eventQuests_js_1.startEventQuestSweeper)(client);
+    (0, runtime_js_1.startMultiStepQuestSweeper)(client);
     (0, evm_js_1.initEVM)();
     console.log(`Treasury: ${(0, evm_js_1.getTreasuryAddress)()}`);
     // Resolve any withdrawals left pending from a previous session

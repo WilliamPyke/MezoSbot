@@ -16,6 +16,7 @@ import { config } from "./config.js";
 import { formatSats } from "./format.js";
 import { initEVM, getTreasuryAddress, startDepositPoller, registerDepositAddress, recoverPendingWithdrawals } from "./evm.js";
 import { commands, commandsData } from "./commands/index.js";
+import { handleQuestBuilderInteraction, isQuestBuilderInteraction } from "./commands/quest.js";
 import {
   startEmulator,
   stopEmulator,
@@ -44,9 +45,16 @@ import {
   updateMatchFeed,
 } from "./arcade/interactions.js";
 import {
+  handleEventQuestScheduledEventUpdate,
   handleQuestVoiceStateUpdate,
   startEventQuestSweeper,
 } from "./eventQuests.js";
+import {
+  handleMultiStepQuestMessage,
+  handleMultiStepScheduledEventUpdate,
+  handleMultiStepQuestVoiceStateUpdate,
+  startMultiStepQuestSweeper,
+} from "./quests/runtime.js";
 import { setMatchSettledHandler } from "./arcade/notify.js";
 import { setDisplayNameResolver } from "./arcade/spectate.js";
 import { getMatch as getArcadeMatch } from "./arcade/db.js";
@@ -65,11 +73,16 @@ console.log("[Network] DNS result order set to ipv4first");
 
 const intents = [
   GatewayIntentBits.Guilds,
+  GatewayIntentBits.GuildScheduledEvents,
   GatewayIntentBits.GuildVoiceStates,
 ];
 
 if (config.discord.guildMembersIntent) {
   intents.push(GatewayIntentBits.GuildMembers);
+}
+
+if (config.discord.messageContentIntent) {
+  intents.push(GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent);
 }
 
 if (
@@ -78,7 +91,8 @@ if (
   config.gameboy.gameChannelId &&
   config.discord.messageContentIntent
 ) {
-  intents.push(GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent);
+  if (!intents.includes(GatewayIntentBits.GuildMessages)) intents.push(GatewayIntentBits.GuildMessages);
+  if (!intents.includes(GatewayIntentBits.MessageContent)) intents.push(GatewayIntentBits.MessageContent);
 }
 
 console.log(`[Discord] Gateway intents: ${intents.join(", ")}`);
@@ -365,6 +379,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return;
   }
 
+  if (isQuestBuilderInteraction(interaction)) {
+    const cid = ("customId" in interaction && interaction.customId) || "";
+    console.log(`[Discord] Quest builder interaction ${cid} from ${tag} (arrivalLag=${arrivalLagMs}ms)`);
+    await handleQuestBuilderInteraction(interaction);
+    console.log(`[Discord] Quest builder ${cid} done in ${Date.now() - startMs}ms`);
+    return;
+  }
+
   if (interaction.isAutocomplete()) {
     const handler = autocompleteMap.get(interaction.commandName);
     if (!handler) {
@@ -423,6 +445,18 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
   await handleQuestVoiceStateUpdate(client, oldState, newState).catch((err) =>
     console.warn("[Quest] Voice state handler failed:", (err as Error)?.message ?? err)
   );
+  await handleMultiStepQuestVoiceStateUpdate(client, oldState, newState).catch((err) =>
+    console.warn("[QuestEngine] Voice state handler failed:", (err as Error)?.message ?? err)
+  );
+});
+
+client.on(Events.GuildScheduledEventUpdate, async (_oldEvent, newEvent) => {
+  await handleEventQuestScheduledEventUpdate(client, newEvent).catch((err) =>
+    console.warn("[Quest] Scheduled event sync failed:", (err as Error)?.message ?? err)
+  );
+  await handleMultiStepScheduledEventUpdate(client, newEvent).catch((err) =>
+    console.warn("[QuestEngine] Scheduled event sync failed:", (err as Error)?.message ?? err)
+  );
 });
 
 /* ────────────────────────────────────────────────────────────────── */
@@ -431,6 +465,10 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
 
 client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot) return;
+  await handleMultiStepQuestMessage(client, message).catch((err) =>
+    console.warn("[QuestEngine] Message handler failed:", (err as Error)?.message ?? err)
+  );
+
   if (!config.gameboy.enabled) return;
   if (!config.gameboy.textInputEnabled) return;
   if (!config.discord.messageContentIntent) return;
@@ -654,6 +692,7 @@ async function main() {
   }, 60_000);
 
   startEventQuestSweeper(client);
+  startMultiStepQuestSweeper(client);
 
   initEVM();
   console.log(`Treasury: ${getTreasuryAddress()}`);

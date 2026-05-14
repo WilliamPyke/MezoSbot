@@ -3,7 +3,7 @@ import {
   EmbedBuilder,
   GuildScheduledEventStatus,
   type Client,
-  type GuildBasedChannel,
+  type GuildScheduledEvent,
   type VoiceBasedChannel,
   type VoiceState,
 } from "discord.js";
@@ -37,15 +37,36 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
-function channelIsVoiceLike(channel: GuildBasedChannel | null): channel is VoiceBasedChannel {
-  return channel?.type === ChannelType.GuildVoice || channel?.type === ChannelType.GuildStageVoice;
+function channelIsVoiceLike(channel: unknown): channel is VoiceBasedChannel {
+  return !!channel &&
+    typeof channel === "object" &&
+    "type" in channel &&
+    (channel.type === ChannelType.GuildVoice || channel.type === ChannelType.GuildStageVoice);
 }
 
-function eventWindowAllowsAttendance(quest: EventQuestRow, now = Date.now()): boolean {
+function effectiveEventStartIso(event: GuildScheduledEvent, existing: string | null): string | null {
+  const scheduledStart = event.scheduledStartAt?.toISOString() ?? null;
+  if (event.status !== GuildScheduledEventStatus.Active) return scheduledStart;
+
+  const now = Date.now();
+  const existingMs = existing ? Date.parse(existing) : null;
+  if (existingMs != null && Number.isFinite(existingMs) && existingMs <= now) return existing;
+
+  const scheduledMs = event.scheduledStartAt?.getTime();
+  return scheduledMs != null && Number.isFinite(scheduledMs) && scheduledMs > now
+    ? new Date(now).toISOString()
+    : scheduledStart;
+}
+
+function eventWindowAllowsAttendance(
+  quest: EventQuestRow,
+  now = Date.now(),
+  options: { ignoreStart?: boolean } = {},
+): boolean {
   const startMs = quest.scheduled_start_at ? Date.parse(quest.scheduled_start_at) : null;
   const endMs = quest.scheduled_end_at ? Date.parse(quest.scheduled_end_at) : null;
 
-  if (startMs != null && Number.isFinite(startMs) && now < startMs) return false;
+  if (!options.ignoreStart && startMs != null && Number.isFinite(startMs) && now < startMs) return false;
   if (endMs != null && Number.isFinite(endMs) && now > endMs) return false;
   return true;
 }
@@ -60,11 +81,46 @@ function eventStatusAllowsAttendance(status: GuildScheduledEventStatus | null | 
 }
 
 async function eventIsRunning(client: Client, quest: EventQuestRow): Promise<boolean> {
-  if (!eventWindowAllowsAttendance(quest)) return false;
-
   const guild = await client.guilds.fetch(quest.guild_id).catch(() => null);
   const event = await guild?.scheduledEvents.fetch(quest.scheduled_event_id).catch(() => null);
-  return eventStatusAllowsAttendance(event?.status);
+  if (!event) return false;
+
+  const syncedQuest = await syncQuestFromEvent(quest, event);
+  Object.assign(quest, syncedQuest);
+  const ignoreStart = event.status === GuildScheduledEventStatus.Active;
+  return eventStatusAllowsAttendance(event.status) && eventWindowAllowsAttendance(syncedQuest, Date.now(), { ignoreStart });
+}
+
+async function syncQuestFromEvent(quest: EventQuestRow, event: GuildScheduledEvent): Promise<EventQuestRow> {
+  const next: EventQuestRow = {
+    ...quest,
+    event_name: event.name,
+    event_channel_id: event.channelId ?? quest.event_channel_id,
+    scheduled_start_at: effectiveEventStartIso(event, quest.scheduled_start_at),
+    scheduled_end_at: event.scheduledEndAt?.toISOString() ?? null,
+  };
+
+  const changed =
+    next.event_name !== quest.event_name ||
+    next.event_channel_id !== quest.event_channel_id ||
+    next.scheduled_start_at !== quest.scheduled_start_at ||
+    next.scheduled_end_at !== quest.scheduled_end_at;
+
+  if (changed) {
+    const { error } = await supabase
+      .from("event_quests")
+      .update({
+        event_name: next.event_name,
+        event_channel_id: next.event_channel_id,
+        scheduled_start_at: next.scheduled_start_at,
+        scheduled_end_at: next.scheduled_end_at,
+      })
+      .eq("id", quest.id);
+
+    if (error) console.warn(`[Quest] Failed to sync event quest ${quest.id}:`, error.message);
+  }
+
+  return next;
 }
 
 async function getActiveQuestsForChannel(guildId: string, channelId: string): Promise<EventQuestRow[]> {
@@ -83,8 +139,12 @@ async function getActiveQuestsForChannel(guildId: string, channelId: string): Pr
   return (data ?? []) as EventQuestRow[];
 }
 
-async function startAttendance(quest: EventQuestRow, userId: string): Promise<void> {
-  if (!eventWindowAllowsAttendance(quest)) return;
+async function startAttendance(
+  quest: EventQuestRow,
+  userId: string,
+  options: { ignoreStart?: boolean } = {},
+): Promise<void> {
+  if (!eventWindowAllowsAttendance(quest, Date.now(), options)) return;
 
   const joinedAt = nowIso();
 
@@ -174,7 +234,7 @@ async function updateConnectedAttendance(
   options: { running: boolean; allowStart?: boolean; accrualEndMs?: number },
 ): Promise<void> {
   const accrualEndMs = eventWindowEndMs(quest, options.accrualEndMs ?? Date.now());
-  if (!options.running || !eventWindowAllowsAttendance(quest, accrualEndMs)) {
+  if (!options.running || !eventWindowAllowsAttendance(quest, accrualEndMs, { ignoreStart: options.running })) {
     await stopAttendance(client, quest, userId, accrualEndMs);
     return;
   }
@@ -188,7 +248,7 @@ async function updateConnectedAttendance(
 
   if (error || row?.rewarded_at) return;
   if (!row) {
-    if (options.allowStart !== false) await startAttendance(quest, userId);
+    if (options.allowStart !== false) await startAttendance(quest, userId, { ignoreStart: options.running });
     return;
   }
   if (!row.joined_at) return;
@@ -334,7 +394,7 @@ export async function handleQuestVoiceStateUpdate(
     const joiningQuests = await getActiveQuestsForChannel(newState.guild.id, newState.channelId);
     await Promise.all(
       joiningQuests.map(async (quest) => {
-        if (await eventIsRunning(client, quest)) await startAttendance(quest, userId);
+        if (await eventIsRunning(client, quest)) await startAttendance(quest, userId, { ignoreStart: true });
       }),
     );
   }
@@ -366,9 +426,10 @@ async function sweepEventQuests(client: Client): Promise<void> {
     if (!guild) continue;
 
     const freshEvent = await guild.scheduledEvents.fetch(quest.scheduled_event_id).catch(() => null);
-    const channel = await guild.channels.fetch(quest.event_channel_id).catch(() => null);
+    const syncedQuest = freshEvent ? await syncQuestFromEvent(quest, freshEvent) : quest;
+    const channel = await guild.channels.fetch(syncedQuest.event_channel_id).catch(() => null);
     const isVoiceChannel = channelIsVoiceLike(channel);
-    const scheduledEndMs = quest.scheduled_end_at ? Date.parse(quest.scheduled_end_at) : null;
+    const scheduledEndMs = syncedQuest.scheduled_end_at ? Date.parse(syncedQuest.scheduled_end_at) : null;
     const endedByTime = scheduledEndMs != null && Number.isFinite(scheduledEndMs) && Date.now() > scheduledEndMs;
     const endedByStatus =
       freshEvent?.status === GuildScheduledEventStatus.Completed ||
@@ -376,10 +437,10 @@ async function sweepEventQuests(client: Client): Promise<void> {
 
     if (endedByTime || endedByStatus) {
       if (isVoiceChannel) {
-        const accrualEndMs = eventWindowEndMs(quest);
+        const accrualEndMs = eventWindowEndMs(syncedQuest);
         for (const [userId, member] of channel.members) {
           if (member.user.bot) continue;
-          await updateConnectedAttendance(client, quest, userId, {
+          await updateConnectedAttendance(client, syncedQuest, userId, {
             running: true,
             allowStart: false,
             accrualEndMs,
@@ -396,12 +457,55 @@ async function sweepEventQuests(client: Client): Promise<void> {
       continue;
     }
 
-    if (!eventStatusAllowsAttendance(freshEvent?.status) || !eventWindowAllowsAttendance(quest)) continue;
+    if (
+      !eventStatusAllowsAttendance(freshEvent?.status) ||
+      !eventWindowAllowsAttendance(syncedQuest, Date.now(), { ignoreStart: freshEvent?.status === GuildScheduledEventStatus.Active })
+    ) continue;
     if (!isVoiceChannel) continue;
 
     for (const [userId, member] of channel.members) {
       if (member.user.bot) continue;
-      await updateConnectedAttendance(client, quest, userId, { running: true });
+      await updateConnectedAttendance(client, syncedQuest, userId, { running: true });
+    }
+  }
+}
+
+export async function handleEventQuestScheduledEventUpdate(
+  client: Client,
+  event: GuildScheduledEvent,
+): Promise<void> {
+  if (!event.guildId) return;
+
+  const { data, error } = await supabase
+    .from("event_quests")
+    .select("*")
+    .eq("status", "active")
+    .eq("guild_id", event.guildId)
+    .eq("scheduled_event_id", event.id);
+
+  if (error) {
+    console.warn("[Quest] Failed to load quests for event sync:", error.message);
+    return;
+  }
+
+  for (const quest of (data ?? []) as EventQuestRow[]) {
+    const syncedQuest = await syncQuestFromEvent(quest, event);
+    const channel = event.channelId
+      ? await client.channels.fetch(event.channelId).catch(() => null)
+      : await client.channels.fetch(syncedQuest.event_channel_id).catch(() => null);
+    if (!channelIsVoiceLike(channel)) continue;
+
+    const running = eventStatusAllowsAttendance(event.status) &&
+      eventWindowAllowsAttendance(syncedQuest, Date.now(), { ignoreStart: event.status === GuildScheduledEventStatus.Active });
+    const accrualEndMs = eventWindowEndMs(syncedQuest);
+
+    for (const [userId, member] of channel.members) {
+      if (member.user.bot) continue;
+      await updateConnectedAttendance(client, syncedQuest, userId, {
+        running,
+        allowStart: running,
+        accrualEndMs,
+      });
     }
   }
 }

@@ -1,0 +1,553 @@
+import {
+  ChannelType,
+  EmbedBuilder,
+  GuildScheduledEventStatus,
+  type Client,
+  type GuildScheduledEvent,
+  type Message,
+  type VoiceBasedChannel,
+  type VoiceState,
+} from "discord.js";
+import { supabase } from "../db.js";
+import { formatSats } from "../format.js";
+import { registerDepositAddress } from "../evm.js";
+import { sendTransferReceivedDm } from "../notifications.js";
+import {
+  completeQuestTask,
+  getActiveTasksByType,
+  getQuestSnapshot,
+  getQuestTaskDefinition,
+  type ActiveQuestTask,
+  type QuestCompletionResult,
+} from "./engine.js";
+
+const SWEEP_MS = 60_000;
+
+type EventAttendanceConfig = {
+  scheduledEventId?: string;
+  eventChannelId: string;
+  minMinutes: number;
+};
+
+type FirstLinkConfig = {
+  targetChannelId: string;
+  source: string;
+  refreshMinutes: number;
+};
+
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+function channelIsVoiceLike(channel: unknown): channel is VoiceBasedChannel {
+  return !!channel &&
+    typeof channel === "object" &&
+    "type" in channel &&
+    (channel.type === ChannelType.GuildVoice || channel.type === ChannelType.GuildStageVoice);
+}
+
+function questWindowAllowsCompletion(
+  quest: Pick<ActiveQuestTask["quest"], "starts_at" | "ends_at">,
+  now = Date.now(),
+  options: { ignoreStart?: boolean } = {},
+): boolean {
+  const startMs = quest.starts_at ? Date.parse(quest.starts_at) : null;
+  const endMs = quest.ends_at ? Date.parse(quest.ends_at) : null;
+
+  if (!options.ignoreStart && startMs != null && Number.isFinite(startMs) && now < startMs) return false;
+  if (endMs != null && Number.isFinite(endMs) && now > endMs) return false;
+  return true;
+}
+
+function questWindowEndMs(quest: Pick<ActiveQuestTask["quest"], "ends_at">, fallback = Date.now()): number {
+  const endMs = quest.ends_at ? Date.parse(quest.ends_at) : null;
+  return endMs != null && Number.isFinite(endMs) ? Math.min(fallback, endMs) : fallback;
+}
+
+function eventStatusAllowsAttendance(status: GuildScheduledEventStatus | null | undefined): boolean {
+  return status === GuildScheduledEventStatus.Active;
+}
+
+function effectiveEventStartIso(event: GuildScheduledEvent, existing: string | null): string | null {
+  const scheduledStart = event.scheduledStartAt?.toISOString() ?? null;
+  if (event.status !== GuildScheduledEventStatus.Active) return scheduledStart;
+
+  const now = Date.now();
+  const existingMs = existing ? Date.parse(existing) : null;
+  if (existingMs != null && Number.isFinite(existingMs) && existingMs <= now) return existing;
+
+  const scheduledMs = event.scheduledStartAt?.getTime();
+  return scheduledMs != null && Number.isFinite(scheduledMs) && scheduledMs > now
+    ? new Date(now).toISOString()
+    : scheduledStart;
+}
+
+function taskMirrorsScheduledEvent(task: ActiveQuestTask<EventAttendanceConfig>, event: GuildScheduledEvent): boolean {
+  const metadata = task.quest.metadata as Record<string, unknown> | undefined;
+  return metadata?.scheduledEventId === event.id || metadata?.legacyEventQuestId != null;
+}
+
+async function syncTaskQuestFromEvent(
+  task: ActiveQuestTask<EventAttendanceConfig>,
+  event: GuildScheduledEvent,
+): Promise<ActiveQuestTask<EventAttendanceConfig>> {
+  if (!taskMirrorsScheduledEvent(task, event)) return task;
+
+  const startsAt = effectiveEventStartIso(event, task.quest.starts_at);
+  const endsAt = event.scheduledEndAt?.toISOString() ?? null;
+  const changed =
+    task.quest.starts_at !== startsAt ||
+    task.quest.ends_at !== endsAt ||
+    task.quest.title !== event.name;
+
+  if (changed) {
+    const { error } = await supabase
+      .from("quests")
+      .update({
+        title: event.name,
+        starts_at: startsAt,
+        ends_at: endsAt,
+        updated_at: nowIso(),
+      })
+      .eq("id", task.quest_id);
+
+    if (error) console.warn(`[QuestEngine] Failed to sync quest ${task.quest_id} with event:`, error.message);
+  }
+
+  return {
+    ...task,
+    quest: {
+      ...task.quest,
+      title: event.name,
+      starts_at: startsAt,
+      ends_at: endsAt,
+    },
+  };
+}
+
+async function eventTaskIsRunning(client: Client, task: ActiveQuestTask<EventAttendanceConfig>): Promise<boolean> {
+  if (!task.config.scheduledEventId) return questWindowAllowsCompletion(task.quest);
+
+  const guild = await client.guilds.fetch(task.quest.guild_id).catch(() => null);
+  const event = await guild?.scheduledEvents.fetch(task.config.scheduledEventId).catch(() => null);
+  if (!event) return false;
+
+  const syncedTask = await syncTaskQuestFromEvent(task, event);
+  Object.assign(task.quest, syncedTask.quest);
+  return eventStatusAllowsAttendance(event.status) &&
+    questWindowAllowsCompletion(syncedTask.quest, Date.now(), { ignoreStart: event.status === GuildScheduledEventStatus.Active });
+}
+
+async function getActiveEventTasksForChannel(
+  guildId: string,
+  channelId: string,
+): Promise<Array<ActiveQuestTask<EventAttendanceConfig>>> {
+  const tasks = await getActiveTasksByType<EventAttendanceConfig>(guildId, "event_attendance").catch((err) => {
+    console.warn("[QuestEngine] Failed to load event tasks:", (err as Error).message);
+    return [];
+  });
+
+  return tasks.filter((task) => task.config.eventChannelId === channelId);
+}
+
+async function startAttendance(
+  task: ActiveQuestTask<EventAttendanceConfig>,
+  userId: string,
+  options: { ignoreStart?: boolean } = {},
+): Promise<void> {
+  if (!questWindowAllowsCompletion(task.quest, Date.now(), options)) return;
+  const joinedAt = nowIso();
+
+  const { data: existing, error: readError } = await supabase
+    .from("quest_task_attendance")
+    .select("joined_at")
+    .eq("task_id", task.id)
+    .eq("user_id", userId)
+    .maybeSingle();
+
+  if (readError) {
+    console.warn(`[QuestEngine] Failed to read attendance for task ${task.id}:`, readError.message);
+    return;
+  }
+  if (existing?.joined_at) return;
+
+  const payload = {
+    quest_id: task.quest_id,
+    task_id: task.id,
+    user_id: userId,
+    joined_at: joinedAt,
+    last_seen_at: joinedAt,
+  };
+
+  const { error } = await supabase
+    .from("quest_task_attendance")
+    .upsert(payload, { onConflict: "task_id,user_id" });
+
+  if (error) console.warn(`[QuestEngine] Failed to start attendance for task ${task.id}:`, error.message);
+}
+
+async function stopAttendance(
+  client: Client,
+  task: ActiveQuestTask<EventAttendanceConfig>,
+  userId: string,
+  accrualEndMs = questWindowEndMs(task.quest),
+): Promise<void> {
+  const { data: row, error } = await supabase
+    .from("quest_task_attendance")
+    .select("joined_at, accumulated_seconds")
+    .eq("task_id", task.id)
+    .eq("user_id", userId)
+    .maybeSingle();
+
+  if (error || !row || !row.joined_at) return;
+
+  const joinedMs = Date.parse(row.joined_at as string);
+  const elapsedSeconds = Number.isFinite(joinedMs)
+    ? Math.max(0, Math.floor((accrualEndMs - joinedMs) / 1000))
+    : 0;
+  const accumulated = Math.max(0, (row.accumulated_seconds as number) + elapsedSeconds);
+
+  await supabase
+    .from("quest_task_attendance")
+    .update({
+      joined_at: null,
+      accumulated_seconds: accumulated,
+      last_seen_at: nowIso(),
+    })
+    .eq("task_id", task.id)
+    .eq("user_id", userId);
+
+  if (accumulated >= task.config.minMinutes * 60) {
+    await completeAndNotify(client, task, userId, {
+      kind: "event_attendance",
+      accumulatedSeconds: accumulated,
+    });
+  }
+}
+
+async function updateConnectedAttendance(
+  client: Client,
+  task: ActiveQuestTask<EventAttendanceConfig>,
+  userId: string,
+  options: { running: boolean; allowStart?: boolean; accrualEndMs?: number },
+): Promise<void> {
+  const accrualEndMs = questWindowEndMs(task.quest, options.accrualEndMs ?? Date.now());
+  if (!options.running || !questWindowAllowsCompletion(task.quest, accrualEndMs, { ignoreStart: options.running })) {
+    await stopAttendance(client, task, userId, accrualEndMs);
+    return;
+  }
+
+  const { data: row, error } = await supabase
+    .from("quest_task_attendance")
+    .select("joined_at, accumulated_seconds")
+    .eq("task_id", task.id)
+    .eq("user_id", userId)
+    .maybeSingle();
+
+  if (error) return;
+  if (!row) {
+    if (options.allowStart !== false) await startAttendance(task, userId, { ignoreStart: options.running });
+    return;
+  }
+  if (!row.joined_at) return;
+
+  const joinedMs = Date.parse(row.joined_at as string);
+  if (!Number.isFinite(joinedMs)) return;
+
+  const accumulated = Math.max(
+    0,
+    (row.accumulated_seconds as number) + Math.floor((accrualEndMs - joinedMs) / 1000),
+  );
+
+  const { error: updateError } = await supabase
+    .from("quest_task_attendance")
+    .update({
+      accumulated_seconds: accumulated,
+      joined_at: nowIso(),
+      last_seen_at: nowIso(),
+    })
+    .eq("task_id", task.id)
+    .eq("user_id", userId);
+
+  if (updateError) {
+    console.warn(`[QuestEngine] Failed to update attendance for task ${task.id}:`, updateError.message);
+    return;
+  }
+
+  if (accumulated >= task.config.minMinutes * 60) {
+    await completeAndNotify(client, task, userId, {
+      kind: "event_attendance",
+      accumulatedSeconds: accumulated,
+    });
+  }
+}
+
+function messageMatchesFirstLinkTask(message: Message, config: FirstLinkConfig): boolean {
+  if (message.channelId !== config.targetChannelId) return false;
+  const content = message.content.trim();
+  if (!content) return false;
+
+  const urls = content.match(/https?:\/\/[^\s<>()]+/gi) ?? [];
+  if (urls.length === 0) return false;
+
+  if (config.source === "latest_tweet") {
+    return urls.some((url) => /^https?:\/\/(www\.)?(twitter\.com|x\.com)\//i.test(url));
+  }
+
+  if (config.source === "nearest_event") {
+    return urls.some((url) => /^https?:\/\/(www\.)?discord\.com\/events\//i.test(url));
+  }
+
+  return urls.length > 0;
+}
+
+function linkWindowStartIso(refreshMinutes: number, now = Date.now()): string {
+  const windowMs = Math.max(1, Math.floor(refreshMinutes)) * 60_000;
+  return new Date(Math.floor(now / windowMs) * windowMs).toISOString();
+}
+
+async function claimFirstLinkWindow(
+  task: ActiveQuestTask<FirstLinkConfig>,
+  userId: string,
+  proof: Record<string, unknown>,
+): Promise<boolean> {
+  const { data, error } = await supabase
+    .from("quest_task_window_claims")
+    .insert({
+      task_id: task.id,
+      window_start: linkWindowStartIso(task.config.refreshMinutes),
+      user_id: userId,
+      proof,
+    })
+    .select("task_id")
+    .maybeSingle();
+
+  if (error) {
+    if (error.code !== "23505") {
+      console.warn(`[QuestEngine] Failed to claim link window for task ${task.id}:`, error.message);
+    }
+    return false;
+  }
+
+  return !!data;
+}
+
+function buildQuestRuntimeEmbed(snapshot: Awaited<ReturnType<typeof getQuestSnapshot>>): EmbedBuilder | null {
+  if (!snapshot) return null;
+
+  const taskLines = snapshot.tasks.length === 0
+    ? ["No tasks yet."]
+    : snapshot.tasks.map((task, index) => {
+      const definition = getQuestTaskDefinition(task.type);
+      const requirement = definition?.renderRequirement(task.config) ?? task.description ?? task.title;
+      return `-> **${index + 1}. ${task.title}**\n${requirement}`;
+    });
+
+  const tierLines = snapshot.tiers.map((tier) =>
+    `-> **${tier.completed_task_count} task${tier.completed_task_count === 1 ? "" : "s"}** -> ${formatSats(tier.reward_sats)}`
+  );
+
+  return new EmbedBuilder()
+    .setColor(0x77a7ff)
+    .setTitle(`Quest: ${snapshot.quest.title}`)
+    .setDescription(snapshot.quest.description ?? "A multistep sats quest.")
+    .addFields(
+      { name: "Rewards:", value: tierLines.join("\n") || "No reward tiers set.", inline: false },
+      { name: "Requirements:", value: taskLines.join("\n\n").slice(0, 1024), inline: false },
+      { name: "Quest ID", value: `\`${snapshot.quest.id}\``, inline: true },
+      { name: "Max Reward", value: `**${formatSats(snapshot.quest.max_reward_sats)}**`, inline: true },
+    )
+    .setFooter({ text: "Powered by matsFi" })
+    .setTimestamp();
+}
+
+async function refreshQuestMessage(client: Client, questId: number): Promise<void> {
+  const snapshot = await getQuestSnapshot(questId).catch(() => null);
+  const embed = buildQuestRuntimeEmbed(snapshot);
+  if (!snapshot?.quest.message_id || !embed) return;
+
+  const channel = await client.channels.fetch(snapshot.quest.channel_id).catch(() => null);
+  if (!channel || !("messages" in channel)) return;
+
+  const message = await channel.messages.fetch(snapshot.quest.message_id).catch(() => null);
+  await message?.edit({ embeds: [embed], allowedMentions: { parse: [] } }).catch(() => {});
+}
+
+export async function completeAndNotify(
+  client: Client,
+  task: Pick<ActiveQuestTask, "id" | "quest_id" | "title" | "quest">,
+  userId: string,
+  proof?: Record<string, unknown>,
+): Promise<QuestCompletionResult> {
+  const result = await completeQuestTask({
+    questId: task.quest_id,
+    taskId: task.id,
+    userId,
+    proof,
+  });
+
+  if (!result.ok) return result;
+
+  if ((result.rewardDeltaSats ?? 0) > 0) {
+    await registerDepositAddress(userId).catch(() => {});
+    await sendTransferReceivedDm({
+      client,
+      recipientId: userId,
+      senderId: task.quest.creator_id,
+      amountSats: result.rewardDeltaSats ?? 0,
+      kind: "quest",
+      customMessage: `Completed quest task: ${task.title}`,
+    });
+
+    const channel = await client.channels.fetch(task.quest.channel_id).catch(() => null);
+    if (channel && "send" in channel) {
+      const embed = new EmbedBuilder()
+        .setColor(0x00cc6a)
+        .setTitle("Quest Reward Earned")
+        .setDescription(
+          `<@${userId}> earned **${formatSats(result.rewardDeltaSats ?? 0)}** for **${task.quest.title}**.`,
+        )
+        .setTimestamp();
+
+      await channel.send({ embeds: [embed], allowedMentions: { parse: [] } }).catch(() => {});
+    }
+  }
+
+  await refreshQuestMessage(client, task.quest_id);
+  return result;
+}
+
+export async function handleMultiStepQuestMessage(client: Client, message: Message): Promise<void> {
+  if (!message.guild || message.author.bot) return;
+  if (!message.content) return;
+  if (!/https?:\/\/[^\s<>()]+/i.test(message.content)) return;
+
+  const tasks = await getActiveTasksByType<FirstLinkConfig>(message.guild.id, "first_link_in_channel").catch((err) => {
+    console.warn("[QuestEngine] Failed to load link tasks:", (err as Error).message);
+    return [];
+  });
+
+  for (const task of tasks) {
+    if (!questWindowAllowsCompletion(task.quest)) continue;
+    if (!messageMatchesFirstLinkTask(message, task.config)) continue;
+
+    const proof = {
+      kind: "first_link_in_channel",
+      messageId: message.id,
+      channelId: message.channelId,
+      source: task.config.source,
+      url: (message.content.match(/https?:\/\/[^\s<>()]+/i) ?? [null])[0],
+    };
+    const wonWindow = await claimFirstLinkWindow(task, message.author.id, proof);
+    if (!wonWindow) continue;
+
+    await completeAndNotify(client, task, message.author.id, proof);
+  }
+}
+
+export async function handleMultiStepQuestVoiceStateUpdate(
+  client: Client,
+  oldState: VoiceState,
+  newState: VoiceState,
+): Promise<void> {
+  const userId = newState.id;
+  if (newState.member?.user.bot || oldState.member?.user.bot) return;
+  if (oldState.channelId === newState.channelId) return;
+
+  if (oldState.guild.id && oldState.channelId) {
+    const leavingTasks = await getActiveEventTasksForChannel(oldState.guild.id, oldState.channelId);
+    await Promise.all(leavingTasks.map((task) => stopAttendance(client, task, userId)));
+  }
+
+  if (newState.guild.id && newState.channelId) {
+    const joiningTasks = await getActiveEventTasksForChannel(newState.guild.id, newState.channelId);
+    await Promise.all(
+      joiningTasks.map(async (task) => {
+        if (await eventTaskIsRunning(client, task)) await startAttendance(task, userId, { ignoreStart: true });
+      }),
+    );
+  }
+}
+
+export function startMultiStepQuestSweeper(client: Client): void {
+  setInterval(() => {
+    sweepMultiStepQuests(client).catch((err) =>
+      console.warn("[QuestEngine] Sweeper failed:", (err as Error)?.message ?? err)
+    );
+  }, SWEEP_MS);
+}
+
+async function sweepMultiStepQuests(client: Client): Promise<void> {
+  const byGuild = new Map<string, Array<ActiveQuestTask<EventAttendanceConfig>>>();
+
+  for (const guild of client.guilds.cache.values()) {
+    const guildTasks = await getActiveTasksByType<EventAttendanceConfig>(guild.id, "event_attendance").catch((err) => {
+      console.warn(`[QuestEngine] Failed to sweep event tasks for guild ${guild.id}:`, (err as Error).message);
+      return [];
+    });
+    byGuild.set(guild.id, guildTasks);
+  }
+
+  for (const [guildId, guildTasks] of byGuild) {
+    const guild = await client.guilds.fetch(guildId).catch(() => null);
+    if (!guild) continue;
+
+    for (const task of guildTasks) {
+      const channel = await guild.channels.fetch(task.config.eventChannelId).catch(() => null);
+      if (!channelIsVoiceLike(channel)) continue;
+
+      const event = task.config.scheduledEventId
+        ? await guild.scheduledEvents.fetch(task.config.scheduledEventId).catch(() => null)
+        : null;
+      const syncedTask = event ? await syncTaskQuestFromEvent(task, event) : task;
+      const endedByStatus =
+        event?.status === GuildScheduledEventStatus.Completed ||
+        event?.status === GuildScheduledEventStatus.Canceled;
+      const running = !endedByStatus && await eventTaskIsRunning(client, syncedTask);
+      const accrualEndMs = questWindowEndMs(syncedTask.quest);
+
+      for (const [userId, member] of channel.members) {
+        if (member.user.bot) continue;
+        await updateConnectedAttendance(client, syncedTask, userId, {
+          running,
+          allowStart: false,
+          accrualEndMs,
+        });
+      }
+    }
+  }
+}
+
+export async function handleMultiStepScheduledEventUpdate(
+  client: Client,
+  event: GuildScheduledEvent,
+): Promise<void> {
+  if (!event.guildId) return;
+
+  const tasks = await getActiveTasksByType<EventAttendanceConfig>(event.guildId, "event_attendance").catch((err) => {
+    console.warn("[QuestEngine] Failed to load event tasks for event sync:", (err as Error).message);
+    return [];
+  });
+  const matchingTasks = tasks.filter((task) => task.config.scheduledEventId === event.id);
+
+  for (const task of matchingTasks) {
+    const syncedTask = await syncTaskQuestFromEvent(task, event);
+    const channel = event.channelId
+      ? await client.channels.fetch(event.channelId).catch(() => null)
+      : await client.channels.fetch(syncedTask.config.eventChannelId).catch(() => null);
+    if (!channelIsVoiceLike(channel)) continue;
+
+    const running = eventStatusAllowsAttendance(event.status) &&
+      questWindowAllowsCompletion(syncedTask.quest, Date.now(), { ignoreStart: event.status === GuildScheduledEventStatus.Active });
+    const accrualEndMs = questWindowEndMs(syncedTask.quest);
+
+    for (const [userId, member] of channel.members) {
+      if (member.user.bot) continue;
+      await updateConnectedAttendance(client, syncedTask, userId, {
+        running,
+        allowStart: running,
+        accrualEndMs,
+      });
+    }
+  }
+}

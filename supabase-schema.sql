@@ -181,6 +181,26 @@ CREATE TABLE IF NOT EXISTS quest_task_completions (
   UNIQUE(task_id, user_id)
 );
 
+CREATE TABLE IF NOT EXISTS quest_task_attendance (
+  quest_id BIGINT NOT NULL REFERENCES quests(id) ON DELETE CASCADE,
+  task_id BIGINT NOT NULL REFERENCES quest_tasks(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL,
+  joined_at TIMESTAMPTZ,
+  accumulated_seconds INTEGER NOT NULL DEFAULT 0,
+  last_seen_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY(task_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS quest_task_window_claims (
+  task_id BIGINT NOT NULL REFERENCES quest_tasks(id) ON DELETE CASCADE,
+  window_start TIMESTAMPTZ NOT NULL,
+  user_id TEXT NOT NULL,
+  proof JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY(task_id, window_start)
+);
+
 CREATE TABLE IF NOT EXISTS quest_user_rewards (
   quest_id BIGINT NOT NULL REFERENCES quests(id) ON DELETE CASCADE,
   user_id TEXT NOT NULL,
@@ -586,6 +606,8 @@ CREATE INDEX IF NOT EXISTS idx_quests_active_guild ON quests(guild_id, status, s
 CREATE INDEX IF NOT EXISTS idx_quest_tasks_quest_order ON quest_tasks(quest_id, sort_order, id);
 CREATE INDEX IF NOT EXISTS idx_quest_tasks_type ON quest_tasks(type, status);
 CREATE INDEX IF NOT EXISTS idx_quest_completions_user ON quest_task_completions(quest_id, user_id);
+CREATE INDEX IF NOT EXISTS idx_quest_task_attendance_joined ON quest_task_attendance(task_id, joined_at) WHERE joined_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_quest_task_window_claims_user ON quest_task_window_claims(user_id, task_id);
 CREATE INDEX IF NOT EXISTS idx_quest_rewards_user ON quest_user_rewards(user_id, quest_id);
 CREATE INDEX IF NOT EXISTS idx_event_quests_active_channel ON event_quests(status, guild_id, event_channel_id);
 CREATE INDEX IF NOT EXISTS idx_event_quest_attendance_joined ON event_quest_attendance(quest_id, joined_at) WHERE rewarded_at IS NULL;
