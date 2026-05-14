@@ -284,12 +284,125 @@ async function updateConnectedAttendance(
   }
 }
 
-function messageMatchesFirstLinkTask(message: Message, config: FirstLinkConfig): boolean {
-  if (message.channelId !== config.targetChannelId) return false;
-  const content = message.content.trim();
-  if (!content) return false;
+function urlsFromText(text: string | null | undefined): string[] {
+  if (!text) return [];
 
-  const urls = content.match(/https?:\/\/[^\s<>()]+/gi) ?? [];
+  const urls = new Set<string>();
+  const markdownLinks = text.matchAll(/\[[^\]]+\]\((https?:\/\/[^)\s]+)\)/gi);
+  for (const match of markdownLinks) urls.add(match[1]);
+
+  const bareLinks = text.matchAll(/https?:\/\/[^\s<>()]+/gi);
+  for (const match of bareLinks) urls.add(match[0]);
+
+  return [...urls].map((url) => url.replace(/[>,.]+$/g, ""));
+}
+
+function discordMessageLinks(urls: string[]): Array<{ channelId: string; messageId: string }> {
+  const links: Array<{ channelId: string; messageId: string }> = [];
+
+  for (const rawUrl of urls) {
+    let url: URL;
+    try {
+      url = new URL(rawUrl);
+    } catch {
+      continue;
+    }
+
+    const host = url.hostname.toLowerCase();
+    if (!/^(www\.|canary\.|ptb\.)?discord(app)?\.com$/.test(host)) continue;
+
+    const parts = url.pathname.split("/").filter(Boolean);
+    if (parts[0] === "channels" && parts[2] && parts[3]) {
+      links.push({ channelId: parts[2], messageId: parts[3] });
+    }
+  }
+
+  return links;
+}
+
+async function collectMessageUrls(message: Message): Promise<string[]> {
+  const urls = new Set<string>(urlsFromText(message.content));
+
+  for (const embed of message.embeds) {
+    for (const url of urlsFromText(embed.url)) urls.add(url);
+    for (const url of urlsFromText(embed.description)) urls.add(url);
+    for (const url of urlsFromText(embed.title)) urls.add(url);
+    for (const field of embed.fields) {
+      for (const url of urlsFromText(field.name)) urls.add(url);
+      for (const url of urlsFromText(field.value)) urls.add(url);
+    }
+  }
+
+  for (const link of discordMessageLinks([...urls])) {
+    const channel = await message.client.channels.fetch(link.channelId).catch(() => null);
+    if (!channel || !("messages" in channel)) continue;
+
+    const linkedMessage = await channel.messages.fetch(link.messageId).catch(() => null);
+    if (!linkedMessage) continue;
+
+    for (const url of urlsFromText(linkedMessage.content)) urls.add(url);
+    for (const embed of linkedMessage.embeds) {
+      for (const url of urlsFromText(embed.url)) urls.add(url);
+      for (const url of urlsFromText(embed.description)) urls.add(url);
+      for (const url of urlsFromText(embed.title)) urls.add(url);
+      for (const field of embed.fields) {
+        for (const url of urlsFromText(field.name)) urls.add(url);
+        for (const url of urlsFromText(field.value)) urls.add(url);
+      }
+    }
+  }
+
+  return [...urls];
+}
+
+function extractDiscordEventIds(urls: string[]): string[] {
+  const ids: string[] = [];
+
+  for (const rawUrl of urls) {
+    let url: URL;
+    try {
+      url = new URL(rawUrl.replace(/[>,.]+$/g, ""));
+    } catch {
+      continue;
+    }
+
+    const host = url.hostname.toLowerCase();
+    if (/^(www\.|canary\.|ptb\.)?discord(app)?\.com$/.test(host)) {
+      const parts = url.pathname.split("/").filter(Boolean);
+      if (parts[0] === "events" && parts[2]) ids.push(parts[2]);
+    }
+
+    if (host === "discord.gg" || host.endsWith(".discord.gg")) {
+      const eventId = url.searchParams.get("event");
+      if (eventId) ids.push(eventId);
+    }
+  }
+
+  return ids;
+}
+
+async function getNearestScheduledEventId(message: Message): Promise<string | null> {
+  if (!message.guild) return null;
+  const events = await message.guild.scheduledEvents.fetch().catch(() => null);
+  if (!events) return null;
+
+  const now = Date.now();
+  const nearest = [...events.values()]
+    .filter((event) =>
+      event.status === GuildScheduledEventStatus.Active ||
+      event.status === GuildScheduledEventStatus.Scheduled
+    )
+    .sort((a, b) => {
+      const aTime = a.status === GuildScheduledEventStatus.Active ? now : a.scheduledStartTimestamp ?? Number.MAX_SAFE_INTEGER;
+      const bTime = b.status === GuildScheduledEventStatus.Active ? now : b.scheduledStartTimestamp ?? Number.MAX_SAFE_INTEGER;
+      return aTime - bTime;
+    })[0];
+
+  return nearest?.id ?? null;
+}
+
+async function messageMatchesFirstLinkTask(message: Message, config: FirstLinkConfig, urls: string[]): Promise<boolean> {
+  if (message.channelId !== config.targetChannelId) return false;
   if (urls.length === 0) return false;
 
   if (config.source === "latest_tweet") {
@@ -297,7 +410,11 @@ function messageMatchesFirstLinkTask(message: Message, config: FirstLinkConfig):
   }
 
   if (config.source === "nearest_event") {
-    return urls.some((url) => /^https?:\/\/(www\.)?discord\.com\/events\//i.test(url));
+    const linkedEventIds = extractDiscordEventIds(urls);
+    if (linkedEventIds.length === 0) return false;
+
+    const nearestEventId = await getNearestScheduledEventId(message);
+    return nearestEventId ? linkedEventIds.includes(nearestEventId) : linkedEventIds.length > 0;
   }
 
   return urls.length > 0;
@@ -421,8 +538,9 @@ export async function completeAndNotify(
 
 export async function handleMultiStepQuestMessage(client: Client, message: Message): Promise<void> {
   if (!message.guild || message.author.bot) return;
-  if (!message.content) return;
-  if (!/https?:\/\/[^\s<>()]+/i.test(message.content)) return;
+
+  const urls = await collectMessageUrls(message);
+  if (urls.length === 0) return;
 
   const tasks = await getActiveTasksByType<FirstLinkConfig>(message.guild.id, "first_link_in_channel").catch((err) => {
     console.warn("[QuestEngine] Failed to load link tasks:", (err as Error).message);
@@ -431,14 +549,14 @@ export async function handleMultiStepQuestMessage(client: Client, message: Messa
 
   for (const task of tasks) {
     if (!questWindowAllowsCompletion(task.quest)) continue;
-    if (!messageMatchesFirstLinkTask(message, task.config)) continue;
+    if (!(await messageMatchesFirstLinkTask(message, task.config, urls))) continue;
 
     const proof = {
       kind: "first_link_in_channel",
       messageId: message.id,
       channelId: message.channelId,
       source: task.config.source,
-      url: (message.content.match(/https?:\/\/[^\s<>()]+/i) ?? [null])[0],
+      url: urls[0] ?? null,
     };
     const wonWindow = await claimFirstLinkWindow(task, message.author.id, proof);
     if (!wonWindow) continue;
