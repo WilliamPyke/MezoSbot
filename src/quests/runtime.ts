@@ -22,6 +22,7 @@ import {
 } from "./engine.js";
 
 const SWEEP_MS = 60_000;
+const EMBED_REFETCH_DELAY_MS = 1_500;
 
 type EventAttendanceConfig = {
   scheduledEventId?: string;
@@ -39,6 +40,10 @@ type FirstLinkConfig = {
 
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function channelIsVoiceLike(channel: unknown): channel is VoiceBasedChannel {
@@ -357,6 +362,22 @@ async function collectMessageUrls(message: Message): Promise<string[]> {
   return [...urls];
 }
 
+async function collectMessageUrlsWithDelayedEmbedFetch(message: Message): Promise<string[]> {
+  let urls = await collectMessageUrls(message);
+  const needsEmbedHydration =
+    urls.length === 0 ||
+    (extractDiscordEventIds(urls).length === 0 && discordMessageLinks(urls).length > 0);
+  if (!needsEmbedHydration) return urls;
+
+  await sleep(EMBED_REFETCH_DELAY_MS);
+  const freshMessage = await message.channel.messages.fetch(message.id).catch(() => null);
+  if (!freshMessage) return urls;
+
+  const freshUrls = await collectMessageUrls(freshMessage);
+  urls = [...new Set([...urls, ...freshUrls])];
+  return urls;
+}
+
 function extractDiscordEventIds(urls: string[]): string[] {
   const ids: string[] = [];
 
@@ -403,7 +424,12 @@ async function getNearestScheduledEventId(message: Message): Promise<string | nu
   return nearest?.id ?? null;
 }
 
-async function messageMatchesFirstLinkTask(message: Message, config: FirstLinkConfig, urls: string[]): Promise<boolean> {
+async function messageMatchesFirstLinkTask(
+  message: Message,
+  task: ActiveQuestTask<FirstLinkConfig>,
+  urls: string[],
+): Promise<boolean> {
+  const config = task.config;
   if (message.channelId !== config.targetChannelId) return false;
   if (urls.length === 0) return false;
 
@@ -413,10 +439,24 @@ async function messageMatchesFirstLinkTask(message: Message, config: FirstLinkCo
 
   if (config.source === "nearest_event") {
     const linkedEventIds = extractDiscordEventIds(urls);
-    if (linkedEventIds.length === 0) return false;
+    if (linkedEventIds.length === 0) {
+      console.log(`[QuestEngine] First-link task ${task.id} saw URLs but no Discord event id`, {
+        messageId: message.id,
+        urls,
+      });
+      return false;
+    }
 
     if (typeof config.expectedEventId === "string" && config.expectedEventId.length > 0) {
-      return linkedEventIds.includes(config.expectedEventId);
+      const matchesExpected = linkedEventIds.includes(config.expectedEventId);
+      if (!matchesExpected) {
+        console.log(`[QuestEngine] First-link task ${task.id} rejected event link`, {
+          messageId: message.id,
+          expectedEventId: config.expectedEventId,
+          linkedEventIds,
+        });
+      }
+      return matchesExpected;
     }
 
     const nearestEventId = await getNearestScheduledEventId(message);
@@ -545,7 +585,7 @@ export async function completeAndNotify(
 export async function handleMultiStepQuestMessage(client: Client, message: Message): Promise<void> {
   if (!message.guild || message.author.bot) return;
 
-  const urls = await collectMessageUrls(message);
+  const urls = await collectMessageUrlsWithDelayedEmbedFetch(message);
   if (urls.length === 0) return;
 
   const tasks = await getActiveTasksByType<FirstLinkConfig>(message.guild.id, "first_link_in_channel").catch((err) => {
@@ -555,7 +595,7 @@ export async function handleMultiStepQuestMessage(client: Client, message: Messa
 
   for (const task of tasks) {
     if (!questWindowAllowsCompletion(task.quest)) continue;
-    if (!(await messageMatchesFirstLinkTask(message, task.config, urls))) continue;
+    if (!(await messageMatchesFirstLinkTask(message, task, urls))) continue;
 
     const proof = {
       kind: "first_link_in_channel",
