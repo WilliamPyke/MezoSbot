@@ -32,6 +32,8 @@ type EventAttendanceConfig = {
 type FirstLinkConfig = {
   targetChannelId: string;
   source: string;
+  expectedEventId?: string;
+  expectedEventUrl?: string;
   refreshMinutes: number;
 };
 
@@ -412,6 +414,10 @@ async function messageMatchesFirstLinkTask(message: Message, config: FirstLinkCo
   if (config.source === "nearest_event") {
     const linkedEventIds = extractDiscordEventIds(urls);
     if (linkedEventIds.length === 0) return false;
+
+    if (typeof config.expectedEventId === "string" && config.expectedEventId.length > 0) {
+      return linkedEventIds.includes(config.expectedEventId);
+    }
 
     const nearestEventId = await getNearestScheduledEventId(message);
     return nearestEventId ? linkedEventIds.includes(nearestEventId) : linkedEventIds.length > 0;

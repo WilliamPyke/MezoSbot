@@ -460,7 +460,8 @@ registerQuestTask({
     return null;
   },
   renderRequirement(config) {
-    return `Be first every ${config.refreshMinutes} min to post ${config.source} in <#${config.targetChannelId}>`;
+    const source = config.source === "nearest_event" ? "the configured event link" : config.source;
+    return `Be first every ${config.refreshMinutes} min to post ${source} in <#${config.targetChannelId}>`;
   },
 });
 
