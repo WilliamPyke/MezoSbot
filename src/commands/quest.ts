@@ -2,6 +2,7 @@ import {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  ChannelSelectMenuBuilder,
   ChannelType,
   EmbedBuilder,
   GuildScheduledEventEntityType,
@@ -11,11 +12,11 @@ import {
   StringSelectMenuBuilder,
   TextInputBuilder,
   TextInputStyle,
-  type AutocompleteInteraction,
-  type ButtonInteraction,
+  type ChannelSelectMenuInteraction,
   type ChatInputCommandInteraction,
   type GuildScheduledEvent,
   type Interaction,
+  type ButtonInteraction,
   type ModalSubmitInteraction,
   type StringSelectMenuInteraction,
 } from "discord.js";
@@ -24,14 +25,9 @@ import { supabase } from "../db.js";
 import { formatSats, roundSats } from "../format.js";
 import { buildEventQuestEmbed, type EventQuestRow } from "../eventQuests.js";
 import {
-  addQuestTask,
   createQuestDefinition,
-  createQuestDraft,
   getQuestSnapshot,
   getQuestTaskDefinition,
-  listQuestTaskDefinitions,
-  publishQuest,
-  type QuestSnapshot,
 } from "../quests/engine.js";
 import { completeAndNotify } from "../quests/runtime.js";
 
@@ -42,69 +38,7 @@ export const data = {
     {
       name: "create",
       type: 1 as const,
-      description: "Open a guided event quest creator",
-    },
-    {
-      name: "create_event",
-      type: 1 as const,
-      description: "Quick create: reward users for attending a Discord event",
-      options: [
-        { name: "event", type: 3 as const, description: "Discord scheduled event", required: true, autocomplete: true },
-        { name: "reward", type: 10 as const, description: "Sats each qualifying attendee receives", required: true, minValue: 0.000001 },
-        { name: "min_minutes", type: 4 as const, description: "Minutes the user must stay connected", required: true, minValue: 1, maxValue: 1440 },
-        { name: "max_rewards", type: 4 as const, description: "Optional cap on total rewarded users", required: false, minValue: 1, maxValue: 10000 },
-      ],
-    },
-    {
-      name: "draft",
-      type: 1 as const,
-      description: "Start a multistep quest draft with tiered sats rewards",
-      options: [
-        { name: "title", type: 3 as const, description: "Quest title", required: true, maxLength: 100 },
-        { name: "reward_1", type: 10 as const, description: "Total sats after 1 task", required: true, minValue: 0.000001 },
-        { name: "description", type: 3 as const, description: "Short quest description", required: false, maxLength: 500 },
-        { name: "reward_2", type: 10 as const, description: "Total sats after 2 tasks", required: false, minValue: 0.000001 },
-        { name: "reward_3", type: 10 as const, description: "Total sats after 3 tasks", required: false, minValue: 0.000001 },
-        { name: "reward_4", type: 10 as const, description: "Total sats after 4 tasks", required: false, minValue: 0.000001 },
-      ],
-    },
-    {
-      name: "add_event_task",
-      type: 1 as const,
-      description: "Add an event attendance task to a draft",
-      options: [
-        { name: "quest_id", type: 4 as const, description: "Draft quest ID", required: true, minValue: 1 },
-        { name: "event", type: 3 as const, description: "Discord scheduled event", required: true, autocomplete: true },
-        { name: "min_minutes", type: 4 as const, description: "Minutes required in the event channel", required: true, minValue: 1, maxValue: 1440 },
-      ],
-    },
-    {
-      name: "add_link_task",
-      type: 1 as const,
-      description: "Add a first-link recurring task to a draft",
-      options: [
-        { name: "quest_id", type: 4 as const, description: "Draft quest ID", required: true, minValue: 1 },
-        { name: "target_channel", type: 7 as const, description: "Channel where users must post the link", required: true, channelTypes: [ChannelType.GuildText] },
-        {
-          name: "source",
-          type: 3 as const,
-          description: "Which link source to use",
-          required: true,
-          choices: [
-            { name: "Latest admin Twitter feed link", value: "latest_tweet" },
-            { name: "Nearest Discord event link", value: "nearest_event" },
-          ],
-        },
-        { name: "refresh_minutes", type: 4 as const, description: "Winner window refresh duration", required: true, minValue: 1, maxValue: 1440 },
-      ],
-    },
-    {
-      name: "preview",
-      type: 1 as const,
-      description: "Preview a multistep quest draft or published quest",
-      options: [
-        { name: "quest_id", type: 4 as const, description: "Quest ID", required: true, minValue: 1 },
-      ],
+      description: "Open the unified quest builder",
     },
     {
       name: "complete_task",
@@ -112,43 +46,19 @@ export const data = {
       description: "Creator override: mark a quest task complete for a user",
       options: [
         { name: "quest_id", type: 4 as const, description: "Quest ID", required: true, minValue: 1 },
-        { name: "task_key", type: 3 as const, description: "Task key from the quest preview", required: true, maxLength: 64 },
+        { name: "task_key", type: 3 as const, description: "Task key (event_attendance, first_link_...)", required: true, maxLength: 64 },
         { name: "user", type: 6 as const, description: "User who completed the task", required: true },
         { name: "note", type: 3 as const, description: "Optional proof note", required: false, maxLength: 300 },
       ],
-    },
-    {
-      name: "publish",
-      type: 1 as const,
-      description: "Publish a draft quest to this channel",
-      options: [
-        { name: "quest_id", type: 4 as const, description: "Draft quest ID", required: true, minValue: 1 },
-      ],
-    },
-    {
-      name: "presets",
-      type: 1 as const,
-      description: "List available task presets",
     },
   ],
 };
 
 const BUILDER_PREFIX = "qcreate";
 const BUILDER_TTL_MS = 15 * 60_000;
-
-type QuestBuilderSession = {
-  id: string;
-  guildId: string;
-  channelId: string;
-  creatorId: string;
-  eventId: string | null;
-  events: QuestBuilderEventOption[];
-  selectedEvent: QuestBuilderEventOption | null;
-  rewardSats: number | null;
-  minMinutes: number | null;
-  maxRewards: number | null;
-  expiresAt: number;
-};
+const DEFAULT_MIN_MINUTES = 10;
+const DEFAULT_REFRESH_MINUTES = 60;
+const QUEST_COLOR = 0x77a7ff;
 
 type QuestBuilderEventOption = {
   id: string;
@@ -158,6 +68,35 @@ type QuestBuilderEventOption = {
   scheduledStartTimestamp: number | null;
 };
 
+type LinkSource = "latest_tweet" | "nearest_event";
+
+type QuestBuilderSession = {
+  id: string;
+  guildId: string;
+  channelId: string;
+  creatorId: string;
+  events: QuestBuilderEventOption[];
+
+  eventEnabled: boolean;
+  eventId: string | null;
+  selectedEvent: QuestBuilderEventOption | null;
+  minMinutes: number;
+
+  linkEnabled: boolean;
+  linkChannelId: string | null;
+  linkChannelName: string | null;
+  linkSource: LinkSource | null;
+  linkRefreshMinutes: number;
+
+  title: string | null;
+  description: string | null;
+  rewardSats1: number | null;
+  rewardSats2: number | null;
+  maxRewards: number | null;
+
+  expiresAt: number;
+};
+
 const questBuilderSessions = new Map<string, QuestBuilderSession>();
 
 function eventIsVoiceLike(event: GuildScheduledEvent): boolean {
@@ -165,12 +104,10 @@ function eventIsVoiceLike(event: GuildScheduledEvent): boolean {
     event.entityType === GuildScheduledEventEntityType.Voice;
 }
 
-async function getSelectableEvents(interaction: AutocompleteInteraction | ChatInputCommandInteraction) {
+async function getSelectableEvents(interaction: ChatInputCommandInteraction) {
   if (!interaction.guild) return [];
-
   const events = await interaction.guild.scheduledEvents.fetch().catch(() => null);
   if (!events) return [];
-
   return [...events.values()]
     .filter((event) =>
       event.channelId &&
@@ -178,108 +115,6 @@ async function getSelectableEvents(interaction: AutocompleteInteraction | ChatIn
       (event.status === GuildScheduledEventStatus.Scheduled || event.status === GuildScheduledEventStatus.Active)
     )
     .sort((a, b) => (a.scheduledStartTimestamp ?? 0) - (b.scheduledStartTimestamp ?? 0));
-}
-
-export async function autocomplete(interaction: AutocompleteInteraction) {
-  const focused = interaction.options.getFocused().toLowerCase();
-  const events = await getSelectableEvents(interaction);
-
-  const choices = events
-    .filter((event) => event.name.toLowerCase().includes(focused) || event.id.includes(focused))
-    .slice(0, 25)
-    .map((event) => {
-      const starts = event.scheduledStartAt
-        ? event.scheduledStartAt.toLocaleString("en-US", {
-          month: "short",
-          day: "numeric",
-          hour: "numeric",
-          minute: "2-digit",
-        })
-        : "unscheduled";
-      return {
-        name: `${event.name} - ${starts}`.slice(0, 100),
-        value: event.id,
-      };
-    });
-
-  await interaction.respond(choices);
-}
-
-export async function execute(interaction: ChatInputCommandInteraction) {
-  if (!interaction.guild) {
-    return interaction.reply({ content: "Quest creation only works in servers.", flags: MessageFlags.Ephemeral });
-  }
-
-  const subcommand = interaction.options.getSubcommand(true);
-  if (subcommand === "create") return startQuestBuilder(interaction);
-  if (subcommand === "create_event") return createEventQuest(interaction);
-  if (subcommand === "draft") return createDraft(interaction);
-  if (subcommand === "add_event_task") return addEventTask(interaction);
-  if (subcommand === "add_link_task") return addLinkTask(interaction);
-  if (subcommand === "preview") return previewQuest(interaction, true);
-  if (subcommand === "complete_task") return completeTaskOverride(interaction);
-  if (subcommand === "publish") return publishDraft(interaction);
-  if (subcommand === "presets") return listPresets(interaction);
-
-  return interaction.reply({ content: "Unknown quest command.", flags: MessageFlags.Ephemeral });
-}
-
-function buildTierInputs(interaction: ChatInputCommandInteraction) {
-  const tiers = [1, 2, 3, 4]
-    .map((count) => {
-      const reward = interaction.options.getNumber(`reward_${count}`);
-      return reward == null ? null : { completedTaskCount: count, rewardSats: roundSats(reward) };
-    })
-    .filter((tier): tier is { completedTaskCount: number; rewardSats: number } => tier !== null);
-
-  return tiers;
-}
-
-function buildQuestBuilderEmbed(snapshot: QuestSnapshot): EmbedBuilder {
-  const taskLines = snapshot.tasks.length === 0
-    ? ["No tasks yet."]
-    : snapshot.tasks.map((task, index) => {
-      const definition = getQuestTaskDefinition(task.type);
-      const requirement = definition?.renderRequirement(task.config) ?? task.description ?? task.title;
-      return `↳ **${index + 1}. ${task.title}**\n${requirement}`;
-    });
-
-  const tierLines = snapshot.tiers.map((tier) =>
-    `↳ **${tier.completed_task_count} task${tier.completed_task_count === 1 ? "" : "s"}** → ${formatSats(tier.reward_sats)}`
-  );
-
-  const isDraft = snapshot.quest.status === "draft";
-  const statusLine = isDraft
-    ? "Draft mode. Add tasks, preview, then publish."
-    : "Quest is live. Rewards are paid automatically as users complete tiers.";
-  const embed = new EmbedBuilder()
-    .setColor(isDraft ? 0xf0b232 : 0x77a7ff)
-    .setTitle(`${isDraft ? "🛠️" : "❄️"} ${snapshot.quest.title}`)
-    .setDescription(
-      [
-        snapshot.quest.description ?? "A multistep sats quest.",
-        "",
-        statusLine,
-      ].join("\n"),
-    )
-    .addFields(
-      { name: "Rewards:", value: tierLines.join("\n") || "No reward tiers set.", inline: false },
-      { name: "Requirements:", value: taskLines.join("\n\n").slice(0, 1024), inline: false },
-      { name: "Quest ID", value: `\`${snapshot.quest.id}\``, inline: true },
-      { name: "Max Reward", value: `**${formatSats(snapshot.quest.max_reward_sats)}**`, inline: true },
-      { name: "💎 Payout", value: "Automatic tier upgrade rewards", inline: true },
-    )
-    .setFooter({ text: "⚡ Powered by matsFi" })
-    .setTimestamp();
-
-  return embed;
-}
-
-function cleanupQuestBuilderSessions() {
-  const now = Date.now();
-  for (const [id, session] of questBuilderSessions) {
-    if (session.expiresAt <= now) questBuilderSessions.delete(id);
-  }
 }
 
 function toBuilderEventOption(event: GuildScheduledEvent): QuestBuilderEventOption {
@@ -292,6 +127,13 @@ function toBuilderEventOption(event: GuildScheduledEvent): QuestBuilderEventOpti
   };
 }
 
+function cleanupQuestBuilderSessions() {
+  const now = Date.now();
+  for (const [id, session] of questBuilderSessions) {
+    if (session.expiresAt <= now) questBuilderSessions.delete(id);
+  }
+}
+
 async function createBuilderSession(interaction: ChatInputCommandInteraction): Promise<QuestBuilderSession> {
   cleanupQuestBuilderSessions();
   const id = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
@@ -301,12 +143,25 @@ async function createBuilderSession(interaction: ChatInputCommandInteraction): P
     guildId: interaction.guild!.id,
     channelId: interaction.channelId,
     creatorId: interaction.user.id,
-    eventId: null,
     events: events.slice(0, 25).map(toBuilderEventOption),
+
+    eventEnabled: false,
+    eventId: null,
     selectedEvent: null,
-    rewardSats: null,
-    minMinutes: null,
+    minMinutes: DEFAULT_MIN_MINUTES,
+
+    linkEnabled: false,
+    linkChannelId: null,
+    linkChannelName: null,
+    linkSource: null,
+    linkRefreshMinutes: DEFAULT_REFRESH_MINUTES,
+
+    title: null,
+    description: null,
+    rewardSats1: null,
+    rewardSats2: null,
     maxRewards: null,
+
     expiresAt: Date.now() + BUILDER_TTL_MS,
   };
   questBuilderSessions.set(id, session);
@@ -323,49 +178,124 @@ function parseBuilderId(customId: string): { action: string; sessionId: string }
   return { action, sessionId };
 }
 
-function selectedLabel(value: string | number | null, fallback = "Not selected"): string {
-  return value == null ? fallback : String(value);
+function touchBuilderSession(session: QuestBuilderSession) {
+  session.expiresAt = Date.now() + BUILDER_TTL_MS;
 }
 
-function buildQuestCreatorView(session: QuestBuilderSession) {
-  const event = session.selectedEvent;
-  const rewardLabel = session.rewardSats == null ? "Not selected" : formatSats(session.rewardSats);
-  const maxLabel = session.maxRewards == null ? "No cap" : `${session.maxRewards} attendees`;
-  const totalLabel = session.rewardSats == null
-    ? "Set reward first"
-    : session.maxRewards == null
-      ? "Open-ended"
-      : formatSats(roundSats(session.rewardSats * session.maxRewards));
+function inferTitle(session: QuestBuilderSession): string {
+  if (session.title?.trim()) return session.title.trim();
+  if (session.eventEnabled && session.selectedEvent) return session.selectedEvent.name;
+  if (session.linkEnabled && session.linkSource === "latest_tweet") return "First to share the latest feed link";
+  if (session.linkEnabled && session.linkSource === "nearest_event") return "First to share the next event link";
+  return "Untitled quest";
+}
+
+function activeTaskCount(session: QuestBuilderSession): number {
+  return (session.eventEnabled ? 1 : 0) + (session.linkEnabled ? 1 : 0);
+}
+
+function isSingleEventMode(session: QuestBuilderSession): boolean {
+  return session.eventEnabled && !session.linkEnabled;
+}
+
+function isReadyToPublish(session: QuestBuilderSession): string | null {
+  if (activeTaskCount(session) === 0) return "Add at least one task before publishing.";
+
+  if (session.eventEnabled) {
+    if (!session.eventId || !session.selectedEvent) return "Pick a scheduled event for the event task.";
+    if (!session.minMinutes || session.minMinutes < 1) return "Set the required minutes for the event task.";
+  }
+
+  if (session.linkEnabled) {
+    if (!session.linkChannelId) return "Pick the channel for the first-link task.";
+    if (!session.linkSource) return "Pick the link source for the first-link task.";
+    if (!session.linkRefreshMinutes || session.linkRefreshMinutes < 1) return "Set the refresh window for the first-link task.";
+  }
+
+  if (!session.rewardSats1 || session.rewardSats1 <= 0) return "Set a reward for the first tier.";
+
+  if (activeTaskCount(session) === 2) {
+    if (!session.rewardSats2 || session.rewardSats2 <= 0) return "Set a reward for the second tier.";
+    if (session.rewardSats2 < session.rewardSats1) return "Tier 2 reward must be at least the tier 1 reward.";
+  }
+
+  return null;
+}
+
+function formatLinkSource(source: LinkSource | null): string {
+  if (source === "latest_tweet") return "Latest admin feed link";
+  if (source === "nearest_event") return "Next Discord event link";
+  return "Not selected";
+}
+
+function buildBuilderEmbed(session: QuestBuilderSession): EmbedBuilder {
+  const lines: string[] = [];
+
+  if (!session.eventEnabled && !session.linkEnabled) {
+    lines.push("Add at least one task to get started.");
+  } else if (isSingleEventMode(session)) {
+    lines.push("Single-event quest. Pay out automatically when attendees stay long enough.");
+  } else if (session.linkEnabled && !session.eventEnabled) {
+    lines.push("First-link quest. Reward the first user to drop the configured link each window.");
+  } else {
+    lines.push("Multi-step quest. Users earn tier rewards as they complete tasks.");
+  }
+
+  const tasks: string[] = [];
+  if (session.eventEnabled) {
+    const eventLabel = session.selectedEvent
+      ? `**${session.selectedEvent.name}** in <#${session.selectedEvent.channelId}>`
+      : "*Event not selected*";
+    tasks.push(`↳ **Event attendance** — ${eventLabel} for **${session.minMinutes}** min`);
+  }
+  if (session.linkEnabled) {
+    const channelLabel = session.linkChannelId ? `<#${session.linkChannelId}>` : "*Channel not selected*";
+    tasks.push(`↳ **First link** — ${channelLabel} • ${formatLinkSource(session.linkSource)} • every **${session.linkRefreshMinutes}** min`);
+  }
+
+  const rewards: string[] = [];
+  if (session.rewardSats1) {
+    if (activeTaskCount(session) === 2) {
+      rewards.push(`↳ **1 task** → ${formatSats(session.rewardSats1)}`);
+      rewards.push(`↳ **2 tasks** → ${session.rewardSats2 ? formatSats(session.rewardSats2) : "Not set"}`);
+    } else if (isSingleEventMode(session)) {
+      rewards.push(`↳ **${formatSats(session.rewardSats1)}** per qualifying attendee`);
+      if (session.maxRewards) rewards.push(`↳ Cap: **${session.maxRewards}** attendees`);
+    } else {
+      rewards.push(`↳ **${formatSats(session.rewardSats1)}** per qualifying user`);
+    }
+  } else {
+    rewards.push("Not set");
+  }
 
   const embed = new EmbedBuilder()
-    .setColor(0x77a7ff)
-    .setTitle("Create Event Quest")
-    .setDescription("Pick the event and reward settings, then confirm when the preview looks right.")
+    .setColor(QUEST_COLOR)
+    .setTitle(`🛠️ ${inferTitle(session)}`)
+    .setDescription(lines.join("\n"))
     .addFields(
-      { name: "Event", value: event ? `${event.name}\n<#${event.channelId}>` : "Not selected", inline: false },
-      { name: "Reward", value: rewardLabel, inline: true },
-      { name: "Required time", value: `${selectedLabel(session.minMinutes)} minute${session.minMinutes === 1 ? "" : "s"}`, inline: true },
-      { name: "Max rewards", value: maxLabel, inline: true },
-      { name: "Total possible spend", value: totalLabel, inline: true },
+      { name: "Tasks", value: tasks.length === 0 ? "No tasks yet." : tasks.join("\n"), inline: false },
+      { name: "Rewards", value: rewards.join("\n"), inline: false },
     )
     .setFooter({ text: "This setup expires after 15 minutes." });
 
-  if (event?.scheduledStartTimestamp) {
-    embed.addFields({
-      name: "Scheduled start",
-      value: `<t:${Math.floor(event.scheduledStartTimestamp / 1000)}:F>`,
-      inline: false,
-    });
+  if (session.description?.trim()) {
+    embed.addFields({ name: "Description", value: session.description.trim().slice(0, 1024), inline: false });
   }
 
-  const rows: Array<ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>> = [];
+  return embed;
+}
 
-  if (session.events.length > 0) {
+type BuilderComponentRow = ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder | ChannelSelectMenuBuilder>;
+
+function buildBuilderComponents(session: QuestBuilderSession): BuilderComponentRow[] {
+  const rows: BuilderComponentRow[] = [];
+
+  if (session.eventEnabled && session.events.length > 0) {
     rows.push(
       new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
         new StringSelectMenuBuilder()
           .setCustomId(builderId("event", session.id))
-          .setPlaceholder(event ? event.name.slice(0, 100) : "Choose a scheduled event")
+          .setPlaceholder(session.selectedEvent ? session.selectedEvent.name.slice(0, 100) : "Choose a scheduled event")
           .addOptions(
             session.events.map((candidate) => {
               const starts = candidate.scheduledStartTimestamp
@@ -388,52 +318,124 @@ function buildQuestCreatorView(session: QuestBuilderSession) {
     );
   }
 
-  rows.push(
-    new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder()
-        .setCustomId(builderId("details", session.id))
-        .setLabel("Set details")
-        .setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder()
-        .setCustomId(builderId("confirm", session.id))
-        .setLabel("Create")
-        .setStyle(ButtonStyle.Success)
-        .setDisabled(!session.eventId || !session.rewardSats || !session.minMinutes),
-      new ButtonBuilder()
-        .setCustomId(builderId("cancel", session.id))
-        .setLabel("Cancel")
-        .setStyle(ButtonStyle.Danger),
-    ),
-  );
+  if (session.linkEnabled) {
+    rows.push(
+      new ActionRowBuilder<ChannelSelectMenuBuilder>().addComponents(
+        new ChannelSelectMenuBuilder()
+          .setCustomId(builderId("link_channel", session.id))
+          .setChannelTypes(ChannelType.GuildText)
+          .setMinValues(1)
+          .setMaxValues(1)
+          .setPlaceholder(session.linkChannelName ? `#${session.linkChannelName}` : "Pick the link target channel")
+          .setDefaultChannels(session.linkChannelId ? [session.linkChannelId] : []),
+      ),
+    );
 
-  return { embeds: [embed], components: rows, allowedMentions: { parse: [] } };
+    rows.push(
+      new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+        new StringSelectMenuBuilder()
+          .setCustomId(builderId("link_source", session.id))
+          .setPlaceholder(session.linkSource ? formatLinkSource(session.linkSource) : "Pick a link source")
+          .addOptions([
+            { label: "Latest admin feed link", value: "latest_tweet", default: session.linkSource === "latest_tweet" },
+            { label: "Next Discord event link", value: "nearest_event", default: session.linkSource === "nearest_event" },
+          ]),
+      ),
+    );
+  }
+
+  const toggleRow = new ActionRowBuilder<ButtonBuilder>();
+  toggleRow.addComponents(
+    new ButtonBuilder()
+      .setCustomId(builderId(session.eventEnabled ? "remove_event" : "add_event", session.id))
+      .setLabel(session.eventEnabled ? "Remove event task" : "Add event task")
+      .setStyle(session.eventEnabled ? ButtonStyle.Secondary : ButtonStyle.Primary)
+      .setDisabled(!session.eventEnabled && session.events.length === 0),
+    new ButtonBuilder()
+      .setCustomId(builderId(session.linkEnabled ? "remove_link" : "add_link", session.id))
+      .setLabel(session.linkEnabled ? "Remove link task" : "Add first-link task")
+      .setStyle(session.linkEnabled ? ButtonStyle.Secondary : ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId(builderId("details", session.id))
+      .setLabel("Edit details")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(activeTaskCount(session) === 0),
+  );
+  rows.push(toggleRow);
+
+  const finalRow = new ActionRowBuilder<ButtonBuilder>();
+  finalRow.addComponents(
+    new ButtonBuilder()
+      .setCustomId(builderId("publish", session.id))
+      .setLabel("Publish")
+      .setStyle(ButtonStyle.Success)
+      .setDisabled(isReadyToPublish(session) !== null),
+    new ButtonBuilder()
+      .setCustomId(builderId("cancel", session.id))
+      .setLabel("Cancel")
+      .setStyle(ButtonStyle.Danger),
+  );
+  rows.push(finalRow);
+
+  return rows;
+}
+
+function renderBuilderView(session: QuestBuilderSession) {
+  return {
+    embeds: [buildBuilderEmbed(session)],
+    components: buildBuilderComponents(session),
+    allowedMentions: { parse: [] as never[] },
+  };
+}
+
+export async function execute(interaction: ChatInputCommandInteraction) {
+  if (!interaction.guild) {
+    return interaction.reply({ content: "Quest creation only works in servers.", flags: MessageFlags.Ephemeral });
+  }
+
+  const subcommand = interaction.options.getSubcommand(true);
+  if (subcommand === "create") return startQuestBuilder(interaction);
+  if (subcommand === "complete_task") return completeTaskOverride(interaction);
+
+  return interaction.reply({ content: "Unknown quest command.", flags: MessageFlags.Ephemeral });
 }
 
 async function startQuestBuilder(interaction: ChatInputCommandInteraction) {
   const session = await createBuilderSession(interaction);
   await interaction.reply({
-    ...buildQuestCreatorView(session),
+    ...renderBuilderView(session),
     flags: MessageFlags.Ephemeral,
   });
 }
 
 export function isQuestBuilderInteraction(interaction: Interaction): boolean {
-  if (interaction.isButton() || interaction.isStringSelectMenu() || interaction.isModalSubmit()) {
+  if (
+    interaction.isButton() ||
+    interaction.isStringSelectMenu() ||
+    interaction.isChannelSelectMenu() ||
+    interaction.isModalSubmit()
+  ) {
     return interaction.customId.startsWith(`${BUILDER_PREFIX}:`);
   }
   return false;
 }
 
+type BuilderInteraction =
+  | ButtonInteraction
+  | StringSelectMenuInteraction
+  | ChannelSelectMenuInteraction
+  | ModalSubmitInteraction;
+
 export async function handleQuestBuilderInteraction(interaction: Interaction): Promise<void> {
-  if (interaction.isStringSelectMenu()) return handleQuestBuilderSelect(interaction);
-  if (interaction.isButton()) return handleQuestBuilderButton(interaction);
-  if (interaction.isModalSubmit()) return handleQuestBuilderModal(interaction);
+  if (interaction.isStringSelectMenu()) return handleSelect(interaction);
+  if (interaction.isChannelSelectMenu()) return handleChannelSelect(interaction);
+  if (interaction.isButton()) return handleButton(interaction);
+  if (interaction.isModalSubmit()) return handleModal(interaction);
 }
 
-function getBuilderSession(interaction: ButtonInteraction | StringSelectMenuInteraction | ModalSubmitInteraction) {
+function getBuilderSession(interaction: BuilderInteraction) {
   const parsed = parseBuilderId(interaction.customId);
   if (!parsed) return { parsed: null, session: null };
-
   const session = questBuilderSessions.get(parsed.sessionId) ?? null;
   if (!session || session.expiresAt <= Date.now()) {
     if (session) questBuilderSessions.delete(parsed.sessionId);
@@ -442,47 +444,71 @@ function getBuilderSession(interaction: ButtonInteraction | StringSelectMenuInte
   return { parsed, session };
 }
 
-async function rejectBuilderInteraction(interaction: ButtonInteraction | StringSelectMenuInteraction | ModalSubmitInteraction, message: string) {
-  if (interaction.isModalSubmit()) {
-    await interaction.reply({ content: message, flags: MessageFlags.Ephemeral }).catch(() => {});
-    return;
-  }
-  await interaction.reply({ content: message, flags: MessageFlags.Ephemeral }).catch(() => {});
+async function rejectExpired(interaction: BuilderInteraction) {
+  await interaction.reply({
+    content: "This quest setup expired. Run `/quest create` again.",
+    flags: MessageFlags.Ephemeral,
+  }).catch(() => {});
 }
 
-function touchBuilderSession(session: QuestBuilderSession) {
-  session.expiresAt = Date.now() + BUILDER_TTL_MS;
+async function rejectNotOwner(interaction: BuilderInteraction) {
+  await interaction.reply({
+    content: "Only the person who opened this setup can edit it.",
+    flags: MessageFlags.Ephemeral,
+  }).catch(() => {});
 }
 
-async function updateBuilderMessage(interaction: ButtonInteraction | StringSelectMenuInteraction | ModalSubmitInteraction, session: QuestBuilderSession) {
-  const view = buildQuestCreatorView(session);
-  if (interaction.deferred || interaction.isModalSubmit()) {
+async function updateBuilderMessage(interaction: BuilderInteraction, session: QuestBuilderSession) {
+  const view = renderBuilderView(session);
+  if (interaction.isModalSubmit() || interaction.deferred) {
     await interaction.editReply(view);
   } else {
     await interaction.update(view);
   }
 }
 
-async function handleQuestBuilderSelect(interaction: StringSelectMenuInteraction): Promise<void> {
+async function handleSelect(interaction: StringSelectMenuInteraction): Promise<void> {
   const { parsed, session } = getBuilderSession(interaction);
-  if (!parsed || !session) return rejectBuilderInteraction(interaction, "This quest setup expired. Run `/quest create` again.");
-  if (interaction.user.id !== session.creatorId) return rejectBuilderInteraction(interaction, "Only the person who opened this setup can edit it.");
+  if (!parsed || !session) return rejectExpired(interaction);
+  if (interaction.user.id !== session.creatorId) return rejectNotOwner(interaction);
 
   const value = interaction.values[0];
   if (parsed.action === "event") {
     session.eventId = value;
     session.selectedEvent = session.events.find((event) => event.id === value) ?? null;
+  } else if (parsed.action === "link_source") {
+    if (value === "latest_tweet" || value === "nearest_event") session.linkSource = value;
+  } else {
+    return;
   }
-  touchBuilderSession(session);
 
+  touchBuilderSession(session);
   await interaction.deferUpdate();
   await updateBuilderMessage(interaction, session);
 }
 
-async function handleQuestBuilderButton(interaction: ButtonInteraction): Promise<void> {
+async function handleChannelSelect(interaction: ChannelSelectMenuInteraction): Promise<void> {
   const { parsed, session } = getBuilderSession(interaction);
-  if (!parsed || !session) return rejectBuilderInteraction(interaction, "This quest setup expired. Run `/quest create` again.");
-  if (interaction.user.id !== session.creatorId) return rejectBuilderInteraction(interaction, "Only the person who opened this setup can edit it.");
+  if (!parsed || !session) return rejectExpired(interaction);
+  if (interaction.user.id !== session.creatorId) return rejectNotOwner(interaction);
+
+  if (parsed.action === "link_channel") {
+    const channel = interaction.channels.first();
+    if (channel) {
+      session.linkChannelId = channel.id;
+      session.linkChannelName = "name" in channel ? (channel as { name: string | null }).name : null;
+    }
+  }
+
+  touchBuilderSession(session);
+  await interaction.deferUpdate();
+  await updateBuilderMessage(interaction, session);
+}
+
+async function handleButton(interaction: ButtonInteraction): Promise<void> {
+  const { parsed, session } = getBuilderSession(interaction);
+  if (!parsed || !session) return rejectExpired(interaction);
+  if (interaction.user.id !== session.creatorId) return rejectNotOwner(interaction);
 
   if (parsed.action === "cancel") {
     questBuilderSessions.delete(session.id);
@@ -490,378 +516,281 @@ async function handleQuestBuilderButton(interaction: ButtonInteraction): Promise
     return;
   }
 
-  if (parsed.action === "details") return showBuilderDetailsModal(interaction, session);
-
-  if (parsed.action !== "confirm") return;
-  await interaction.deferUpdate();
-
-  if (!session.eventId || !session.rewardSats || !session.minMinutes) {
-    await interaction.editReply({
-      content: "Pick an event, reward, and required time before creating the quest.",
-      ...buildQuestCreatorView(session),
-    });
+  if (parsed.action === "add_event") {
+    if (session.events.length === 0) {
+      await interaction.reply({
+        content: "No upcoming voice or stage events to attach.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    session.eventEnabled = true;
+    touchBuilderSession(session);
+    await interaction.update(renderBuilderView(session));
     return;
   }
 
-  const event = await interaction.guild?.scheduledEvents
-    .fetch({ guildScheduledEvent: session.eventId, withUserCount: true })
-    .catch(() => null);
-  if (!event) {
-    await interaction.editReply({ content: "I could not find that scheduled event anymore.", embeds: [], components: [] });
+  if (parsed.action === "remove_event") {
+    session.eventEnabled = false;
+    session.eventId = null;
+    session.selectedEvent = null;
+    touchBuilderSession(session);
+    await interaction.update(renderBuilderView(session));
     return;
   }
 
-  const result = await createEventQuestFromSelection({
-    guildId: session.guildId,
-    channelId: session.channelId,
-    creatorId: session.creatorId,
-    event,
-    reward: session.rewardSats,
-    minMinutes: session.minMinutes,
-    maxRewards: session.maxRewards,
-  });
-
-  if (!result.ok) {
-    await interaction.editReply({ content: result.error, ...buildQuestCreatorView(session) });
+  if (parsed.action === "add_link") {
+    session.linkEnabled = true;
+    touchBuilderSession(session);
+    await interaction.update(renderBuilderView(session));
     return;
   }
 
-  const message = await interaction.followUp({ embeds: [result.embed], allowedMentions: { parse: [] } });
-  await storeEventQuestMessageId(result.quest.id, message.id);
-  questBuilderSessions.delete(session.id);
+  if (parsed.action === "remove_link") {
+    session.linkEnabled = false;
+    session.linkChannelId = null;
+    session.linkChannelName = null;
+    session.linkSource = null;
+    touchBuilderSession(session);
+    await interaction.update(renderBuilderView(session));
+    return;
+  }
 
-  await interaction.editReply({
-    content: `Created **${event.name}** event quest in <#${session.channelId}>.`,
-    embeds: [],
-    components: [],
-    allowedMentions: { parse: [] },
-  });
+  if (parsed.action === "details") return showDetailsModal(interaction, session);
+
+  if (parsed.action === "publish") return publishSession(interaction, session);
 }
 
-async function showBuilderDetailsModal(interaction: ButtonInteraction, session: QuestBuilderSession) {
+async function showDetailsModal(interaction: ButtonInteraction, session: QuestBuilderSession): Promise<void> {
   const modal = new ModalBuilder()
     .setCustomId(builderId("details_modal", session.id))
-    .setTitle("Event quest details")
-    .addComponents(
+    .setTitle("Quest details");
+
+  const titleInput = new TextInputBuilder()
+    .setCustomId("title")
+    .setLabel("Title (blank = auto)")
+    .setStyle(TextInputStyle.Short)
+    .setRequired(false)
+    .setMaxLength(100)
+    .setPlaceholder(inferTitle(session))
+    .setValue(session.title ?? "");
+
+  const reward1Input = new TextInputBuilder()
+    .setCustomId("reward1")
+    .setLabel(
+      activeTaskCount(session) === 2 ? "Reward after 1 task (sats)" : "Reward (sats)",
+    )
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true)
+    .setPlaceholder("500")
+    .setValue(session.rewardSats1 == null ? "" : String(session.rewardSats1));
+
+  const rows: ActionRowBuilder<TextInputBuilder>[] = [
+    new ActionRowBuilder<TextInputBuilder>().addComponents(titleInput),
+    new ActionRowBuilder<TextInputBuilder>().addComponents(reward1Input),
+  ];
+
+  if (activeTaskCount(session) === 2) {
+    rows.push(
       new ActionRowBuilder<TextInputBuilder>().addComponents(
         new TextInputBuilder()
-          .setCustomId("reward")
-          .setLabel("Reward per attendee in sats")
+          .setCustomId("reward2")
+          .setLabel("Reward after both tasks (sats)")
           .setStyle(TextInputStyle.Short)
           .setRequired(true)
-          .setPlaceholder("1000")
-          .setValue(session.rewardSats == null ? "" : String(session.rewardSats)),
+          .setPlaceholder("1500")
+          .setValue(session.rewardSats2 == null ? "" : String(session.rewardSats2)),
       ),
+    );
+  }
+
+  if (session.eventEnabled) {
+    rows.push(
       new ActionRowBuilder<TextInputBuilder>().addComponents(
         new TextInputBuilder()
-          .setCustomId("minutes")
-          .setLabel("Minutes required to attend")
+          .setCustomId("min_minutes")
+          .setLabel("Minutes required in event")
           .setStyle(TextInputStyle.Short)
           .setRequired(true)
-          .setPlaceholder("10")
-          .setValue(session.minMinutes == null ? "" : String(session.minMinutes)),
+          .setPlaceholder(String(DEFAULT_MIN_MINUTES))
+          .setValue(String(session.minMinutes)),
       ),
+    );
+  }
+
+  if (session.linkEnabled && rows.length < 5) {
+    rows.push(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("refresh_minutes")
+          .setLabel("First-link refresh window (minutes)")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setPlaceholder(String(DEFAULT_REFRESH_MINUTES))
+          .setValue(String(session.linkRefreshMinutes)),
+      ),
+    );
+  }
+
+  if (isSingleEventMode(session) && rows.length < 5) {
+    rows.push(
       new ActionRowBuilder<TextInputBuilder>().addComponents(
         new TextInputBuilder()
           .setCustomId("cap")
-          .setLabel("Max rewarded attendees")
+          .setLabel("Max rewarded attendees (blank = none)")
           .setStyle(TextInputStyle.Short)
           .setRequired(false)
-          .setPlaceholder("Blank means no cap")
+          .setPlaceholder("Blank for no cap")
           .setValue(session.maxRewards == null ? "" : String(session.maxRewards)),
       ),
     );
+  }
 
+  modal.addComponents(...rows);
   await interaction.showModal(modal);
 }
 
-async function handleQuestBuilderModal(interaction: ModalSubmitInteraction): Promise<void> {
+async function handleModal(interaction: ModalSubmitInteraction): Promise<void> {
   const { parsed, session } = getBuilderSession(interaction);
-  if (!parsed || !session) return rejectBuilderInteraction(interaction, "This quest setup expired. Run `/quest create` again.");
-  if (interaction.user.id !== session.creatorId) return rejectBuilderInteraction(interaction, "Only the person who opened this setup can edit it.");
-
+  if (!parsed || !session) return rejectExpired(interaction);
+  if (interaction.user.id !== session.creatorId) return rejectNotOwner(interaction);
   if (parsed.action !== "details_modal") return;
 
-  const rewardRaw = interaction.fields.getTextInputValue("reward").trim();
-  const minutesRaw = interaction.fields.getTextInputValue("minutes").trim();
-  const capRaw = interaction.fields.getTextInputValue("cap").trim();
+  const titleRaw = interaction.fields.getTextInputValue("title").trim();
+  const reward1Raw = interaction.fields.getTextInputValue("reward1").trim();
 
-  const reward = Number(rewardRaw);
-  if (!Number.isFinite(reward) || reward <= 0) {
+  const reward1 = Number(reward1Raw);
+  if (!Number.isFinite(reward1) || reward1 <= 0) {
     await interaction.reply({ content: "Reward must be a positive number of sats.", flags: MessageFlags.Ephemeral });
     return;
   }
+  session.rewardSats1 = roundSats(reward1);
 
-  const minutes = Math.floor(Number(minutesRaw));
-  if (!Number.isFinite(minutes) || minutes < 1 || minutes > 1440) {
-    await interaction.reply({ content: "Required time must be between 1 and 1440 minutes.", flags: MessageFlags.Ephemeral });
-    return;
-  }
-
-  let cap: number | null = null;
-  if (capRaw.length > 0) {
-    cap = Math.floor(Number(capRaw));
-    if (cap < 1 || cap > 10000) {
-      await interaction.reply({ content: "Max rewards must be between 1 and 10000, or blank for no cap.", flags: MessageFlags.Ephemeral });
+  if (activeTaskCount(session) === 2) {
+    const reward2Raw = interaction.fields.getTextInputValue("reward2").trim();
+    const reward2 = Number(reward2Raw);
+    if (!Number.isFinite(reward2) || reward2 <= 0) {
+      await interaction.reply({ content: "Tier 2 reward must be a positive number of sats.", flags: MessageFlags.Ephemeral });
       return;
     }
+    session.rewardSats2 = roundSats(reward2);
+  } else {
+    session.rewardSats2 = null;
   }
 
-  session.rewardSats = roundSats(reward);
-  session.minMinutes = minutes;
-  session.maxRewards = cap;
+  if (session.eventEnabled) {
+    const minutesRaw = interaction.fields.getTextInputValue("min_minutes").trim();
+    const minutes = Math.floor(Number(minutesRaw));
+    if (!Number.isFinite(minutes) || minutes < 1 || minutes > 1440) {
+      await interaction.reply({ content: "Event minutes must be between 1 and 1440.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    session.minMinutes = minutes;
+  }
+
+  if (session.linkEnabled && hasField(interaction, "refresh_minutes")) {
+    const refreshRaw = interaction.fields.getTextInputValue("refresh_minutes").trim();
+    const refresh = Math.floor(Number(refreshRaw));
+    if (!Number.isFinite(refresh) || refresh < 1 || refresh > 1440) {
+      await interaction.reply({ content: "Refresh window must be between 1 and 1440 minutes.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    session.linkRefreshMinutes = refresh;
+  }
+
+  if (isSingleEventMode(session) && hasField(interaction, "cap")) {
+    const capRaw = interaction.fields.getTextInputValue("cap").trim();
+    if (capRaw.length === 0) {
+      session.maxRewards = null;
+    } else {
+      const cap = Math.floor(Number(capRaw));
+      if (!Number.isFinite(cap) || cap < 1 || cap > 10000) {
+        await interaction.reply({ content: "Max rewards must be between 1 and 10000.", flags: MessageFlags.Ephemeral });
+        return;
+      }
+      session.maxRewards = cap;
+    }
+  } else {
+    session.maxRewards = null;
+  }
+
+  session.title = titleRaw.length > 0 ? titleRaw : null;
   touchBuilderSession(session);
   await interaction.deferUpdate();
   await updateBuilderMessage(interaction, session);
 }
 
-async function createDraft(interaction: ChatInputCommandInteraction) {
-  const title = interaction.options.getString("title", true).trim();
-  const description = interaction.options.getString("description")?.trim() || null;
-  const tiers = buildTierInputs(interaction);
-
-  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-
+function hasField(interaction: ModalSubmitInteraction, customId: string): boolean {
   try {
-    const snapshot = await createQuestDraft({
-      guildId: interaction.guild!.id,
-      channelId: interaction.channelId,
-      creatorId: interaction.user.id,
-      title,
-      description,
-      rewardTiers: tiers,
+    interaction.fields.getTextInputValue(customId);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function publishSession(interaction: ButtonInteraction, session: QuestBuilderSession): Promise<void> {
+  const validation = isReadyToPublish(session);
+  if (validation) {
+    await interaction.reply({ content: validation, flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  await interaction.deferUpdate();
+
+  if (isSingleEventMode(session)) {
+    const event = await interaction.guild?.scheduledEvents
+      .fetch({ guildScheduledEvent: session.eventId!, withUserCount: true })
+      .catch(() => null);
+    if (!event) {
+      await interaction.editReply({ content: "I could not find that scheduled event anymore.", embeds: [], components: [] });
+      return;
+    }
+
+    const result = await createEventQuestFromSelection({
+      guildId: session.guildId,
+      channelId: session.channelId,
+      creatorId: session.creatorId,
+      event,
+      reward: session.rewardSats1!,
+      minMinutes: session.minMinutes,
+      maxRewards: session.maxRewards,
     });
+
+    if (!result.ok) {
+      await interaction.editReply({ content: result.error, ...renderBuilderView(session) });
+      return;
+    }
+
+    const message = await interaction.followUp({ embeds: [result.embed], allowedMentions: { parse: [] } });
+    await storeEventQuestMessageId(result.quest.id, message.id);
+    questBuilderSessions.delete(session.id);
 
     await interaction.editReply({
-      embeds: [buildQuestBuilderEmbed(snapshot)],
+      content: `Created **${event.name}** event quest in <#${session.channelId}>.`,
+      embeds: [],
+      components: [],
+      allowedMentions: { parse: [] },
     });
-  } catch (err) {
-    await interaction.editReply({ content: `Could not create quest draft: ${(err as Error).message}` });
-  }
-}
-
-async function addEventTask(interaction: ChatInputCommandInteraction) {
-  const questId = interaction.options.getInteger("quest_id", true);
-  const eventId = interaction.options.getString("event", true);
-  const minMinutes = interaction.options.getInteger("min_minutes", true);
-
-  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-
-  const event = await interaction.guild!.scheduledEvents
-    .fetch({ guildScheduledEvent: eventId, withUserCount: true })
-    .catch(() => null);
-  if (!event?.channelId || !eventIsVoiceLike(event)) {
-    return interaction.editReply({ content: "That event is not attached to a voice or stage channel." });
+    return;
   }
 
-  try {
-    const snapshot = await addQuestTask({
-      questId,
-      creatorId: interaction.user.id,
-      taskKey: `event_${event.id}`,
-      type: "event_attendance",
-      title: `Attend ${event.name}`,
-      description: `Stay connected to <#${event.channelId}> for ${minMinutes} minute${minMinutes === 1 ? "" : "s"}.`,
-      config: {
-        scheduledEventId: event.id,
-        eventChannelId: event.channelId,
-        minMinutes,
-      },
-    });
-
-    await interaction.editReply({ embeds: [buildQuestBuilderEmbed(snapshot)] });
-  } catch (err) {
-    await interaction.editReply({ content: `Could not add event task: ${(err as Error).message}` });
-  }
-}
-
-async function addLinkTask(interaction: ChatInputCommandInteraction) {
-  const questId = interaction.options.getInteger("quest_id", true);
-  const channel = interaction.options.getChannel("target_channel", true);
-  const source = interaction.options.getString("source", true);
-  const refreshMinutes = interaction.options.getInteger("refresh_minutes", true);
-
-  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-
-  try {
-    const snapshot = await addQuestTask({
-      questId,
-      creatorId: interaction.user.id,
-      taskKey: `first_link_${source}_${channel.id}`,
-      type: "first_link_in_channel",
-      title: source === "latest_tweet" ? "Share latest feed link" : "Share nearest event link",
-      description: `Be first every ${refreshMinutes} minutes to post the configured link in <#${channel.id}>.`,
-      config: {
-        targetChannelId: channel.id,
-        source,
-        refreshMinutes,
-      },
-    });
-
-    await interaction.editReply({ embeds: [buildQuestBuilderEmbed(snapshot)] });
-  } catch (err) {
-    await interaction.editReply({ content: `Could not add link task: ${(err as Error).message}` });
-  }
-}
-
-async function previewQuest(interaction: ChatInputCommandInteraction, ephemeral: boolean) {
-  const questId = interaction.options.getInteger("quest_id", true);
-  await interaction.deferReply({ flags: ephemeral ? MessageFlags.Ephemeral : undefined });
-
-  const snapshot = await getQuestSnapshot(questId).catch((err) => {
-    console.warn("[Quest] Preview failed:", (err as Error).message);
-    return null;
-  });
-  if (!snapshot) return interaction.editReply({ content: "Quest not found." });
-
-  await interaction.editReply({ embeds: [buildQuestBuilderEmbed(snapshot)] });
-}
-
-async function completeTaskOverride(interaction: ChatInputCommandInteraction) {
-  const questId = interaction.options.getInteger("quest_id", true);
-  const taskKey = interaction.options.getString("task_key", true).trim();
-  const user = interaction.options.getUser("user", true);
-  const note = interaction.options.getString("note")?.trim() || null;
-
-  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-
-  const snapshot = await getQuestSnapshot(questId).catch((err) => {
-    console.warn("[Quest] Manual completion failed:", (err as Error).message);
-    return null;
-  });
-  if (!snapshot) return interaction.editReply({ content: "Quest not found." });
-  if (snapshot.quest.creator_id !== interaction.user.id) {
-    return interaction.editReply({ content: "Only the quest creator can complete tasks manually." });
-  }
-  if (snapshot.quest.status !== "active") {
-    return interaction.editReply({ content: "Only active quests can receive completions." });
-  }
-
-  const task = snapshot.tasks.find((candidate) => candidate.task_key === taskKey);
-  if (!task) {
-    return interaction.editReply({
-      content: `Task \`${taskKey}\` was not found. Use \`/quest preview\` to see task keys.`,
-    });
-  }
-
-  const result = await completeAndNotify(
-    interaction.client,
-    {
-      id: task.id,
-      quest_id: snapshot.quest.id,
-      title: task.title,
-      quest: {
-        id: snapshot.quest.id,
-        guild_id: snapshot.quest.guild_id,
-        channel_id: snapshot.quest.channel_id,
-        message_id: snapshot.quest.message_id,
-        creator_id: snapshot.quest.creator_id,
-        title: snapshot.quest.title,
-        description: snapshot.quest.description,
-        status: snapshot.quest.status,
-        max_reward_sats: snapshot.quest.max_reward_sats,
-        starts_at: snapshot.quest.starts_at,
-        ends_at: snapshot.quest.ends_at,
-        metadata: snapshot.quest.metadata,
-      },
-    },
-    user.id,
-    {
-      kind: "manual_override",
-      completedBy: interaction.user.id,
-      note,
-    },
-  ).catch((err) => {
-    throw new Error(`Could not complete task: ${(err as Error).message}`);
-  });
-
+  const result = await createMultiStepQuestFromSession(interaction, session);
   if (!result.ok) {
-    return interaction.editReply({ content: `Task was not completed: ${result.reason ?? "unknown reason"}.` });
+    await interaction.editReply({ content: result.error, ...renderBuilderView(session) });
+    return;
   }
 
-  const rewardText = (result.rewardDeltaSats ?? 0) > 0
-    ? ` Paid **${formatSats(result.rewardDeltaSats ?? 0)}**.`
-    : " No new tier payout was due.";
-  const duplicateText = result.insertedCompletion === false ? " This user had already completed that task." : "";
+  const message = await interaction.followUp({ embeds: [result.embed], allowedMentions: { parse: [] } });
+  await storeQuestMessageId(result.questId, message.id);
+  questBuilderSessions.delete(session.id);
 
   await interaction.editReply({
-    content: `Marked **${task.title}** complete for ${user}.${rewardText}${duplicateText}`,
+    content: `Created **${inferTitle(session)}** in <#${session.channelId}>.`,
+    embeds: [],
+    components: [],
     allowedMentions: { parse: [] },
   });
-}
-
-async function publishDraft(interaction: ChatInputCommandInteraction) {
-  const questId = interaction.options.getInteger("quest_id", true);
-  await interaction.deferReply();
-
-  const initial = await getQuestSnapshot(questId).catch(() => null);
-  if (!initial) return interaction.editReply({ content: "Quest not found." });
-  if (initial.quest.creator_id !== interaction.user.id) {
-    return interaction.editReply({ content: "Only the quest creator can publish this quest." });
-  }
-
-  const publishedEmbed = buildQuestBuilderEmbed({
-    ...initial,
-    quest: { ...initial.quest, status: "active" },
-  });
-  const message = await interaction.editReply({ embeds: [publishedEmbed], allowedMentions: { parse: [] } });
-
-  try {
-    const snapshot = await publishQuest({
-      questId,
-      creatorId: interaction.user.id,
-      messageId: message.id,
-    });
-
-    await interaction.editReply({ embeds: [buildQuestBuilderEmbed(snapshot)], allowedMentions: { parse: [] } });
-  } catch (err) {
-    await interaction.editReply({ content: `Could not publish quest: ${(err as Error).message}` });
-  }
-}
-
-async function listPresets(interaction: ChatInputCommandInteraction) {
-  const lines = listQuestTaskDefinitions().map((definition) => `**${definition.label}**\n\`${definition.type}\``);
-  const embed = new EmbedBuilder()
-    .setColor(0x77a7ff)
-    .setTitle("Quest Task Presets")
-    .setDescription(lines.join("\n\n"))
-    .setFooter({ text: "Use /quest draft, then add preset tasks." })
-    .setTimestamp();
-
-  await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
-}
-
-async function createEventQuest(interaction: ChatInputCommandInteraction) {
-  const eventId = interaction.options.getString("event", true);
-  const reward = roundSats(interaction.options.getNumber("reward", true));
-  const minMinutes = interaction.options.getInteger("min_minutes", true);
-  const maxRewards = interaction.options.getInteger("max_rewards");
-
-  if (reward <= 0) {
-    return interaction.reply({ content: "Reward must be greater than zero.", flags: MessageFlags.Ephemeral });
-  }
-
-  await interaction.deferReply();
-
-  const event = await interaction.guild!.scheduledEvents
-    .fetch({ guildScheduledEvent: eventId, withUserCount: true })
-    .catch(() => null);
-  if (!event) return interaction.editReply({ content: "I could not find that scheduled event." });
-
-  const result = await createEventQuestFromSelection({
-    guildId: interaction.guild!.id,
-    channelId: interaction.channelId,
-    creatorId: interaction.user.id,
-    event,
-    reward,
-    minMinutes,
-    maxRewards,
-  });
-
-  if (!result.ok) return interaction.editReply({ content: result.error });
-
-  const reply = await interaction.editReply({ embeds: [result.embed], allowedMentions: { parse: [] } });
-  await storeEventQuestMessageId(result.quest.id, reply.id);
 }
 
 async function createEventQuestFromSelection(input: {
@@ -882,7 +811,6 @@ async function createEventQuestFromSelection(input: {
 
   const balance = await getBalance(input.creatorId);
   if (balance < input.reward) return { ok: false, error: "Insufficient balance to fund even one quest reward." };
-
   if (input.maxRewards !== null && balance < roundSats(input.reward * input.maxRewards)) {
     return {
       ok: false,
@@ -961,11 +889,194 @@ async function createEventQuestFromSelection(input: {
   return { ok: true, quest, embed };
 }
 
+async function createMultiStepQuestFromSession(
+  interaction: ButtonInteraction,
+  session: QuestBuilderSession,
+): Promise<{ ok: true; questId: number; embed: EmbedBuilder } | { ok: false; error: string }> {
+  const tasks: Parameters<typeof createQuestDefinition>[0]["tasks"] = [];
+  const rewardTiers: Array<{ completedTaskCount: number; rewardSats: number }> = [];
+
+  let taskIndex = 0;
+  if (session.eventEnabled && session.selectedEvent) {
+    const event = await interaction.guild?.scheduledEvents
+      .fetch({ guildScheduledEvent: session.selectedEvent.id, withUserCount: false })
+      .catch(() => null);
+    if (!event || !event.channelId || !eventIsVoiceLike(event)) {
+      return { ok: false, error: "That event is not attached to a voice or stage channel anymore." };
+    }
+
+    tasks.push({
+      taskKey: "event_attendance",
+      type: "event_attendance",
+      title: `Attend ${event.name}`,
+      description: `Stay connected to <#${event.channelId}> for ${session.minMinutes} minute${session.minMinutes === 1 ? "" : "s"}.`,
+      config: {
+        scheduledEventId: event.id,
+        eventChannelId: event.channelId,
+        minMinutes: session.minMinutes,
+      },
+    });
+    taskIndex += 1;
+  }
+
+  if (session.linkEnabled && session.linkChannelId && session.linkSource) {
+    tasks.push({
+      taskKey: `first_link_${session.linkSource}_${session.linkChannelId}`,
+      type: "first_link_in_channel",
+      title: session.linkSource === "latest_tweet" ? "Share latest feed link" : "Share nearest event link",
+      description: `Be first every ${session.linkRefreshMinutes} minutes to post the configured link in <#${session.linkChannelId}>.`,
+      config: {
+        targetChannelId: session.linkChannelId,
+        source: session.linkSource,
+        refreshMinutes: session.linkRefreshMinutes,
+      },
+    });
+    taskIndex += 1;
+  }
+
+  if (tasks.length === 0) return { ok: false, error: "Add at least one task before publishing." };
+
+  rewardTiers.push({ completedTaskCount: 1, rewardSats: session.rewardSats1! });
+  if (tasks.length === 2) {
+    rewardTiers.push({ completedTaskCount: 2, rewardSats: session.rewardSats2! });
+  }
+
+  const maxReward = Math.max(...rewardTiers.map((tier) => tier.rewardSats));
+  const balance = await getBalance(session.creatorId);
+  if (balance < maxReward) {
+    return { ok: false, error: "Insufficient balance to cover at least one full payout." };
+  }
+
+  const title = inferTitle(session);
+  const description = session.description ?? null;
+  const startsAt = session.eventEnabled && session.selectedEvent?.scheduledStartTimestamp
+    ? new Date(session.selectedEvent.scheduledStartTimestamp).toISOString()
+    : null;
+
+  try {
+    const snapshot = await createQuestDefinition({
+      guildId: session.guildId,
+      channelId: session.channelId,
+      creatorId: session.creatorId,
+      title,
+      description,
+      startsAt,
+      endsAt: null,
+      tasks,
+      rewardTiers,
+    });
+
+    return { ok: true, questId: snapshot.quest.id, embed: buildPublishedQuestEmbed(snapshot) };
+  } catch (err) {
+    return { ok: false, error: `Could not publish quest: ${(err as Error).message}` };
+  }
+}
+
+function buildPublishedQuestEmbed(snapshot: Awaited<ReturnType<typeof getQuestSnapshot>> & {}): EmbedBuilder {
+  const tierLines = snapshot.tiers.map((tier) =>
+    `↳ **${tier.completed_task_count} task${tier.completed_task_count === 1 ? "" : "s"}** → ${formatSats(tier.reward_sats)}`
+  );
+  const taskLines = snapshot.tasks.map((task, index) => {
+    const def = getQuestTaskDefinition(task.type);
+    const requirement = def?.renderRequirement(task.config) ?? task.description ?? task.title;
+    return `↳ **${index + 1}. ${task.title}**\n${requirement}`;
+  });
+
+  return new EmbedBuilder()
+    .setColor(QUEST_COLOR)
+    .setTitle(`❄️ ${snapshot.quest.title}`)
+    .setDescription(snapshot.quest.description ?? "A multi-step sats quest.")
+    .addFields(
+      { name: "Rewards:", value: tierLines.join("\n") || "No reward tiers.", inline: false },
+      { name: "Requirements:", value: taskLines.join("\n\n").slice(0, 1024), inline: false },
+    )
+    .setFooter({ text: "⚡ Powered by matsFi" })
+    .setTimestamp();
+}
+
 async function storeEventQuestMessageId(questId: number, messageId: string) {
   const { error } = await supabase
     .from("event_quests")
     .update({ message_id: messageId })
     .eq("id", questId);
-
   if (error) console.warn("[Quest] Failed to store quest message id:", error.message);
+}
+
+async function storeQuestMessageId(questId: number, messageId: string) {
+  const { error } = await supabase
+    .from("quests")
+    .update({ message_id: messageId })
+    .eq("id", questId);
+  if (error) console.warn("[Quest] Failed to store quest message id:", error.message);
+}
+
+async function completeTaskOverride(interaction: ChatInputCommandInteraction) {
+  const questId = interaction.options.getInteger("quest_id", true);
+  const taskKey = interaction.options.getString("task_key", true).trim();
+  const user = interaction.options.getUser("user", true);
+  const note = interaction.options.getString("note")?.trim() || null;
+
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  const snapshot = await getQuestSnapshot(questId).catch((err) => {
+    console.warn("[Quest] Manual completion failed:", (err as Error).message);
+    return null;
+  });
+  if (!snapshot) return interaction.editReply({ content: "Quest not found." });
+  if (snapshot.quest.creator_id !== interaction.user.id) {
+    return interaction.editReply({ content: "Only the quest creator can complete tasks manually." });
+  }
+  if (snapshot.quest.status !== "active") {
+    return interaction.editReply({ content: "Only active quests can receive completions." });
+  }
+
+  const task = snapshot.tasks.find((candidate) => candidate.task_key === taskKey);
+  if (!task) {
+    return interaction.editReply({ content: `Task \`${taskKey}\` was not found on this quest.` });
+  }
+
+  const result = await completeAndNotify(
+    interaction.client,
+    {
+      id: task.id,
+      quest_id: snapshot.quest.id,
+      title: task.title,
+      quest: {
+        id: snapshot.quest.id,
+        guild_id: snapshot.quest.guild_id,
+        channel_id: snapshot.quest.channel_id,
+        message_id: snapshot.quest.message_id,
+        creator_id: snapshot.quest.creator_id,
+        title: snapshot.quest.title,
+        description: snapshot.quest.description,
+        status: snapshot.quest.status,
+        max_reward_sats: snapshot.quest.max_reward_sats,
+        starts_at: snapshot.quest.starts_at,
+        ends_at: snapshot.quest.ends_at,
+        metadata: snapshot.quest.metadata,
+      },
+    },
+    user.id,
+    {
+      kind: "manual_override",
+      completedBy: interaction.user.id,
+      note,
+    },
+  ).catch((err) => {
+    throw new Error(`Could not complete task: ${(err as Error).message}`);
+  });
+
+  if (!result.ok) {
+    return interaction.editReply({ content: `Task was not completed: ${result.reason ?? "unknown reason"}.` });
+  }
+
+  const rewardText = (result.rewardDeltaSats ?? 0) > 0
+    ? ` Paid **${formatSats(result.rewardDeltaSats ?? 0)}**.`
+    : " No new tier payout was due.";
+  const duplicateText = result.insertedCompletion === false ? " This user had already completed that task." : "";
+
+  await interaction.editReply({
+    content: `Marked **${task.title}** complete for ${user}.${rewardText}${duplicateText}`,
+    allowedMentions: { parse: [] },
+  });
 }
