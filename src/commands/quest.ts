@@ -142,10 +142,20 @@ type QuestBuilderSession = {
   channelId: string;
   creatorId: string;
   eventId: string | null;
+  events: QuestBuilderEventOption[];
+  selectedEvent: QuestBuilderEventOption | null;
   rewardSats: number | null;
   minMinutes: number | null;
   maxRewards: number | null;
   expiresAt: number;
+};
+
+type QuestBuilderEventOption = {
+  id: string;
+  name: string;
+  channelId: string;
+  channelName: string | null;
+  scheduledStartTimestamp: number | null;
 };
 
 const questBuilderSessions = new Map<string, QuestBuilderSession>();
@@ -272,15 +282,28 @@ function cleanupQuestBuilderSessions() {
   }
 }
 
-function createBuilderSession(interaction: ChatInputCommandInteraction): QuestBuilderSession {
+function toBuilderEventOption(event: GuildScheduledEvent): QuestBuilderEventOption {
+  return {
+    id: event.id,
+    name: event.name,
+    channelId: event.channelId ?? "",
+    channelName: event.channel?.name ?? null,
+    scheduledStartTimestamp: event.scheduledStartTimestamp ?? null,
+  };
+}
+
+async function createBuilderSession(interaction: ChatInputCommandInteraction): Promise<QuestBuilderSession> {
   cleanupQuestBuilderSessions();
   const id = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+  const events = await getSelectableEvents(interaction).catch(() => []);
   const session: QuestBuilderSession = {
     id,
     guildId: interaction.guild!.id,
     channelId: interaction.channelId,
     creatorId: interaction.user.id,
     eventId: null,
+    events: events.slice(0, 25).map(toBuilderEventOption),
+    selectedEvent: null,
     rewardSats: null,
     minMinutes: null,
     maxRewards: null,
@@ -304,13 +327,8 @@ function selectedLabel(value: string | number | null, fallback = "Not selected")
   return value == null ? fallback : String(value);
 }
 
-async function resolveBuilderEvent(interaction: Interaction, session: QuestBuilderSession): Promise<GuildScheduledEvent | null> {
-  if (!interaction.guild || !session.eventId) return null;
-  return interaction.guild.scheduledEvents.fetch(session.eventId).catch(() => null);
-}
-
-async function buildQuestCreatorView(interaction: Interaction, session: QuestBuilderSession) {
-  const event = await resolveBuilderEvent(interaction, session);
+function buildQuestCreatorView(session: QuestBuilderSession) {
+  const event = session.selectedEvent;
   const rewardLabel = session.rewardSats == null ? "Not selected" : formatSats(session.rewardSats);
   const maxLabel = session.maxRewards == null ? "No cap" : `${session.maxRewards} attendees`;
   const totalLabel = session.rewardSats == null
@@ -332,29 +350,26 @@ async function buildQuestCreatorView(interaction: Interaction, session: QuestBui
     )
     .setFooter({ text: "This setup expires after 15 minutes." });
 
-  if (event?.scheduledStartAt) {
+  if (event?.scheduledStartTimestamp) {
     embed.addFields({
       name: "Scheduled start",
-      value: `<t:${Math.floor(event.scheduledStartAt.getTime() / 1000)}:F>`,
+      value: `<t:${Math.floor(event.scheduledStartTimestamp / 1000)}:F>`,
       inline: false,
     });
   }
 
   const rows: Array<ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>> = [];
 
-  const events = interaction.guild
-    ? await getSelectableEvents(interaction as ChatInputCommandInteraction).catch(() => [])
-    : [];
-  if (events.length > 0) {
+  if (session.events.length > 0) {
     rows.push(
       new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
         new StringSelectMenuBuilder()
           .setCustomId(builderId("event", session.id))
           .setPlaceholder(event ? event.name.slice(0, 100) : "Choose a scheduled event")
           .addOptions(
-            events.slice(0, 25).map((candidate) => {
-              const starts = candidate.scheduledStartAt
-                ? candidate.scheduledStartAt.toLocaleString("en-US", {
+            session.events.map((candidate) => {
+              const starts = candidate.scheduledStartTimestamp
+                ? new Date(candidate.scheduledStartTimestamp).toLocaleString("en-US", {
                   month: "short",
                   day: "numeric",
                   hour: "numeric",
@@ -363,7 +378,7 @@ async function buildQuestCreatorView(interaction: Interaction, session: QuestBui
                 : "unscheduled";
               return {
                 label: candidate.name.slice(0, 100),
-                description: `${starts} in ${candidate.channel?.name ?? "event channel"}`.slice(0, 100),
+                description: `${starts} in ${candidate.channelName ?? "event channel"}`.slice(0, 100),
                 value: candidate.id,
                 default: candidate.id === session.eventId,
               };
@@ -395,9 +410,9 @@ async function buildQuestCreatorView(interaction: Interaction, session: QuestBui
 }
 
 async function startQuestBuilder(interaction: ChatInputCommandInteraction) {
-  const session = createBuilderSession(interaction);
+  const session = await createBuilderSession(interaction);
   await interaction.reply({
-    ...(await buildQuestCreatorView(interaction, session)),
+    ...buildQuestCreatorView(session),
     flags: MessageFlags.Ephemeral,
   });
 }
@@ -440,7 +455,7 @@ function touchBuilderSession(session: QuestBuilderSession) {
 }
 
 async function updateBuilderMessage(interaction: ButtonInteraction | StringSelectMenuInteraction | ModalSubmitInteraction, session: QuestBuilderSession) {
-  const view = await buildQuestCreatorView(interaction, session);
+  const view = buildQuestCreatorView(session);
   if (interaction.deferred || interaction.isModalSubmit()) {
     await interaction.editReply(view);
   } else {
@@ -454,7 +469,10 @@ async function handleQuestBuilderSelect(interaction: StringSelectMenuInteraction
   if (interaction.user.id !== session.creatorId) return rejectBuilderInteraction(interaction, "Only the person who opened this setup can edit it.");
 
   const value = interaction.values[0];
-  if (parsed.action === "event") session.eventId = value;
+  if (parsed.action === "event") {
+    session.eventId = value;
+    session.selectedEvent = session.events.find((event) => event.id === value) ?? null;
+  }
   touchBuilderSession(session);
 
   await interaction.deferUpdate();
@@ -480,7 +498,7 @@ async function handleQuestBuilderButton(interaction: ButtonInteraction): Promise
   if (!session.eventId || !session.rewardSats || !session.minMinutes) {
     await interaction.editReply({
       content: "Pick an event, reward, and required time before creating the quest.",
-      ...(await buildQuestCreatorView(interaction, session)),
+      ...buildQuestCreatorView(session),
     });
     return;
   }
@@ -488,12 +506,6 @@ async function handleQuestBuilderButton(interaction: ButtonInteraction): Promise
   const event = await interaction.guild?.scheduledEvents.fetch(session.eventId).catch(() => null);
   if (!event) {
     await interaction.editReply({ content: "I could not find that scheduled event anymore.", embeds: [], components: [] });
-    return;
-  }
-
-  const targetChannel = await interaction.client.channels.fetch(session.channelId).catch(() => null);
-  if (!targetChannel || !("send" in targetChannel)) {
-    await interaction.editReply({ content: "I cannot post the quest in this channel.", embeds: [], components: [] });
     return;
   }
 
@@ -508,11 +520,11 @@ async function handleQuestBuilderButton(interaction: ButtonInteraction): Promise
   });
 
   if (!result.ok) {
-    await interaction.editReply({ content: result.error, ...(await buildQuestCreatorView(interaction, session)) });
+    await interaction.editReply({ content: result.error, ...buildQuestCreatorView(session) });
     return;
   }
 
-  const message = await targetChannel.send({ embeds: [result.embed], allowedMentions: { parse: [] } });
+  const message = await interaction.followUp({ embeds: [result.embed], allowedMentions: { parse: [] } });
   await storeEventQuestMessageId(result.quest.id, message.id);
   questBuilderSessions.delete(session.id);
 
