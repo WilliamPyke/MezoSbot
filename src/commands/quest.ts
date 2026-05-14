@@ -955,7 +955,7 @@ async function createEventQuestFromSelection(input: {
   };
 
   const thumbnail = input.event.coverImageURL({ size: 256 });
-  const embed = buildEventQuestEmbed(quest, { confirmedParticipants: input.event.userCount ?? null });
+  const embed = buildEventQuestEmbed(quest);
   if (thumbnail) embed.setThumbnail(thumbnail);
 
   return { ok: true, quest, embed };

@@ -35,10 +35,6 @@ export type EventQuestRow = {
 const SWEEP_MS = 60_000;
 const QUEST_COLOR = 0x77a7ff;
 
-type EventQuestEmbedOptions = {
-  confirmedParticipants?: number | null;
-};
-
 function nowIso(): string {
   return new Date().toISOString();
 }
@@ -299,15 +295,12 @@ async function updateConnectedAttendance(
   }
 }
 
-export function buildEventQuestEmbed(quest: EventQuestRow, options: EventQuestEmbedOptions = {}): EmbedBuilder {
+export function buildEventQuestEmbed(quest: EventQuestRow): EmbedBuilder {
   const cleanEventUrl = `https://discord.com/events/${quest.guild_id}/${quest.scheduled_event_id}`;
   const cleanStartsRelative = quest.scheduled_start_at
     ? `<t:${Math.floor(Date.parse(quest.scheduled_start_at) / 1000)}:R>`
     : "Unknown";
   const cleanMinutes = `${quest.min_minutes} minute${quest.min_minutes === 1 ? "" : "s"}`;
-  const automaticRewardLine = options.confirmedParticipants == null
-    ? "Unknown"
-    : `${options.confirmedParticipants} confirmed`;
 
   return new EmbedBuilder()
     .setColor(QUEST_COLOR)
@@ -325,8 +318,6 @@ export function buildEventQuestEmbed(quest: EventQuestRow, options: EventQuestEm
     .addFields(
       { name: "Rewards:", value: `↳ **${formatSats(quest.reward_sats)}** ⚡ Per Person`, inline: false },
       { name: "Requirements:", value: `↳ Join <#${quest.event_channel_id}> for **${cleanMinutes}**`, inline: false },
-      { name: "Progress", value: `Quest completed **${quest.rewards_count}** time${quest.rewards_count === 1 ? "" : "s"}.`, inline: false },
-      { name: "💎 Automatic Reward", value: automaticRewardLine, inline: true },
       { name: "Event", value: `[Open Discord Event](${cleanEventUrl})`, inline: true },
     )
     .setFooter({ text: "⚡ Powered by matsFi" })
@@ -350,7 +341,7 @@ async function refreshQuestMessage(client: Client, questId: number): Promise<voi
   const guild = await client.guilds.fetch(quest.guild_id).catch(() => null);
   const event = guild ? await fetchScheduledEventWithUserCount(guild, quest.scheduled_event_id) : null;
   const syncedQuest = event ? await syncQuestFromEvent(quest, event) : quest;
-  const embed = buildEventQuestEmbed(syncedQuest, { confirmedParticipants: event?.userCount ?? null });
+  const embed = buildEventQuestEmbed(syncedQuest);
   const thumbnail = event?.coverImageURL({ size: 256 });
   if (thumbnail) embed.setThumbnail(thumbnail);
 
