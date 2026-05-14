@@ -491,7 +491,7 @@ function touchBuilderSession(session: QuestBuilderSession) {
 
 async function updateBuilderMessage(interaction: ButtonInteraction | StringSelectMenuInteraction | ModalSubmitInteraction, session: QuestBuilderSession) {
   const view = await buildQuestCreatorView(interaction, session);
-  if (interaction.isModalSubmit()) {
+  if (interaction.deferred || interaction.isModalSubmit()) {
     await interaction.editReply(view);
   } else {
     await interaction.update(view);
@@ -510,6 +510,7 @@ async function handleQuestBuilderSelect(interaction: StringSelectMenuInteraction
   if (parsed.action === "cap") session.maxRewards = value === "none" ? null : Number(value);
   touchBuilderSession(session);
 
+  await interaction.deferUpdate();
   await updateBuilderMessage(interaction, session);
 }
 

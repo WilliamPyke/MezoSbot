@@ -382,7 +382,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
   if (isQuestBuilderInteraction(interaction)) {
     const cid = ("customId" in interaction && interaction.customId) || "";
     console.log(`[Discord] Quest builder interaction ${cid} from ${tag} (arrivalLag=${arrivalLagMs}ms)`);
-    await handleQuestBuilderInteraction(interaction);
+    try {
+      await handleQuestBuilderInteraction(interaction);
+    } catch (err) {
+      const message = (err as Error)?.message ?? String(err);
+      console.warn(`[Quest] Builder interaction ${cid} failed:`, message);
+      if ("followUp" in interaction && (interaction.deferred || interaction.replied)) {
+        await interaction.followUp({ content: `Could not update quest setup: ${message}`, flags: MessageFlags.Ephemeral }).catch(() => {});
+      } else if ("reply" in interaction) {
+        await interaction.reply({ content: `Could not update quest setup: ${message}`, flags: MessageFlags.Ephemeral }).catch(() => {});
+      }
+    }
     console.log(`[Discord] Quest builder ${cid} done in ${Date.now() - startMs}ms`);
     return;
   }
