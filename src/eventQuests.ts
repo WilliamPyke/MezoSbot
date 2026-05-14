@@ -90,11 +90,13 @@ async function eventIsRunning(client: Client, quest: EventQuestRow): Promise<boo
   const guild = await client.guilds.fetch(quest.guild_id).catch(() => null);
   const event = guild ? await fetchScheduledEventWithUserCount(guild, quest.scheduled_event_id) : null;
   if (!event) return false;
+  if (event.status === GuildScheduledEventStatus.Completed || event.status === GuildScheduledEventStatus.Canceled) {
+    return false;
+  }
 
   const syncedQuest = await syncQuestFromEvent(quest, event);
   Object.assign(quest, syncedQuest);
-  const ignoreStart = event.status === GuildScheduledEventStatus.Active;
-  return eventStatusAllowsAttendance(event.status) && eventWindowAllowsAttendance(syncedQuest, Date.now(), { ignoreStart });
+  return eventWindowAllowsAttendance(syncedQuest, Date.now(), { ignoreStart: true });
 }
 
 async function fetchScheduledEventWithUserCount(
@@ -303,10 +305,7 @@ export function buildEventQuestEmbed(quest: EventQuestRow, options: EventQuestEm
     ? `<t:${Math.floor(Date.parse(quest.scheduled_start_at) / 1000)}:R>`
     : "Unknown";
   const cleanMinutes = `${quest.min_minutes} minute${quest.min_minutes === 1 ? "" : "s"}`;
-  const claimLine = quest.max_rewards === null
-    ? "Automatic one time reward"
-    : `${quest.rewards_count}/${quest.max_rewards} rewards claimed`;
-  const confirmedLine = options.confirmedParticipants == null
+  const automaticRewardLine = options.confirmedParticipants == null
     ? "Unknown"
     : `${options.confirmedParticipants} confirmed`;
 
@@ -327,8 +326,7 @@ export function buildEventQuestEmbed(quest: EventQuestRow, options: EventQuestEm
       { name: "Rewards:", value: `↳ **${formatSats(quest.reward_sats)}** ⚡ Per Person`, inline: false },
       { name: "Requirements:", value: `↳ Join <#${quest.event_channel_id}> for **${cleanMinutes}**`, inline: false },
       { name: "Progress", value: `Quest completed **${quest.rewards_count}** time${quest.rewards_count === 1 ? "" : "s"}.`, inline: false },
-      { name: "💎 Automatic Reward", value: claimLine, inline: false },
-      { name: "Confirmed Participants", value: confirmedLine, inline: true },
+      { name: "💎 Automatic Reward", value: automaticRewardLine, inline: true },
       { name: "Event", value: `[Open Discord Event](${cleanEventUrl})`, inline: true },
     )
     .setFooter({ text: "⚡ Powered by matsFi" })

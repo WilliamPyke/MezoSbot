@@ -131,11 +131,13 @@ async function eventTaskIsRunning(client: Client, task: ActiveQuestTask<EventAtt
   const guild = await client.guilds.fetch(task.quest.guild_id).catch(() => null);
   const event = await guild?.scheduledEvents.fetch(task.config.scheduledEventId).catch(() => null);
   if (!event) return false;
+  if (event.status === GuildScheduledEventStatus.Completed || event.status === GuildScheduledEventStatus.Canceled) {
+    return false;
+  }
 
   const syncedTask = await syncTaskQuestFromEvent(task, event);
   Object.assign(task.quest, syncedTask.quest);
-  return eventStatusAllowsAttendance(event.status) &&
-    questWindowAllowsCompletion(syncedTask.quest, Date.now(), { ignoreStart: event.status === GuildScheduledEventStatus.Active });
+  return questWindowAllowsCompletion(syncedTask.quest, Date.now(), { ignoreStart: true });
 }
 
 async function getActiveEventTasksForChannel(
