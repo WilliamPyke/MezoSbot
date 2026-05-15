@@ -36,6 +36,11 @@ type FirstLinkConfig = {
   refreshMinutes: number;
   // Rotating-list mode (current).
   linkList?: string[];
+  // Quantized window-boundary timestamp (ms) when the rotation should begin
+  // at index 0. Anchoring lets the quest start at link 1 of N regardless of
+  // wall-clock phase. Aligned to refreshMinutes window so rotation transitions
+  // line up with window-claim boundaries.
+  rotationStartMs?: number;
   // Legacy single-event mode: treated as a 1-item rotation.
   expectedEventId?: string;
   expectedEventUrl?: string;
@@ -51,10 +56,22 @@ export function resolveLinkList(config: FirstLinkConfig): string[] {
   return [];
 }
 
-export function currentLinkIndex(refreshMinutes: number, listLength: number, now = Date.now()): number {
+export function currentLinkIndex(
+  refreshMinutes: number,
+  listLength: number,
+  rotationStartMs: number | null = null,
+  now = Date.now(),
+): number {
   if (listLength <= 1) return 0;
   const windowMs = Math.max(1, Math.floor(refreshMinutes)) * 60_000;
-  return Math.floor(now / windowMs) % listLength;
+  const reference = typeof rotationStartMs === "number" && Number.isFinite(rotationStartMs) ? rotationStartMs : 0;
+  const elapsed = Math.max(0, now - reference);
+  return Math.floor(elapsed / windowMs) % listLength;
+}
+
+export function quantizeRotationAnchor(refreshMinutes: number, now = Date.now()): number {
+  const windowMs = Math.max(1, Math.floor(refreshMinutes)) * 60_000;
+  return Math.floor(now / windowMs) * windowMs;
 }
 
 export function normalizeUrlForMatch(rawUrl: string): string | null {
@@ -457,7 +474,7 @@ async function messageMatchesFirstLinkTask(
     const list = resolveLinkList(config);
     if (list.length === 0) return false;
 
-    const index = currentLinkIndex(config.refreshMinutes, list.length);
+    const index = currentLinkIndex(config.refreshMinutes, list.length, config.rotationStartMs ?? null);
     const targetNorm = normalizeUrlForMatch(list[index]);
     if (!targetNorm) return false;
 
@@ -503,33 +520,83 @@ async function claimFirstLinkWindow(
   return !!data;
 }
 
-function buildQuestRuntimeEmbed(snapshot: Awaited<ReturnType<typeof getQuestSnapshot>>): EmbedBuilder | null {
+const QUEST_STATUS_META: Record<string, { color: number; emoji: string; label: string }> = {
+  active: { color: 0x77a7ff, emoji: "❄️", label: "Active" },
+  completed: { color: 0x00cc6a, emoji: "✅", label: "Completed" },
+  exhausted: { color: 0xb59f4a, emoji: "💤", label: "Exhausted" },
+  cancelled: { color: 0x808080, emoji: "🚫", label: "Cancelled" },
+  draft: { color: 0x77a7ff, emoji: "📝", label: "Draft" },
+};
+
+export function buildQuestRuntimeEmbed(snapshot: Awaited<ReturnType<typeof getQuestSnapshot>>): EmbedBuilder | null {
   if (!snapshot) return null;
+  const status = QUEST_STATUS_META[snapshot.quest.status] ?? QUEST_STATUS_META.active;
+
+  const tierLines = snapshot.tiers.length === 0
+    ? "No reward tiers set."
+    : snapshot.tiers.map((tier) =>
+      `↳ **${tier.completed_task_count} task${tier.completed_task_count === 1 ? "" : "s"}** → **${formatSats(tier.reward_sats)}**`,
+    ).join("\n");
+
+  const embed = new EmbedBuilder()
+    .setColor(status.color)
+    .setTitle(`${status.emoji} ${snapshot.quest.title}`)
+    .setDescription(snapshot.quest.description?.trim() || "A multi-step sats quest. Complete tasks to earn rewards.")
+    .setFooter({ text: `Quest #${snapshot.quest.id} • ⚡ Powered by matsFi` })
+    .setTimestamp();
+
+  // Surface the rotating-link target front-and-center for link-quest tasks.
+  for (const task of snapshot.tasks) {
+    if (task.type !== "first_link_in_channel") continue;
+    const config = task.config as FirstLinkConfig;
+    if (config.source !== "rotating_list" && config.source !== "nearest_event") continue;
+
+    const list = resolveLinkList(config);
+    if (list.length === 0) continue;
+
+    const anchor = typeof config.rotationStartMs === "number" && Number.isFinite(config.rotationStartMs)
+      ? config.rotationStartMs
+      : null;
+    const index = currentLinkIndex(config.refreshMinutes, list.length, anchor);
+    const current = list[index];
+
+    const windowMs = Math.max(1, Math.floor(config.refreshMinutes)) * 60_000;
+    const reference = anchor ?? 0;
+    const elapsed = Math.max(0, Date.now() - reference);
+    const windowsElapsed = Math.floor(elapsed / windowMs);
+    const nextRotationMs = reference + (windowsElapsed + 1) * windowMs;
+    const nextTs = Math.floor(nextRotationMs / 1000);
+
+    const channelRef = `<#${config.targetChannelId}>`;
+    const positionLine = list.length > 1
+      ? `**Link ${index + 1} of ${list.length}** • Rotates every **${config.refreshMinutes}** min • Next rotation <t:${nextTs}:R>`
+      : `Refresh every **${config.refreshMinutes}** min • Next reset <t:${nextTs}:R>`;
+
+    embed.addFields(
+      { name: "🎯 Current target", value: `${positionLine}\n${current}`, inline: false },
+      { name: "📨 Post in", value: channelRef, inline: true },
+    );
+    break;
+  }
+
+  embed.addFields({ name: "✨ Rewards", value: tierLines, inline: false });
 
   const taskLines = snapshot.tasks.length === 0
-    ? ["No tasks yet."]
+    ? "No tasks yet."
     : snapshot.tasks.map((task, index) => {
       const definition = getQuestTaskDefinition(task.type);
       const requirement = definition?.renderRequirement(task.config) ?? task.description ?? task.title;
-      return `-> **${index + 1}. ${task.title}**\n${requirement}`;
-    });
+      return `**${index + 1}. ${task.title}**\n${requirement}`;
+    }).join("\n\n");
 
-  const tierLines = snapshot.tiers.map((tier) =>
-    `-> **${tier.completed_task_count} task${tier.completed_task_count === 1 ? "" : "s"}** -> ${formatSats(tier.reward_sats)}`
+  embed.addFields({ name: "📋 Requirements", value: taskLines.slice(0, 1024), inline: false });
+
+  embed.addFields(
+    { name: "Status", value: status.label, inline: true },
+    { name: "Max payout", value: `**${formatSats(snapshot.quest.max_reward_sats)}**`, inline: true },
   );
 
-  return new EmbedBuilder()
-    .setColor(0x77a7ff)
-    .setTitle(`Quest: ${snapshot.quest.title}`)
-    .setDescription(snapshot.quest.description ?? "A multistep sats quest.")
-    .addFields(
-      { name: "Rewards:", value: tierLines.join("\n") || "No reward tiers set.", inline: false },
-      { name: "Requirements:", value: taskLines.join("\n\n").slice(0, 1024), inline: false },
-      { name: "Quest ID", value: `\`${snapshot.quest.id}\``, inline: true },
-      { name: "Max Reward", value: `**${formatSats(snapshot.quest.max_reward_sats)}**`, inline: true },
-    )
-    .setFooter({ text: "Powered by matsFi" })
-    .setTimestamp();
+  return embed;
 }
 
 async function refreshQuestMessage(client: Client, questId: number): Promise<void> {
@@ -711,7 +778,25 @@ async function sweepRotatingLinkQuests(client: Client): Promise<void> {
       const list = resolveLinkList(task.config);
       if (list.length <= 1) continue;
 
-      const index = currentLinkIndex(task.config.refreshMinutes, list.length);
+      // Back-fill rotationStartMs for quests created before anchored rotation
+      // existed. Quantize to the current window boundary so the rotation
+      // resets to link 1 starting now.
+      let rotationStartMs = task.config.rotationStartMs ?? null;
+      if (typeof rotationStartMs !== "number" || !Number.isFinite(rotationStartMs)) {
+        rotationStartMs = quantizeRotationAnchor(task.config.refreshMinutes);
+        const newConfig = { ...task.config, rotationStartMs };
+        const { error: configError } = await supabase
+          .from("quest_tasks")
+          .update({ config: newConfig })
+          .eq("id", task.id);
+        if (configError) {
+          console.warn(`[QuestEngine] Failed to back-fill rotationStartMs for task ${task.id}:`, configError.message);
+          continue;
+        }
+        task.config = newConfig;
+      }
+
+      const index = currentLinkIndex(task.config.refreshMinutes, list.length, rotationStartMs);
       const metadata = (task.quest.metadata ?? {}) as Record<string, unknown>;
       const lastRendered = metadata.lastRenderedLinkIndex;
       if (lastRendered === index) continue;

@@ -21,6 +21,7 @@ import {
   type StringSelectMenuInteraction,
 } from "discord.js";
 import { getBalance } from "../balance.js";
+import { config as appConfig } from "../config.js";
 import { supabase } from "../db.js";
 import { formatSats, roundSats } from "../format.js";
 import { buildEventQuestEmbed, type EventQuestRow } from "../eventQuests.js";
@@ -29,7 +30,7 @@ import {
   getQuestSnapshot,
   getQuestTaskDefinition,
 } from "../quests/engine.js";
-import { completeAndNotify } from "../quests/runtime.js";
+import { buildQuestRuntimeEmbed, completeAndNotify } from "../quests/runtime.js";
 
 export const data = {
   name: "quest",
@@ -49,6 +50,14 @@ export const data = {
         { name: "task_key", type: 3 as const, description: "Task key (event_attendance, first_link_...)", required: true, maxLength: 64 },
         { name: "user", type: 6 as const, description: "User who completed the task", required: true },
         { name: "note", type: 3 as const, description: "Optional proof note", required: false, maxLength: 300 },
+      ],
+    },
+    {
+      name: "cancel",
+      type: 1 as const,
+      description: "Cancel a quest (creator or admin)",
+      options: [
+        { name: "quest_id", type: 4 as const, description: "Quest ID", required: true, minValue: 1 },
       ],
     },
   ],
@@ -441,6 +450,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   const subcommand = interaction.options.getSubcommand(true);
   if (subcommand === "create") return startQuestBuilder(interaction);
   if (subcommand === "complete_task") return completeTaskOverride(interaction);
+  if (subcommand === "cancel") return cancelQuest(interaction);
 
   return interaction.reply({ content: "Unknown quest command.", flags: MessageFlags.Ephemeral });
 }
@@ -1007,6 +1017,8 @@ async function createMultiStepQuestFromSession(
   }
 
   if (session.linkEnabled && session.linkChannelId && session.linkSource) {
+    const windowMs = Math.max(1, Math.floor(session.linkRefreshMinutes)) * 60_000;
+    const rotationStartMs = Math.floor(Date.now() / windowMs) * windowMs;
     tasks.push({
       taskKey: `first_link_${session.linkSource}_${session.linkChannelId}`,
       type: "first_link_in_channel",
@@ -1015,7 +1027,9 @@ async function createMultiStepQuestFromSession(
       config: {
         targetChannelId: session.linkChannelId,
         source: session.linkSource,
-        ...(session.linkSource === "rotating_list" ? { linkList: session.linkList } : {}),
+        ...(session.linkSource === "rotating_list"
+          ? { linkList: session.linkList, rotationStartMs }
+          : {}),
         refreshMinutes: session.linkRefreshMinutes,
       },
     });
@@ -1054,32 +1068,12 @@ async function createMultiStepQuestFromSession(
       rewardTiers,
     });
 
-    return { ok: true, questId: snapshot.quest.id, embed: buildPublishedQuestEmbed(snapshot) };
+    const embed = buildQuestRuntimeEmbed(snapshot);
+    if (!embed) return { ok: false, error: "Could not render quest embed." };
+    return { ok: true, questId: snapshot.quest.id, embed };
   } catch (err) {
     return { ok: false, error: `Could not publish quest: ${(err as Error).message}` };
   }
-}
-
-function buildPublishedQuestEmbed(snapshot: Awaited<ReturnType<typeof getQuestSnapshot>> & {}): EmbedBuilder {
-  const tierLines = snapshot.tiers.map((tier) =>
-    `↳ **${tier.completed_task_count} task${tier.completed_task_count === 1 ? "" : "s"}** → ${formatSats(tier.reward_sats)}`
-  );
-  const taskLines = snapshot.tasks.map((task, index) => {
-    const def = getQuestTaskDefinition(task.type);
-    const requirement = def?.renderRequirement(task.config) ?? task.description ?? task.title;
-    return `↳ **${index + 1}. ${task.title}**\n${requirement}`;
-  });
-
-  return new EmbedBuilder()
-    .setColor(QUEST_COLOR)
-    .setTitle(`❄️ ${snapshot.quest.title}`)
-    .setDescription(snapshot.quest.description ?? "A multi-step sats quest.")
-    .addFields(
-      { name: "Rewards:", value: tierLines.join("\n") || "No reward tiers.", inline: false },
-      { name: "Requirements:", value: taskLines.join("\n\n").slice(0, 1024), inline: false },
-    )
-    .setFooter({ text: "⚡ Powered by matsFi" })
-    .setTimestamp();
 }
 
 async function storeEventQuestMessageId(questId: number, messageId: string) {
@@ -1166,5 +1160,58 @@ async function completeTaskOverride(interaction: ChatInputCommandInteraction) {
   await interaction.editReply({
     content: `Marked **${task.title}** complete for ${user}.${rewardText}${duplicateText}`,
     allowedMentions: { parse: [] },
+  });
+}
+
+async function cancelQuest(interaction: ChatInputCommandInteraction) {
+  const questId = interaction.options.getInteger("quest_id", true);
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  const snapshot = await getQuestSnapshot(questId).catch((err) => {
+    console.warn("[Quest] Cancel lookup failed:", (err as Error).message);
+    return null;
+  });
+  if (!snapshot) return interaction.editReply({ content: `Quest \`${questId}\` was not found.` });
+
+  const isCreator = snapshot.quest.creator_id === interaction.user.id;
+  const isAdmin = appConfig.discord.adminIds.includes(interaction.user.id);
+  if (!isCreator && !isAdmin) {
+    return interaction.editReply({ content: "Only the quest creator or a bot admin can cancel a quest." });
+  }
+
+  if (snapshot.quest.status !== "active" && snapshot.quest.status !== "draft") {
+    return interaction.editReply({ content: `Quest is already \`${snapshot.quest.status}\`; nothing to cancel.` });
+  }
+
+  const { error } = await supabase
+    .from("quests")
+    .update({
+      status: "cancelled",
+      completed_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", questId)
+    .in("status", ["active", "draft"]);
+
+  if (error) {
+    console.warn("[Quest] Cancel failed:", error.message);
+    return interaction.editReply({ content: `Could not cancel: ${error.message}` });
+  }
+
+  // Repaint the public quest embed so it shows as cancelled.
+  const fresh = await getQuestSnapshot(questId).catch(() => null);
+  if (fresh?.quest.message_id) {
+    const channel = await interaction.client.channels.fetch(fresh.quest.channel_id).catch(() => null);
+    if (channel && "messages" in channel) {
+      const message = await channel.messages.fetch(fresh.quest.message_id).catch(() => null);
+      const embed = buildQuestRuntimeEmbed(fresh);
+      if (message && embed) {
+        await message.edit({ embeds: [embed], allowedMentions: { parse: [] } }).catch(() => {});
+      }
+    }
+  }
+
+  await interaction.editReply({
+    content: `🚫 Cancelled quest \`${questId}\` — **${snapshot.quest.title}**.${isAdmin && !isCreator ? " (admin override)" : ""}`,
   });
 }

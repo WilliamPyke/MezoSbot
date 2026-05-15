@@ -473,7 +473,11 @@ registerQuestTask({
     if (config.source === "rotating_list" && Array.isArray(config.linkList) && config.linkList.length > 0) {
       const list = config.linkList as string[];
       const windowMs = Math.max(1, Math.floor(refreshMinutes)) * 60_000;
-      const index = list.length <= 1 ? 0 : Math.floor(Date.now() / windowMs) % list.length;
+      const anchor = typeof config.rotationStartMs === "number" && Number.isFinite(config.rotationStartMs)
+        ? config.rotationStartMs as number
+        : 0;
+      const elapsed = Math.max(0, Date.now() - anchor);
+      const index = list.length <= 1 ? 0 : Math.floor(elapsed / windowMs) % list.length;
       const current = list[index];
       const rotationLine = list.length > 1
         ? `Rotates every ${refreshMinutes} min · link ${index + 1} of ${list.length}`
