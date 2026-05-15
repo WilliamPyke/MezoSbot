@@ -33,10 +33,44 @@ type EventAttendanceConfig = {
 type FirstLinkConfig = {
   targetChannelId: string;
   source: string;
+  refreshMinutes: number;
+  // Rotating-list mode (current).
+  linkList?: string[];
+  // Legacy single-event mode: treated as a 1-item rotation.
   expectedEventId?: string;
   expectedEventUrl?: string;
-  refreshMinutes: number;
 };
+
+export function resolveLinkList(config: FirstLinkConfig): string[] {
+  if (Array.isArray(config.linkList) && config.linkList.length > 0) {
+    return config.linkList.filter((url): url is string => typeof url === "string" && url.length > 0);
+  }
+  if (typeof config.expectedEventUrl === "string" && config.expectedEventUrl.length > 0) {
+    return [config.expectedEventUrl];
+  }
+  return [];
+}
+
+export function currentLinkIndex(refreshMinutes: number, listLength: number, now = Date.now()): number {
+  if (listLength <= 1) return 0;
+  const windowMs = Math.max(1, Math.floor(refreshMinutes)) * 60_000;
+  return Math.floor(now / windowMs) % listLength;
+}
+
+export function normalizeUrlForMatch(rawUrl: string): string | null {
+  if (typeof rawUrl !== "string") return null;
+  const stripped = rawUrl.trim().replace(/^<+/, "").replace(/[>,.;:!?)]+$/g, "");
+  let url: URL;
+  try {
+    url = new URL(stripped);
+  } catch {
+    return null;
+  }
+  let host = url.hostname.toLowerCase();
+  if (/^(www\.|canary\.|ptb\.)?discord(app)?\.com$/.test(host)) host = "discord.com";
+  const path = url.pathname.replace(/\/+$/, "");
+  return `${url.protocol.toLowerCase()}//${host}${path}${url.search}`;
+}
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -404,26 +438,6 @@ function extractDiscordEventIds(urls: string[]): string[] {
   return ids;
 }
 
-async function getNearestScheduledEventId(message: Message): Promise<string | null> {
-  if (!message.guild) return null;
-  const events = await message.guild.scheduledEvents.fetch().catch(() => null);
-  if (!events) return null;
-
-  const now = Date.now();
-  const nearest = [...events.values()]
-    .filter((event) =>
-      event.status === GuildScheduledEventStatus.Active ||
-      event.status === GuildScheduledEventStatus.Scheduled
-    )
-    .sort((a, b) => {
-      const aTime = a.status === GuildScheduledEventStatus.Active ? now : a.scheduledStartTimestamp ?? Number.MAX_SAFE_INTEGER;
-      const bTime = b.status === GuildScheduledEventStatus.Active ? now : b.scheduledStartTimestamp ?? Number.MAX_SAFE_INTEGER;
-      return aTime - bTime;
-    })[0];
-
-  return nearest?.id ?? null;
-}
-
 async function messageMatchesFirstLinkTask(
   message: Message,
   task: ActiveQuestTask<FirstLinkConfig>,
@@ -437,30 +451,22 @@ async function messageMatchesFirstLinkTask(
     return urls.some((url) => /^https?:\/\/(www\.)?(twitter\.com|x\.com)\//i.test(url));
   }
 
-  if (config.source === "nearest_event") {
-    const linkedEventIds = extractDiscordEventIds(urls);
-    if (linkedEventIds.length === 0) {
-      console.log(`[QuestEngine] First-link task ${task.id} saw URLs but no Discord event id`, {
-        messageId: message.id,
-        urls,
-      });
+  // rotating_list (and legacy nearest_event quests reuse the rotating-list matcher
+  // via resolveLinkList — a 1-item list reconstructed from expectedEventUrl).
+  if (config.source === "rotating_list" || config.source === "nearest_event") {
+    const list = resolveLinkList(config);
+    if (list.length === 0) return false;
+
+    const index = currentLinkIndex(config.refreshMinutes, list.length);
+    const targetNorm = normalizeUrlForMatch(list[index]);
+    if (!targetNorm) return false;
+
+    const messageNorms = new Set(urls.map(normalizeUrlForMatch).filter((u): u is string => !!u));
+    if (!messageNorms.has(targetNorm)) {
+      console.log(`[QuestEngine] First-link task ${task.id} rejected: expected=${targetNorm} got=${[...messageNorms].join(",")}`);
       return false;
     }
-
-    if (typeof config.expectedEventId === "string" && config.expectedEventId.length > 0) {
-      const matchesExpected = linkedEventIds.includes(config.expectedEventId);
-      if (!matchesExpected) {
-        console.log(`[QuestEngine] First-link task ${task.id} rejected event link`, {
-          messageId: message.id,
-          expectedEventId: config.expectedEventId,
-          linkedEventIds,
-        });
-      }
-      return matchesExpected;
-    }
-
-    const nearestEventId = await getNearestScheduledEventId(message);
-    return nearestEventId ? linkedEventIds.includes(nearestEventId) : linkedEventIds.length > 0;
+    return true;
   }
 
   return urls.length > 0;
@@ -687,6 +693,42 @@ async function sweepMultiStepQuests(client: Client): Promise<void> {
           accrualEndMs,
         });
       }
+    }
+  }
+
+  await sweepRotatingLinkQuests(client);
+}
+
+async function sweepRotatingLinkQuests(client: Client): Promise<void> {
+  for (const guild of client.guilds.cache.values()) {
+    const tasks = await getActiveTasksByType<FirstLinkConfig>(guild.id, "first_link_in_channel").catch(() => []);
+    const seenQuests = new Set<number>();
+    for (const task of tasks) {
+      if (task.config.source !== "rotating_list" && task.config.source !== "nearest_event") continue;
+      if (seenQuests.has(task.quest_id)) continue;
+      seenQuests.add(task.quest_id);
+
+      const list = resolveLinkList(task.config);
+      if (list.length <= 1) continue;
+
+      const index = currentLinkIndex(task.config.refreshMinutes, list.length);
+      const metadata = (task.quest.metadata ?? {}) as Record<string, unknown>;
+      const lastRendered = metadata.lastRenderedLinkIndex;
+      if (lastRendered === index) continue;
+
+      const { error } = await supabase
+        .from("quests")
+        .update({
+          metadata: { ...metadata, lastRenderedLinkIndex: index },
+          updated_at: nowIso(),
+        })
+        .eq("id", task.quest_id);
+      if (error) {
+        console.warn(`[QuestEngine] Failed to persist rotation index for quest ${task.quest_id}:`, error.message);
+        continue;
+      }
+
+      await refreshQuestMessage(client, task.quest_id);
     }
   }
 }

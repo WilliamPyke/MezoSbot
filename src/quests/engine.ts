@@ -457,11 +457,34 @@ registerQuestTask({
     if (typeof config.targetChannelId !== "string") return "targetChannelId is required";
     if (typeof config.source !== "string") return "source is required";
     if (typeof config.refreshMinutes !== "number" || config.refreshMinutes < 1) return "refreshMinutes must be at least 1";
+    if (config.source === "rotating_list") {
+      if (!Array.isArray(config.linkList) || config.linkList.length === 0) {
+        return "linkList must contain at least one URL";
+      }
+      if (!config.linkList.every((url) => typeof url === "string" && /^https?:\/\//i.test(url))) {
+        return "linkList entries must be http(s) URLs";
+      }
+    }
     return null;
   },
   renderRequirement(config) {
-    const source = config.source === "nearest_event" ? "the configured event link" : config.source;
-    return `Be first every ${config.refreshMinutes} min to post ${source} in <#${config.targetChannelId}>`;
+    const channelRef = `<#${config.targetChannelId}>`;
+    const refreshMinutes = typeof config.refreshMinutes === "number" ? config.refreshMinutes : 60;
+    if (config.source === "rotating_list" && Array.isArray(config.linkList) && config.linkList.length > 0) {
+      const list = config.linkList as string[];
+      const windowMs = Math.max(1, Math.floor(refreshMinutes)) * 60_000;
+      const index = list.length <= 1 ? 0 : Math.floor(Date.now() / windowMs) % list.length;
+      const current = list[index];
+      const rotationLine = list.length > 1
+        ? `Rotates every ${refreshMinutes} min · link ${index + 1} of ${list.length}`
+        : `Refresh every ${refreshMinutes} min`;
+      return `Be first to post **the current link** in ${channelRef}\n${rotationLine}\nCurrent: ${current}`;
+    }
+    if (config.source === "nearest_event" && typeof config.expectedEventUrl === "string") {
+      return `Be first every ${refreshMinutes} min to post ${config.expectedEventUrl} in ${channelRef}`;
+    }
+    const source = config.source === "latest_tweet" ? "the latest admin feed link" : String(config.source);
+    return `Be first every ${refreshMinutes} min to post ${source} in ${channelRef}`;
   },
 });
 

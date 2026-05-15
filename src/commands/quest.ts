@@ -68,7 +68,7 @@ type QuestBuilderEventOption = {
   scheduledStartTimestamp: number | null;
 };
 
-type LinkSource = "latest_tweet" | "nearest_event";
+type LinkSource = "latest_tweet" | "rotating_list";
 
 type QuestBuilderSession = {
   id: string;
@@ -86,8 +86,7 @@ type QuestBuilderSession = {
   linkChannelId: string | null;
   linkChannelName: string | null;
   linkSource: LinkSource | null;
-  linkEventUrl: string | null;
-  linkEventId: string | null;
+  linkList: string[];
   linkRefreshMinutes: number;
 
   title: string | null;
@@ -156,8 +155,7 @@ async function createBuilderSession(interaction: ChatInputCommandInteraction): P
     linkChannelId: null,
     linkChannelName: null,
     linkSource: null,
-    linkEventUrl: null,
-    linkEventId: null,
+    linkList: [],
     linkRefreshMinutes: DEFAULT_REFRESH_MINUTES,
 
     title: null,
@@ -186,32 +184,40 @@ function touchBuilderSession(session: QuestBuilderSession) {
   session.expiresAt = Date.now() + BUILDER_TTL_MS;
 }
 
-function extractDiscordEventIdFromUrl(rawUrl: string): string | null {
-  let url: URL;
-  try {
-    url = new URL(rawUrl.trim().replace(/[>,.]+$/g, ""));
-  } catch {
-    return null;
-  }
+function parseLinkListInput(raw: string): { ok: true; list: string[] } | { ok: false; error: string } {
+  const lines = raw
+    .split(/\r?\n/)
+    .map((line) => line.trim().replace(/^<+/, "").replace(/[>,.;:!?)]+$/g, ""))
+    .filter((line) => line.length > 0);
+  if (lines.length === 0) return { ok: false, error: "Add at least one URL (one per line)." };
 
-  const host = url.hostname.toLowerCase();
-  if (/^(www\.|canary\.|ptb\.)?discord(app)?\.com$/.test(host)) {
-    const parts = url.pathname.split("/").filter(Boolean);
-    if (parts[0] === "events" && parts[2]) return parts[2];
+  const list: string[] = [];
+  const seen = new Set<string>();
+  for (const line of lines) {
+    let url: URL;
+    try {
+      url = new URL(line);
+    } catch {
+      return { ok: false, error: `Not a valid URL: ${line.slice(0, 80)}` };
+    }
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      return { ok: false, error: `Only http/https URLs are allowed: ${line.slice(0, 80)}` };
+    }
+    if (seen.has(url.toString())) continue;
+    seen.add(url.toString());
+    list.push(line);
   }
-
-  if (host === "discord.gg" || host.endsWith(".discord.gg")) {
-    return url.searchParams.get("event");
-  }
-
-  return null;
+  if (list.length === 0) return { ok: false, error: "Add at least one URL (one per line)." };
+  return { ok: true, list };
 }
 
 function inferTitle(session: QuestBuilderSession): string {
   if (session.title?.trim()) return session.title.trim();
   if (session.eventEnabled && session.selectedEvent) return session.selectedEvent.name;
   if (session.linkEnabled && session.linkSource === "latest_tweet") return "First to share the latest feed link";
-  if (session.linkEnabled && session.linkSource === "nearest_event") return "First to share the event link";
+  if (session.linkEnabled && session.linkSource === "rotating_list") {
+    return session.linkList.length > 1 ? "First to share the active link" : "First to share the link";
+  }
   return "Untitled quest";
 }
 
@@ -234,7 +240,9 @@ function isReadyToPublish(session: QuestBuilderSession): string | null {
   if (session.linkEnabled) {
     if (!session.linkChannelId) return "Pick the channel for the first-link task.";
     if (!session.linkSource) return "Pick the link source for the first-link task.";
-    if (session.linkSource === "nearest_event" && !session.linkEventId) return "Set the Discord event link for the first-link task.";
+    if (session.linkSource === "rotating_list" && session.linkList.length === 0) {
+      return "Paste at least one URL into the rotating link list.";
+    }
     if (!session.linkRefreshMinutes || session.linkRefreshMinutes < 1) return "Set the refresh window for the first-link task.";
   }
 
@@ -250,7 +258,7 @@ function isReadyToPublish(session: QuestBuilderSession): string | null {
 
 function formatLinkSource(source: LinkSource | null): string {
   if (source === "latest_tweet") return "Latest admin feed link";
-  if (source === "nearest_event") return "Specific Discord event link";
+  if (source === "rotating_list") return "Rotating link list";
   return "Not selected";
 }
 
@@ -276,10 +284,10 @@ function buildBuilderEmbed(session: QuestBuilderSession): EmbedBuilder {
   }
   if (session.linkEnabled) {
     const channelLabel = session.linkChannelId ? `<#${session.linkChannelId}>` : "*Channel not selected*";
-    const eventLabel = session.linkSource === "nearest_event"
-      ? ` • ${session.linkEventUrl ? `[event](${session.linkEventUrl})` : "*Event link not set*"}`
+    const listLabel = session.linkSource === "rotating_list"
+      ? ` • ${session.linkList.length > 0 ? `${session.linkList.length} link${session.linkList.length === 1 ? "" : "s"}` : "*No links set*"}`
       : "";
-    tasks.push(`↳ **First link** — ${channelLabel} • ${formatLinkSource(session.linkSource)}${eventLabel} • every **${session.linkRefreshMinutes}** min`);
+    tasks.push(`↳ **First link** — ${channelLabel} • ${formatLinkSource(session.linkSource)}${listLabel} • every **${session.linkRefreshMinutes}** min`);
   }
 
   const rewards: string[] = [];
@@ -367,7 +375,7 @@ function buildBuilderComponents(session: QuestBuilderSession): BuilderComponentR
           .setPlaceholder(session.linkSource ? formatLinkSource(session.linkSource) : "Pick a link source")
           .addOptions([
             { label: "Latest admin feed link", value: "latest_tweet", default: session.linkSource === "latest_tweet" },
-            { label: "Specific Discord event link", value: "nearest_event", default: session.linkSource === "nearest_event" },
+            { label: "Rotating link list", value: "rotating_list", default: session.linkSource === "rotating_list" },
           ]),
       ),
     );
@@ -390,12 +398,12 @@ function buildBuilderComponents(session: QuestBuilderSession): BuilderComponentR
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(activeTaskCount(session) === 0),
   );
-  if (session.linkEnabled && session.linkSource === "nearest_event") {
+  if (session.linkEnabled && session.linkSource === "rotating_list") {
     toggleRow.addComponents(
       new ButtonBuilder()
-        .setCustomId(builderId("event_link", session.id))
-        .setLabel(session.linkEventId ? "Edit event link" : "Set event link")
-        .setStyle(session.linkEventId ? ButtonStyle.Secondary : ButtonStyle.Primary),
+        .setCustomId(builderId("link_list", session.id))
+        .setLabel(session.linkList.length > 0 ? `Edit link list (${session.linkList.length})` : "Set link list")
+        .setStyle(session.linkList.length > 0 ? ButtonStyle.Secondary : ButtonStyle.Primary),
     );
   }
   rows.push(toggleRow);
@@ -514,11 +522,10 @@ async function handleSelect(interaction: StringSelectMenuInteraction): Promise<v
     session.eventId = value;
     session.selectedEvent = session.events.find((event) => event.id === value) ?? null;
   } else if (parsed.action === "link_source") {
-    if (value === "latest_tweet" || value === "nearest_event") {
+    if (value === "latest_tweet" || value === "rotating_list") {
       session.linkSource = value;
       if (value === "latest_tweet") {
-        session.linkEventUrl = null;
-        session.linkEventId = null;
+        session.linkList = [];
       }
     }
   } else {
@@ -594,14 +601,13 @@ async function handleButton(interaction: ButtonInteraction): Promise<void> {
     session.linkChannelId = null;
     session.linkChannelName = null;
     session.linkSource = null;
-    session.linkEventUrl = null;
-    session.linkEventId = null;
+    session.linkList = [];
     touchBuilderSession(session);
     await interaction.update(renderBuilderView(session));
     return;
   }
 
-  if (parsed.action === "event_link") return showEventLinkModal(interaction, session);
+  if (parsed.action === "link_list") return showLinkListModal(interaction, session);
 
   if (parsed.action === "details") return showDetailsModal(interaction, session);
 
@@ -697,21 +703,21 @@ async function showDetailsModal(interaction: ButtonInteraction, session: QuestBu
   await interaction.showModal(modal);
 }
 
-async function showEventLinkModal(interaction: ButtonInteraction, session: QuestBuilderSession): Promise<void> {
+async function showLinkListModal(interaction: ButtonInteraction, session: QuestBuilderSession): Promise<void> {
   const modal = new ModalBuilder()
-    .setCustomId(builderId("event_link_modal", session.id))
-    .setTitle("Event link");
+    .setCustomId(builderId("link_list_modal", session.id))
+    .setTitle("Rotating link list");
 
-  const eventLinkInput = new TextInputBuilder()
-    .setCustomId("event_link")
-    .setLabel("Discord event link")
-    .setStyle(TextInputStyle.Short)
+  const linkListInput = new TextInputBuilder()
+    .setCustomId("link_list")
+    .setLabel("One URL per line — rotates each window")
+    .setStyle(TextInputStyle.Paragraph)
     .setRequired(true)
-    .setMaxLength(300)
-    .setPlaceholder(`https://discord.com/events/${session.guildId}/...`)
-    .setValue(session.linkEventUrl ?? "");
+    .setMaxLength(4000)
+    .setPlaceholder("https://example.com/one\nhttps://example.com/two\nhttps://example.com/three")
+    .setValue(session.linkList.join("\n"));
 
-  modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(eventLinkInput));
+  modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(linkListInput));
   await interaction.showModal(modal);
 }
 
@@ -720,19 +726,15 @@ async function handleModal(interaction: ModalSubmitInteraction): Promise<void> {
   if (!parsed || !session) return rejectExpired(interaction);
   if (interaction.user.id !== session.creatorId) return rejectNotOwner(interaction);
 
-  if (parsed.action === "event_link_modal") {
-    const eventLink = interaction.fields.getTextInputValue("event_link").trim();
-    const eventId = extractDiscordEventIdFromUrl(eventLink);
-    if (!eventId) {
-      await interaction.reply({
-        content: "That does not look like a Discord event link. Use a discord.com/events link or an invite link with an event parameter.",
-        flags: MessageFlags.Ephemeral,
-      });
+  if (parsed.action === "link_list_modal") {
+    const raw = interaction.fields.getTextInputValue("link_list");
+    const result = parseLinkListInput(raw);
+    if (!result.ok) {
+      await interaction.reply({ content: result.error, flags: MessageFlags.Ephemeral });
       return;
     }
 
-    session.linkEventUrl = eventLink;
-    session.linkEventId = eventId;
+    session.linkList = result.list;
     touchBuilderSession(session);
     await interaction.deferUpdate();
     await updateBuilderMessage(interaction, session);
@@ -1008,14 +1010,12 @@ async function createMultiStepQuestFromSession(
     tasks.push({
       taskKey: `first_link_${session.linkSource}_${session.linkChannelId}`,
       type: "first_link_in_channel",
-      title: session.linkSource === "latest_tweet" ? "Share latest feed link" : "Share event link",
-      description: `Be first every ${session.linkRefreshMinutes} minutes to post the configured link in <#${session.linkChannelId}>.`,
+      title: session.linkSource === "latest_tweet" ? "Share latest feed link" : "Share the active link",
+      description: `Be first every ${session.linkRefreshMinutes} minutes to post the active link in <#${session.linkChannelId}>.`,
       config: {
         targetChannelId: session.linkChannelId,
         source: session.linkSource,
-        ...(session.linkSource === "nearest_event"
-          ? { expectedEventId: session.linkEventId, expectedEventUrl: session.linkEventUrl }
-          : {}),
+        ...(session.linkSource === "rotating_list" ? { linkList: session.linkList } : {}),
         refreshMinutes: session.linkRefreshMinutes,
       },
     });
