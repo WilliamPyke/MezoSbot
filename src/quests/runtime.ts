@@ -585,13 +585,20 @@ export async function completeAndNotify(
 export async function handleMultiStepQuestMessage(client: Client, message: Message): Promise<void> {
   if (!message.guild || message.author.bot) return;
 
-  const urls = await collectMessageUrlsWithDelayedEmbedFetch(message);
-  if (urls.length === 0) return;
-
   const tasks = await getActiveTasksByType<FirstLinkConfig>(message.guild.id, "first_link_in_channel").catch((err) => {
     console.warn("[QuestEngine] Failed to load link tasks:", (err as Error).message);
     return [];
   });
+  const channelHasTask = tasks.some((task) => task.config.targetChannelId === message.channelId);
+  if (channelHasTask) {
+    console.log(`[QuestEngine] Message ${message.id} in link-quest channel ${message.channelId} by ${message.author.id}: contentLen=${message.content.length} embeds=${message.embeds.length}`);
+  }
+
+  const urls = await collectMessageUrlsWithDelayedEmbedFetch(message);
+  if (channelHasTask) {
+    console.log(`[QuestEngine] Message ${message.id} extracted urls=${JSON.stringify(urls)}`);
+  }
+  if (urls.length === 0) return;
 
   for (const task of tasks) {
     if (!questWindowAllowsCompletion(task.quest)) continue;
