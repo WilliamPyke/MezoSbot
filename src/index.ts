@@ -77,6 +77,10 @@ const intents = [
   GatewayIntentBits.Guilds,
   GatewayIntentBits.GuildScheduledEvents,
   GatewayIntentBits.GuildVoiceStates,
+  // Required so MessageCreate fires for first-link quest matching. Reading
+  // message.content additionally needs the privileged MessageContent intent
+  // (added below); without it, the runtime falls back to embed URLs.
+  GatewayIntentBits.GuildMessages,
 ];
 
 if (config.discord.guildMembersIntent) {
@@ -84,17 +88,7 @@ if (config.discord.guildMembersIntent) {
 }
 
 if (config.discord.messageContentIntent) {
-  intents.push(GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent);
-}
-
-if (
-  config.gameboy.enabled &&
-  config.gameboy.textInputEnabled &&
-  config.gameboy.gameChannelId &&
-  config.discord.messageContentIntent
-) {
-  if (!intents.includes(GatewayIntentBits.GuildMessages)) intents.push(GatewayIntentBits.GuildMessages);
-  if (!intents.includes(GatewayIntentBits.MessageContent)) intents.push(GatewayIntentBits.MessageContent);
+  intents.push(GatewayIntentBits.MessageContent);
 }
 
 console.log(`[Discord] Gateway intents: ${intents.join(", ")}`);
