@@ -3,6 +3,7 @@ import { subtractBalance, addBalance, getBalance } from "../balance.js";
 import { registerDepositAddress } from "../evm.js";
 import { formatSats, roundSats } from "../format.js";
 import { sendTransferReceivedDm } from "../notifications.js";
+import { getRainBannedTerms, messageMatchesRainBan } from "../rainBans.js";
 
 export const data = {
   name: "rain",
@@ -51,12 +52,27 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     return interaction.editReply({ content: "❌ I need **Read Message History** permission in this channel to find active users." });
   }
   const sorted = [...fetched.values()].sort((a, b) => b.createdTimestamp - a.createdTimestamp);
+  let bannedTerms: Awaited<ReturnType<typeof getRainBannedTerms>> = [];
+  try {
+    bannedTerms = await getRainBannedTerms(interaction.guild.id);
+  } catch (err) {
+    console.warn("[Rain] Failed to load banned terms:", (err as Error)?.message ?? err);
+  }
+  const bannedUserIds = new Set<string>();
+  if (bannedTerms.length > 0) {
+    for (const msg of sorted) {
+      if (msg.author.bot || msg.author.id === interaction.user.id) continue;
+      if (messageMatchesRainBan(msg.content, bannedTerms)) {
+        bannedUserIds.add(msg.author.id);
+      }
+    }
+  }
 
   const activeUserIds: string[] = [];
   const seen = new Set<string>();
 
   for (const msg of sorted) {
-    if (msg.author.bot || msg.author.id === interaction.user.id || seen.has(msg.author.id)) continue;
+    if (msg.author.bot || msg.author.id === interaction.user.id || seen.has(msg.author.id) || bannedUserIds.has(msg.author.id)) continue;
 
     seen.add(msg.author.id);
 

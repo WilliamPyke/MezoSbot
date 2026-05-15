@@ -17,6 +17,7 @@ import { formatSats } from "./format.js";
 import { initEVM, getTreasuryAddress, startDepositPoller, registerDepositAddress, recoverPendingWithdrawals } from "./evm.js";
 import { commands, commandsData } from "./commands/index.js";
 import { handleQuestBuilderInteraction, isQuestBuilderInteraction } from "./commands/quest.js";
+import { handleRainBanInteraction, isRainBanInteraction } from "./commands/rainban.js";
 import {
   startEmulator,
   stopEmulator,
@@ -395,6 +396,24 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
     }
     console.log(`[Discord] Quest builder ${cid} done in ${Date.now() - startMs}ms`);
+    return;
+  }
+
+  if (isRainBanInteraction(interaction)) {
+    const cid = ("customId" in interaction && interaction.customId) || "";
+    console.log(`[Discord] Rain ban interaction ${cid} from ${tag} (arrivalLag=${arrivalLagMs}ms)`);
+    try {
+      await handleRainBanInteraction(interaction);
+    } catch (err) {
+      const message = (err as Error)?.message ?? String(err);
+      console.warn(`[Rain] Ban interaction ${cid} failed:`, message);
+      if ("followUp" in interaction && (interaction.deferred || interaction.replied)) {
+        await interaction.followUp({ content: `Could not update rain banned words: ${message}`, flags: MessageFlags.Ephemeral }).catch(() => {});
+      } else if ("reply" in interaction) {
+        await interaction.reply({ content: `Could not update rain banned words: ${message}`, flags: MessageFlags.Ephemeral }).catch(() => {});
+      }
+    }
+    console.log(`[Discord] Rain ban ${cid} done in ${Date.now() - startMs}ms`);
     return;
   }
 

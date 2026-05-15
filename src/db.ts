@@ -36,3 +36,4 @@ export type QuestRewardTierRow = { id: number; quest_id: number; completed_task_
 export type QuestTaskCompletionRow = { id: number; quest_id: number; task_id: number; user_id: string; proof: Record<string, unknown>; completed_at: string };
 export type QuestUserRewardRow = { quest_id: number; user_id: string; completed_task_count: number; total_reward_sats: number; paid_sats: number; last_paid_at: string | null; updated_at: string };
 export type GameSaveRow = { rom_name: string; save_data: string; updated_at: string };
+export type RainBannedTermRow = { id: number; guild_id: string; term: string; created_by: string | null; created_at: string };
