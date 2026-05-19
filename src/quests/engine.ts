@@ -420,6 +420,45 @@ export async function getActiveTasksByType<TConfig extends Record<string, unknow
   return (data ?? []) as unknown as Array<ActiveQuestTask<TConfig>>;
 }
 
+export async function getAllActiveTasksByType<TConfig extends Record<string, unknown>>(
+  type: QuestTaskType,
+): Promise<Array<ActiveQuestTask<TConfig>>> {
+  const { data, error } = await supabase
+    .from("quest_tasks")
+    .select(`
+      id,
+      quest_id,
+      task_key,
+      type,
+      title,
+      description,
+      config,
+      sort_order,
+      status,
+      created_at,
+      quest:quests!inner (
+        id,
+        guild_id,
+        channel_id,
+        message_id,
+        creator_id,
+        title,
+        description,
+        status,
+        max_reward_sats,
+        starts_at,
+        ends_at,
+        metadata
+      )
+    `)
+    .eq("type", type)
+    .eq("status", "active")
+    .eq("quest.status", "active");
+
+  if (error) throw error;
+  return (data ?? []) as unknown as Array<ActiveQuestTask<TConfig>>;
+}
+
 export async function completeQuestTask(params: {
   questId: number;
   taskId: number;

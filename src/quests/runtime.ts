@@ -15,6 +15,7 @@ import { sendTransferReceivedDm } from "../notifications.js";
 import {
   completeQuestTask,
   getActiveTasksByType,
+  getAllActiveTasksByType,
   getQuestSnapshot,
   getQuestTaskDefinition,
   type ActiveQuestTask,
@@ -667,16 +668,25 @@ export function buildQuestRuntimeEmbed(snapshot: Awaited<ReturnType<typeof getQu
   return embed;
 }
 
-async function refreshQuestMessage(client: Client, questId: number): Promise<void> {
+async function refreshQuestMessage(client: Client, questId: number): Promise<boolean> {
   const snapshot = await getQuestSnapshot(questId).catch(() => null);
+  if (!snapshot) return false;
   const embed = buildQuestRuntimeEmbed(snapshot);
-  if (!snapshot?.quest.message_id || !embed) return;
+  if (!snapshot.quest.message_id || !embed) return false;
 
   const channel = await client.channels.fetch(snapshot.quest.channel_id).catch(() => null);
-  if (!channel || !("messages" in channel)) return;
+  if (!channel || !("messages" in channel)) return false;
 
   const message = await channel.messages.fetch(snapshot.quest.message_id).catch(() => null);
-  await message?.edit({ embeds: [embed], allowedMentions: { parse: [] } }).catch(() => {});
+  if (!message) return false;
+
+  try {
+    await message.edit({ embeds: [embed], allowedMentions: { parse: [] } });
+    return true;
+  } catch (err) {
+    console.warn(`[QuestEngine] Failed to edit quest message ${snapshot.quest.message_id}:`, (err as Error).message);
+    return false;
+  }
 }
 
 export async function completeAndNotify(
@@ -798,22 +808,30 @@ export function startMultiStepQuestSweeper(client: Client): void {
 }
 
 async function sweepMultiStepQuests(client: Client): Promise<void> {
-  const byGuild = new Map<string, Array<ActiveQuestTask<EventAttendanceConfig>>>();
-
-  for (const guild of client.guilds.cache.values()) {
-    const guildTasks = await getActiveTasksByType<EventAttendanceConfig>(guild.id, "event_attendance").catch((err) => {
-      console.warn(`[QuestEngine] Failed to sweep event tasks for guild ${guild.id}:`, (err as Error).message);
+  let guildTasks: Array<ActiveQuestTask<EventAttendanceConfig>> = [];
+  try {
+    guildTasks = await getAllActiveTasksByType<EventAttendanceConfig>("event_attendance").catch((err) => {
+      console.warn(`[QuestEngine] Failed to fetch active voice event tasks:`, (err as Error).message);
       return [];
     });
-    byGuild.set(guild.id, guildTasks);
+  } catch (err) {
+    console.error("[QuestEngine] Error during voice attendance tasks query:", err);
+  }
+
+  // Group by guildId
+  const byGuild = new Map<string, Array<ActiveQuestTask<EventAttendanceConfig>>>();
+  for (const task of guildTasks) {
+    const list = byGuild.get(task.quest.guild_id) ?? [];
+    list.push(task);
+    byGuild.set(task.quest.guild_id, list);
   }
 
   try {
-    for (const [guildId, guildTasks] of byGuild) {
+    for (const [guildId, tasks] of byGuild) {
       const guild = await client.guilds.fetch(guildId).catch(() => null);
       if (!guild) continue;
 
-      for (const task of guildTasks) {
+      for (const task of tasks) {
         try {
           const channel = await guild.channels.fetch(task.config.eventChannelId).catch(() => null);
           if (!channelIsVoiceLike(channel)) continue;
@@ -855,62 +873,66 @@ async function sweepMultiStepQuests(client: Client): Promise<void> {
 }
 
 async function sweepRotatingLinkQuests(client: Client): Promise<void> {
-  for (const guild of client.guilds.cache.values()) {
-    const tasks = await getActiveTasksByType<FirstLinkConfig>(guild.id, "first_link_in_channel").catch(() => []);
-    const seenQuests = new Set<number>();
-    for (const task of tasks) {
-      const config = task.config as FirstLinkConfig | null | undefined;
-      if (!config) continue;
-      if (config.source !== "rotating_list" && config.source !== "nearest_event") continue;
-      if (seenQuests.has(task.quest_id)) continue;
-      seenQuests.add(task.quest_id);
+  const tasks = await getAllActiveTasksByType<FirstLinkConfig>("first_link_in_channel").catch(() => []);
+  const seenQuests = new Set<number>();
 
-      const list = resolveLinkList(config);
-      if (list.length === 0) continue;
+  for (const task of tasks) {
+    const config = task.config as FirstLinkConfig | null | undefined;
+    if (!config) continue;
+    if (config.source !== "rotating_list" && config.source !== "nearest_event") continue;
+    if (seenQuests.has(task.quest_id)) continue;
+    seenQuests.add(task.quest_id);
 
-      const refreshMinutes = Number.isFinite(config.refreshMinutes) && config.refreshMinutes >= 1
-        ? Math.floor(config.refreshMinutes)
-        : 60;
+    const guild = await client.guilds.fetch(task.quest.guild_id).catch(() => null);
+    if (!guild) continue;
 
-      // Back-fill rotationStartMs and refreshMinutes for quests created before anchored rotation existed.
-      let rotationStartMs = config.rotationStartMs ?? null;
-      const needsBackfill = typeof rotationStartMs !== "number" || !Number.isFinite(rotationStartMs) || config.refreshMinutes !== refreshMinutes;
-      if (needsBackfill) {
-        if (typeof rotationStartMs !== "number" || !Number.isFinite(rotationStartMs)) {
-          rotationStartMs = quantizeRotationAnchor(refreshMinutes);
-        }
-        const newConfig = { ...config, rotationStartMs, refreshMinutes };
-        const { error: configError } = await supabase
-          .from("quest_tasks")
-          .update({ config: newConfig })
-          .eq("id", task.id);
-        if (configError) {
-          console.warn(`[QuestEngine] Failed to back-fill config for task ${task.id}:`, configError.message);
-          continue;
-        }
-        task.config = newConfig;
+    const list = resolveLinkList(config);
+    if (list.length === 0) continue;
+
+    const refreshMinutes = Number.isFinite(config.refreshMinutes) && config.refreshMinutes >= 1
+      ? Math.floor(config.refreshMinutes)
+      : 60;
+
+    // Back-fill rotationStartMs and refreshMinutes for quests created before anchored rotation existed.
+    let rotationStartMs = config.rotationStartMs ?? null;
+    const needsBackfill = typeof rotationStartMs !== "number" || !Number.isFinite(rotationStartMs) || config.refreshMinutes !== refreshMinutes;
+    if (needsBackfill) {
+      if (typeof rotationStartMs !== "number" || !Number.isFinite(rotationStartMs)) {
+        rotationStartMs = quantizeRotationAnchor(refreshMinutes);
       }
-
-      const index = currentLinkIndex(refreshMinutes, list.length, rotationStartMs);
-      const windowStart = new Date(linkWindowStartMs(refreshMinutes)).toISOString();
-      const metadata = (task.quest.metadata ?? {}) as Record<string, unknown>;
-      const lastRendered = metadata.lastRenderedLinkIndex;
-      const lastRenderedWindow = metadata.lastRenderedLinkWindowStart;
-      if (lastRendered === index && lastRenderedWindow === windowStart) continue;
-
-      const { error } = await supabase
-        .from("quests")
-        .update({
-          metadata: { ...metadata, lastRenderedLinkIndex: index, lastRenderedLinkWindowStart: windowStart },
-          updated_at: nowIso(),
-        })
-        .eq("id", task.quest_id);
-      if (error) {
-        console.warn(`[QuestEngine] Failed to persist rotation index for quest ${task.quest_id}:`, error.message);
+      const newConfig = { ...config, rotationStartMs, refreshMinutes };
+      const { error: configError } = await supabase
+        .from("quest_tasks")
+        .update({ config: newConfig })
+        .eq("id", task.id);
+      if (configError) {
+        console.warn(`[QuestEngine] Failed to back-fill config for task ${task.id}:`, configError.message);
         continue;
       }
+      task.config = newConfig;
+    }
 
-      await refreshQuestMessage(client, task.quest_id);
+    const index = currentLinkIndex(refreshMinutes, list.length, rotationStartMs);
+    const windowStart = new Date(linkWindowStartMs(refreshMinutes)).toISOString();
+    const metadata = (task.quest.metadata ?? {}) as Record<string, unknown>;
+    const lastRendered = metadata.lastRenderedLinkIndex;
+    const lastRenderedWindow = metadata.lastRenderedLinkWindowStart;
+    if (lastRendered === index && lastRenderedWindow === windowStart) continue;
+
+    // Refresh Discord message first
+    const refreshed = await refreshQuestMessage(client, task.quest_id);
+    if (!refreshed) continue;
+
+    // Persist only after successful Discord edit
+    const { error } = await supabase
+      .from("quests")
+      .update({
+        metadata: { ...metadata, lastRenderedLinkIndex: index, lastRenderedLinkWindowStart: windowStart },
+        updated_at: nowIso(),
+      })
+      .eq("id", task.quest_id);
+    if (error) {
+      console.warn(`[QuestEngine] Failed to persist rotation index for quest ${task.quest_id}:`, error.message);
     }
   }
 }
