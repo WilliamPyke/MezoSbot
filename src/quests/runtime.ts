@@ -54,7 +54,8 @@ type FirstLinkClaimMetadata = {
   claimedAt?: string;
 };
 
-export function resolveLinkList(config: FirstLinkConfig): string[] {
+export function resolveLinkList(config: FirstLinkConfig | null | undefined): string[] {
+  if (!config) return [];
   if (Array.isArray(config.linkList) && config.linkList.length > 0) {
     return config.linkList.filter((url): url is string => typeof url === "string" && url.length > 0);
   }
@@ -71,14 +72,16 @@ export function currentLinkIndex(
   now = Date.now(),
 ): number {
   if (listLength <= 1) return 0;
-  const windowMs = Math.max(1, Math.floor(refreshMinutes)) * 60_000;
+  const safeMins = Number.isFinite(refreshMinutes) && refreshMinutes >= 1 ? Math.floor(refreshMinutes) : 60;
+  const windowMs = safeMins * 60_000;
   const reference = typeof rotationStartMs === "number" && Number.isFinite(rotationStartMs) ? rotationStartMs : 0;
   const elapsed = Math.max(0, now - reference);
   return Math.floor(elapsed / windowMs) % listLength;
 }
 
 export function quantizeRotationAnchor(refreshMinutes: number, now = Date.now()): number {
-  const windowMs = Math.max(1, Math.floor(refreshMinutes)) * 60_000;
+  const safeMins = Number.isFinite(refreshMinutes) && refreshMinutes >= 1 ? Math.floor(refreshMinutes) : 60;
+  const windowMs = safeMins * 60_000;
   return Math.floor(now / windowMs) * windowMs;
 }
 
@@ -469,7 +472,7 @@ async function messageMatchesFirstLinkTask(
   urls: string[],
 ): Promise<boolean> {
   const config = task.config;
-  if (message.channelId !== config.targetChannelId) return false;
+  if (!config || message.channelId !== config.targetChannelId) return false;
   if (urls.length === 0) return false;
 
   if (config.source === "latest_tweet") {
@@ -482,7 +485,10 @@ async function messageMatchesFirstLinkTask(
     const list = resolveLinkList(config);
     if (list.length === 0) return false;
 
-    const index = currentLinkIndex(config.refreshMinutes, list.length, config.rotationStartMs ?? null);
+    const refreshMinutes = Number.isFinite(config.refreshMinutes) && config.refreshMinutes >= 1
+      ? Math.floor(config.refreshMinutes)
+      : 60;
+    const index = currentLinkIndex(refreshMinutes, list.length, config.rotationStartMs ?? null);
     const targetNorm = normalizeUrlForMatch(list[index]);
     if (!targetNorm) return false;
 
@@ -498,12 +504,14 @@ async function messageMatchesFirstLinkTask(
 }
 
 function linkWindowStartIso(refreshMinutes: number, now = Date.now()): string {
-  const windowMs = Math.max(1, Math.floor(refreshMinutes)) * 60_000;
+  const safeMins = Number.isFinite(refreshMinutes) && refreshMinutes >= 1 ? Math.floor(refreshMinutes) : 60;
+  const windowMs = safeMins * 60_000;
   return new Date(Math.floor(now / windowMs) * windowMs).toISOString();
 }
 
 function linkWindowStartMs(refreshMinutes: number, now = Date.now()): number {
-  const windowMs = Math.max(1, Math.floor(refreshMinutes)) * 60_000;
+  const safeMins = Number.isFinite(refreshMinutes) && refreshMinutes >= 1 ? Math.floor(refreshMinutes) : 60;
+  const windowMs = safeMins * 60_000;
   return Math.floor(now / windowMs) * windowMs;
 }
 
@@ -512,11 +520,14 @@ async function claimFirstLinkWindow(
   userId: string,
   proof: Record<string, unknown>,
 ): Promise<boolean> {
+  const refreshMinutes = Number.isFinite(task.config.refreshMinutes) && task.config.refreshMinutes >= 1
+    ? Math.floor(task.config.refreshMinutes)
+    : 60;
   const { data, error } = await supabase
     .from("quest_task_window_claims")
     .insert({
       task_id: task.id,
-      window_start: linkWindowStartIso(task.config.refreshMinutes),
+      window_start: linkWindowStartIso(refreshMinutes),
       user_id: userId,
       proof,
     })
@@ -538,10 +549,13 @@ async function markFirstLinkWindowClaimed(
   userId: string,
   linkIndex: number,
 ): Promise<void> {
+  const refreshMinutes = Number.isFinite(task.config.refreshMinutes) && task.config.refreshMinutes >= 1
+    ? Math.floor(task.config.refreshMinutes)
+    : 60;
   const metadata = (task.quest.metadata ?? {}) as Record<string, unknown>;
   const currentLinkClaim: FirstLinkClaimMetadata = {
     taskId: task.id,
-    windowStart: linkWindowStartIso(task.config.refreshMinutes),
+    windowStart: linkWindowStartIso(refreshMinutes),
     userId,
     linkIndex,
     claimedAt: nowIso(),
@@ -591,23 +605,28 @@ export function buildQuestRuntimeEmbed(snapshot: Awaited<ReturnType<typeof getQu
   // Surface the rotating-link target front-and-center for link-quest tasks.
   for (const task of snapshot.tasks) {
     if (task.type !== "first_link_in_channel") continue;
-    const config = task.config as FirstLinkConfig;
+    const config = task.config as FirstLinkConfig | null | undefined;
+    if (!config) continue;
     if (config.source !== "rotating_list" && config.source !== "nearest_event") continue;
 
     const list = resolveLinkList(config);
     if (list.length === 0) continue;
 
+    const refreshMinutes = Number.isFinite(config.refreshMinutes) && config.refreshMinutes >= 1
+      ? Math.floor(config.refreshMinutes)
+      : 60;
+
     const anchor = typeof config.rotationStartMs === "number" && Number.isFinite(config.rotationStartMs)
       ? config.rotationStartMs
       : null;
-    const index = currentLinkIndex(config.refreshMinutes, list.length, anchor);
+    const index = currentLinkIndex(refreshMinutes, list.length, anchor);
     const current = list[index];
-    const windowStart = new Date(linkWindowStartMs(config.refreshMinutes)).toISOString();
+    const windowStart = new Date(linkWindowStartMs(refreshMinutes)).toISOString();
     const claim = (snapshot.quest.metadata as Record<string, unknown> | null | undefined)?.currentLinkClaim as FirstLinkClaimMetadata | undefined;
     const isClaimed = claim?.taskId === task.id && claim.windowStart === windowStart;
 
-    const windowMs = Math.max(1, Math.floor(config.refreshMinutes)) * 60_000;
-    const reference = anchor ?? linkWindowStartMs(config.refreshMinutes);
+    const windowMs = refreshMinutes * 60_000;
+    const reference = anchor ?? linkWindowStartMs(refreshMinutes);
     const elapsed = Math.max(0, Date.now() - reference);
     const windowsElapsed = Math.floor(elapsed / windowMs);
     const nextRotationMs = reference + (windowsElapsed + 1) * windowMs;
@@ -618,8 +637,8 @@ export function buildQuestRuntimeEmbed(snapshot: Awaited<ReturnType<typeof getQu
       ? `Status: **Claimed** by <@${claim.userId}>`
       : "Status: **Open**";
     const positionLine = list.length > 1
-      ? `**Link ${index + 1} of ${list.length}** • Rotates every **${config.refreshMinutes}** min • Next rotation <t:${nextTs}:R>`
-      : `Refresh every **${config.refreshMinutes}** min • Next reset <t:${nextTs}:R>`;
+      ? `**Link ${index + 1} of ${list.length}** • Rotates every **${refreshMinutes}** min • Next rotation <t:${nextTs}:R>`
+      : `Refresh every **${refreshMinutes}** min • Next reset <t:${nextTs}:R>`;
 
     embed.addFields(
       { name: "🎯 Current target", value: `${positionLine}\n${claimLine}\n${current}`, inline: false },
@@ -737,7 +756,10 @@ export async function handleMultiStepQuestMessage(client: Client, message: Messa
     if (!wonWindow) continue;
 
     const list = resolveLinkList(task.config);
-    const linkIndex = currentLinkIndex(task.config.refreshMinutes, list.length, task.config.rotationStartMs ?? null);
+    const refreshMinutes = Number.isFinite(task.config.refreshMinutes) && task.config.refreshMinutes >= 1
+      ? Math.floor(task.config.refreshMinutes)
+      : 60;
+    const linkIndex = currentLinkIndex(refreshMinutes, list.length, task.config.rotationStartMs ?? null);
     await markFirstLinkWindowClaimed(task, message.author.id, linkIndex);
     await completeAndNotify(client, task, message.author.id, proof);
   }
@@ -786,36 +808,50 @@ async function sweepMultiStepQuests(client: Client): Promise<void> {
     byGuild.set(guild.id, guildTasks);
   }
 
-  for (const [guildId, guildTasks] of byGuild) {
-    const guild = await client.guilds.fetch(guildId).catch(() => null);
-    if (!guild) continue;
+  try {
+    for (const [guildId, guildTasks] of byGuild) {
+      const guild = await client.guilds.fetch(guildId).catch(() => null);
+      if (!guild) continue;
 
-    for (const task of guildTasks) {
-      const channel = await guild.channels.fetch(task.config.eventChannelId).catch(() => null);
-      if (!channelIsVoiceLike(channel)) continue;
+      for (const task of guildTasks) {
+        try {
+          const channel = await guild.channels.fetch(task.config.eventChannelId).catch(() => null);
+          if (!channelIsVoiceLike(channel)) continue;
 
-      const event = task.config.scheduledEventId
-        ? await guild.scheduledEvents.fetch(task.config.scheduledEventId).catch(() => null)
-        : null;
-      const syncedTask = event ? await syncTaskQuestFromEvent(task, event) : task;
-      const endedByStatus =
-        event?.status === GuildScheduledEventStatus.Completed ||
-        event?.status === GuildScheduledEventStatus.Canceled;
-      const running = !endedByStatus && await eventTaskIsRunning(client, syncedTask);
-      const accrualEndMs = questWindowEndMs(syncedTask.quest);
+          const event = task.config.scheduledEventId
+            ? await guild.scheduledEvents.fetch(task.config.scheduledEventId).catch(() => null)
+            : null;
+          const syncedTask = event ? await syncTaskQuestFromEvent(task, event) : task;
+          const endedByStatus =
+            event?.status === GuildScheduledEventStatus.Completed ||
+            event?.status === GuildScheduledEventStatus.Canceled;
+          const running = !endedByStatus && await eventTaskIsRunning(client, syncedTask);
+          const accrualEndMs = questWindowEndMs(syncedTask.quest);
 
-      for (const [userId, member] of channel.members) {
-        if (member.user.bot) continue;
-        await updateConnectedAttendance(client, syncedTask, userId, {
-          running,
-          allowStart: false,
-          accrualEndMs,
-        });
+          for (const [userId, member] of channel.members) {
+            if (member.user.bot) continue;
+            await updateConnectedAttendance(client, syncedTask, userId, {
+              running,
+              allowStart: false,
+              accrualEndMs,
+            }).catch((err) => {
+              console.warn(`[QuestEngine] Failed to update attendance for user ${userId}:`, err.message);
+            });
+          }
+        } catch (taskErr) {
+          console.error(`[QuestEngine] Error sweeping task ${task.id}:`, taskErr);
+        }
       }
     }
+  } catch (err) {
+    console.error("[QuestEngine] Error during voice attendance sweep:", err);
   }
 
-  await sweepRotatingLinkQuests(client);
+  try {
+    await sweepRotatingLinkQuests(client);
+  } catch (err) {
+    console.error("[QuestEngine] Error during rotating link sweep:", err);
+  }
 }
 
 async function sweepRotatingLinkQuests(client: Client): Promise<void> {
@@ -823,33 +859,40 @@ async function sweepRotatingLinkQuests(client: Client): Promise<void> {
     const tasks = await getActiveTasksByType<FirstLinkConfig>(guild.id, "first_link_in_channel").catch(() => []);
     const seenQuests = new Set<number>();
     for (const task of tasks) {
-      if (task.config.source !== "rotating_list" && task.config.source !== "nearest_event") continue;
+      const config = task.config as FirstLinkConfig | null | undefined;
+      if (!config) continue;
+      if (config.source !== "rotating_list" && config.source !== "nearest_event") continue;
       if (seenQuests.has(task.quest_id)) continue;
       seenQuests.add(task.quest_id);
 
-      const list = resolveLinkList(task.config);
-      if (list.length <= 1) continue;
+      const list = resolveLinkList(config);
+      if (list.length === 0) continue;
 
-      // Back-fill rotationStartMs for quests created before anchored rotation
-      // existed. Quantize to the current window boundary so the rotation
-      // resets to link 1 starting now.
-      let rotationStartMs = task.config.rotationStartMs ?? null;
-      if (typeof rotationStartMs !== "number" || !Number.isFinite(rotationStartMs)) {
-        rotationStartMs = quantizeRotationAnchor(task.config.refreshMinutes);
-        const newConfig = { ...task.config, rotationStartMs };
+      const refreshMinutes = Number.isFinite(config.refreshMinutes) && config.refreshMinutes >= 1
+        ? Math.floor(config.refreshMinutes)
+        : 60;
+
+      // Back-fill rotationStartMs and refreshMinutes for quests created before anchored rotation existed.
+      let rotationStartMs = config.rotationStartMs ?? null;
+      const needsBackfill = typeof rotationStartMs !== "number" || !Number.isFinite(rotationStartMs) || config.refreshMinutes !== refreshMinutes;
+      if (needsBackfill) {
+        if (typeof rotationStartMs !== "number" || !Number.isFinite(rotationStartMs)) {
+          rotationStartMs = quantizeRotationAnchor(refreshMinutes);
+        }
+        const newConfig = { ...config, rotationStartMs, refreshMinutes };
         const { error: configError } = await supabase
           .from("quest_tasks")
           .update({ config: newConfig })
           .eq("id", task.id);
         if (configError) {
-          console.warn(`[QuestEngine] Failed to back-fill rotationStartMs for task ${task.id}:`, configError.message);
+          console.warn(`[QuestEngine] Failed to back-fill config for task ${task.id}:`, configError.message);
           continue;
         }
         task.config = newConfig;
       }
 
-      const index = currentLinkIndex(task.config.refreshMinutes, list.length, rotationStartMs);
-      const windowStart = new Date(linkWindowStartMs(task.config.refreshMinutes)).toISOString();
+      const index = currentLinkIndex(refreshMinutes, list.length, rotationStartMs);
+      const windowStart = new Date(linkWindowStartMs(refreshMinutes)).toISOString();
       const metadata = (task.quest.metadata ?? {}) as Record<string, unknown>;
       const lastRendered = metadata.lastRenderedLinkIndex;
       const lastRenderedWindow = metadata.lastRenderedLinkWindowStart;

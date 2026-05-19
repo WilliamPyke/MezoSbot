@@ -69,6 +69,10 @@ async function renderMainMenu() {
       .setLabel("🌧️ Manage Rain Bans")
       .setStyle(ButtonStyle.Primary),
     new ButtonBuilder()
+      .setCustomId(`${CUSTOM_ID_PREFIX}:menu_quests`)
+      .setLabel("⚔️ Manage Quests")
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
       .setCustomId(`${CUSTOM_ID_PREFIX}:dismiss`)
       .setLabel("Dismiss Panel")
       .setStyle(ButtonStyle.Danger)
@@ -241,6 +245,112 @@ async function renderRainBansMenu(guildId: string, statusText?: string) {
   return { embeds: [embed], components: [row1] };
 }
 
+async function renderQuestsMenu(guildId: string) {
+  const { data: quests, error } = await supabase
+    .from("quests")
+    .select("id, title, starts_at, max_reward_sats, creator_id")
+    .eq("guild_id", guildId)
+    .eq("status", "active")
+    .order("id", { ascending: false });
+
+  const embed = new EmbedBuilder()
+    .setColor(0x77a7ff)
+    .setTitle("⚔️ Manage Guild Quests")
+    .setDescription("Select an active quest from the dropdown below to view details and cancel/delete it.")
+    .setTimestamp();
+
+  if (error) {
+    embed.setDescription(`❌ Error fetching quests: ${error.message}`);
+    const backRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`${CUSTOM_ID_PREFIX}:menu_main`)
+        .setLabel("⬅️ Back to Main Menu")
+        .setStyle(ButtonStyle.Secondary)
+    );
+    return { embeds: [embed], components: [backRow] };
+  }
+
+  if (!quests || quests.length === 0) {
+    embed.setDescription("ℹ️ There are currently no active quests in this server.");
+    const backRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`${CUSTOM_ID_PREFIX}:menu_main`)
+        .setLabel("⬅️ Back to Main Menu")
+        .setStyle(ButtonStyle.Secondary)
+    );
+    return { embeds: [embed], components: [backRow] };
+  }
+
+  // Create select menu
+  const selectMenu = new StringSelectMenuBuilder()
+    .setCustomId(`${CUSTOM_ID_PREFIX}:quest_select`)
+    .setPlaceholder("Select a quest to manage...")
+    .addOptions(
+      quests.map((q) => ({
+        label: `${q.title.slice(0, 50)} (ID: ${q.id})`,
+        description: `Max payout: ${q.max_reward_sats} sats`,
+        value: String(q.id),
+      }))
+    );
+
+  const selectRow = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(selectMenu);
+
+  const backRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`${CUSTOM_ID_PREFIX}:menu_main`)
+      .setLabel("⬅️ Back to Main Menu")
+      .setStyle(ButtonStyle.Secondary)
+  );
+
+  return { embeds: [embed], components: [selectRow, backRow] };
+}
+
+async function renderQuestDetail(guildId: string, questId: number) {
+  const { data: quest, error } = await supabase
+    .from("quests")
+    .select("*")
+    .eq("id", questId)
+    .single();
+
+  const embed = new EmbedBuilder()
+    .setColor(0x77a7ff)
+    .setTitle("⚔️ Quest Details")
+    .setTimestamp();
+
+  if (error || !quest) {
+    embed.setColor(0xff3333).setDescription("❌ Quest not found or has already been deleted.");
+    const backRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`${CUSTOM_ID_PREFIX}:menu_quests`)
+        .setLabel("⬅️ Back to Quests")
+        .setStyle(ButtonStyle.Secondary)
+    );
+    return { embeds: [embed], components: [backRow] };
+  }
+
+  embed.setTitle(`⚔️ Quest: ${quest.title}`);
+  embed.setDescription(quest.description || "No description provided.");
+  embed.addFields(
+    { name: "Quest ID", value: String(quest.id), inline: true },
+    { name: "Status", value: quest.status, inline: true },
+    { name: "Creator", value: `<@${quest.creator_id}>`, inline: true },
+    { name: "Max Reward", value: `${quest.max_reward_sats} sats`, inline: true }
+  );
+
+  const actionRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`${CUSTOM_ID_PREFIX}:delete_quest:${quest.id}`)
+      .setLabel("🚫 Cancel & Delete Quest")
+      .setStyle(ButtonStyle.Danger),
+    new ButtonBuilder()
+      .setCustomId(`${CUSTOM_ID_PREFIX}:menu_quests`)
+      .setLabel("⬅️ Back to Quests")
+      .setStyle(ButtonStyle.Secondary)
+  );
+
+  return { embeds: [embed], components: [actionRow] };
+}
+
 // ---------------------------------------------------------
 // Command Execution & Routing
 // ---------------------------------------------------------
@@ -308,6 +418,45 @@ export async function handleAdminInteraction(interaction: Interaction): Promise<
       await btnInteraction.editReply(menu);
     } else if (action === "menu_rainbans") {
       const menu = await renderRainBansMenu(btnInteraction.guildId!);
+      await btnInteraction.editReply(menu);
+    } else if (action === "menu_quests") {
+      const menu = await renderQuestsMenu(btnInteraction.guildId!);
+      await btnInteraction.editReply(menu);
+    } else if (action === "delete_quest") {
+      const questId = parseInt(parts[2], 10);
+      
+      const fresh = await supabase.from("quests").select("*").eq("id", questId).single();
+      if (fresh.data) {
+        if (fresh.data.message_id) {
+          const channel = await btnInteraction.client.channels.fetch(fresh.data.channel_id).catch(() => null);
+          if (channel && "messages" in channel) {
+            const message = await channel.messages.fetch(fresh.data.message_id).catch(() => null);
+            if (message) {
+              await message.delete().catch(() => {});
+            }
+          }
+        }
+
+        const legacyEventQuestId = (fresh.data.metadata as any)?.legacyEventQuestId;
+        if (legacyEventQuestId) {
+          const { data: eq } = await supabase.from("event_quests").select("*").eq("id", legacyEventQuestId).single();
+          if (eq && eq.message_id) {
+            const channel = await btnInteraction.client.channels.fetch(eq.channel_id).catch(() => null);
+            if (channel && "messages" in channel) {
+              const message = await channel.messages.fetch(eq.message_id).catch(() => null);
+              if (message) {
+                await message.delete().catch(() => {});
+              }
+            }
+          }
+          await supabase.from("event_quests").delete().eq("id", legacyEventQuestId);
+        }
+      }
+
+      await supabase.from("quests").delete().eq("id", questId);
+
+      const menu = await renderQuestsMenu(btnInteraction.guildId!);
+      menu.embeds[0].setDescription(`✅ Quest **#${questId}** was successfully deleted from the database.`);
       await btnInteraction.editReply(menu);
     } else if (action === "sync_all") {
       // Temporarily change view to show loading state
@@ -380,6 +529,10 @@ export async function handleAdminInteraction(interaction: Interaction): Promise<
       const type = parts[2] as "tipper" | "rainer";
       const idx = parseInt(selInteraction.values[0], 10);
       const panel = await renderStageConfig(selInteraction.guildId!, type, idx);
+      await selInteraction.editReply(panel);
+    } else if (action === "quest_select") {
+      const questId = parseInt(selInteraction.values[0], 10);
+      const panel = await renderQuestDetail(selInteraction.guildId!, questId);
       await selInteraction.editReply(panel);
     }
   }
