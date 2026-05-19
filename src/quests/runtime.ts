@@ -756,19 +756,6 @@ export async function completeAndNotify(
       kind: "quest",
       customMessage: `Completed quest task: ${task.title}`,
     });
-
-    const channel = await client.channels.fetch(task.quest.channel_id).catch(() => null);
-    if (channel && "send" in channel) {
-      const embed = new EmbedBuilder()
-        .setColor(0x00cc6a)
-        .setTitle("Quest Reward Earned")
-        .setDescription(
-          `<@${userId}> earned **${formatSats(result.rewardDeltaSats ?? 0)}** for **${task.quest.title}**.`,
-        )
-        .setTimestamp();
-
-      await channel.send({ embeds: [embed], allowedMentions: { parse: [] } }).catch(() => {});
-    }
   }
 
   const refreshed = await refreshQuestMessage(client, task.quest_id);
