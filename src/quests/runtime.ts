@@ -504,16 +504,25 @@ async function messageMatchesFirstLinkTask(
   return urls.length > 0;
 }
 
-function linkWindowStartIso(refreshMinutes: number, now = Date.now()): string {
+function linkWindowStartMs(
+  refreshMinutes: number,
+  rotationStartMs: number | null = null,
+  now = Date.now(),
+): number {
   const safeMins = Number.isFinite(refreshMinutes) && refreshMinutes >= 1 ? Math.floor(refreshMinutes) : 60;
   const windowMs = safeMins * 60_000;
-  return new Date(Math.floor(now / windowMs) * windowMs).toISOString();
+  const reference = typeof rotationStartMs === "number" && Number.isFinite(rotationStartMs) ? rotationStartMs : 0;
+  const elapsed = Math.max(0, now - reference);
+  const windowsElapsed = Math.floor(elapsed / windowMs);
+  return reference + windowsElapsed * windowMs;
 }
 
-function linkWindowStartMs(refreshMinutes: number, now = Date.now()): number {
-  const safeMins = Number.isFinite(refreshMinutes) && refreshMinutes >= 1 ? Math.floor(refreshMinutes) : 60;
-  const windowMs = safeMins * 60_000;
-  return Math.floor(now / windowMs) * windowMs;
+function linkWindowStartIso(
+  refreshMinutes: number,
+  rotationStartMs: number | null = null,
+  now = Date.now(),
+): string {
+  return new Date(linkWindowStartMs(refreshMinutes, rotationStartMs, now)).toISOString();
 }
 
 async function claimFirstLinkWindow(
@@ -528,7 +537,7 @@ async function claimFirstLinkWindow(
     .from("quest_task_window_claims")
     .insert({
       task_id: task.id,
-      window_start: linkWindowStartIso(refreshMinutes),
+      window_start: linkWindowStartIso(refreshMinutes, task.config.rotationStartMs ?? null),
       user_id: userId,
       proof,
     })
@@ -556,7 +565,7 @@ async function markFirstLinkWindowClaimed(
   const metadata = (task.quest.metadata ?? {}) as Record<string, unknown>;
   const currentLinkClaim: FirstLinkClaimMetadata = {
     taskId: task.id,
-    windowStart: linkWindowStartIso(refreshMinutes),
+    windowStart: linkWindowStartIso(refreshMinutes, task.config.rotationStartMs ?? null),
     userId,
     linkIndex,
     claimedAt: nowIso(),
@@ -622,7 +631,7 @@ export function buildQuestRuntimeEmbed(snapshot: Awaited<ReturnType<typeof getQu
       : null;
     const index = currentLinkIndex(refreshMinutes, list.length, anchor);
     const current = list[index];
-    const windowStart = new Date(linkWindowStartMs(refreshMinutes)).toISOString();
+    const windowStart = linkWindowStartIso(refreshMinutes, anchor);
     const claim = (snapshot.quest.metadata as Record<string, unknown> | null | undefined)?.currentLinkClaim as FirstLinkClaimMetadata | undefined;
     const isClaimed = claim?.taskId === task.id && claim.windowStart === windowStart;
 
@@ -913,7 +922,7 @@ async function sweepRotatingLinkQuests(client: Client): Promise<void> {
     }
 
     const index = currentLinkIndex(refreshMinutes, list.length, rotationStartMs);
-    const windowStart = new Date(linkWindowStartMs(refreshMinutes)).toISOString();
+    const windowStart = linkWindowStartIso(refreshMinutes, rotationStartMs);
     const metadata = (task.quest.metadata ?? {}) as Record<string, unknown>;
     const lastRendered = metadata.lastRenderedLinkIndex;
     const lastRenderedWindow = metadata.lastRenderedLinkWindowStart;
