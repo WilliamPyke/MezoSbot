@@ -696,7 +696,11 @@ async function refreshQuestMessage(client: Client, questId: number): Promise<boo
   }
 
   const channel = await client.channels.fetch(snapshot.quest.channel_id).catch((err) => {
-    console.warn(`[QuestEngine] refreshQuestMessage: Failed to fetch channel ${snapshot.quest.channel_id} for quest ${questId}:`, err.message);
+    if (err.code === 50001 || err.message?.includes("Missing Access")) {
+      console.warn(`[QuestEngine] refreshQuestMessage: Missing Access (50001) when fetching channel ${snapshot.quest.channel_id} for quest ${questId}. Please ensure the bot has 'View Channel' permissions in this channel.`);
+    } else {
+      console.warn(`[QuestEngine] refreshQuestMessage: Failed to fetch channel ${snapshot.quest.channel_id} for quest ${questId}:`, err.message);
+    }
     return null;
   });
   if (!channel) {
@@ -709,7 +713,11 @@ async function refreshQuestMessage(client: Client, questId: number): Promise<boo
   }
 
   const message = await channel.messages.fetch(snapshot.quest.message_id).catch((err) => {
-    console.warn(`[QuestEngine] refreshQuestMessage: Message ${snapshot.quest.message_id} in channel ${snapshot.quest.channel_id} not found:`, err.message);
+    if (err.code === 50001 || err.message?.includes("Missing Access")) {
+      console.warn(`[QuestEngine] refreshQuestMessage: Missing Access (50001) when fetching message ${snapshot.quest.message_id} in channel ${snapshot.quest.channel_id}. Please ensure the bot has both 'View Channel' and 'Read Message History' permissions in this channel.`);
+    } else {
+      console.warn(`[QuestEngine] refreshQuestMessage: Message ${snapshot.quest.message_id} in channel ${snapshot.quest.channel_id} not found:`, err.message);
+    }
     return null;
   });
   if (!message) return false;
