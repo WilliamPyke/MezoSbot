@@ -54,8 +54,34 @@ export async function removeRainBannedTerm(guildId: string, term: string): Promi
   return { ok: true, removed: data?.length ?? 0 };
 }
 
+function isWordChar(char: string | undefined): boolean {
+  return !!char && /[\p{L}\p{N}_'’\u2010-\u2015-]/u.test(char);
+}
+
+export function messageMatchesRainTerm(content: string, term: string): boolean {
+  const normalizedContent = normalizeRainBannedTerm(content);
+  const normalizedTerm = normalizeRainBannedTerm(term);
+  if (!normalizedContent || !normalizedTerm) return false;
+
+  let fromIndex = 0;
+  while (fromIndex <= normalizedContent.length) {
+    const index = normalizedContent.indexOf(normalizedTerm, fromIndex);
+    if (index === -1) return false;
+
+    const before = normalizedContent[index - 1];
+    const after = normalizedContent[index + normalizedTerm.length];
+    if (!isWordChar(before) && !isWordChar(after)) return true;
+
+    fromIndex = index + Math.max(1, normalizedTerm.length);
+  }
+  return false;
+}
+
+export function messageMatchesAnyRainTerm(content: string, terms: string[]): boolean {
+  return terms.some((term) => messageMatchesRainTerm(content, term));
+}
+
 export function messageMatchesRainBan(content: string, terms: RainBannedTermRow[]): boolean {
   if (!content || terms.length === 0) return false;
-  const normalized = content.toLowerCase();
-  return terms.some((row) => normalized.includes(row.term));
+  return terms.some((row) => messageMatchesRainTerm(content, row.term));
 }

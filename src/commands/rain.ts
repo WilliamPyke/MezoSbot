@@ -3,7 +3,7 @@ import { subtractBalance, addBalance, getBalance } from "../balance.js";
 import { registerDepositAddress } from "../evm.js";
 import { formatSats, roundSats } from "../format.js";
 import { sendTransferReceivedDm } from "../notifications.js";
-import { getRainBannedTerms, messageMatchesRainBan } from "../rainBans.js";
+import { getRainBannedTerms, messageMatchesAnyRainTerm, messageMatchesRainBan, normalizeRainBannedTerm } from "../rainBans.js";
 
 export const data = {
   name: "rain",
@@ -13,8 +13,19 @@ export const data = {
     { name: "count", type: 4 as const, description: "Number of users to rain on", required: true, minValue: 1, maxValue: 50 },
     { name: "role", type: 8 as const, description: "Only rain on users with this role", required: false },
     { name: "message", type: 3 as const, description: "Optional message for recipients", required: false },
+    { name: "words", type: 3 as const, description: "Only count messages containing these words/phrases", required: false },
   ],
 };
+
+function parseWordFilter(input: string | null): string[] {
+  if (!input) return [];
+  const seen = new Set<string>();
+  for (const raw of input.split(/[\n,]+/)) {
+    const term = normalizeRainBannedTerm(raw);
+    if (term) seen.add(term);
+  }
+  return [...seen].slice(0, 25);
+}
 
 export async function execute(interaction: ChatInputCommandInteraction) {
   if (!interaction.guild) {
@@ -39,9 +50,15 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   const rawMessage = interaction.options.getString("message");
   const trimmedMessage = rawMessage?.trim() ?? "";
   const customMessage = trimmedMessage.length > 0 ? trimmedMessage : undefined;
+  const rawWords = interaction.options.getString("words");
+  const wordFilter = parseWordFilter(rawWords);
 
   if (customMessage && customMessage.length > 200) {
     return interaction.editReply({ content: "❌ Message must be 200 characters or fewer." });
+  }
+
+  if ((rawWords?.trim().length ?? 0) > 0 && wordFilter.length === 0) {
+    return interaction.editReply({ content: "❌ Add at least one word or phrase to use the word filter." });
   }
 
   // Fetch recent messages, sort newest-first, pick the last N unique users
@@ -73,6 +90,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
 
   for (const msg of sorted) {
     if (msg.author.bot || msg.author.id === interaction.user.id || seen.has(msg.author.id) || bannedUserIds.has(msg.author.id)) continue;
+    if (wordFilter.length > 0 && !messageMatchesAnyRainTerm(msg.content, wordFilter)) continue;
 
     seen.add(msg.author.id);
 
@@ -130,13 +148,16 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     .addFields(
       { name: "Per User", value: `**${formatSats(perUser)}**`, inline: true },
       { name: "Total", value: `**${formatSats(totalNeeded)}**`, inline: true },
-      { name: "Recipients", value: `**${activeUserIds.length}** users`, inline: true },
-      { name: "Rained On", value: recipients },
+      { name: "Recipients", value: `**${activeUserIds.length}**`, inline: true },
+      { name: "Rained On", value: recipients, inline: false },
     )
     .setTimestamp();
 
   if (role) {
     embed.addFields({ name: "Eligible Role", value: `<@&${role.id}>`, inline: true });
+  }
+  if (wordFilter.length > 0) {
+    embed.addFields({ name: "Matched Words", value: wordFilter.map((term) => `\`${term.replace(/`/g, "'")}\``).join(", "), inline: true });
   }
   if (customMessage) {
     embed.addFields({ name: "Message", value: customMessage });

@@ -7,6 +7,7 @@ const format_js_1 = require("./format.js");
 const evm_js_1 = require("./evm.js");
 const index_js_1 = require("./commands/index.js");
 const quest_js_1 = require("./commands/quest.js");
+const rainban_js_1 = require("./commands/rainban.js");
 const emulator_js_1 = require("./emulator.js");
 const stream_js_1 = require("./stream.js");
 const balance_js_1 = require("./balance.js");
@@ -33,21 +34,16 @@ const intents = [
     discord_js_1.GatewayIntentBits.Guilds,
     discord_js_1.GatewayIntentBits.GuildScheduledEvents,
     discord_js_1.GatewayIntentBits.GuildVoiceStates,
+    // Required so MessageCreate fires for first-link quest matching. Reading
+    // message.content additionally needs the privileged MessageContent intent
+    // (added below); without it, the runtime falls back to embed URLs.
+    discord_js_1.GatewayIntentBits.GuildMessages,
 ];
 if (config_js_1.config.discord.guildMembersIntent) {
     intents.push(discord_js_1.GatewayIntentBits.GuildMembers);
 }
 if (config_js_1.config.discord.messageContentIntent) {
-    intents.push(discord_js_1.GatewayIntentBits.GuildMessages, discord_js_1.GatewayIntentBits.MessageContent);
-}
-if (config_js_1.config.gameboy.enabled &&
-    config_js_1.config.gameboy.textInputEnabled &&
-    config_js_1.config.gameboy.gameChannelId &&
-    config_js_1.config.discord.messageContentIntent) {
-    if (!intents.includes(discord_js_1.GatewayIntentBits.GuildMessages))
-        intents.push(discord_js_1.GatewayIntentBits.GuildMessages);
-    if (!intents.includes(discord_js_1.GatewayIntentBits.MessageContent))
-        intents.push(discord_js_1.GatewayIntentBits.MessageContent);
+    intents.push(discord_js_1.GatewayIntentBits.MessageContent);
 }
 console.log(`[Discord] Gateway intents: ${intents.join(", ")}`);
 let discordState = "not_started";
@@ -302,6 +298,25 @@ client.on(discord_js_1.Events.InteractionCreate, async (interaction) => {
             }
         }
         console.log(`[Discord] Quest builder ${cid} done in ${Date.now() - startMs}ms`);
+        return;
+    }
+    if ((0, rainban_js_1.isRainBanInteraction)(interaction)) {
+        const cid = ("customId" in interaction && interaction.customId) || "";
+        console.log(`[Discord] Rain ban interaction ${cid} from ${tag} (arrivalLag=${arrivalLagMs}ms)`);
+        try {
+            await (0, rainban_js_1.handleRainBanInteraction)(interaction);
+        }
+        catch (err) {
+            const message = err?.message ?? String(err);
+            console.warn(`[Rain] Ban interaction ${cid} failed:`, message);
+            if ("followUp" in interaction && (interaction.deferred || interaction.replied)) {
+                await interaction.followUp({ content: `Could not update rain banned words: ${message}`, flags: discord_js_1.MessageFlags.Ephemeral }).catch(() => { });
+            }
+            else if ("reply" in interaction) {
+                await interaction.reply({ content: `Could not update rain banned words: ${message}`, flags: discord_js_1.MessageFlags.Ephemeral }).catch(() => { });
+            }
+        }
+        console.log(`[Discord] Rain ban ${cid} done in ${Date.now() - startMs}ms`);
         return;
     }
     if (interaction.isAutocomplete()) {

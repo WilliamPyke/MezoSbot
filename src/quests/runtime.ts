@@ -46,6 +46,14 @@ type FirstLinkConfig = {
   expectedEventUrl?: string;
 };
 
+type FirstLinkClaimMetadata = {
+  taskId?: number;
+  windowStart?: string;
+  userId?: string;
+  linkIndex?: number;
+  claimedAt?: string;
+};
+
 export function resolveLinkList(config: FirstLinkConfig): string[] {
   if (Array.isArray(config.linkList) && config.linkList.length > 0) {
     return config.linkList.filter((url): url is string => typeof url === "string" && url.length > 0);
@@ -494,6 +502,11 @@ function linkWindowStartIso(refreshMinutes: number, now = Date.now()): string {
   return new Date(Math.floor(now / windowMs) * windowMs).toISOString();
 }
 
+function linkWindowStartMs(refreshMinutes: number, now = Date.now()): number {
+  const windowMs = Math.max(1, Math.floor(refreshMinutes)) * 60_000;
+  return Math.floor(now / windowMs) * windowMs;
+}
+
 async function claimFirstLinkWindow(
   task: ActiveQuestTask<FirstLinkConfig>,
   userId: string,
@@ -518,6 +531,36 @@ async function claimFirstLinkWindow(
   }
 
   return !!data;
+}
+
+async function markFirstLinkWindowClaimed(
+  task: ActiveQuestTask<FirstLinkConfig>,
+  userId: string,
+  linkIndex: number,
+): Promise<void> {
+  const metadata = (task.quest.metadata ?? {}) as Record<string, unknown>;
+  const currentLinkClaim: FirstLinkClaimMetadata = {
+    taskId: task.id,
+    windowStart: linkWindowStartIso(task.config.refreshMinutes),
+    userId,
+    linkIndex,
+    claimedAt: nowIso(),
+  };
+
+  const { error } = await supabase
+    .from("quests")
+    .update({
+      metadata: { ...metadata, currentLinkClaim },
+      updated_at: nowIso(),
+    })
+    .eq("id", task.quest_id);
+
+  if (error) {
+    console.warn(`[QuestEngine] Failed to mark link window claimed for quest ${task.quest_id}:`, error.message);
+    return;
+  }
+
+  task.quest.metadata = { ...metadata, currentLinkClaim };
 }
 
 const QUEST_STATUS_META: Record<string, { color: number; emoji: string; label: string }> = {
@@ -559,21 +602,27 @@ export function buildQuestRuntimeEmbed(snapshot: Awaited<ReturnType<typeof getQu
       : null;
     const index = currentLinkIndex(config.refreshMinutes, list.length, anchor);
     const current = list[index];
+    const windowStart = new Date(linkWindowStartMs(config.refreshMinutes)).toISOString();
+    const claim = (snapshot.quest.metadata as Record<string, unknown> | null | undefined)?.currentLinkClaim as FirstLinkClaimMetadata | undefined;
+    const isClaimed = claim?.taskId === task.id && claim.windowStart === windowStart;
 
     const windowMs = Math.max(1, Math.floor(config.refreshMinutes)) * 60_000;
-    const reference = anchor ?? 0;
+    const reference = anchor ?? linkWindowStartMs(config.refreshMinutes);
     const elapsed = Math.max(0, Date.now() - reference);
     const windowsElapsed = Math.floor(elapsed / windowMs);
     const nextRotationMs = reference + (windowsElapsed + 1) * windowMs;
     const nextTs = Math.floor(nextRotationMs / 1000);
 
     const channelRef = `<#${config.targetChannelId}>`;
+    const claimLine = isClaimed && claim?.userId
+      ? `Status: **Claimed** by <@${claim.userId}>`
+      : "Status: **Open**";
     const positionLine = list.length > 1
       ? `**Link ${index + 1} of ${list.length}** • Rotates every **${config.refreshMinutes}** min • Next rotation <t:${nextTs}:R>`
       : `Refresh every **${config.refreshMinutes}** min • Next reset <t:${nextTs}:R>`;
 
     embed.addFields(
-      { name: "🎯 Current target", value: `${positionLine}\n${current}`, inline: false },
+      { name: "🎯 Current target", value: `${positionLine}\n${claimLine}\n${current}`, inline: false },
       { name: "📨 Post in", value: channelRef, inline: true },
     );
     break;
@@ -687,6 +736,9 @@ export async function handleMultiStepQuestMessage(client: Client, message: Messa
     const wonWindow = await claimFirstLinkWindow(task, message.author.id, proof);
     if (!wonWindow) continue;
 
+    const list = resolveLinkList(task.config);
+    const linkIndex = currentLinkIndex(task.config.refreshMinutes, list.length, task.config.rotationStartMs ?? null);
+    await markFirstLinkWindowClaimed(task, message.author.id, linkIndex);
     await completeAndNotify(client, task, message.author.id, proof);
   }
 }
@@ -797,14 +849,16 @@ async function sweepRotatingLinkQuests(client: Client): Promise<void> {
       }
 
       const index = currentLinkIndex(task.config.refreshMinutes, list.length, rotationStartMs);
+      const windowStart = new Date(linkWindowStartMs(task.config.refreshMinutes)).toISOString();
       const metadata = (task.quest.metadata ?? {}) as Record<string, unknown>;
       const lastRendered = metadata.lastRenderedLinkIndex;
-      if (lastRendered === index) continue;
+      const lastRenderedWindow = metadata.lastRenderedLinkWindowStart;
+      if (lastRendered === index && lastRenderedWindow === windowStart) continue;
 
       const { error } = await supabase
         .from("quests")
         .update({
-          metadata: { ...metadata, lastRenderedLinkIndex: index },
+          metadata: { ...metadata, lastRenderedLinkIndex: index, lastRenderedLinkWindowStart: windowStart },
           updated_at: nowIso(),
         })
         .eq("id", task.quest_id);
