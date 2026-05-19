@@ -40,6 +40,7 @@ import {
 import { supabase } from "./db.js";
 import { extractProfile, updateUserProfile } from "./profile.js";
 import { sendTransferReceivedDm } from "./notifications.js";
+import { updateUserBadges } from "./badges.js";
 import {
   handleArcadeInteraction,
   isArcadeInteraction,
@@ -641,7 +642,15 @@ async function handleDropButton(interaction: ButtonInteraction) {
       amountSats: result.amountSats,
       kind: "drop",
     });
+
+    // Update drop creator's badge roles in Discord (since their rained total increased)
+    if (interaction.guildId) {
+      updateUserBadges(interaction.client, interaction.guildId, result.creatorId).catch((err) => {
+        console.error("[Badges] Error updating drop creator badges after button claim:", err);
+      });
+    }
   }
+
 
   const { data: drop } = await supabase
     .from("drops")

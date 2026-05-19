@@ -3,6 +3,9 @@ import { subtractBalance, addBalance, getBalance } from "../balance.js";
 import { registerDepositAddress } from "../evm.js";
 import { formatSats } from "../format.js";
 import { sendTransferReceivedDm } from "../notifications.js";
+import { supabase } from "../db.js";
+import { updateUserBadges } from "../badges.js";
+
 
 export const data = {
   name: "tip",
@@ -54,6 +57,21 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     kind: "tip",
     customMessage,
   });
+
+  // Log the tip in the database
+  await supabase.from("tips").insert({
+    sender_id: interaction.user.id,
+    recipient_id: target.id,
+    amount_sats: amount,
+  });
+
+  // Update user badge roles in Discord
+  if (interaction.guildId) {
+    updateUserBadges(interaction.client, interaction.guildId, interaction.user.id).catch((err) => {
+      console.error("[Badges] Error updating badges for user after tip:", err);
+    });
+  }
+
 
   const embed = new EmbedBuilder()
     .setColor(0x00cc6a)

@@ -8,6 +8,8 @@ const evm_js_1 = require("../evm.js");
 const format_js_1 = require("../format.js");
 const notifications_js_1 = require("../notifications.js");
 const rainBans_js_1 = require("../rainBans.js");
+const db_js_1 = require("../db.js");
+const badges_js_1 = require("../badges.js");
 exports.data = {
     name: "rain",
     description: "Rain sats on recently active users in this channel",
@@ -128,6 +130,18 @@ async function execute(interaction) {
             customMessage,
         });
     }));
+    // Log the rain in the database
+    await db_js_1.supabase.from("rains").insert({
+        sender_id: interaction.user.id,
+        amount_sats: totalNeeded,
+        recipient_count: activeUserIds.length,
+    });
+    // Update rainer badge roles in Discord
+    if (interaction.guildId) {
+        (0, badges_js_1.updateUserBadges)(interaction.client, interaction.guildId, interaction.user.id).catch((err) => {
+            console.error("[Badges] Error updating rainer badges:", err);
+        });
+    }
     const recipients = activeUserIds.map((id) => `<@${id}>`).join("\n");
     const embed = new discord_js_1.EmbedBuilder()
         .setColor(0x3498db)

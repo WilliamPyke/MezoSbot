@@ -45,6 +45,7 @@ const claim = __importStar(require("./claim.js"));
 const leaderboard = __importStar(require("./leaderboard.js"));
 const rain = __importStar(require("./rain.js"));
 const rainban = __importStar(require("./rainban.js"));
+const profile = __importStar(require("./profile.js"));
 const history = __importStar(require("./history.js"));
 const treasury = __importStar(require("./treasury.js"));
 const backfill = __importStar(require("./backfill.js"));
@@ -67,6 +68,7 @@ const baseCommands = [
     leaderboard,
     rain,
     rainban,
+    profile,
     history,
     treasury,
     backfill,

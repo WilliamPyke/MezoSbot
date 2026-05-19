@@ -3,6 +3,8 @@ import { supabase } from "../db.js";
 import { processClaim, updateDropMessage, type Drop } from "../drops.js";
 import { formatSats } from "../format.js";
 import { sendTransferReceivedDm } from "../notifications.js";
+import { updateUserBadges } from "../badges.js";
+
 
 export const data = {
   name: "claim",
@@ -43,6 +45,14 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     amountSats: result.amountSats ?? drop.per_claim_sats,
     kind: "drop",
   });
+
+  // Update drop creator's badge roles in Discord (since their rained total increased)
+  if (interaction.guildId && (result.creatorId ?? drop.creator_id)) {
+    updateUserBadges(interaction.client, interaction.guildId, result.creatorId ?? drop.creator_id).catch((err) => {
+      console.error("[Badges] Error updating drop creator badges after claim:", err);
+    });
+  }
+
 
   const embed = new EmbedBuilder()
     .setColor(0x00cc6a)

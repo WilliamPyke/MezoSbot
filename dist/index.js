@@ -15,6 +15,7 @@ const drops_js_1 = require("./drops.js");
 const db_js_1 = require("./db.js");
 const profile_js_1 = require("./profile.js");
 const notifications_js_1 = require("./notifications.js");
+const badges_js_1 = require("./badges.js");
 const interactions_js_1 = require("./arcade/interactions.js");
 const eventQuests_js_1 = require("./eventQuests.js");
 const runtime_js_1 = require("./quests/runtime.js");
@@ -513,6 +514,12 @@ async function handleDropButton(interaction) {
             amountSats: result.amountSats,
             kind: "drop",
         });
+        // Update drop creator's badge roles in Discord (since their rained total increased)
+        if (interaction.guildId) {
+            (0, badges_js_1.updateUserBadges)(interaction.client, interaction.guildId, result.creatorId).catch((err) => {
+                console.error("[Badges] Error updating drop creator badges after button claim:", err);
+            });
+        }
     }
     const { data: drop } = await db_js_1.supabase
         .from("drops")

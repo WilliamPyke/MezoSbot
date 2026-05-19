@@ -10,6 +10,7 @@ import * as claim from "./claim.js";
 import * as leaderboard from "./leaderboard.js";
 import * as rain from "./rain.js";
 import * as rainban from "./rainban.js";
+import * as profile from "./profile.js";
 import * as history from "./history.js";
 import * as treasury from "./treasury.js";
 import * as backfill from "./backfill.js";
@@ -33,6 +34,7 @@ const baseCommands = [
   leaderboard,
   rain,
   rainban,
+  profile,
   history,
   treasury,
   backfill,

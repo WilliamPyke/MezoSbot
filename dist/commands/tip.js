@@ -7,6 +7,8 @@ const balance_js_1 = require("../balance.js");
 const evm_js_1 = require("../evm.js");
 const format_js_1 = require("../format.js");
 const notifications_js_1 = require("../notifications.js");
+const db_js_1 = require("../db.js");
+const badges_js_1 = require("../badges.js");
 exports.data = {
     name: "tip",
     description: "Send sats to another user",
@@ -49,6 +51,18 @@ async function execute(interaction) {
         kind: "tip",
         customMessage,
     });
+    // Log the tip in the database
+    await db_js_1.supabase.from("tips").insert({
+        sender_id: interaction.user.id,
+        recipient_id: target.id,
+        amount_sats: amount,
+    });
+    // Update user badge roles in Discord
+    if (interaction.guildId) {
+        (0, badges_js_1.updateUserBadges)(interaction.client, interaction.guildId, interaction.user.id).catch((err) => {
+            console.error("[Badges] Error updating badges for user after tip:", err);
+        });
+    }
     const embed = new discord_js_1.EmbedBuilder()
         .setColor(0x00cc6a)
         .setTitle("💫 Tip Sent!")

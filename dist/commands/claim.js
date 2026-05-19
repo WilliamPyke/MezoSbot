@@ -7,6 +7,7 @@ const db_js_1 = require("../db.js");
 const drops_js_1 = require("../drops.js");
 const format_js_1 = require("../format.js");
 const notifications_js_1 = require("../notifications.js");
+const badges_js_1 = require("../badges.js");
 exports.data = {
     name: "claim",
     description: "Claim sats from the active drop in this channel",
@@ -39,6 +40,12 @@ async function execute(interaction) {
         amountSats: result.amountSats ?? drop.per_claim_sats,
         kind: "drop",
     });
+    // Update drop creator's badge roles in Discord (since their rained total increased)
+    if (interaction.guildId && (result.creatorId ?? drop.creator_id)) {
+        (0, badges_js_1.updateUserBadges)(interaction.client, interaction.guildId, result.creatorId ?? drop.creator_id).catch((err) => {
+            console.error("[Badges] Error updating drop creator badges after claim:", err);
+        });
+    }
     const embed = new discord_js_1.EmbedBuilder()
         .setColor(0x00cc6a)
         .setTitle("🎉 Claimed!")

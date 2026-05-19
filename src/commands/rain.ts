@@ -4,6 +4,9 @@ import { registerDepositAddress } from "../evm.js";
 import { formatSats, roundSats } from "../format.js";
 import { sendTransferReceivedDm } from "../notifications.js";
 import { getRainBannedTerms, messageMatchesAnyRainTerm, messageMatchesRainBan, normalizeRainBannedTerm } from "../rainBans.js";
+import { supabase } from "../db.js";
+import { updateUserBadges } from "../badges.js";
+
 
 export const data = {
   name: "rain",
@@ -138,6 +141,21 @@ export async function execute(interaction: ChatInputCommandInteraction) {
       });
     })
   );
+
+  // Log the rain in the database
+  await supabase.from("rains").insert({
+    sender_id: interaction.user.id,
+    amount_sats: totalNeeded,
+    recipient_count: activeUserIds.length,
+  });
+
+  // Update rainer badge roles in Discord
+  if (interaction.guildId) {
+    updateUserBadges(interaction.client, interaction.guildId, interaction.user.id).catch((err) => {
+      console.error("[Badges] Error updating rainer badges:", err);
+    });
+  }
+
 
   const recipients = activeUserIds.map((id) => `<@${id}>`).join("\n");
 
