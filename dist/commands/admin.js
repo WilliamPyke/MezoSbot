@@ -55,17 +55,21 @@ async function renderBadgesMenu(guildId) {
         .setTitle("🏆 Badge Configurations")
         .setDescription("Sync Discord roles to users when they cross tipping and raining milestones. Choose a category below:")
         .setTimestamp();
-    const row = new discord_js_1.ActionRowBuilder().addComponents(new discord_js_1.ButtonBuilder()
+    const row1 = new discord_js_1.ActionRowBuilder().addComponents(new discord_js_1.ButtonBuilder()
         .setCustomId(`${CUSTOM_ID_PREFIX}:badge_type:tipper`)
         .setLabel("Tipper Tiers")
         .setStyle(discord_js_1.ButtonStyle.Primary), new discord_js_1.ButtonBuilder()
         .setCustomId(`${CUSTOM_ID_PREFIX}:badge_type:rainer`)
         .setLabel("Rainer Tiers")
         .setStyle(discord_js_1.ButtonStyle.Primary), new discord_js_1.ButtonBuilder()
+        .setCustomId(`${CUSTOM_ID_PREFIX}:sync_all`)
+        .setLabel("🔄 Sync All Roles")
+        .setStyle(discord_js_1.ButtonStyle.Success));
+    const row2 = new discord_js_1.ActionRowBuilder().addComponents(new discord_js_1.ButtonBuilder()
         .setCustomId(`${CUSTOM_ID_PREFIX}:menu_main`)
         .setLabel("⬅️ Back to Main Menu")
         .setStyle(discord_js_1.ButtonStyle.Secondary));
-    return { embeds: [embed], components: [row] };
+    return { embeds: [embed], components: [row1, row2] };
 }
 async function renderBadgeTypeMenu(guildId, badgeType) {
     const { data: configs } = await db_js_1.supabase
@@ -218,6 +222,25 @@ async function handleAdminInteraction(interaction) {
             const menu = await renderRainBansMenu(btnInteraction.guildId);
             await btnInteraction.editReply(menu);
         }
+        else if (action === "sync_all") {
+            // Temporarily change view to show loading state
+            await btnInteraction.editReply({
+                embeds: [
+                    new discord_js_1.EmbedBuilder()
+                        .setColor(COLOR_BADGES)
+                        .setTitle("🔄 Synchronizing Roles")
+                        .setDescription("Syncing badge roles for all historical users in the server. This may take a moment...")
+                ],
+                components: []
+            });
+            const count = await syncAllGuildBadges(btnInteraction.client, btnInteraction.guildId);
+            const menu = await renderBadgesMenu(btnInteraction.guildId);
+            menu.embeds[0].addFields({
+                name: "Sync Status",
+                value: `✅ Successfully synchronized badge roles for **${count}** historical users!`
+            });
+            await btnInteraction.editReply(menu);
+        }
         else if (action === "badge_type") {
             const type = parts[2];
             const menu = await renderBadgeTypeMenu(btnInteraction.guildId, type);
@@ -337,4 +360,21 @@ async function handleAdminModalTriggers(interaction) {
         return true;
     }
     return false;
+}
+async function syncAllGuildBadges(client, guildId) {
+    await (0, badges_js_1.ensureDefaultBadgesExist)(guildId);
+    // Fetch unique discord IDs who have tipped or rained historically
+    const { data: tips } = await db_js_1.supabase.from("user_tip_stats").select("discord_id");
+    const { data: rains } = await db_js_1.supabase.from("user_rain_stats").select("discord_id");
+    const userIds = new Set();
+    tips?.forEach(t => userIds.add(t.discord_id));
+    rains?.forEach(r => userIds.add(r.discord_id));
+    let count = 0;
+    for (const userId of userIds) {
+        await (0, badges_js_1.updateUserBadges)(client, guildId, userId).catch(() => { });
+        count++;
+        // Sleep 50ms to prevent hitting rate limit hard
+        await new Promise((r) => setTimeout(r, 50));
+    }
+    return count;
 }
