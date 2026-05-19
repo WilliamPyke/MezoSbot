@@ -18,6 +18,7 @@ import { initEVM, getTreasuryAddress, startDepositPoller, registerDepositAddress
 import { commands, commandsData } from "./commands/index.js";
 import { handleQuestBuilderInteraction, isQuestBuilderInteraction } from "./commands/quest.js";
 import { handleRainBanInteraction, isRainBanInteraction } from "./commands/rainban.js";
+import { handleAdminInteraction, isAdminInteraction, handleAdminModalTriggers } from "./commands/admin.js";
 import {
   startEmulator,
   stopEmulator,
@@ -391,6 +392,28 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
     }
     console.log(`[Discord] Quest builder ${cid} done in ${Date.now() - startMs}ms`);
+    return;
+  }
+
+  if (isAdminInteraction(interaction)) {
+    const cid = ("customId" in interaction && interaction.customId) || "";
+    console.log(`[Discord] Admin interaction ${cid} from ${tag} (arrivalLag=${arrivalLagMs}ms)`);
+    try {
+      if (interaction.isButton() && await handleAdminModalTriggers(interaction)) {
+        console.log(`[Discord] Admin modal trigger ${cid} shown in ${Date.now() - startMs}ms`);
+        return;
+      }
+      await handleAdminInteraction(interaction);
+    } catch (err) {
+      const message = (err as Error)?.message ?? String(err);
+      console.warn(`[Admin] Interaction ${cid} failed:`, message);
+      if ("followUp" in interaction && (interaction.deferred || interaction.replied)) {
+        await interaction.followUp({ content: `Could not update admin settings: ${message}`, flags: MessageFlags.Ephemeral }).catch(() => {});
+      } else if ("reply" in interaction) {
+        await interaction.reply({ content: `Could not update admin settings: ${message}`, flags: MessageFlags.Ephemeral }).catch(() => {});
+      }
+    }
+    console.log(`[Discord] Admin interaction ${cid} done in ${Date.now() - startMs}ms`);
     return;
   }
 

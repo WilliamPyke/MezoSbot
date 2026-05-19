@@ -8,6 +8,7 @@ const evm_js_1 = require("./evm.js");
 const index_js_1 = require("./commands/index.js");
 const quest_js_1 = require("./commands/quest.js");
 const rainban_js_1 = require("./commands/rainban.js");
+const admin_js_1 = require("./commands/admin.js");
 const emulator_js_1 = require("./emulator.js");
 const stream_js_1 = require("./stream.js");
 const balance_js_1 = require("./balance.js");
@@ -299,6 +300,29 @@ client.on(discord_js_1.Events.InteractionCreate, async (interaction) => {
             }
         }
         console.log(`[Discord] Quest builder ${cid} done in ${Date.now() - startMs}ms`);
+        return;
+    }
+    if ((0, admin_js_1.isAdminInteraction)(interaction)) {
+        const cid = ("customId" in interaction && interaction.customId) || "";
+        console.log(`[Discord] Admin interaction ${cid} from ${tag} (arrivalLag=${arrivalLagMs}ms)`);
+        try {
+            if (interaction.isButton() && await (0, admin_js_1.handleAdminModalTriggers)(interaction)) {
+                console.log(`[Discord] Admin modal trigger ${cid} shown in ${Date.now() - startMs}ms`);
+                return;
+            }
+            await (0, admin_js_1.handleAdminInteraction)(interaction);
+        }
+        catch (err) {
+            const message = err?.message ?? String(err);
+            console.warn(`[Admin] Interaction ${cid} failed:`, message);
+            if ("followUp" in interaction && (interaction.deferred || interaction.replied)) {
+                await interaction.followUp({ content: `Could not update admin settings: ${message}`, flags: discord_js_1.MessageFlags.Ephemeral }).catch(() => { });
+            }
+            else if ("reply" in interaction) {
+                await interaction.reply({ content: `Could not update admin settings: ${message}`, flags: discord_js_1.MessageFlags.Ephemeral }).catch(() => { });
+            }
+        }
+        console.log(`[Discord] Admin interaction ${cid} done in ${Date.now() - startMs}ms`);
         return;
     }
     if ((0, rainban_js_1.isRainBanInteraction)(interaction)) {

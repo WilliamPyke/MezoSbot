@@ -69,47 +69,40 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   const embed = new EmbedBuilder()
     .setColor(0x00cc6a)
     .setTitle(`${target.displayName ?? target.username}'s Profile`)
-    .setDescription(`Discord user: <@${target.id}>`)
+    .setDescription(`<@${target.id}>`)
     .setThumbnail(target.displayAvatarURL({ size: 128 }) || null)
     .addFields(
       { name: "🪙 Balance", value: `**${formatSats(dbUser.balance_sats)}**`, inline: true },
-      { name: "🔗 EVM Wallet", value: dbUser.wallet_address ? `\`${dbUser.wallet_address}\`` : "*Not linked*", inline: true }
+      { name: "📊 Statistics", value: `📤 Tipped: **${formatSats(totalTipped)}**\n🌧️ Rained: **${formatSats(totalRained)}**`, inline: true }
     );
-
-  // Stats section
-  const statsLines = [
-    `📤 **Total Tipped:** ${formatSats(totalTipped)}`,
-    `🌧️ **Total Rained:** ${formatSats(totalRained)} *(incl. drops)*`,
-  ];
-  embed.addFields({ name: "📊 Transaction Stats", value: statsLines.join("\n"), inline: false });
 
   // Achievements section
   const achievementLines: string[] = [];
 
   if (activeTipper) {
-    achievementLines.push(`${activeTipper.emoji} **${activeTipper.stageName}** (Tipping Tier ${earnedTipperStages.length}/6)`);
+    achievementLines.push(`${activeTipper.emoji} **${activeTipper.stageName}** (Tier ${earnedTipperStages.length}/6)`);
   } else {
     achievementLines.push("⚪ *No Tipping Badges earned*");
   }
 
   if (nextTipper) {
-    achievementLines.push(`  ↳ Next: **${nextTipper.stageName}** (${formatSats(totalTipped)} / ${formatSats(nextTipper.thresholdSats)})\n  ${buildProgressBar(totalTipped, nextTipper.thresholdSats)}`);
+    achievementLines.push(`↳ Next: **${nextTipper.stageName}** (${formatSats(totalTipped)} / ${formatSats(nextTipper.thresholdSats)})\n${buildProgressBar(totalTipped, nextTipper.thresholdSats)}`);
   } else {
-    achievementLines.push("  🏆 *Max Tipping Level Reached!*");
+    achievementLines.push("🏆 *Max Tipping Level Reached!*");
   }
 
   achievementLines.push(""); // Spacing
 
   if (activeRainer) {
-    achievementLines.push(`${activeRainer.emoji} **${activeRainer.stageName}** (Raining Tier ${earnedRainerStages.length}/6)`);
+    achievementLines.push(`${activeRainer.emoji} **${activeRainer.stageName}** (Tier ${earnedRainerStages.length}/6)`);
   } else {
     achievementLines.push("⚪ *No Raining Badges earned*");
   }
 
   if (nextRainer) {
-    achievementLines.push(`  ↳ Next: **${nextRainer.stageName}** (${formatSats(totalRained)} / ${formatSats(nextRainer.thresholdSats)})\n  ${buildProgressBar(totalRained, nextRainer.thresholdSats)}`);
+    achievementLines.push(`↳ Next: **${nextRainer.stageName}** (${formatSats(totalRained)} / ${formatSats(nextRainer.thresholdSats)})\n${buildProgressBar(totalRained, nextRainer.thresholdSats)}`);
   } else {
-    achievementLines.push("  🏆 *Max Raining Level Reached!*");
+    achievementLines.push("🏆 *Max Raining Level Reached!*");
   }
 
   embed.addFields({ name: "🏆 Badges & Achievements", value: achievementLines.join("\n"), inline: false });
