@@ -836,14 +836,10 @@ CREATE INDEX IF NOT EXISTS idx_badge_roles_guild ON badge_roles(guild_id);
 
 CREATE OR REPLACE VIEW user_rain_stats AS
 SELECT 
-  creator_id AS discord_id,
+  sender_id AS discord_id,
   SUM(amount_sats) AS total_rained_sats
-FROM (
-  SELECT sender_id AS creator_id, amount_sats FROM rains
-  UNION ALL
-  SELECT d.creator_id, dc.amount_sats FROM drops d JOIN drop_claims dc ON d.id = dc.drop_id
-) AS combined
-GROUP BY creator_id;
+FROM rains
+GROUP BY sender_id;
 
 CREATE OR REPLACE VIEW user_tip_stats AS
 SELECT 

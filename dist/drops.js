@@ -97,6 +97,17 @@ async function processClaim(dropId, claimantId, claimantRoleIds = []) {
     if (claimError) {
         return { ok: false, error: "You've already claimed from this drop." };
     }
+    // Log the drop claim as rain in the database
+    const { error: rainError } = await db_js_1.supabase
+        .from("rains")
+        .insert({
+        sender_id: drop.creator_id,
+        amount_sats: drop.per_claim_sats,
+        recipient_count: 1,
+    });
+    if (rainError) {
+        console.error("[Drops] Failed to log drop claim to rains table:", rainError.message);
+    }
     // Update drop state
     const newCount = drop.claims_count + 1;
     const completed = newCount >= drop.max_claims;
