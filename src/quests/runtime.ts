@@ -24,6 +24,7 @@ import {
 
 const SWEEP_MS = 60_000;
 const EMBED_REFETCH_DELAY_MS = 1_500;
+const initializedQuestIds = new Set<number>();
 
 type EventAttendanceConfig = {
   scheduledEventId?: string;
@@ -678,15 +679,39 @@ export function buildQuestRuntimeEmbed(snapshot: Awaited<ReturnType<typeof getQu
 }
 
 async function refreshQuestMessage(client: Client, questId: number): Promise<boolean> {
-  const snapshot = await getQuestSnapshot(questId).catch(() => null);
+  const snapshot = await getQuestSnapshot(questId).catch((err) => {
+    console.warn(`[QuestEngine] refreshQuestMessage: Failed to get quest snapshot for ${questId}:`, err);
+    return null;
+  });
   if (!snapshot) return false;
+
   const embed = buildQuestRuntimeEmbed(snapshot);
-  if (!snapshot.quest.message_id || !embed) return false;
+  if (!snapshot.quest.message_id) {
+    console.warn(`[QuestEngine] refreshQuestMessage: Quest ${questId} has no message_id in database.`);
+    return false;
+  }
+  if (!embed) {
+    console.warn(`[QuestEngine] refreshQuestMessage: Failed to build quest embed for quest ${questId}.`);
+    return false;
+  }
 
-  const channel = await client.channels.fetch(snapshot.quest.channel_id).catch(() => null);
-  if (!channel || !("messages" in channel)) return false;
+  const channel = await client.channels.fetch(snapshot.quest.channel_id).catch((err) => {
+    console.warn(`[QuestEngine] refreshQuestMessage: Failed to fetch channel ${snapshot.quest.channel_id} for quest ${questId}:`, err.message);
+    return null;
+  });
+  if (!channel) {
+    console.warn(`[QuestEngine] refreshQuestMessage: Channel ${snapshot.quest.channel_id} for quest ${questId} not found.`);
+    return false;
+  }
+  if (!("messages" in channel)) {
+    console.warn(`[QuestEngine] refreshQuestMessage: Channel ${snapshot.quest.channel_id} for quest ${questId} is not text-based.`);
+    return false;
+  }
 
-  const message = await channel.messages.fetch(snapshot.quest.message_id).catch(() => null);
+  const message = await channel.messages.fetch(snapshot.quest.message_id).catch((err) => {
+    console.warn(`[QuestEngine] refreshQuestMessage: Message ${snapshot.quest.message_id} in channel ${snapshot.quest.channel_id} not found:`, err.message);
+    return null;
+  });
   if (!message) return false;
 
   try {
@@ -738,7 +763,10 @@ export async function completeAndNotify(
     }
   }
 
-  await refreshQuestMessage(client, task.quest_id);
+  const refreshed = await refreshQuestMessage(client, task.quest_id);
+  if (refreshed) {
+    initializedQuestIds.add(task.quest_id);
+  }
   return result;
 }
 
@@ -926,11 +954,15 @@ async function sweepRotatingLinkQuests(client: Client): Promise<void> {
     const metadata = (task.quest.metadata ?? {}) as Record<string, unknown>;
     const lastRendered = metadata.lastRenderedLinkIndex;
     const lastRenderedWindow = metadata.lastRenderedLinkWindowStart;
-    if (lastRendered === index && lastRenderedWindow === windowStart) continue;
+
+    const isFirstCheckInProcess = !initializedQuestIds.has(task.quest_id);
+    if (!isFirstCheckInProcess && lastRendered === index && lastRenderedWindow === windowStart) continue;
 
     // Refresh Discord message first
     const refreshed = await refreshQuestMessage(client, task.quest_id);
     if (!refreshed) continue;
+
+    initializedQuestIds.add(task.quest_id);
 
     // Persist only after successful Discord edit
     const { error } = await supabase
