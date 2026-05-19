@@ -89,43 +89,77 @@ export async function updateUserBadges(client: Client, guildId: string, userId: 
   const totalTipped = tipData?.total_tipped_sats ?? 0;
   const totalRained = rainData?.total_rained_sats ?? 0;
 
-  // Fetch role configurations
-  const { data: configs, error: configError } = await supabase
-    .from("badge_roles")
-    .select("*")
-    .eq("guild_id", guildId);
-
-  if (configError || !configs) {
-    console.error(`[Badges] Error fetching configurations for guild ${guildId}:`, configError);
-    return;
-  }
-
-  // Get Discord Guild and Member
   try {
+    // Fetch role configurations
+    const { data: configs, error: configError } = await supabase
+      .from("badge_roles")
+      .select("*")
+      .eq("guild_id", guildId);
+
+    if (configError || !configs) {
+      console.error(`[Badges] Error fetching configurations for guild ${guildId}:`, configError);
+      return;
+    }
+
     const guild = await client.guilds.fetch(guildId);
     if (!guild) return;
 
     const member = await guild.members.fetch(userId).catch(() => null);
     if (!member) return;
 
-    for (const config of configs) {
-      if (!config.role_id) continue;
+    // 1. Process Tipper Roles
+    const tipperConfigs = configs.filter((c) => c.badge_type === "tipper" && c.role_id);
+    tipperConfigs.sort((a, b) => a.threshold_sats - b.threshold_sats);
+    const eligibleTippers = tipperConfigs.filter((c) => totalTipped >= c.threshold_sats);
+    const targetTipperConfig = eligibleTippers.length > 0 ? eligibleTippers[eligibleTippers.length - 1] : null;
+    const targetTipperRoleId = targetTipperConfig?.role_id ?? null;
+    const tipperRolesToRemove = tipperConfigs
+      .map((c) => c.role_id)
+      .filter((rid): rid is string => !!rid && rid !== targetTipperRoleId);
 
-      const isEligible =
-        config.badge_type === "tipper"
-          ? totalTipped >= config.threshold_sats
-          : totalRained >= config.threshold_sats;
+    // 2. Process Rainer Roles
+    const rainerConfigs = configs.filter((c) => c.badge_type === "rainer" && c.role_id);
+    rainerConfigs.sort((a, b) => a.threshold_sats - b.threshold_sats);
+    const eligibleRainers = rainerConfigs.filter((c) => totalRained >= c.threshold_sats);
+    const targetRainerConfig = eligibleRainers.length > 0 ? eligibleRainers[eligibleRainers.length - 1] : null;
+    const targetRainerRoleId = targetRainerConfig?.role_id ?? null;
+    const rainerRolesToRemove = rainerConfigs
+      .map((c) => c.role_id)
+      .filter((rid): rid is string => !!rid && rid !== targetRainerRoleId);
 
-      const hasRole = member.roles.cache.has(config.role_id);
+    // Collect roles to add & remove
+    const rolesToAdd: string[] = [];
+    const rolesToRemove: string[] = [];
 
-      if (isEligible && !hasRole) {
-        // Grant role
-        try {
-          await member.roles.add(config.role_id);
-          console.log(`[Badges] Granted role "${config.stage_name}" (${config.role_id}) to user ${userId} in guild ${guildId}`);
-        } catch (e) {
-          console.warn(`[Badges] Failed to add role ${config.role_id} to user ${userId}:`, e);
-        }
+    if (targetTipperRoleId && !member.roles.cache.has(targetTipperRoleId)) {
+      rolesToAdd.push(targetTipperRoleId);
+    }
+    if (targetRainerRoleId && !member.roles.cache.has(targetRainerRoleId)) {
+      rolesToAdd.push(targetRainerRoleId);
+    }
+
+    for (const rid of [...tipperRolesToRemove, ...rainerRolesToRemove]) {
+      if (member.roles.cache.has(rid)) {
+        rolesToRemove.push(rid);
+      }
+    }
+
+    // Execute bulk Discord role adjustments
+    if (rolesToRemove.length > 0) {
+      try {
+        await member.roles.remove(rolesToRemove);
+        console.log(`[Badges] Removed legacy roles ${rolesToRemove.join(", ")} from user ${userId} in guild ${guildId}`);
+      } catch (e) {
+        console.warn(`[Badges] Failed to remove roles ${rolesToRemove.join(", ")} from user ${userId}:`, e);
+      }
+    }
+
+    if (rolesToAdd.length > 0) {
+      try {
+        await member.roles.add(rolesToAdd);
+        console.log(`[Badges] Granted roles ${rolesToAdd.join(", ")} to user ${userId} in guild ${guildId}`);
+      } catch (e) {
+        console.warn(`[Badges] Failed to add roles ${rolesToAdd.join(", ")} to user ${userId}:`, e);
       }
     }
   } catch (err) {
