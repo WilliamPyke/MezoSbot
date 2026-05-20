@@ -12,6 +12,7 @@ const discord_js_1 = require("discord.js");
 const db_js_1 = require("./db.js");
 const balance_js_1 = require("./balance.js");
 const evm_js_1 = require("./evm.js");
+const ledger_js_1 = require("./ledger.js");
 const format_js_1 = require("./format.js");
 /* ------------------------------------------------------------------ */
 /*  Build the drop embed + button                                     */
@@ -61,7 +62,7 @@ async function getClaimants(dropId) {
 /* ------------------------------------------------------------------ */
 /*  Process a claim (shared by button handler and /claim command)      */
 /* ------------------------------------------------------------------ */
-async function processClaim(dropId, claimantId, claimantRoleIds = []) {
+async function processClaim(dropId, claimantId, claimantRoleIds = [], client = null, guildId = null) {
     // Re-fetch the drop to get latest state
     const { data: drop } = await db_js_1.supabase
         .from("drops")
@@ -119,6 +120,15 @@ async function processClaim(dropId, claimantId, claimantRoleIds = []) {
     // Credit the claimant
     await (0, balance_js_1.addBalance)(claimantId, drop.per_claim_sats);
     await (0, evm_js_1.registerDepositAddress)(claimantId);
+    (0, ledger_js_1.recordLedgerEntry)(client, {
+        type: "drop_claim",
+        amountSats: drop.per_claim_sats,
+        senderId: drop.creator_id,
+        receiverId: claimantId,
+        guildId,
+        referenceType: "drop_claims",
+        referenceId: String(dropId),
+    });
     return {
         ok: true,
         newCount,

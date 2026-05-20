@@ -32,7 +32,13 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     : null;
   const claimantRoleIds = member ? [...member.roles.cache.keys()] : [];
 
-  const result = await processClaim(drop.id, interaction.user.id, claimantRoleIds);
+  const result = await processClaim(
+    drop.id,
+    interaction.user.id,
+    claimantRoleIds,
+    interaction.client,
+    interaction.guildId,
+  );
 
   if (!result.ok) {
     return interaction.editReply({ content: `❌ ${result.error}` });

@@ -8,6 +8,7 @@ const evm_js_1 = require("../evm.js");
 const balance_js_1 = require("../balance.js");
 const db_js_1 = require("../db.js");
 const format_js_1 = require("../format.js");
+const ledger_js_1 = require("../ledger.js");
 exports.data = {
     name: "backfill",
     description: "Admin: manually check and credit a user's uncredited deposit",
@@ -57,6 +58,16 @@ async function execute(interaction) {
             block_number: 0,
         });
         await (0, balance_js_1.addBalance)(target.id, diffSats);
+        (0, ledger_js_1.recordLedgerEntry)(interaction.client, {
+            type: "deposit",
+            amountSats: diffSats,
+            senderId: "treasury",
+            receiverId: target.id,
+            guildId: interaction.guildId,
+            referenceType: "deposits",
+            referenceId: txId,
+            metadata: { source: "backfill" },
+        });
         await db_js_1.supabase
             .from("deposit_addresses")
             .update({ last_checked_balance: bal.toString() })

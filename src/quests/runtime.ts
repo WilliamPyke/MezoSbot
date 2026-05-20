@@ -2,12 +2,15 @@ import {
   ChannelType,
   EmbedBuilder,
   GuildScheduledEventStatus,
+  PermissionFlagsBits,
   type Client,
   type GuildScheduledEvent,
   type Message,
   type VoiceBasedChannel,
   type VoiceState,
 } from "discord.js";
+import { config as appConfig } from "../config.js";
+import { recordLedgerEntry } from "../ledger.js";
 import { supabase } from "../db.js";
 import { formatSats } from "../format.js";
 import { registerDepositAddress } from "../evm.js";
@@ -54,7 +57,18 @@ type FirstLinkClaimMetadata = {
   userId?: string;
   linkIndex?: number;
   claimedAt?: string;
+  winnerMessageId?: string;
+  matchedUrl?: string;
 };
+
+type CollectedMessageUrls = {
+  posterUrls: string[];
+  expandedUrls: string[];
+  allUrls: string[];
+};
+
+const LINK_QUEST_OPEN_COLOR = 0xed4245;
+const LINK_QUEST_CLAIMED_COLOR = 0x57f287;
 
 export function resolveLinkList(config: FirstLinkConfig | null | undefined): string[] {
   if (!config) return [];
@@ -391,7 +405,7 @@ function discordMessageLinks(urls: string[]): Array<{ channelId: string; message
   return links;
 }
 
-async function collectMessageUrls(message: Message): Promise<string[]> {
+function collectPosterUrls(message: Message): string[] {
   const urls = new Set<string>(urlsFromText(message.content));
 
   for (const embed of message.embeds) {
@@ -404,42 +418,135 @@ async function collectMessageUrls(message: Message): Promise<string[]> {
     }
   }
 
-  for (const link of discordMessageLinks([...urls])) {
+  return [...urls];
+}
+
+function isDiscordChannelsUrl(rawUrl: string): boolean {
+  try {
+    const host = new URL(rawUrl).hostname.toLowerCase();
+    if (!/^(www\.|canary\.|ptb\.)?discord(app)?\.com$/.test(host)) return false;
+    const parts = new URL(rawUrl).pathname.split("/").filter(Boolean);
+    return parts[0] === "channels" && !!parts[2] && !!parts[3];
+  } catch {
+    return false;
+  }
+}
+
+function isPosterContentOnlyDiscordMessageLinks(message: Message, posterUrls: string[]): boolean {
+  const contentUrls = urlsFromText(message.content);
+  if (contentUrls.length === 0) return false;
+  return contentUrls.every(isDiscordChannelsUrl);
+}
+
+function scrapeUrlsFromMessageSurface(linkedMessage: Message): string[] {
+  const urls = new Set<string>(urlsFromText(linkedMessage.content));
+  for (const embed of linkedMessage.embeds) {
+    for (const url of urlsFromText(embed.url)) urls.add(url);
+    for (const url of urlsFromText(embed.description)) urls.add(url);
+    for (const url of urlsFromText(embed.title)) urls.add(url);
+    for (const field of embed.fields) {
+      for (const url of urlsFromText(field.name)) urls.add(url);
+      for (const url of urlsFromText(field.value)) urls.add(url);
+    }
+  }
+  return [...urls];
+}
+
+async function expandDiscordMessageLinks(
+  message: Message,
+  posterUrls: string[],
+  authoritativeByMessageId?: Map<string, string>,
+): Promise<string[]> {
+  const expanded = new Set<string>();
+
+  for (const link of discordMessageLinks(posterUrls)) {
+    const authoritative = authoritativeByMessageId?.get(link.messageId);
+    if (authoritative) {
+      expanded.add(authoritative);
+      continue;
+    }
+
     const channel = await message.client.channels.fetch(link.channelId).catch(() => null);
     if (!channel || !("messages" in channel)) continue;
 
     const linkedMessage = await channel.messages.fetch(link.messageId).catch(() => null);
     if (!linkedMessage) continue;
 
-    for (const url of urlsFromText(linkedMessage.content)) urls.add(url);
-    for (const embed of linkedMessage.embeds) {
-      for (const url of urlsFromText(embed.url)) urls.add(url);
-      for (const url of urlsFromText(embed.description)) urls.add(url);
-      for (const url of urlsFromText(embed.title)) urls.add(url);
-      for (const field of embed.fields) {
-        for (const url of urlsFromText(field.name)) urls.add(url);
-        for (const url of urlsFromText(field.value)) urls.add(url);
-      }
-    }
+    for (const url of scrapeUrlsFromMessageSurface(linkedMessage)) expanded.add(url);
   }
 
-  return [...urls];
+  return [...expanded];
 }
 
-async function collectMessageUrlsWithDelayedEmbedFetch(message: Message): Promise<string[]> {
-  let urls = await collectMessageUrls(message);
+async function collectMessageUrls(message: Message): Promise<CollectedMessageUrls> {
+  const posterUrls = collectPosterUrls(message);
+  const expandedUrls = await expandDiscordMessageLinks(message, posterUrls);
+  const allUrls = [...new Set([...posterUrls, ...expandedUrls])];
+  return { posterUrls, expandedUrls, allUrls };
+}
+
+async function collectMessageUrlsWithDelayedEmbedFetch(message: Message): Promise<CollectedMessageUrls> {
+  let collected = await collectMessageUrls(message);
   const needsEmbedHydration =
-    urls.length === 0 ||
-    (extractDiscordEventIds(urls).length === 0 && discordMessageLinks(urls).length > 0);
-  if (!needsEmbedHydration) return urls;
+    collected.allUrls.length === 0 ||
+    (extractDiscordEventIds(collected.allUrls).length === 0 && discordMessageLinks(collected.posterUrls).length > 0);
+  if (!needsEmbedHydration) return collected;
 
   await sleep(EMBED_REFETCH_DELAY_MS);
   const freshMessage = await message.channel.messages.fetch(message.id).catch(() => null);
-  if (!freshMessage) return urls;
+  if (!freshMessage) return collected;
 
-  const freshUrls = await collectMessageUrls(freshMessage);
-  urls = [...new Set([...urls, ...freshUrls])];
-  return urls;
+  const fresh = await collectMessageUrls(freshMessage);
+  collected = {
+    posterUrls: [...new Set([...collected.posterUrls, ...fresh.posterUrls])],
+    expandedUrls: [...new Set([...collected.expandedUrls, ...fresh.expandedUrls])],
+    allUrls: [...new Set([...collected.allUrls, ...fresh.allUrls])],
+  };
+  return collected;
+}
+
+function activeRotatingLinkUrl(config: FirstLinkConfig): string | null {
+  const list = resolveLinkList(config);
+  if (list.length === 0) return null;
+  const refreshMinutes = Number.isFinite(config.refreshMinutes) && config.refreshMinutes >= 1
+    ? Math.floor(config.refreshMinutes)
+    : 60;
+  const index = currentLinkIndex(refreshMinutes, list.length, config.rotationStartMs ?? null);
+  return list[index] ?? null;
+}
+
+function urlsForTaskMatching(
+  message: Message,
+  task: ActiveQuestTask<FirstLinkConfig>,
+  collected: CollectedMessageUrls,
+): string[] {
+  const config = task.config;
+  const posterDiscordLinks = discordMessageLinks(collected.posterUrls);
+  const questMessageId = task.quest.message_id;
+  const questChannelId = task.quest.channel_id;
+
+  const linksToQuestAnnouncement = questMessageId && questChannelId
+    && posterDiscordLinks.some((link) => link.messageId === questMessageId && link.channelId === questChannelId);
+
+  if (
+    linksToQuestAnnouncement
+    && (config.source === "rotating_list" || config.source === "nearest_event")
+  ) {
+    const activeUrl = activeRotatingLinkUrl(config);
+    if (activeUrl) return [activeUrl];
+  }
+
+  if (isPosterContentOnlyDiscordMessageLinks(message, collected.posterUrls) && collected.expandedUrls.length > 0) {
+    return collected.expandedUrls;
+  }
+
+  return collected.allUrls;
+}
+
+function matchNormsForLog(urls: string[]): string[] {
+  return urls
+    .map(normalizeUrlForMatch)
+    .filter((u): u is string => !!u && !isDiscordChannelsUrl(u));
 }
 
 function extractDiscordEventIds(urls: string[]): string[] {
@@ -468,13 +575,15 @@ function extractDiscordEventIds(urls: string[]): string[] {
   return ids;
 }
 
-async function messageMatchesFirstLinkTask(
+function messageMatchesFirstLinkTask(
   message: Message,
   task: ActiveQuestTask<FirstLinkConfig>,
-  urls: string[],
-): Promise<boolean> {
+  collected: CollectedMessageUrls,
+): boolean {
   const config = task.config;
   if (!config || message.channelId !== config.targetChannelId) return false;
+
+  const urls = urlsForTaskMatching(message, task, collected);
   if (urls.length === 0) return false;
 
   if (config.source === "latest_tweet") {
@@ -496,7 +605,8 @@ async function messageMatchesFirstLinkTask(
 
     const messageNorms = new Set(urls.map(normalizeUrlForMatch).filter((u): u is string => !!u));
     if (!messageNorms.has(targetNorm)) {
-      console.log(`[QuestEngine] First-link task ${task.id} rejected: expected=${targetNorm} got=${[...messageNorms].join(",")}`);
+      const logNorms = matchNormsForLog(urls);
+      console.log(`[QuestEngine] First-link task ${task.id} rejected: expected=${targetNorm} got=${logNorms.join(",")}`);
       return false;
     }
     return true;
@@ -559,6 +669,8 @@ async function markFirstLinkWindowClaimed(
   task: ActiveQuestTask<FirstLinkConfig>,
   userId: string,
   linkIndex: number,
+  winnerMessageId: string,
+  matchedUrl: string | null,
 ): Promise<void> {
   const refreshMinutes = Number.isFinite(task.config.refreshMinutes) && task.config.refreshMinutes >= 1
     ? Math.floor(task.config.refreshMinutes)
@@ -570,6 +682,8 @@ async function markFirstLinkWindowClaimed(
     userId,
     linkIndex,
     claimedAt: nowIso(),
+    winnerMessageId,
+    matchedUrl: matchedUrl ?? undefined,
   };
 
   const { error } = await supabase
@@ -645,11 +759,13 @@ export function buildQuestRuntimeEmbed(snapshot: Awaited<ReturnType<typeof getQu
 
     const channelRef = `<#${config.targetChannelId}>`;
     const claimLine = isClaimed && claim?.userId
-      ? `Status: **Claimed** by <@${claim.userId}>`
-      : "Status: **Open**";
+      ? "🟢 **Claimed** by " + `<@${claim.userId}>`
+      : "🔴 **Open** — post the current link";
     const positionLine = list.length > 1
       ? `**Link ${index + 1} of ${list.length}** • Rotates every **${refreshMinutes}** min • Next rotation <t:${nextTs}:R>`
       : `Refresh every **${refreshMinutes}** min • Next reset <t:${nextTs}:R>`;
+
+    embed.setColor(isClaimed ? LINK_QUEST_CLAIMED_COLOR : LINK_QUEST_OPEN_COLOR);
 
     embed.addFields(
       { name: "🎯 Current target", value: `${positionLine}\n${claimLine}\n${current}`, inline: false },
@@ -678,7 +794,7 @@ export function buildQuestRuntimeEmbed(snapshot: Awaited<ReturnType<typeof getQu
   return embed;
 }
 
-async function refreshQuestMessage(client: Client, questId: number): Promise<boolean> {
+export async function refreshQuestMessage(client: Client, questId: number): Promise<boolean> {
   const snapshot = await getQuestSnapshot(questId).catch((err) => {
     console.warn(`[QuestEngine] refreshQuestMessage: Failed to get quest snapshot for ${questId}:`, err);
     return null;
@@ -747,6 +863,17 @@ export async function completeAndNotify(
   if (!result.ok) return result;
 
   if ((result.rewardDeltaSats ?? 0) > 0) {
+    recordLedgerEntry(client, {
+      type: "quest_reward",
+      amountSats: result.rewardDeltaSats ?? 0,
+      senderId: task.quest.creator_id,
+      receiverId: userId,
+      guildId: task.quest.guild_id,
+      referenceType: "quest_reward_events",
+      referenceId: String(task.quest_id),
+      metadata: { task_id: task.id, task_title: task.title },
+    });
+
     await registerDepositAddress(userId).catch(() => {});
     await sendTransferReceivedDm({
       client,
@@ -765,6 +892,112 @@ export async function completeAndNotify(
   return result;
 }
 
+async function maybeDeleteDuplicateLinkPost(
+  client: Client,
+  message: Message,
+  tasks: Array<ActiveQuestTask<FirstLinkConfig>>,
+  collected: CollectedMessageUrls,
+): Promise<void> {
+  const deleteMinutes = appConfig.quests.linkDuplicateDeleteMinutes;
+  if (deleteMinutes <= 0 || message.author.bot) return;
+
+  const channel = message.channel;
+  if (!channel.isTextBased() || channel.isDMBased()) return;
+
+  const me = message.guild?.members.me ?? client.user;
+  if (!me) return;
+
+  const perms = channel.permissionsFor(me);
+  if (!perms?.has(PermissionFlagsBits.ManageMessages)) return;
+
+  for (const task of tasks) {
+    if (task.config.targetChannelId !== message.channelId) continue;
+
+    const claim = (task.quest.metadata as Record<string, unknown> | null | undefined)?.currentLinkClaim as FirstLinkClaimMetadata | undefined;
+    if (!claim?.claimedAt || !claim.windowStart) continue;
+    if (claim.winnerMessageId === message.id) continue;
+
+    const refreshMinutes = Number.isFinite(task.config.refreshMinutes) && task.config.refreshMinutes >= 1
+      ? Math.floor(task.config.refreshMinutes)
+      : 60;
+    const windowStart = linkWindowStartIso(refreshMinutes, task.config.rotationStartMs ?? null);
+    if (claim.windowStart !== windowStart) continue;
+
+    const claimAgeMs = Date.now() - Date.parse(claim.claimedAt);
+    if (!Number.isFinite(claimAgeMs) || claimAgeMs > deleteMinutes * 60_000) continue;
+
+    const list = resolveLinkList(task.config);
+    if (list.length === 0) continue;
+
+    const linkIndex = typeof claim.linkIndex === "number" ? claim.linkIndex : currentLinkIndex(
+      refreshMinutes,
+      list.length,
+      task.config.rotationStartMs ?? null,
+    );
+    const targetNorm = normalizeUrlForMatch(list[linkIndex]);
+    if (!targetNorm) continue;
+
+    const matchUrls = urlsForTaskMatching(message, task, collected);
+    const messageNorms = new Set(matchUrls.map(normalizeUrlForMatch).filter((u): u is string => !!u));
+    if (!messageNorms.has(targetNorm)) continue;
+
+    await message.delete().catch((err) => {
+      console.warn(`[QuestEngine] Failed to delete duplicate link message ${message.id}:`, (err as Error).message);
+    });
+    return;
+  }
+}
+
+export async function resetFirstLinkWindow(
+  client: Client,
+  questId: number,
+): Promise<{ ok: boolean; reason?: string; taskId?: number; windowStart?: string }> {
+  const snapshot = await getQuestSnapshot(questId).catch(() => null);
+  if (!snapshot) return { ok: false, reason: "quest_not_found" };
+  if (snapshot.quest.status !== "active") return { ok: false, reason: "quest_not_active" };
+
+  const linkTask = snapshot.tasks.find((task) => {
+    if (task.type !== "first_link_in_channel") return false;
+    const cfg = task.config as FirstLinkConfig | null | undefined;
+    return cfg && (cfg.source === "rotating_list" || cfg.source === "nearest_event");
+  });
+  if (!linkTask) return { ok: false, reason: "no_link_task" };
+
+  const config = linkTask.config as FirstLinkConfig;
+  const refreshMinutes = Number.isFinite(config.refreshMinutes) && config.refreshMinutes >= 1
+    ? Math.floor(config.refreshMinutes)
+    : 60;
+  const windowStart = linkWindowStartIso(refreshMinutes, config.rotationStartMs ?? null);
+
+  const { error: claimError } = await supabase
+    .from("quest_task_window_claims")
+    .delete()
+    .eq("task_id", linkTask.id)
+    .eq("window_start", windowStart);
+
+  if (claimError) {
+    console.warn(`[QuestEngine] resetFirstLinkWindow claim delete failed for quest ${questId}:`, claimError.message);
+    return { ok: false, reason: claimError.message };
+  }
+
+  const metadata = { ...(snapshot.quest.metadata as Record<string, unknown> | null ?? {}) };
+  delete metadata.currentLinkClaim;
+
+  const { error: metaError } = await supabase
+    .from("quests")
+    .update({ metadata, updated_at: nowIso() })
+    .eq("id", questId);
+
+  if (metaError) {
+    console.warn(`[QuestEngine] resetFirstLinkWindow metadata update failed for quest ${questId}:`, metaError.message);
+    return { ok: false, reason: metaError.message };
+  }
+
+  await refreshQuestMessage(client, questId);
+
+  return { ok: true, taskId: linkTask.id, windowStart };
+}
+
 export async function handleMultiStepQuestMessage(client: Client, message: Message): Promise<void> {
   if (!message.guild || message.author.bot) return;
 
@@ -777,32 +1010,39 @@ export async function handleMultiStepQuestMessage(client: Client, message: Messa
     console.log(`[QuestEngine] Message ${message.id} in link-quest channel ${message.channelId} by ${message.author.id}: contentLen=${message.content.length} embeds=${message.embeds.length}`);
   }
 
-  const urls = await collectMessageUrlsWithDelayedEmbedFetch(message);
+  const collected = await collectMessageUrlsWithDelayedEmbedFetch(message);
   if (channelHasTask) {
-    console.log(`[QuestEngine] Message ${message.id} extracted urls=${JSON.stringify(urls)}`);
+    console.log(`[QuestEngine] Message ${message.id} extracted urls=${JSON.stringify(collected.allUrls)}`);
   }
-  if (urls.length === 0) return;
+
+  await maybeDeleteDuplicateLinkPost(client, message, tasks, collected);
+
+  if (collected.allUrls.length === 0) return;
 
   for (const task of tasks) {
     if (!questWindowAllowsCompletion(task.quest)) continue;
-    if (!(await messageMatchesFirstLinkTask(message, task, urls))) continue;
+    if (!messageMatchesFirstLinkTask(message, task, collected)) continue;
+
+    const matchUrls = urlsForTaskMatching(message, task, collected);
+    const list = resolveLinkList(task.config);
+    const refreshMinutes = Number.isFinite(task.config.refreshMinutes) && task.config.refreshMinutes >= 1
+      ? Math.floor(task.config.refreshMinutes)
+      : 60;
+    const linkIndex = currentLinkIndex(refreshMinutes, list.length, task.config.rotationStartMs ?? null);
+    const matchedUrl = list[linkIndex] ?? matchUrls[0] ?? null;
 
     const proof = {
       kind: "first_link_in_channel",
       messageId: message.id,
       channelId: message.channelId,
       source: task.config.source,
-      url: urls[0] ?? null,
+      url: matchUrls[0] ?? null,
+      matchedUrl,
     };
     const wonWindow = await claimFirstLinkWindow(task, message.author.id, proof);
     if (!wonWindow) continue;
 
-    const list = resolveLinkList(task.config);
-    const refreshMinutes = Number.isFinite(task.config.refreshMinutes) && task.config.refreshMinutes >= 1
-      ? Math.floor(task.config.refreshMinutes)
-      : 60;
-    const linkIndex = currentLinkIndex(refreshMinutes, list.length, task.config.rotationStartMs ?? null);
-    await markFirstLinkWindowClaimed(task, message.author.id, linkIndex);
+    await markFirstLinkWindowClaimed(task, message.author.id, linkIndex, message.id, matchedUrl);
     await completeAndNotify(client, task, message.author.id, proof);
   }
 }

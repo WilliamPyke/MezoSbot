@@ -9,6 +9,7 @@ import {
 import { addBalance } from "../balance.js";
 import { supabase } from "../db.js";
 import { formatSats } from "../format.js";
+import { recordLedgerEntry } from "../ledger.js";
 
 export const data = {
   name: "backfill",
@@ -79,6 +80,17 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     });
 
     await addBalance(target.id, diffSats);
+
+    recordLedgerEntry(interaction.client, {
+      type: "deposit",
+      amountSats: diffSats,
+      senderId: "treasury",
+      receiverId: target.id,
+      guildId: interaction.guildId,
+      referenceType: "deposits",
+      referenceId: txId,
+      metadata: { source: "backfill" },
+    });
 
     await supabase
       .from("deposit_addresses")

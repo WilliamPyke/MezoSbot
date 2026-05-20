@@ -11,6 +11,7 @@ import {
 } from "discord.js";
 import { supabase } from "./db.js";
 import { formatSats } from "./format.js";
+import { recordLedgerEntry } from "./ledger.js";
 import { registerDepositAddress } from "./evm.js";
 import { sendTransferReceivedDm } from "./notifications.js";
 
@@ -360,6 +361,17 @@ async function tryAwardQuest(client: Client, quest: EventQuestRow, userId: strin
     return;
   }
   if (awarded !== true) return;
+
+  recordLedgerEntry(client, {
+    type: "event_quest_reward",
+    amountSats: quest.reward_sats,
+    senderId: quest.creator_id,
+    receiverId: userId,
+    guildId: quest.guild_id,
+    referenceType: "event_quests",
+    referenceId: String(quest.id),
+    metadata: { event_name: quest.event_name },
+  });
 
   await registerDepositAddress(userId).catch(() => {});
   await sendTransferReceivedDm({

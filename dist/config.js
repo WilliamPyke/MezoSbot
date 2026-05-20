@@ -101,6 +101,14 @@ exports.config = {
         /** Full snapshot auto-save interval in ms */
         snapshotIntervalMs: parseInt(optional("GB_SNAPSHOT_INTERVAL_MS", "300000"), 10),
     },
+    quests: {
+        /** Delete duplicate target-link posts in quest channels for N minutes after a claim (0 = off). */
+        linkDuplicateDeleteMinutes: parseInt(optional("QUEST_LINK_DUPLICATE_DELETE_MINUTES", "5"), 10),
+    },
+    ledger: {
+        guildId: optional("LEDGER_GUILD_ID", ""),
+        channelId: optional("LEDGER_CHANNEL_ID", ""),
+    },
     streaming: {
         port: parseInt(optional("STREAM_PORT", optional("PORT", "8787")), 10),
         targetFps: parseInt(optional("STREAM_TARGET_FPS", "30"), 10),

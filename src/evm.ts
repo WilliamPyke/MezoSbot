@@ -2,6 +2,7 @@ import { ethers } from "ethers";
 import { config, satsToTokenUnits, tokenUnitsToSats } from "./config.js";
 import { supabase } from "./db.js";
 import { addBalance } from "./balance.js";
+import { recordLedgerEntry } from "./ledger.js";
 import { verifyWalletFromDeposit } from "./walletVerification.js";
 
 let provider: ethers.JsonRpcProvider;
@@ -377,7 +378,7 @@ export async function fundGasAndSweep(discordId: string): Promise<string | null>
  * hadn't mined yet.
  */
 export function startDepositPoller(
-  onDeposit?: (discordId: string, amountSats: number, gasSats: number) => void
+  onDeposit?: (discordId: string, amountSats: number, gasSats: number, txHash: string) => void
 ) {
   let isPolling = false;
   const balanceConcurrency = clampPositiveInt(config.deposits.balanceConcurrency, 8);
@@ -457,7 +458,7 @@ export function startDepositPoller(
                   block_number: 0,
                 });
                 await addBalance(row.discord_id, netSats);
-                onDeposit?.(row.discord_id, netSats, gasSats);
+                onDeposit?.(row.discord_id, netSats, gasSats, txId);
               }
             } else {
               console.log(
@@ -619,6 +620,15 @@ export async function recoverPendingWithdrawals(): Promise<void> {
     if (!w.tx_hash) {
       // sendTransaction never got a hash — safe to refund
       await addBalance(w.discord_id, w.amount_sats);
+      recordLedgerEntry(null, {
+        type: "withdrawal_refund",
+        amountSats: w.amount_sats,
+        senderId: "treasury",
+        receiverId: w.discord_id,
+        referenceType: "withdrawals",
+        referenceId: String(w.id),
+        metadata: { reason: "recovery_no_tx_hash" },
+      });
       await supabase.from("withdrawals").update({ status: "failed" }).eq("id", w.id);
       console.log(`[Recovery] Withdrawal ${w.id}: no tx_hash → refunded ${w.amount_sats} sats`);
       continue;
@@ -633,6 +643,15 @@ export async function recoverPendingWithdrawals(): Promise<void> {
           console.log(`[Recovery] Withdrawal ${w.id}: tx confirmed on-chain → marked completed (no refund)`);
         } else {
           await addBalance(w.discord_id, w.amount_sats);
+          recordLedgerEntry(null, {
+            type: "withdrawal_refund",
+            amountSats: w.amount_sats,
+            senderId: "treasury",
+            receiverId: w.discord_id,
+            referenceType: "withdrawals",
+            referenceId: String(w.id),
+            metadata: { reason: "recovery_tx_reverted" },
+          });
           await supabase.from("withdrawals").update({ status: "failed" }).eq("id", w.id);
           console.log(`[Recovery] Withdrawal ${w.id}: tx reverted → refunded ${w.amount_sats} sats`);
         }
@@ -661,6 +680,15 @@ export async function recoverPendingWithdrawals(): Promise<void> {
           } else {
             // Still null after retry — tx genuinely dropped
             await addBalance(w.discord_id, w.amount_sats);
+            recordLedgerEntry(null, {
+              type: "withdrawal_refund",
+              amountSats: w.amount_sats,
+              senderId: "treasury",
+              receiverId: w.discord_id,
+              referenceType: "withdrawals",
+              referenceId: String(w.id),
+              metadata: { reason: "recovery_tx_dropped" },
+            });
             await supabase.from("withdrawals").update({ status: "failed" }).eq("id", w.id);
             console.log(`[Recovery] Withdrawal ${w.id}: tx not found after retry → refunded ${w.amount_sats} sats`);
           }

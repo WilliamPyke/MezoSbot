@@ -7,6 +7,7 @@ const db_js_1 = require("../db.js");
 const balance_js_1 = require("../balance.js");
 const format_js_1 = require("../format.js");
 const drops_js_1 = require("../drops.js");
+const ledger_js_1 = require("../ledger.js");
 exports.data = {
     name: "drop",
     description: "Create a sats drop - first users to claim get sats",
@@ -52,6 +53,15 @@ async function execute(interaction) {
         return interaction.editReply({ content: "❌ Failed to create drop." });
     }
     const dropId = inserted.id;
+    (0, ledger_js_1.recordLedgerEntry)(interaction.client, {
+        type: "drop_create",
+        amountSats: total,
+        senderId: interaction.user.id,
+        receiverId: null,
+        guildId: interaction.guildId,
+        referenceType: "drops",
+        referenceId: String(dropId),
+    });
     const drop = {
         id: dropId,
         channel_id: interaction.channelId,

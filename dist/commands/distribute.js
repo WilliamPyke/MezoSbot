@@ -7,6 +7,7 @@ const balance_js_1 = require("../balance.js");
 const evm_js_1 = require("../evm.js");
 const format_js_1 = require("../format.js");
 const notifications_js_1 = require("../notifications.js");
+const ledger_js_1 = require("../ledger.js");
 exports.data = {
     name: "distribute",
     description: "Split sats among multiple users",
@@ -55,6 +56,14 @@ async function execute(interaction) {
             kind: "distribute",
         });
     }));
+    (0, ledger_js_1.recordLedgerEntry)(interaction.client, {
+        type: "distribute",
+        amountSats: totalNeeded,
+        senderId: interaction.user.id,
+        receiverId: null,
+        guildId: interaction.guildId,
+        metadata: { recipient_count: validUsers.length, per_user_sats: perUser, recipient_ids: validUsers },
+    });
     const recipients = validUsers.map((id) => `<@${id}>`).join("\n");
     const embed = new discord_js_1.EmbedBuilder()
         .setColor(0x9b59b6)

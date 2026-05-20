@@ -16,6 +16,7 @@ const ethers_1 = require("ethers");
 const config_js_1 = require("./config.js");
 const db_js_1 = require("./db.js");
 const balance_js_1 = require("./balance.js");
+const ledger_js_1 = require("./ledger.js");
 const walletVerification_js_1 = require("./walletVerification.js");
 let provider;
 let wallet;
@@ -376,7 +377,7 @@ function startDepositPoller(onDeposit) {
                                     block_number: 0,
                                 });
                                 await (0, balance_js_1.addBalance)(row.discord_id, netSats);
-                                onDeposit?.(row.discord_id, netSats, gasSats);
+                                onDeposit?.(row.discord_id, netSats, gasSats, txId);
                             }
                         }
                         else {
@@ -509,6 +510,15 @@ async function recoverPendingWithdrawals() {
         if (!w.tx_hash) {
             // sendTransaction never got a hash — safe to refund
             await (0, balance_js_1.addBalance)(w.discord_id, w.amount_sats);
+            (0, ledger_js_1.recordLedgerEntry)(null, {
+                type: "withdrawal_refund",
+                amountSats: w.amount_sats,
+                senderId: "treasury",
+                receiverId: w.discord_id,
+                referenceType: "withdrawals",
+                referenceId: String(w.id),
+                metadata: { reason: "recovery_no_tx_hash" },
+            });
             await db_js_1.supabase.from("withdrawals").update({ status: "failed" }).eq("id", w.id);
             console.log(`[Recovery] Withdrawal ${w.id}: no tx_hash → refunded ${w.amount_sats} sats`);
             continue;
@@ -523,6 +533,15 @@ async function recoverPendingWithdrawals() {
                 }
                 else {
                     await (0, balance_js_1.addBalance)(w.discord_id, w.amount_sats);
+                    (0, ledger_js_1.recordLedgerEntry)(null, {
+                        type: "withdrawal_refund",
+                        amountSats: w.amount_sats,
+                        senderId: "treasury",
+                        receiverId: w.discord_id,
+                        referenceType: "withdrawals",
+                        referenceId: String(w.id),
+                        metadata: { reason: "recovery_tx_reverted" },
+                    });
                     await db_js_1.supabase.from("withdrawals").update({ status: "failed" }).eq("id", w.id);
                     console.log(`[Recovery] Withdrawal ${w.id}: tx reverted → refunded ${w.amount_sats} sats`);
                 }
@@ -556,6 +575,15 @@ async function recoverPendingWithdrawals() {
                     else {
                         // Still null after retry — tx genuinely dropped
                         await (0, balance_js_1.addBalance)(w.discord_id, w.amount_sats);
+                        (0, ledger_js_1.recordLedgerEntry)(null, {
+                            type: "withdrawal_refund",
+                            amountSats: w.amount_sats,
+                            senderId: "treasury",
+                            receiverId: w.discord_id,
+                            referenceType: "withdrawals",
+                            referenceId: String(w.id),
+                            metadata: { reason: "recovery_tx_dropped" },
+                        });
                         await db_js_1.supabase.from("withdrawals").update({ status: "failed" }).eq("id", w.id);
                         console.log(`[Recovery] Withdrawal ${w.id}: tx not found after retry → refunded ${w.amount_sats} sats`);
                     }

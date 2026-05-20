@@ -3,6 +3,7 @@ import { subtractBalance, addBalance, getBalance } from "../balance.js";
 import { registerDepositAddress } from "../evm.js";
 import { formatSats, roundSats } from "../format.js";
 import { sendTransferReceivedDm } from "../notifications.js";
+import { recordLedgerEntry } from "../ledger.js";
 
 export const data = {
   name: "distribute",
@@ -62,6 +63,15 @@ export async function execute(interaction: ChatInputCommandInteraction) {
       });
     })
   );
+
+  recordLedgerEntry(interaction.client, {
+    type: "distribute",
+    amountSats: totalNeeded,
+    senderId: interaction.user.id,
+    receiverId: null,
+    guildId: interaction.guildId,
+    metadata: { recipient_count: validUsers.length, per_user_sats: perUser, recipient_ids: validUsers },
+  });
 
   const recipients = validUsers.map((id) => `<@${id}>`).join("\n");
 

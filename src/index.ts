@@ -15,8 +15,9 @@ import { setDefaultResultOrder } from "node:dns";
 import { config } from "./config.js";
 import { formatSats } from "./format.js";
 import { initEVM, getTreasuryAddress, startDepositPoller, registerDepositAddress, recoverPendingWithdrawals } from "./evm.js";
+import { bindLedgerClient, recordLedgerEntry } from "./ledger.js";
 import { commands, commandsData } from "./commands/index.js";
-import { handleQuestBuilderInteraction, isQuestBuilderInteraction } from "./commands/quest.js";
+import { handleQuestBuilderInteraction, isQuestBuilderInteraction, handleQuestEditInteraction, isQuestEditInteraction } from "./commands/quest.js";
 import { handleRainBanInteraction, isRainBanInteraction } from "./commands/rainban.js";
 import { handleAdminInteraction, isAdminInteraction, handleAdminModalTriggers } from "./commands/admin.js";
 import {
@@ -395,6 +396,24 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return;
   }
 
+  if (isQuestEditInteraction(interaction)) {
+    const cid = ("customId" in interaction && interaction.customId) || "";
+    console.log(`[Discord] Quest edit interaction ${cid} from ${tag} (arrivalLag=${arrivalLagMs}ms)`);
+    try {
+      await handleQuestEditInteraction(interaction);
+    } catch (err) {
+      const message = (err as Error)?.message ?? String(err);
+      console.warn(`[Quest] Edit interaction ${cid} failed:`, message);
+      if ("followUp" in interaction && (interaction.deferred || interaction.replied)) {
+        await interaction.followUp({ content: `Could not update quest links: ${message}`, flags: MessageFlags.Ephemeral }).catch(() => {});
+      } else if ("reply" in interaction) {
+        await interaction.reply({ content: `Could not update quest links: ${message}`, flags: MessageFlags.Ephemeral }).catch(() => {});
+      }
+    }
+    console.log(`[Discord] Quest edit ${cid} done in ${Date.now() - startMs}ms`);
+    return;
+  }
+
   if (isAdminInteraction(interaction)) {
     const cid = ("customId" in interaction && interaction.customId) || "";
     console.log(`[Discord] Admin interaction ${cid} from ${tag} (arrivalLag=${arrivalLagMs}ms)`);
@@ -591,9 +610,25 @@ function setupGameBoyCallbacks() {
     const { winningButton, winners, winningSats, tally, totalBids } = result;
 
     // ── Charge all winning voters — fire and forget ──
+    const totalDebited = winners.reduce((sum, bid) => sum + bid.amount, 0);
     subtractBalances(
       winners.map((bid) => ({ discordId: bid.userId, amountSats: bid.amount }))
-    ).catch(() => {});
+    ).then(() => {
+      if (totalDebited > 0) {
+        recordLedgerEntry(client, {
+          type: "gameboy_bid",
+          amountSats: totalDebited,
+          senderId: winners[0]?.userId ?? null,
+          receiverId: "platform",
+          guildId: cachedGameChannel?.guildId ?? null,
+          metadata: {
+            button: winningButton,
+            voter_count: winners.length,
+            winning_sats: winningSats,
+          },
+        });
+      }
+    }).catch(() => {});
 
     // ── Update feed message — throttled, non-blocking ──
     const now = Date.now();
@@ -650,7 +685,13 @@ async function handleDropButton(interaction: ButtonInteraction) {
     : null;
   const claimantRoleIds = member ? [...member.roles.cache.keys()] : [];
 
-  const result = await processClaim(dropId, interaction.user.id, claimantRoleIds);
+  const result = await processClaim(
+    dropId,
+    interaction.user.id,
+    claimantRoleIds,
+    interaction.client,
+    interaction.guildId,
+  );
 
   if (!result.ok) {
     await interaction.editReply({ content: `❌ ${result.error}` });
@@ -713,6 +754,8 @@ async function handleDropButton(interaction: ButtonInteraction) {
 /* ── Main ─────────────────────────────────────────────────────── */
 
 async function main() {
+  bindLedgerClient(client);
+
   // ── Web canvas server (start first — Render needs an open port quickly) ──
   await startStream();
 
@@ -772,8 +815,17 @@ async function main() {
 
   await connectDiscordWithRetry();
 
-  startDepositPoller((discordId, amountSats, gasSats) => {
+  startDepositPoller((discordId, amountSats, gasSats, txHash) => {
     console.log(`Auto-deposit: ${formatSats(amountSats)} (gas: ~${formatSats(gasSats)}) for ${discordId}`);
+    recordLedgerEntry(client, {
+      type: "deposit",
+      amountSats,
+      senderId: "treasury",
+      receiverId: discordId,
+      referenceType: "deposits",
+      referenceId: txHash,
+      metadata: gasSats > 0 ? { gas_sats: gasSats } : {},
+    });
     client.users.fetch(discordId).then((u) => {
       const embed = new EmbedBuilder()
         .setColor(0x00cc6a)

@@ -3,6 +3,7 @@ import { withdraw } from "../evm.js";
 import { subtractBalance, addBalance, getWalletForUser } from "../balance.js";
 import { supabase } from "../db.js";
 import { config } from "../config.js";
+import { recordLedgerEntry } from "../ledger.js";
 import { formatSats } from "../format.js";
 
 const MIN_WITHDRAWAL_SATS = parseFloat(process.env.MIN_WITHDRAWAL_SATS ?? "50");
@@ -69,12 +70,33 @@ export async function execute(interaction: ChatInputCommandInteraction) {
 
   const withdrawalId = row?.id;
 
+  recordLedgerEntry(interaction.client, {
+    type: "withdrawal",
+    amountSats: amount,
+    senderId: interaction.user.id,
+    receiverId: "treasury",
+    guildId: interaction.guildId,
+    referenceType: "withdrawals",
+    referenceId: withdrawalId != null ? String(withdrawalId) : null,
+  });
+
   // 3. Send the transaction and wait for receipt
   const result = await withdraw(address, amount);
 
   // 4. Handle failure — refund balance + mark failed
   if (result.error && !result.confirmed) {
     await addBalance(interaction.user.id, amount);
+
+    recordLedgerEntry(interaction.client, {
+      type: "withdrawal_refund",
+      amountSats: amount,
+      senderId: "treasury",
+      receiverId: interaction.user.id,
+      guildId: interaction.guildId,
+      referenceType: "withdrawals",
+      referenceId: withdrawalId != null ? String(withdrawalId) : null,
+      metadata: { reason: "withdrawal_failed" },
+    });
 
     if (withdrawalId) {
       await supabase.from("withdrawals").update({

@@ -12,6 +12,7 @@ import {
 import { supabase } from "./db.js";
 import { addBalance } from "./balance.js";
 import { registerDepositAddress } from "./evm.js";
+import { recordLedgerEntry } from "./ledger.js";
 import { formatSats } from "./format.js";
 
 /* ------------------------------------------------------------------ */
@@ -114,6 +115,8 @@ export async function processClaim(
   dropId: number,
   claimantId: string,
   claimantRoleIds: string[] = [],
+  client: Client | null = null,
+  guildId: string | null = null,
 ): Promise<ClaimResult> {
   // Re-fetch the drop to get latest state
   const { data: drop } = await supabase
@@ -183,6 +186,16 @@ export async function processClaim(
   // Credit the claimant
   await addBalance(claimantId, drop.per_claim_sats);
   await registerDepositAddress(claimantId);
+
+  recordLedgerEntry(client, {
+    type: "drop_claim",
+    amountSats: drop.per_claim_sats,
+    senderId: drop.creator_id,
+    receiverId: claimantId,
+    guildId,
+    referenceType: "drop_claims",
+    referenceId: String(dropId),
+  });
 
   return {
     ok: true,

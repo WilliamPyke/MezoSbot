@@ -6,6 +6,7 @@ import { sendTransferReceivedDm } from "../notifications.js";
 import { getRainBannedTerms, messageMatchesAnyRainTerm, messageMatchesRainBan, normalizeRainBannedTerm } from "../rainBans.js";
 import { supabase } from "../db.js";
 import { updateUserBadges } from "../badges.js";
+import { recordLedgerEntry } from "../ledger.js";
 
 
 export const data = {
@@ -142,11 +143,21 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     })
   );
 
-  // Log the rain in the database
-  await supabase.from("rains").insert({
+  const { data: rainRow } = await supabase.from("rains").insert({
     sender_id: interaction.user.id,
     amount_sats: totalNeeded,
     recipient_count: activeUserIds.length,
+  }).select("id").single();
+
+  recordLedgerEntry(interaction.client, {
+    type: "rain",
+    amountSats: totalNeeded,
+    senderId: interaction.user.id,
+    receiverId: null,
+    guildId: interaction.guildId,
+    referenceType: "rains",
+    referenceId: rainRow?.id != null ? String(rainRow.id) : null,
+    metadata: { recipient_count: activeUserIds.length, per_user_sats: perUser },
   });
 
   // Update rainer badge roles in Discord

@@ -3,6 +3,7 @@ import { supabase } from "../db.js";
 import { subtractBalance, getBalance } from "../balance.js";
 import { roundSats } from "../format.js";
 import { buildDropEmbed, buildClaimButton, type Drop } from "../drops.js";
+import { recordLedgerEntry } from "../ledger.js";
 
 export const data = {
   name: "drop",
@@ -57,6 +58,16 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   }
 
   const dropId = inserted.id;
+
+  recordLedgerEntry(interaction.client, {
+    type: "drop_create",
+    amountSats: total,
+    senderId: interaction.user.id,
+    receiverId: null,
+    guildId: interaction.guildId,
+    referenceType: "drops",
+    referenceId: String(dropId),
+  });
 
   const drop: Drop = {
     id: dropId,

@@ -7,6 +7,7 @@ const evm_js_1 = require("../evm.js");
 const balance_js_1 = require("../balance.js");
 const db_js_1 = require("../db.js");
 const config_js_1 = require("../config.js");
+const ledger_js_1 = require("../ledger.js");
 const format_js_1 = require("../format.js");
 const MIN_WITHDRAWAL_SATS = parseFloat(process.env.MIN_WITHDRAWAL_SATS ?? "50");
 exports.data = {
@@ -60,11 +61,30 @@ async function execute(interaction) {
         status: "pending",
     }).select("id").single();
     const withdrawalId = row?.id;
+    (0, ledger_js_1.recordLedgerEntry)(interaction.client, {
+        type: "withdrawal",
+        amountSats: amount,
+        senderId: interaction.user.id,
+        receiverId: "treasury",
+        guildId: interaction.guildId,
+        referenceType: "withdrawals",
+        referenceId: withdrawalId != null ? String(withdrawalId) : null,
+    });
     // 3. Send the transaction and wait for receipt
     const result = await (0, evm_js_1.withdraw)(address, amount);
     // 4. Handle failure — refund balance + mark failed
     if (result.error && !result.confirmed) {
         await (0, balance_js_1.addBalance)(interaction.user.id, amount);
+        (0, ledger_js_1.recordLedgerEntry)(interaction.client, {
+            type: "withdrawal_refund",
+            amountSats: amount,
+            senderId: "treasury",
+            receiverId: interaction.user.id,
+            guildId: interaction.guildId,
+            referenceType: "withdrawals",
+            referenceId: withdrawalId != null ? String(withdrawalId) : null,
+            metadata: { reason: "withdrawal_failed" },
+        });
         if (withdrawalId) {
             await db_js_1.supabase.from("withdrawals").update({
                 status: "failed",

@@ -6,6 +6,7 @@ exports.isAdminInteraction = isAdminInteraction;
 exports.handleAdminInteraction = handleAdminInteraction;
 exports.handleAdminModalTriggers = handleAdminModalTriggers;
 const discord_js_1 = require("discord.js");
+const ledger_js_1 = require("../ledger.js");
 const db_js_1 = require("../db.js");
 const badges_js_1 = require("../badges.js");
 const rainBans_js_1 = require("../rainBans.js");
@@ -15,6 +16,7 @@ const COLOR_MAIN = 0x2ecc71; // Green
 const COLOR_BADGES = 0xf1c40f; // Gold
 const COLOR_RAINBAN = 0xe74c3c; // Red
 const COLOR_CONFIG = 0x3498db; // Blue
+const COLOR_LEDGER = 0x2ecc71; // Green
 exports.data = {
     name: "admin",
     description: "Access the MezoSbot Admin Control Panel",
@@ -46,10 +48,40 @@ async function renderMainMenu() {
         .setCustomId(`${CUSTOM_ID_PREFIX}:menu_quests`)
         .setLabel("⚔️ Manage Quests")
         .setStyle(discord_js_1.ButtonStyle.Primary), new discord_js_1.ButtonBuilder()
+        .setCustomId(`${CUSTOM_ID_PREFIX}:menu_ledger`)
+        .setLabel("📒 Transaction Ledger")
+        .setStyle(discord_js_1.ButtonStyle.Primary), new discord_js_1.ButtonBuilder()
         .setCustomId(`${CUSTOM_ID_PREFIX}:dismiss`)
         .setLabel("Dismiss Panel")
         .setStyle(discord_js_1.ButtonStyle.Danger));
     return { embeds: [embed], components: [row] };
+}
+async function renderLedgerMenu(guildId) {
+    const config = await (0, ledger_js_1.getLedgerChannelConfig)();
+    const channelLine = config
+        ? `**Current ledger channel:** <#${config.channelId}> (guild \`${config.guildId}\`)\n\nAll bot transactions are posted here.`
+        : "**Ledger channel:** Not configured\n\nPick a text channel below. This applies **bot-wide** (all servers).";
+    const embed = new discord_js_1.EmbedBuilder()
+        .setColor(COLOR_LEDGER)
+        .setTitle("📒 Transaction Ledger")
+        .setDescription(channelLine)
+        .setTimestamp();
+    const channelSelect = new discord_js_1.ChannelSelectMenuBuilder()
+        .setCustomId(`${CUSTOM_ID_PREFIX}:ledger_channel_select`)
+        .setPlaceholder("Select ledger channel…")
+        .addChannelTypes(discord_js_1.ChannelType.GuildText, discord_js_1.ChannelType.GuildAnnouncement)
+        .setMinValues(1)
+        .setMaxValues(1);
+    const row1 = new discord_js_1.ActionRowBuilder().addComponents(channelSelect);
+    const row2 = new discord_js_1.ActionRowBuilder().addComponents(new discord_js_1.ButtonBuilder()
+        .setCustomId(`${CUSTOM_ID_PREFIX}:ledger_clear`)
+        .setLabel("Clear Ledger Channel")
+        .setStyle(discord_js_1.ButtonStyle.Danger)
+        .setDisabled(!config), new discord_js_1.ButtonBuilder()
+        .setCustomId(`${CUSTOM_ID_PREFIX}:menu_main`)
+        .setLabel("← Back")
+        .setStyle(discord_js_1.ButtonStyle.Secondary));
+    return { embeds: [embed], components: [row1, row2] };
 }
 async function renderBadgesMenu(guildId) {
     await (0, badges_js_1.ensureDefaultBadgesExist)(guildId);
@@ -303,6 +335,16 @@ async function handleAdminInteraction(interaction) {
             const menu = await renderQuestsMenu(btnInteraction.guildId);
             await btnInteraction.editReply(menu);
         }
+        else if (action === "menu_ledger") {
+            const menu = await renderLedgerMenu(btnInteraction.guildId);
+            await btnInteraction.editReply(menu);
+        }
+        else if (action === "ledger_clear") {
+            await (0, ledger_js_1.clearLedgerChannelConfig)();
+            const menu = await renderLedgerMenu(btnInteraction.guildId);
+            menu.embeds[0].setDescription("**Ledger channel cleared.** Transactions are still saved in the database but will not be posted to Discord until you configure a channel again.");
+            await btnInteraction.editReply(menu);
+        }
         else if (action === "delete_quest") {
             const questId = parseInt(parts[2], 10);
             const fresh = await db_js_1.supabase.from("quests").select("*").eq("id", questId).single();
@@ -409,6 +451,23 @@ async function handleAdminInteraction(interaction) {
             const panel = await renderQuestDetail(selInteraction.guildId, questId);
             await selInteraction.editReply(panel);
         }
+    }
+    // Handle ChannelSelectMenu interaction
+    if (interaction.isChannelSelectMenu()) {
+        const chInteraction = interaction;
+        await chInteraction.deferUpdate();
+        if (action === "ledger_channel_select") {
+            const channelId = chInteraction.values[0];
+            const previous = await (0, ledger_js_1.setLedgerChannelConfig)(chInteraction.guildId, channelId);
+            const menu = await renderLedgerMenu(chInteraction.guildId);
+            let status = `✅ Ledger channel set to <#${channelId}>. All bot transactions will be posted there.`;
+            if (previous && previous.channelId !== channelId) {
+                status = `✅ Ledger channel updated from <#${previous.channelId}> to <#${channelId}>.`;
+            }
+            menu.embeds[0].setDescription(status);
+            await chInteraction.editReply(menu);
+        }
+        return;
     }
     // Handle RoleSelectMenu interaction
     if (interaction.isRoleSelectMenu()) {

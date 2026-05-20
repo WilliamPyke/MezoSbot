@@ -10,6 +10,7 @@ const notifications_js_1 = require("../notifications.js");
 const rainBans_js_1 = require("../rainBans.js");
 const db_js_1 = require("../db.js");
 const badges_js_1 = require("../badges.js");
+const ledger_js_1 = require("../ledger.js");
 exports.data = {
     name: "rain",
     description: "Rain sats on recently active users in this channel",
@@ -130,11 +131,20 @@ async function execute(interaction) {
             customMessage,
         });
     }));
-    // Log the rain in the database
-    await db_js_1.supabase.from("rains").insert({
+    const { data: rainRow } = await db_js_1.supabase.from("rains").insert({
         sender_id: interaction.user.id,
         amount_sats: totalNeeded,
         recipient_count: activeUserIds.length,
+    }).select("id").single();
+    (0, ledger_js_1.recordLedgerEntry)(interaction.client, {
+        type: "rain",
+        amountSats: totalNeeded,
+        senderId: interaction.user.id,
+        receiverId: null,
+        guildId: interaction.guildId,
+        referenceType: "rains",
+        referenceId: rainRow?.id != null ? String(rainRow.id) : null,
+        metadata: { recipient_count: activeUserIds.length, per_user_sats: perUser },
     });
     // Update rainer badge roles in Discord
     if (interaction.guildId) {

@@ -1,5 +1,6 @@
 import { supabase } from "../db.js";
 import { addBalance, subtractBalance } from "../balance.js";
+import { recordLedgerEntry } from "../ledger.js";
 import { roundSats } from "../format.js";
 import {
   DEFAULT_PLATFORM_RAKE_BPS,
@@ -282,6 +283,17 @@ export async function fundEscrowFromBalance(
       .eq("id", matchId);
   }
 
+  const matchForLedger = matchRow ?? await getMatch(matchId);
+  recordLedgerEntry(null, {
+    type: "arcade_stake",
+    amountSats: rounded,
+    senderId: userId,
+    receiverId: null,
+    referenceType: "arcade_matches",
+    referenceId: String(matchId),
+    metadata: { mode: matchForLedger?.mode ?? null },
+  });
+
   return { ok: true };
 }
 
@@ -297,6 +309,14 @@ export async function refundAllEscrow(
     .eq("status", "funded");
   for (const row of rows ?? []) {
     await addBalance(row.user_id, row.amount_sats);
+    recordLedgerEntry(null, {
+      type: "arcade_refund",
+      amountSats: row.amount_sats,
+      senderId: "platform",
+      receiverId: row.user_id,
+      referenceType: "arcade_matches",
+      referenceId: String(matchId),
+    });
     await supabase
       .from("arcade_escrow")
       .update({ status: "refunded", updated_at: new Date().toISOString() })
@@ -404,6 +424,29 @@ export async function trySettleMatch(matchId: number): Promise<SettlementResult>
       const payout = match.winner_payout_sats ?? 0;
       if (payout > 0) await addBalance(match.player_b_id!, payout);
 
+      if (payout > 0) {
+        recordLedgerEntry(null, {
+          type: "arcade_payout",
+          amountSats: payout,
+          senderId: "platform",
+          receiverId: match.player_b_id!,
+          referenceType: "arcade_matches",
+          referenceId: String(matchId),
+          metadata: { mode: "tipfight" },
+        });
+      }
+      if (rake > 0) {
+        recordLedgerEntry(null, {
+          type: "arcade_rake",
+          amountSats: rake,
+          senderId: "platform",
+          receiverId: null,
+          referenceType: "arcade_matches",
+          referenceId: String(matchId),
+          metadata: { mode: "tipfight" },
+        });
+      }
+
       await supabase
         .from("arcade_escrow")
         .update({ status: "released", updated_at: new Date().toISOString() })
@@ -447,6 +490,29 @@ export async function trySettleMatch(matchId: number): Promise<SettlementResult>
     const rake = match.rake_amount_sats ?? 0;
     const payout = match.winner_payout_sats ?? 0;
     if (payout > 0) await addBalance(winnerId, payout);
+
+    if (payout > 0) {
+      recordLedgerEntry(null, {
+        type: "arcade_payout",
+        amountSats: payout,
+        senderId: "platform",
+        receiverId: winnerId,
+        referenceType: "arcade_matches",
+        referenceId: String(matchId),
+        metadata: { mode: "staked_pvp" },
+      });
+    }
+    if (rake > 0) {
+      recordLedgerEntry(null, {
+        type: "arcade_rake",
+        amountSats: rake,
+        senderId: "platform",
+        receiverId: null,
+        referenceType: "arcade_matches",
+        referenceId: String(matchId),
+        metadata: { mode: "staked_pvp" },
+      });
+    }
 
     await supabase
       .from("arcade_escrow")
@@ -715,6 +781,15 @@ export async function cancelRematch(matchId: number, userId: string): Promise<{ 
         .eq("status", "funded");
       for (const row of rows ?? []) {
         await addBalance(userId, row.amount_sats);
+        recordLedgerEntry(null, {
+          type: "arcade_refund",
+          amountSats: row.amount_sats,
+          senderId: "platform",
+          receiverId: userId,
+          referenceType: "arcade_matches",
+          referenceId: String(child.id),
+          metadata: { reason: "rematch_cancel" },
+        });
         await supabase
           .from("arcade_escrow")
           .update({ status: "refunded", updated_at: new Date().toISOString() })

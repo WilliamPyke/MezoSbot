@@ -30,7 +30,7 @@ import {
   getQuestSnapshot,
   getQuestTaskDefinition,
 } from "../quests/engine.js";
-import { buildQuestRuntimeEmbed, completeAndNotify } from "../quests/runtime.js";
+import { buildQuestRuntimeEmbed, completeAndNotify, resetFirstLinkWindow, refreshQuestMessage } from "../quests/runtime.js";
 
 export const data = {
   name: "quest",
@@ -56,6 +56,22 @@ export const data = {
       name: "cancel",
       type: 1 as const,
       description: "Cancel a quest (creator or admin)",
+      options: [
+        { name: "quest_id", type: 4 as const, description: "Quest ID", required: true, minValue: 1 },
+      ],
+    },
+    {
+      name: "reset",
+      type: 1 as const,
+      description: "Reset the current link window (creator or admin, for testing)",
+      options: [
+        { name: "quest_id", type: 4 as const, description: "Quest ID", required: true, minValue: 1 },
+      ],
+    },
+    {
+      name: "edit",
+      type: 1 as const,
+      description: "Edit rotating links for a quest (creator or admin)",
       options: [
         { name: "quest_id", type: 4 as const, description: "Quest ID", required: true, minValue: 1 },
       ],
@@ -451,6 +467,8 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   if (subcommand === "create") return startQuestBuilder(interaction);
   if (subcommand === "complete_task") return completeTaskOverride(interaction);
   if (subcommand === "cancel") return cancelQuest(interaction);
+  if (subcommand === "reset") return resetQuest(interaction);
+  if (subcommand === "edit") return editQuest(interaction);
 
   return interaction.reply({ content: "Unknown quest command.", flags: MessageFlags.Ephemeral });
 }
@@ -1163,6 +1181,40 @@ async function completeTaskOverride(interaction: ChatInputCommandInteraction) {
   });
 }
 
+async function resetQuest(interaction: ChatInputCommandInteraction) {
+  const questId = interaction.options.getInteger("quest_id", true);
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  const snapshot = await getQuestSnapshot(questId).catch((err) => {
+    console.warn("[Quest] Reset lookup failed:", (err as Error).message);
+    return null;
+  });
+  if (!snapshot) return interaction.editReply({ content: `Quest \`${questId}\` was not found.` });
+
+  const isCreator = snapshot.quest.creator_id === interaction.user.id;
+  const isAdmin = appConfig.discord.adminIds.includes(interaction.user.id);
+  if (!isCreator && !isAdmin) {
+    return interaction.editReply({ content: "Only the quest creator or a bot admin can reset a link window." });
+  }
+
+  if (snapshot.quest.status !== "active") {
+    return interaction.editReply({ content: `Quest is \`${snapshot.quest.status}\`; only active quests can be reset.` });
+  }
+
+  const result = await resetFirstLinkWindow(interaction.client, questId);
+  if (!result.ok) {
+    const reason = result.reason ?? "unknown_error";
+    if (reason === "no_link_task") {
+      return interaction.editReply({ content: "This quest has no rotating or nearest-event link task to reset." });
+    }
+    return interaction.editReply({ content: `Could not reset quest window: ${reason}` });
+  }
+
+  await interaction.editReply({
+    content: `Reset link window for quest \`${questId}\` — **${snapshot.quest.title}** (task \`${result.taskId}\`, window \`${result.windowStart}\`). The embed should show open again.${isAdmin && !isCreator ? " (admin override)" : ""}`,
+  });
+}
+
 async function cancelQuest(interaction: ChatInputCommandInteraction) {
   const questId = interaction.options.getInteger("quest_id", true);
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
@@ -1215,3 +1267,166 @@ async function cancelQuest(interaction: ChatInputCommandInteraction) {
     content: `🚫 Cancelled quest \`${questId}\` — **${snapshot.quest.title}**.${isAdmin && !isCreator ? " (admin override)" : ""}`,
   });
 }
+
+async function editQuest(interaction: ChatInputCommandInteraction) {
+  const questId = interaction.options.getInteger("quest_id", true);
+
+  const snapshot = await getQuestSnapshot(questId).catch((err) => {
+    console.warn("[Quest] Edit lookup failed:", (err as Error).message);
+    return null;
+  });
+  if (!snapshot) {
+    return interaction.reply({ content: `Quest \`${questId}\` was not found.`, flags: MessageFlags.Ephemeral });
+  }
+
+  const isCreator = snapshot.quest.creator_id === interaction.user.id;
+  const isAdmin = appConfig.discord.adminIds.includes(interaction.user.id);
+  if (!isCreator && !isAdmin) {
+    return interaction.reply({ content: "Only the quest creator or a bot admin can edit a quest.", flags: MessageFlags.Ephemeral });
+  }
+
+  if (snapshot.quest.status !== "active" && snapshot.quest.status !== "draft") {
+    return interaction.reply({
+      content: `Quest is \`${snapshot.quest.status}\`; only active or draft quests can be edited.`,
+      flags: MessageFlags.Ephemeral
+    });
+  }
+
+  // Find the rotating link list task
+  const linkTask = snapshot.tasks.find(
+    (task) =>
+      task.type === "first_link_in_channel" &&
+      (task.config as Record<string, unknown> | null)?.source === "rotating_list"
+  );
+
+  if (!linkTask) {
+    return interaction.reply({
+      content: "This quest does not have a rotating link list task to edit.",
+      flags: MessageFlags.Ephemeral
+    });
+  }
+
+  const config = linkTask.config as Record<string, unknown>;
+  const linkList = (config.linkList as string[]) ?? [];
+
+  // Show a modal to edit the rotating link list
+  const modal = new ModalBuilder()
+    .setCustomId(`qedit:link_list_modal:${questId}:${linkTask.id}`)
+    .setTitle("Edit Rotating Links");
+
+  const linkListInput = new TextInputBuilder()
+    .setCustomId("link_list")
+    .setLabel("One URL per line — rotates each window")
+    .setStyle(TextInputStyle.Paragraph)
+    .setRequired(true)
+    .setMaxLength(4000)
+    .setPlaceholder("https://example.com/one\nhttps://example.com/two")
+    .setValue(linkList.join("\n"));
+
+  modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(linkListInput));
+  await interaction.showModal(modal);
+}
+
+export function isQuestEditInteraction(interaction: Interaction): boolean {
+  if (interaction.isModalSubmit()) {
+    return interaction.customId.startsWith("qedit:");
+  }
+  return false;
+}
+
+export async function handleQuestEditInteraction(interaction: Interaction): Promise<void> {
+  if (!interaction.isModalSubmit()) return;
+
+  const parts = interaction.customId.split(":");
+  if (parts[0] !== "qedit" || parts[1] !== "link_list_modal") return;
+
+  const questId = Number(parts[2]);
+  const taskId = Number(parts[3]);
+
+  if (isNaN(questId) || isNaN(taskId)) {
+    await interaction.reply({ content: "Invalid interaction parameters.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  const snapshot = await getQuestSnapshot(questId).catch(() => null);
+  if (!snapshot) {
+    await interaction.editReply({ content: "Quest not found." });
+    return;
+  }
+
+  const isCreator = snapshot.quest.creator_id === interaction.user.id;
+  const isAdmin = appConfig.discord.adminIds.includes(interaction.user.id);
+  if (!isCreator && !isAdmin) {
+    await interaction.editReply({ content: "Only the quest creator or a bot admin can edit this quest." });
+    return;
+  }
+
+  const task = snapshot.tasks.find((t) => t.id === taskId);
+  if (!task || task.type !== "first_link_in_channel") {
+    await interaction.editReply({ content: "Task not found or is not a rotating link task." });
+    return;
+  }
+
+  const raw = interaction.fields.getTextInputValue("link_list");
+  const parsedResult = parseLinkListInput(raw);
+  if (!parsedResult.ok) {
+    await interaction.editReply({ content: parsedResult.error });
+    return;
+  }
+
+  const newLinkList = parsedResult.list;
+  const config = task.config as Record<string, unknown>;
+  const currentLinkList = (config.linkList as string[]) ?? [];
+
+  const refreshMinutes = Number(config.refreshMinutes) || 60;
+  const windowMs = refreshMinutes * 60_000;
+  const currentRotationStart = typeof config.rotationStartMs === "number" ? config.rotationStartMs : Math.floor(Date.now() / windowMs) * windowMs;
+
+  const newConfig = {
+    ...config,
+    linkList: newLinkList,
+    rotationStartMs: currentRotationStart,
+  };
+
+  const { error: dbError } = await supabase
+    .from("quest_tasks")
+    .update({
+      config: newConfig,
+    })
+    .eq("id", taskId);
+
+  if (dbError) {
+    console.warn(`[QuestEngine] Failed to update task config for task ${taskId}:`, dbError.message);
+    await interaction.editReply({ content: `Failed to update quest task: ${dbError.message}` });
+    return;
+  }
+
+  // Also update quests updated_at timestamp to mark modifications
+  try {
+    await supabase
+      .from("quests")
+      .update({ updated_at: new Date().toISOString() })
+      .eq("id", questId);
+  } catch (err) {
+    console.warn(`[QuestEngine] Failed to update quests updated_at for quest ${questId}:`, err);
+  }
+
+  const refreshed = await refreshQuestMessage(interaction.client, questId);
+
+  const addedCount = newLinkList.length - currentLinkList.length;
+  const totalCount = newLinkList.length;
+
+  let replyText = `Successfully updated rotating link list for Quest #${questId} (**${snapshot.quest.title}**).`;
+  replyText += `\n- Previous links: **${currentLinkList.length}**`;
+  replyText += `\n- Current links: **${totalCount}** (${addedCount >= 0 ? `+${addedCount}` : addedCount} change)`;
+  if (refreshed) {
+    replyText += "\n- The public quest card has been repainted.";
+  } else {
+    replyText += "\n- Warning: Could not find or edit the public quest card message.";
+  }
+
+  await interaction.editReply({ content: replyText });
+}
+

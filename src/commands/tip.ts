@@ -5,6 +5,7 @@ import { formatSats } from "../format.js";
 import { sendTransferReceivedDm } from "../notifications.js";
 import { supabase } from "../db.js";
 import { updateUserBadges } from "../badges.js";
+import { recordLedgerEntry } from "../ledger.js";
 
 
 export const data = {
@@ -58,11 +59,20 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     customMessage,
   });
 
-  // Log the tip in the database
-  await supabase.from("tips").insert({
+  const { data: tipRow } = await supabase.from("tips").insert({
     sender_id: interaction.user.id,
     recipient_id: target.id,
     amount_sats: amount,
+  }).select("id").single();
+
+  recordLedgerEntry(interaction.client, {
+    type: "tip",
+    amountSats: amount,
+    senderId: interaction.user.id,
+    receiverId: target.id,
+    guildId: interaction.guildId,
+    referenceType: "tips",
+    referenceId: tipRow?.id != null ? String(tipRow.id) : null,
   });
 
   // Update user badge roles in Discord

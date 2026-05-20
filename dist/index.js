@@ -5,6 +5,7 @@ const node_dns_1 = require("node:dns");
 const config_js_1 = require("./config.js");
 const format_js_1 = require("./format.js");
 const evm_js_1 = require("./evm.js");
+const ledger_js_1 = require("./ledger.js");
 const index_js_1 = require("./commands/index.js");
 const quest_js_1 = require("./commands/quest.js");
 const rainban_js_1 = require("./commands/rainban.js");
@@ -302,6 +303,25 @@ client.on(discord_js_1.Events.InteractionCreate, async (interaction) => {
         console.log(`[Discord] Quest builder ${cid} done in ${Date.now() - startMs}ms`);
         return;
     }
+    if ((0, quest_js_1.isQuestEditInteraction)(interaction)) {
+        const cid = ("customId" in interaction && interaction.customId) || "";
+        console.log(`[Discord] Quest edit interaction ${cid} from ${tag} (arrivalLag=${arrivalLagMs}ms)`);
+        try {
+            await (0, quest_js_1.handleQuestEditInteraction)(interaction);
+        }
+        catch (err) {
+            const message = err?.message ?? String(err);
+            console.warn(`[Quest] Edit interaction ${cid} failed:`, message);
+            if ("followUp" in interaction && (interaction.deferred || interaction.replied)) {
+                await interaction.followUp({ content: `Could not update quest links: ${message}`, flags: discord_js_1.MessageFlags.Ephemeral }).catch(() => { });
+            }
+            else if ("reply" in interaction) {
+                await interaction.reply({ content: `Could not update quest links: ${message}`, flags: discord_js_1.MessageFlags.Ephemeral }).catch(() => { });
+            }
+        }
+        console.log(`[Discord] Quest edit ${cid} done in ${Date.now() - startMs}ms`);
+        return;
+    }
     if ((0, admin_js_1.isAdminInteraction)(interaction)) {
         const cid = ("customId" in interaction && interaction.customId) || "";
         console.log(`[Discord] Admin interaction ${cid} from ${tag} (arrivalLag=${arrivalLagMs}ms)`);
@@ -479,7 +499,23 @@ function setupGameBoyCallbacks() {
     (0, emulator_js_1.onRound)((result) => {
         const { winningButton, winners, winningSats, tally, totalBids } = result;
         // ── Charge all winning voters — fire and forget ──
-        (0, balance_js_1.subtractBalances)(winners.map((bid) => ({ discordId: bid.userId, amountSats: bid.amount }))).catch(() => { });
+        const totalDebited = winners.reduce((sum, bid) => sum + bid.amount, 0);
+        (0, balance_js_1.subtractBalances)(winners.map((bid) => ({ discordId: bid.userId, amountSats: bid.amount }))).then(() => {
+            if (totalDebited > 0) {
+                (0, ledger_js_1.recordLedgerEntry)(client, {
+                    type: "gameboy_bid",
+                    amountSats: totalDebited,
+                    senderId: winners[0]?.userId ?? null,
+                    receiverId: "platform",
+                    guildId: cachedGameChannel?.guildId ?? null,
+                    metadata: {
+                        button: winningButton,
+                        voter_count: winners.length,
+                        winning_sats: winningSats,
+                    },
+                });
+            }
+        }).catch(() => { });
         // ── Update feed message — throttled, non-blocking ──
         const now = Date.now();
         if (feedBusy || now - lastFeedTime < FEED_THROTTLE_MS)
@@ -525,7 +561,7 @@ async function handleDropButton(interaction) {
         ? await interaction.guild.members.fetch(interaction.user.id).catch(() => null)
         : null;
     const claimantRoleIds = member ? [...member.roles.cache.keys()] : [];
-    const result = await (0, drops_js_1.processClaim)(dropId, interaction.user.id, claimantRoleIds);
+    const result = await (0, drops_js_1.processClaim)(dropId, interaction.user.id, claimantRoleIds, interaction.client, interaction.guildId);
     if (!result.ok) {
         await interaction.editReply({ content: `❌ ${result.error}` });
         return;
@@ -576,6 +612,7 @@ async function handleDropButton(interaction) {
 }
 /* ── Main ─────────────────────────────────────────────────────── */
 async function main() {
+    (0, ledger_js_1.bindLedgerClient)(client);
     // ── Web canvas server (start first — Render needs an open port quickly) ──
     await (0, stream_js_1.startStream)();
     // Slice Arcade browser flow needs a public HTTPS URL to put in Discord
@@ -624,8 +661,17 @@ async function main() {
     // Resolve any withdrawals left pending from a previous session
     (0, evm_js_1.recoverPendingWithdrawals)().catch((err) => console.error("[Recovery] Failed:", err?.message ?? err));
     await connectDiscordWithRetry();
-    (0, evm_js_1.startDepositPoller)((discordId, amountSats, gasSats) => {
+    (0, evm_js_1.startDepositPoller)((discordId, amountSats, gasSats, txHash) => {
         console.log(`Auto-deposit: ${(0, format_js_1.formatSats)(amountSats)} (gas: ~${(0, format_js_1.formatSats)(gasSats)}) for ${discordId}`);
+        (0, ledger_js_1.recordLedgerEntry)(client, {
+            type: "deposit",
+            amountSats,
+            senderId: "treasury",
+            receiverId: discordId,
+            referenceType: "deposits",
+            referenceId: txHash,
+            metadata: gasSats > 0 ? { gas_sats: gasSats } : {},
+        });
         client.users.fetch(discordId).then((u) => {
             const embed = new discord_js_1.EmbedBuilder()
                 .setColor(0x00cc6a)

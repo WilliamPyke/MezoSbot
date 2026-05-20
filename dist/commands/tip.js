@@ -9,6 +9,7 @@ const format_js_1 = require("../format.js");
 const notifications_js_1 = require("../notifications.js");
 const db_js_1 = require("../db.js");
 const badges_js_1 = require("../badges.js");
+const ledger_js_1 = require("../ledger.js");
 exports.data = {
     name: "tip",
     description: "Send sats to another user",
@@ -51,11 +52,19 @@ async function execute(interaction) {
         kind: "tip",
         customMessage,
     });
-    // Log the tip in the database
-    await db_js_1.supabase.from("tips").insert({
+    const { data: tipRow } = await db_js_1.supabase.from("tips").insert({
         sender_id: interaction.user.id,
         recipient_id: target.id,
         amount_sats: amount,
+    }).select("id").single();
+    (0, ledger_js_1.recordLedgerEntry)(interaction.client, {
+        type: "tip",
+        amountSats: amount,
+        senderId: interaction.user.id,
+        receiverId: target.id,
+        guildId: interaction.guildId,
+        referenceType: "tips",
+        referenceId: tipRow?.id != null ? String(tipRow.id) : null,
     });
     // Update user badge roles in Discord
     if (interaction.guildId) {
