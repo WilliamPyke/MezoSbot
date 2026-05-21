@@ -21,6 +21,7 @@ import {
   getAllActiveTasksByType,
   getQuestSnapshot,
   getQuestTaskDefinition,
+  payRepeatableQuestTaskReward,
   type ActiveQuestTask,
   type QuestCompletionResult,
 } from "./engine.js";
@@ -892,6 +893,71 @@ export async function completeAndNotify(
   return result;
 }
 
+async function notifyQuestReward(
+  client: Client,
+  task: Pick<ActiveQuestTask, "id" | "quest_id" | "title" | "quest">,
+  userId: string,
+  rewardSats: number,
+): Promise<void> {
+  recordLedgerEntry(client, {
+    type: "quest_reward",
+    amountSats: rewardSats,
+    senderId: task.quest.creator_id,
+    receiverId: userId,
+    guildId: task.quest.guild_id,
+    referenceType: "quest_reward_events",
+    referenceId: String(task.quest_id),
+    metadata: { task_id: task.id, task_title: task.title },
+  });
+
+  await registerDepositAddress(userId).catch(() => {});
+  await sendTransferReceivedDm({
+    client,
+    recipientId: userId,
+    senderId: task.quest.creator_id,
+    amountSats: rewardSats,
+    kind: "quest",
+    customMessage: `Completed quest task: ${task.title}`,
+  });
+}
+
+async function completeRepeatableLinkWindowAndNotify(
+  client: Client,
+  task: ActiveQuestTask<FirstLinkConfig>,
+  userId: string,
+  proof: Record<string, unknown>,
+): Promise<QuestCompletionResult> {
+  const result = await completeQuestTask({
+    questId: task.quest_id,
+    taskId: task.id,
+    userId,
+    proof,
+  });
+
+  if (!result.ok) return result;
+
+  if ((result.rewardDeltaSats ?? 0) > 0) {
+    await notifyQuestReward(client, task, userId, result.rewardDeltaSats ?? 0);
+  } else if (result.insertedCompletion === false) {
+    const repeatResult = await payRepeatableQuestTaskReward({
+      questId: task.quest_id,
+      taskId: task.id,
+      userId,
+      proof,
+    });
+
+    if (repeatResult.ok && (repeatResult.rewardDeltaSats ?? 0) > 0) {
+      await notifyQuestReward(client, task, userId, repeatResult.rewardDeltaSats ?? 0);
+    }
+  }
+
+  const refreshed = await refreshQuestMessage(client, task.quest_id);
+  if (refreshed) {
+    initializedQuestIds.add(task.quest_id);
+  }
+  return result;
+}
+
 async function maybeDeleteDuplicateLinkPost(
   client: Client,
   message: Message,
@@ -1043,7 +1109,7 @@ export async function handleMultiStepQuestMessage(client: Client, message: Messa
     if (!wonWindow) continue;
 
     await markFirstLinkWindowClaimed(task, message.author.id, linkIndex, message.id, matchedUrl);
-    await completeAndNotify(client, task, message.author.id, proof);
+    await completeRepeatableLinkWindowAndNotify(client, task, message.author.id, proof);
   }
 }
 

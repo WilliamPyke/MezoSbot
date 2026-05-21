@@ -476,6 +476,23 @@ export async function completeQuestTask(params: {
   return data as QuestCompletionResult;
 }
 
+export async function payRepeatableQuestTaskReward(params: {
+  questId: number;
+  taskId: number;
+  userId: string;
+  proof?: Record<string, unknown>;
+}): Promise<QuestCompletionResult> {
+  const { data, error } = await supabase.rpc("pay_repeatable_quest_task_reward", {
+    p_quest_id: params.questId,
+    p_task_id: params.taskId,
+    p_user_id: params.userId,
+    p_proof: params.proof ?? {},
+  });
+
+  if (error) throw error;
+  return data as QuestCompletionResult;
+}
+
 registerQuestTask({
   type: "event_attendance",
   label: "Event attendance",
