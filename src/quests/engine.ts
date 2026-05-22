@@ -489,8 +489,133 @@ export async function payRepeatableQuestTaskReward(params: {
     p_proof: params.proof ?? {},
   });
 
-  if (error) throw error;
+  if (error) {
+    const functionMissing = error.code === "PGRST202" || /pay_repeatable_quest_task_reward/i.test(error.message ?? "");
+    if (!functionMissing) throw error;
+    return payRepeatableQuestTaskRewardFallback(params);
+  }
   return data as QuestCompletionResult;
+}
+
+async function payRepeatableQuestTaskRewardFallback(params: {
+  questId: number;
+  taskId: number;
+  userId: string;
+  proof?: Record<string, unknown>;
+}): Promise<QuestCompletionResult> {
+  const { data: quest, error: questError } = await supabase
+    .from("quests")
+    .select("id, creator_id, status, starts_at, ends_at")
+    .eq("id", params.questId)
+    .maybeSingle();
+  if (questError) throw questError;
+  if (!quest || quest.status !== "active") return { ok: false, reason: "quest_inactive" };
+
+  const now = Date.now();
+  if (quest.starts_at && now < Date.parse(quest.starts_at)) return { ok: false, reason: "quest_not_started" };
+  if (quest.ends_at && now > Date.parse(quest.ends_at)) {
+    await supabase
+      .from("quests")
+      .update({ status: "completed", completed_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+      .eq("id", params.questId);
+    return { ok: false, reason: "quest_ended" };
+  }
+
+  const { data: task, error: taskError } = await supabase
+    .from("quest_tasks")
+    .select("id")
+    .eq("id", params.taskId)
+    .eq("quest_id", params.questId)
+    .eq("status", "active")
+    .maybeSingle();
+  if (taskError) throw taskError;
+  if (!task) return { ok: false, reason: "task_not_found" };
+
+  const { data: tiers, error: tierError } = await supabase
+    .from("quest_reward_tiers")
+    .select("reward_sats")
+    .eq("quest_id", params.questId)
+    .lte("completed_task_count", 1);
+  if (tierError) throw tierError;
+
+  const rewardSats = Math.max(0, ...(tiers ?? []).map((tier) => roundSats(Number(tier.reward_sats))));
+  if (rewardSats <= 0) return { ok: false, reason: "reward_not_configured" };
+
+  const { data: rewardRow, error: rewardError } = await supabase
+    .from("quest_user_rewards")
+    .select("paid_sats")
+    .eq("quest_id", params.questId)
+    .eq("user_id", params.userId)
+    .maybeSingle();
+  if (rewardError) throw rewardError;
+
+  const { data: repeatEvents, error: repeatError } = await supabase
+    .from("quest_reward_events")
+    .select("reward_delta_sats")
+    .eq("quest_id", params.questId)
+    .eq("user_id", params.userId)
+    .eq("reason", "repeatable_task");
+  if (repeatError) throw repeatError;
+
+  const previousPaid = roundSats(
+    Number(rewardRow?.paid_sats ?? 0) +
+      (repeatEvents ?? []).reduce((sum, event) => sum + Number(event.reward_delta_sats ?? 0), 0),
+  );
+
+  await supabase.from("users").upsert([{ discord_id: quest.creator_id }, { discord_id: params.userId }], {
+    onConflict: "discord_id",
+    ignoreDuplicates: true,
+  });
+
+  const { data: debited, error: debitError } = await supabase.rpc("subtract_balance_if_sufficient", {
+    p_discord_id: quest.creator_id,
+    p_amount: rewardSats,
+  });
+  if (debitError) throw debitError;
+  if (!debited) {
+    await supabase
+      .from("quests")
+      .update({ status: "exhausted", completed_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+      .eq("id", params.questId);
+    return {
+      ok: false,
+      reason: "insufficient_creator_balance",
+      insertedCompletion: false,
+      completedTaskCount: 1,
+      tierRewardSats: rewardSats,
+      previousPaidSats: previousPaid,
+      rewardDeltaSats: rewardSats,
+    };
+  }
+
+  const { error: creditError } = await supabase.rpc("add_balance", {
+    p_discord_id: params.userId,
+    p_amount: rewardSats,
+  });
+  if (creditError) throw creditError;
+
+  const totalPaid = roundSats(previousPaid + rewardSats);
+  const { error: eventError } = await supabase
+    .from("quest_reward_events")
+    .insert({
+      quest_id: params.questId,
+      user_id: params.userId,
+      reward_delta_sats: rewardSats,
+      total_paid_sats: totalPaid,
+      completed_task_count: 1,
+      reason: "repeatable_task",
+    });
+  if (eventError) throw eventError;
+
+  return {
+    ok: true,
+    insertedCompletion: false,
+    completedTaskCount: 1,
+    tierRewardSats: rewardSats,
+    previousPaidSats: previousPaid,
+    rewardDeltaSats: rewardSats,
+    totalPaidSats: totalPaid,
+  };
 }
 
 registerQuestTask({

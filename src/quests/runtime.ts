@@ -927,34 +927,43 @@ async function completeRepeatableLinkWindowAndNotify(
   userId: string,
   proof: Record<string, unknown>,
 ): Promise<QuestCompletionResult> {
-  const result = await completeQuestTask({
-    questId: task.quest_id,
-    taskId: task.id,
-    userId,
-    proof,
-  });
+  let result: QuestCompletionResult = { ok: false, reason: "unknown_error" };
 
-  if (!result.ok) return result;
-
-  if ((result.rewardDeltaSats ?? 0) > 0) {
-    await notifyQuestReward(client, task, userId, result.rewardDeltaSats ?? 0);
-  } else if (result.insertedCompletion === false) {
-    const repeatResult = await payRepeatableQuestTaskReward({
+  try {
+    result = await completeQuestTask({
       questId: task.quest_id,
       taskId: task.id,
       userId,
       proof,
     });
 
-    if (repeatResult.ok && (repeatResult.rewardDeltaSats ?? 0) > 0) {
-      await notifyQuestReward(client, task, userId, repeatResult.rewardDeltaSats ?? 0);
+    if (!result.ok) return result;
+
+    if ((result.rewardDeltaSats ?? 0) > 0) {
+      await notifyQuestReward(client, task, userId, result.rewardDeltaSats ?? 0);
+    } else if (result.insertedCompletion === false) {
+      const repeatResult = await payRepeatableQuestTaskReward({
+        questId: task.quest_id,
+        taskId: task.id,
+        userId,
+        proof,
+      });
+
+      if (repeatResult.ok && (repeatResult.rewardDeltaSats ?? 0) > 0) {
+        await notifyQuestReward(client, task, userId, repeatResult.rewardDeltaSats ?? 0);
+      }
+    }
+  } catch (err) {
+    const message = (err as Error)?.message ?? String(err);
+    console.warn(`[QuestEngine] Failed to pay link-window reward for quest ${task.quest_id}:`, message);
+    result = { ok: false, reason: message };
+  } finally {
+    const refreshed = await refreshQuestMessage(client, task.quest_id);
+    if (refreshed) {
+      initializedQuestIds.add(task.quest_id);
     }
   }
 
-  const refreshed = await refreshQuestMessage(client, task.quest_id);
-  if (refreshed) {
-    initializedQuestIds.add(task.quest_id);
-  }
   return result;
 }
 
@@ -1048,6 +1057,8 @@ export async function resetFirstLinkWindow(
 
   const metadata = { ...(snapshot.quest.metadata as Record<string, unknown> | null ?? {}) };
   delete metadata.currentLinkClaim;
+  delete metadata.lastRenderedLinkIndex;
+  delete metadata.lastRenderedLinkWindowStart;
 
   const { error: metaError } = await supabase
     .from("quests")
