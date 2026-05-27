@@ -105,7 +105,7 @@ const PAGE_HTML = /* html */ `<!doctype html>
     <span class="meta" id="meta">connecting…</span>
   </header>
   <div class="wrap"><canvas id="map" width="900" height="640"></canvas></div>
-  <p class="hint">Drag to pan · scroll to zoom · live every 2s</p>
+  <p class="hint">🟦 Town · 🟩 Jungle · 🟨 Desert · ⬜ Winter · 🟪 India &nbsp;—&nbsp; drag to pan · scroll to zoom · live every 2s</p>
 <script>
 (function () {
   var canvas = document.getElementById("map");
@@ -117,29 +117,53 @@ const PAGE_HTML = /* html */ `<!doctype html>
   function worldToScreen(wx, wy) {
     return [canvas.width / 2 + (wx * scale) + ox, canvas.height / 2 + (wy * scale) + oy];
   }
+  // ── world generation (MUST mirror server src/satscape/engine.ts biomeAt) ──
+  var TOWN_RADIUS = 15, REGION_SIZE = 22;
+  function hash01(a, b, salt) {
+    return Math.abs(Math.sin(a * 12.9898 + b * 78.233 + salt) * 43758.5453) % 1;
+  }
+  function biomeAt(x, y) {
+    if (Math.sqrt(x * x + y * y) <= TOWN_RADIUS) return "town";
+    var wx = x + Math.sin(y * 0.12) * 4;
+    var wy = y + Math.cos(x * 0.12) * 4;
+    var cx = Math.floor(wx / REGION_SIZE), cy = Math.floor(wy / REGION_SIZE);
+    var h = hash01(cx * 1.7, cy * 2.3, 99);
+    if (h < 0.3) return "jungle";
+    if (h < 0.55) return "desert";
+    if (h < 0.78) return "winter";
+    return "india";
+  }
   function biomeColor(b) {
-    return b === "town" ? "#1e3a8a" : b === "jungle" ? "#15803d"
+    return b === "town" ? "#1e3a8a" : b === "jungle" ? "#166534"
          : b === "desert" ? "#ca8a04" : b === "winter" ? "#cbd5e1"
          : b === "india" ? "#be185d" : "#1f2937";
   }
   function draw() {
     ctx.fillStyle = "#020617"; ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-    // grid
-    ctx.strokeStyle = "rgba(148,163,184,0.06)"; ctx.lineWidth = 1;
-    for (var gx = (ox % scale) - scale; gx < canvas.width; gx += scale) {
-      ctx.beginPath(); ctx.moveTo(gx, 0); ctx.lineTo(gx, canvas.height); ctx.stroke();
-    }
-    for (var gy = (oy % scale) - scale; gy < canvas.height; gy += scale) {
-      ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(canvas.width, gy); ctx.stroke();
+    // terrain — fill every visible tile by biome (tiles centred on integer coords)
+    var cxp = canvas.width / 2 + ox, cyp = canvas.height / 2 + oy;
+    var minTX = Math.floor((0 - cxp) / scale - 0.5), maxTX = Math.ceil((canvas.width - cxp) / scale + 0.5);
+    var minTY = Math.floor((0 - cyp) / scale - 0.5), maxTY = Math.ceil((canvas.height - cyp) / scale + 0.5);
+    for (var ty = minTY; ty <= maxTY; ty++) {
+      for (var tx = minTX; tx <= maxTX; tx++) {
+        ctx.fillStyle = biomeColor(biomeAt(tx, ty));
+        ctx.fillRect(cxp + (tx - 0.5) * scale, cyp + (ty - 0.5) * scale, scale + 1, scale + 1);
+      }
     }
 
-    // safe-zone town
-    var r = state.townRadius * scale;
+    // grid lines only when zoomed in enough to read them
+    if (scale >= 12) {
+      ctx.strokeStyle = "rgba(2,6,23,0.25)"; ctx.lineWidth = 1;
+      for (var gtx = minTX; gtx <= maxTX; gtx++) { var gx = cxp + (gtx - 0.5) * scale; ctx.beginPath(); ctx.moveTo(gx, 0); ctx.lineTo(gx, canvas.height); ctx.stroke(); }
+      for (var gty = minTY; gty <= maxTY; gty++) { var gy = cyp + (gty - 0.5) * scale; ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(canvas.width, gy); ctx.stroke(); }
+    }
+
+    // town ring + label
     var c = worldToScreen(0, 0);
-    ctx.fillStyle = "rgba(30,58,138,0.35)"; ctx.strokeStyle = "#3b82f6"; ctx.lineWidth = 1.5;
-    ctx.beginPath(); ctx.arc(c[0], c[1], r, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
-    ctx.fillStyle = "#93c5fd"; ctx.font = "12px monospace"; ctx.textAlign = "center";
+    ctx.strokeStyle = "#3b82f6"; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(c[0], c[1], TOWN_RADIUS * scale, 0, Math.PI * 2); ctx.stroke();
+    ctx.fillStyle = "#dbeafe"; ctx.font = "12px monospace"; ctx.textAlign = "center";
     ctx.fillText("TOWN (0,0)", c[0], c[1] + 4);
 
     // players
@@ -148,13 +172,16 @@ const PAGE_HTML = /* html */ `<!doctype html>
       var s = worldToScreen(p.x, p.y);
       ctx.fillStyle = p.state === "combat" ? "#f97316" : "#f43f5e";
       ctx.beginPath(); ctx.arc(s[0], s[1], 5, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = "#0f172a"; ctx.lineWidth = 1.5; ctx.stroke();
       if (p.state === "combat") {
         ctx.strokeStyle = "#fb923c"; ctx.lineWidth = 2;
         ctx.beginPath(); ctx.arc(s[0], s[1], 9, 0, Math.PI * 2); ctx.stroke();
       }
-      ctx.fillStyle = biomeColor(p.biome); ctx.fillRect(s[0] + 9, s[1] - 11, 4, 4);
-      ctx.fillStyle = "#f8fafc"; ctx.font = "11px monospace";
-      ctx.fillText(p.name + "  " + p.hpPct + "%hp", s[0] + 9, s[1] + 4);
+      var label = p.name + "  " + p.hpPct + "%";
+      ctx.font = "11px monospace";
+      var tw = ctx.measureText(label).width + 6;
+      ctx.fillStyle = "rgba(2,6,23,0.7)"; ctx.fillRect(s[0] + 8, s[1] - 9, tw, 14);
+      ctx.fillStyle = "#f8fafc"; ctx.fillText(label, s[0] + 11, s[1] + 2);
     });
   }
 
@@ -175,7 +202,7 @@ const PAGE_HTML = /* html */ `<!doctype html>
     lastX = e.clientX; lastY = e.clientY; draw();
   });
   canvas.addEventListener("wheel", function (e) {
-    e.preventDefault(); scale = Math.max(4, Math.min(48, scale * (e.deltaY < 0 ? 1.1 : 0.9))); draw();
+    e.preventDefault(); scale = Math.max(8, Math.min(48, scale * (e.deltaY < 0 ? 1.1 : 0.9))); draw();
   }, { passive: false });
 
   fetchPlayers();
