@@ -55,6 +55,7 @@ export interface Town {
   safeRadius: number; // tiles of safe zone around the centre
   identity: string;
   palette: [Terrain, Terrain, Terrain]; // biomes filling this town's territory
+  monsterColor: string; // sprite tint for this territory's monsters
   monsters: string[];
   keeper: Keeper;
   catalog: ShopItem[];
@@ -79,6 +80,7 @@ export const TOWNS: Town[] = [
     cx: 0, cy: 0, safeRadius: 12,
     identity: "The temperate starter town — rolling plains, woods and hills.",
     palette: ["plains", "forest", "hills"],
+    monsterColor: "#6b7280",
     monsters: ["Highway Bandit", "Dire Wolf", "Stone Golem"],
     keeper: { name: "Hodlnaur", persona: "business", blurb: "Time is sats. What'll it be?" },
     catalog: catalog("rest", 3, 40,
@@ -91,6 +93,7 @@ export const TOWNS: Town[] = [
     cx: 260, cy: 40, safeRadius: 14,
     identity: "A vast eastern realm of jungle, monsoon wetlands and golden savanna.",
     palette: ["jungle", "monsoon", "savanna"],
+    monsterColor: "#b45309",
     monsters: ["Bengal Tiger", "Rakshasa Fiend", "River Naga"],
     keeper: { name: "Ravi the Fair", persona: "fair", blurb: "Browse freely, traveller. Honest prices here." },
     catalog: catalog("jaipur", 6, 160,
@@ -103,6 +106,7 @@ export const TOWNS: Town[] = [
     cx: -280, cy: 120, safeRadius: 14,
     identity: "A sun-blasted expanse of desert, slot canyons and rare oases.",
     palette: ["desert", "canyon", "oasis"],
+    monsterColor: "#a16207",
     monsters: ["Sand Wraith", "Dune Scorpion", "Mirage Djinn"],
     keeper: { name: "Dim Dougal", persona: "bargain", blurb: "Uhh… prices are whatever. Two-for-one? Sure, why not!" },
     catalog: catalog("dustfall", 8, 320,
@@ -115,6 +119,7 @@ export const TOWNS: Town[] = [
     cx: -40, cy: -300, safeRadius: 14,
     identity: "A frozen north of snowfields, frostbitten tundra and blue ice.",
     palette: ["snow", "tundra", "ice"],
+    monsterColor: "#7c3aed",
     monsters: ["Frost Wyrm", "Ice Revenant", "Yeti"],
     keeper: { name: "Greta the Greedy", persona: "greedy", blurb: "Everything's for sale… at a price you'll hate." },
     catalog: catalog("frosthold", 11, 640,

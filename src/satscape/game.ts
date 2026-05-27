@@ -243,12 +243,23 @@ export function estimateTravel(player: SatPlayerRow, tx: number, ty: number): Tr
   };
 }
 
+/** Sats actually charged for a trip, after any road/portal discount. */
+export function travelCost(est: TravelEstimate, discountMul = 1): number {
+  return Math.ceil(est.satCost * discountMul);
+}
+
 /**
- * Execute a confirmed fast-travel: deduct the (cheapest) bread cost to the pool,
+ * Execute a confirmed fast-travel: deduct the (discounted) bread cost to the pool,
  * teleport to the destination, set the resulting stamina, and resolve the tile.
  * Encounters along the way are abstracted away — only the destination is resolved.
+ * `discountMul` < 1 models a road/portal between towns (provisions are subsidised).
  */
-export async function travelTo(discordId: string, tx: number, ty: number): Promise<ActionResult> {
+export async function travelTo(
+  discordId: string,
+  tx: number,
+  ty: number,
+  opts: { discountMul?: number } = {},
+): Promise<ActionResult> {
   const player = await getPlayer(discordId);
   if (!player || !player.active) return { ok: false, note: "Use `/satscape join` first." };
   if (player.state === "combat") return { ok: false, note: "Can't travel mid-combat." };
@@ -256,14 +267,15 @@ export async function travelTo(discordId: string, tx: number, ty: number): Promi
   const est = estimateTravel(player, tx, ty);
   if (est.steps === 0) return { ok: false, note: "You're already there." };
 
+  const cost = travelCost(est, opts.discountMul ?? 1);
+  const viaPortal = (opts.discountMul ?? 1) < 1;
   let paidNote = "";
-  if (est.satCost > 0) {
-    const paid = await takeDamage(discordId, est.satCost);
-    if (paid < est.satCost) {
-      // Couldn't fully fund the trip → arrive exhausted, HP already drained by `paid`.
+  if (cost > 0) {
+    const paid = await takeDamage(discordId, cost);
+    if (paid < cost) {
       paidNote = `Provisions ran short (−${paid} sat). `;
     } else {
-      paidNote = `Bought ${est.breadNeeded} bread (−${est.satCost} sat). `;
+      paidNote = viaPortal ? `Road toll (−${cost} sat, ½ price). ` : `Bought ${est.breadNeeded} bread (−${cost} sat). `;
     }
   }
 

@@ -1,4 +1,4 @@
-import { createCanvas } from "@napi-rs/canvas";
+import { createCanvas, type SKRSContext2D } from "@napi-rs/canvas";
 import {
   ActionRowBuilder,
   AttachmentBuilder,
@@ -9,6 +9,7 @@ import {
 } from "discord.js";
 import { formatSats } from "../format.js";
 import { biomeAt, SAT, viewportBounds } from "./engine.js";
+import { estimateTravel, travelCost, type TravelEstimate } from "./game.js";
 import { lossFor, winChance } from "./items.js";
 import {
   effectivePrice,
@@ -16,7 +17,9 @@ import {
   ITEM_BY_ID,
   nearestTown,
   TERRAIN_COLOR,
+  TOWNS,
   townAt,
+  type KeeperPersona,
   type Terrain,
   type Town,
 } from "./towns.js";
@@ -101,20 +104,16 @@ export function buildMapImage(view: ViewModel): AttachmentBuilder {
     const [px, py] = toPx(e.x, e.y);
     const cx = px + TILE / 2;
     const cy = py + TILE / 2;
-    if (e.type === "chest") {
-      ctx.fillStyle = "#b45309";
-      ctx.fillRect(cx - 7, cy - 5, 14, 11);
-      ctx.fillStyle = "#fbbf24";
-      ctx.fillRect(cx - 7, cy - 1, 14, 2);
-    } else {
-      ctx.fillStyle = "#ef4444";
-      ctx.beginPath();
-      ctx.moveTo(cx, cy - 7);
-      ctx.lineTo(cx + 7, cy + 6);
-      ctx.lineTo(cx - 7, cy + 6);
-      ctx.closePath();
-      ctx.fill();
-    }
+    if (e.type === "chest") drawChest(ctx, cx, cy);
+    else drawMonster(ctx, cx, cy, nearestTown(e.x, e.y).town.monsterColor, nameVariant(String(e.data.name ?? "")));
+  }
+
+  // town keepers standing in their towns (if the centre is in view & known)
+  for (const t of TOWNS) {
+    if (t.cx < b.minX || t.cx > b.maxX || t.cy < b.minY || t.cy > b.maxY) continue;
+    if (!(inSight(t.cx, t.cy) || explored.has(`${t.cx},${t.cy}`))) continue;
+    const [px, py] = toPx(t.cx, t.cy);
+    drawKeeper(ctx, px + TILE / 2, py + TILE / 2, t.keeper.persona);
   }
 
   // other players — only what's currently in sight
@@ -165,9 +164,107 @@ export function buildMapImage(view: ViewModel): AttachmentBuilder {
   ctx.fillRect(0, SAT.VIEW_H * TILE, w, LEGEND_H);
   ctx.fillStyle = "#e2e8f0";
   ctx.font = "12px sans-serif";
-  ctx.fillText(`${locationLabel(player.x_coord, player.y_coord)}  ·  (${player.x_coord}, ${player.y_coord})`, 8, SAT.VIEW_H * TILE + 16);
+  // strip emoji (canvas has no colour-emoji font) but keep punctuation like "·"
+  const legend = `${locationLabel(player.x_coord, player.y_coord)}  ·  (${player.x_coord}, ${player.y_coord})`.replace(/\p{Extended_Pictographic}/gu, "").trim();
+  ctx.fillText(legend, 8, SAT.VIEW_H * TILE + 16);
 
   return new AttachmentBuilder(canvas.toBuffer("image/png"), { name: MAP_FILE });
+}
+
+/* ─────────── sprites (drawn procedurally — no binary art) ─────────── */
+
+const ROBE: Record<KeeperPersona, string> = {
+  business: "#1e40af",
+  fair: "#15803d",
+  greedy: "#b91c1c",
+  bargain: "#a16207",
+};
+
+function nameVariant(name: string): number {
+  let h = 0;
+  for (const ch of name) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+  return h % 3;
+}
+
+function drawChest(ctx: SKRSContext2D, cx: number, cy: number): void {
+  ctx.fillStyle = "#7c4a1e";
+  ctx.fillRect(cx - 8, cy - 4, 16, 10); // body
+  ctx.fillStyle = "#a16207";
+  ctx.fillRect(cx - 8, cy - 8, 16, 5); // lid
+  ctx.fillStyle = "#fbbf24";
+  ctx.fillRect(cx - 8, cy - 1, 16, 2); // band
+  ctx.fillStyle = "#fde047";
+  ctx.fillRect(cx - 2, cy - 2, 4, 5); // lock
+}
+
+function drawMonster(ctx: SKRSContext2D, cx: number, cy: number, tint: string, variant: number): void {
+  // horns
+  ctx.fillStyle = "#0f172a";
+  ctx.beginPath();
+  ctx.moveTo(cx - 6, cy - 4); ctx.lineTo(cx - 8, cy - 11); ctx.lineTo(cx - 3, cy - 6); ctx.closePath(); ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(cx + 6, cy - 4); ctx.lineTo(cx + 8, cy - 11); ctx.lineTo(cx + 3, cy - 6); ctx.closePath(); ctx.fill();
+  // body
+  ctx.fillStyle = tint;
+  ctx.beginPath();
+  ctx.arc(cx, cy + 1, 8, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = "#0f172a";
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  // eyes (1..3 by variant)
+  const eyes = variant + 1;
+  ctx.fillStyle = "#fde047";
+  for (let i = 0; i < eyes; i++) {
+    const ex = cx + (i - (eyes - 1) / 2) * 5;
+    ctx.beginPath();
+    ctx.arc(ex, cy - 1, 1.6, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  // fangs
+  ctx.fillStyle = "#ffffff";
+  ctx.beginPath();
+  ctx.moveTo(cx - 3, cy + 6); ctx.lineTo(cx - 1, cy + 6); ctx.lineTo(cx - 2, cy + 9); ctx.closePath(); ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(cx + 3, cy + 6); ctx.lineTo(cx + 1, cy + 6); ctx.lineTo(cx + 2, cy + 9); ctx.closePath(); ctx.fill();
+}
+
+function drawKeeper(ctx: SKRSContext2D, cx: number, cy: number, persona: KeeperPersona): void {
+  // robe (trapezoid body)
+  ctx.fillStyle = ROBE[persona];
+  ctx.beginPath();
+  ctx.moveTo(cx - 6, cy + 9); ctx.lineTo(cx + 6, cy + 9); ctx.lineTo(cx + 4, cy - 1); ctx.lineTo(cx - 4, cy - 1); ctx.closePath();
+  ctx.fill();
+  // head
+  ctx.fillStyle = "#f1c27d";
+  ctx.beginPath();
+  ctx.arc(cx, cy - 4, 4, 0, Math.PI * 2);
+  ctx.fill();
+  // merchant cap
+  ctx.fillStyle = "#0f172a";
+  ctx.fillRect(cx - 5, cy - 8, 10, 3);
+  ctx.fillRect(cx - 2, cy - 11, 4, 3);
+}
+
+export const KEEPER_FILE = "satscape-keeper.png";
+
+/** A small keeper portrait for the shop embed thumbnail. */
+export function buildKeeperPortrait(town: Town): AttachmentBuilder {
+  const canvas = createCanvas(96, 96);
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "#0f172a";
+  ctx.fillRect(0, 0, 96, 96);
+  // scaled-up keeper
+  ctx.save();
+  ctx.translate(48, 40);
+  ctx.scale(3, 3);
+  drawKeeper(ctx, 0, 0, town.keeper.persona);
+  ctx.restore();
+  ctx.fillStyle = "#e2e8f0";
+  ctx.font = "bold 11px sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText(town.keeper.name.slice(0, 14), 48, 90);
+  return new AttachmentBuilder(canvas.toBuffer("image/png"), { name: KEEPER_FILE });
 }
 
 function bar(value: number, max: number, width = 12): string {
@@ -229,6 +326,7 @@ export function buildComponents(
   if (townAt(view.player.x_coord, view.player.y_coord)) {
     actionRow.addComponents(
       new ButtonBuilder().setCustomId(sqCid("shop")).setLabel("Shop").setEmoji("🛒").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(sqCid("roads")).setLabel("Roads").setEmoji("🛣️").setStyle(ButtonStyle.Secondary),
     );
   }
   return [
@@ -259,6 +357,7 @@ export function buildShopEmbed(town: Town, player: SatPlayerRow, hp: number, _ow
   return new EmbedBuilder()
     .setColor(0x1d4ed8)
     .setTitle(`🛒 ${town.name} — ${town.keeper.name}`)
+    .setThumbnail(`attachment://${KEEPER_FILE}`)
     .setDescription(
       `*"${town.keeper.blurb}"*\n\n` +
         `Balance: **${formatSats(hp)}**  ·  Gear score: **${gear}**\n` +
@@ -309,4 +408,41 @@ export function buildShopComponents(town: Town, ownedIds: string[]): ActionRowBu
     ),
   );
   return rows;
+}
+
+/* ─────────── roads / portal network ─────────── */
+
+export function buildPortalEmbed(currentTown: Town, player: SatPlayerRow): EmbedBuilder {
+  const lines = TOWNS.filter((t) => t.id !== currentTown.id).map((t) => {
+    const est = estimateTravel(player, t.cx, t.cy);
+    const cost = travelCost(est, SAT.PORTAL_DISCOUNT);
+    return `**${t.name}** — ${est.steps} tiles · ~${formatSats(cost)} (½ price)`;
+  });
+  return new EmbedBuilder()
+    .setColor(0x6d28d9)
+    .setTitle(`🛣️ ${currentTown.name} — Road Network`)
+    .setDescription(`Roads connect the towns. Travel by road for **${Math.round(SAT.PORTAL_DISCOUNT * 100)}%** of the usual fare.\n\n${lines.join("\n")}`)
+    .setFooter({ text: "Pick a destination below." });
+}
+
+export function buildPortalComponents(currentTown: Town, player: SatPlayerRow): ActionRowBuilder<StringSelectMenuBuilder | ButtonBuilder>[] {
+  const pick = new StringSelectMenuBuilder()
+    .setCustomId(sqCid("portalpick"))
+    .setPlaceholder("Travel by road to…")
+    .addOptions(
+      TOWNS.filter((t) => t.id !== currentTown.id).map((t) => {
+        const est = estimateTravel(player, t.cx, t.cy);
+        return {
+          label: t.name,
+          description: `~${travelCost(est, SAT.PORTAL_DISCOUNT)} sats · ${est.steps} tiles`,
+          value: t.id,
+        };
+      }),
+    );
+  return [
+    new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(pick),
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId(sqCid("shopclose")).setLabel("Back to map").setEmoji("🗺️").setStyle(ButtonStyle.Primary),
+    ),
+  ];
 }

@@ -15,6 +15,7 @@ export const SAT = {
   CHEST_SPAWN: 0.03, // per-tile spawn probability in the wilds
   MONSTER_SPAWN: 0.08, // cumulative upper bound (monster occupies 0.03..0.08)
   BREAD_STAMINA: 20, // stamina restored per 1-sat loaf
+  PORTAL_DISCOUNT: 0.5, // town↔town road/portal travel costs this fraction of the normal fare
 } as const;
 
 /** Deterministic [0,1) hash. */

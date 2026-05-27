@@ -2,16 +2,19 @@ import type {
   ButtonInteraction,
   ChatInputCommandInteraction,
   ModalSubmitInteraction,
+  StringSelectMenuInteraction,
 } from "discord.js";
 import { loadView } from "./db.js";
 import { move } from "./game.js";
 import { buildComponents, buildMapEmbed, buildMapImage } from "./render.js";
 import type { Direction } from "./types.js";
 
-type EditableInteraction =
+/** Any SatScape interaction we deferUpdate then editReply on. */
+export type EditableInteraction =
   | ChatInputCommandInteraction
   | ButtonInteraction
-  | ModalSubmitInteraction;
+  | ModalSubmitInteraction
+  | StringSelectMenuInteraction;
 
 interface Session {
   interaction: EditableInteraction; // latest one (holds a fresh 15-min token)

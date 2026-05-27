@@ -31,10 +31,12 @@ import {
   fight,
   flee,
   move,
+  travelCost,
   travelTo,
 } from "./game.js";
 import { getCombat, getPlayer, isTileCleared, startRun, updatePlayer } from "./db.js";
-import { gearScore, lossFor, winChance } from "./items.js";
+import { lossFor, winChance } from "./items.js";
+import { gearScore, nearestTown } from "./towns.js";
 
 const TEST_ID = `smoke-${Date.now()}`;
 const START_BALANCE = 2000;
@@ -103,6 +105,9 @@ async function main() {
   await move(TEST_ID, "down");
   ok((await getBalance(TEST_ID)) === balPreStarve - 1, "exhausted step burned 1 sat");
   await conserved(TOTAL, "after exhaustion");
+  const { count: explored } = await supabase
+    .from("sat_explored").select("*", { count: "exact", head: true }).eq("discord_id", TEST_ID);
+  ok((explored ?? 0) > 0, `fog: ${explored} tiles revealed after moving`);
 
   // 3. Eat
   console.log("\n3. Eat bread");
@@ -113,21 +118,22 @@ async function main() {
   ok((await getBalance(TEST_ID)) === balPreEat - 1, "bread cost 1 sat");
   await conserved(TOTAL, "after eat");
 
-  // 4. Shop & gear (town only)
+  // 4. Shop & gear (town-exclusive, keeper pricing)
   console.log("\n4. Shop & gear");
   await updatePlayer(TEST_ID, { x_coord: 0, y_coord: 0, state: "idle", equipped_weapon: null });
   const balPreBuy = await getBalance(TEST_ID);
   const poolPreBuy = await readPool();
-  const buy = await buyItem(TEST_ID, "iron_sword"); // +5, 120 sats
-  ok(buy.ok, "bought iron_sword in town");
-  ok((await getBalance(TEST_ID)) === balPreBuy - 120, "shop debited 120 sats");
-  ok((await readPool()) === poolPreBuy + 120, "purchase flowed to the pool");
-  ok((await equipItem(TEST_ID, "iron_sword")).ok, "equipped iron_sword");
+  const buy = await buyItem(TEST_ID, "rest_weapon"); // +3, base 40, business keeper x1.25 = 50
+  ok(buy.ok, "bought rest_weapon in spawn town");
+  ok((await getBalance(TEST_ID)) === balPreBuy - 50, "shop debited keeper price (50, marked up)");
+  ok((await readPool()) === poolPreBuy + 50, "purchase flowed to the pool");
+  ok((await equipItem(TEST_ID, "rest_weapon")).ok, "equipped rest_weapon");
   let p = await getPlayer(TEST_ID);
-  ok(p?.equipped_weapon === "iron_sword" && gearScore(p) === 5, "gear score is 5 after equip");
+  ok(p?.equipped_weapon === "rest_weapon" && gearScore(p) === 3, "gear score is 3 after equip");
   ok(winChance(gearScore(p!), 1) > winChance(0, 1), "equipped gear raised win chance");
+  ok(!(await buyItem(TEST_ID, "jaipur_weapon")).ok, "spawn keeper doesn't stock Jaipur gear (town-exclusive)");
   await updatePlayer(TEST_ID, { x_coord: REGION_X + 5, y_coord: 9999, state: "idle" }); // wilds
-  ok(!(await buyItem(TEST_ID, "chainmail")).ok, "shop refused outside town");
+  ok(!(await buyItem(TEST_ID, "rest_weapon")).ok, "shop refused outside town");
   await conserved(TOTAL, "after shop");
 
   // 5. Combat — forced WIN then forced LOSS via deterministic RNG
@@ -204,14 +210,26 @@ async function main() {
     ok((await getBalance(TEST_ID)) === before - est.satCost, `charged the bread cost (${est.satCost} sats)`);
     ok((await readPool()) === poolBeforeTravel + est.satCost, "travel cost flowed to the pool");
     await conserved(TOTAL, "after travel");
+
+    // road/portal: same trip back, discounted
+    await updatePlayer(TEST_ID, { x_coord: dest.x - 30, y_coord: dest.y, hunger: 5, state: "idle" });
+    const pl2 = (await getPlayer(TEST_ID))!;
+    const est2 = estimateTravel(pl2, dest.x, dest.y);
+    const discounted = travelCost(est2, SAT.PORTAL_DISCOUNT);
+    ok(discounted === Math.ceil(est2.satCost * SAT.PORTAL_DISCOUNT), `road fare is ½ price (${discounted} vs ${est2.satCost})`);
+    const before2 = await getBalance(TEST_ID);
+    await travelTo(TEST_ID, dest.x, dest.y, { discountMul: SAT.PORTAL_DISCOUNT });
+    ok((await getBalance(TEST_ID)) === before2 - discounted, `road charged discounted fare (${discounted})`);
+    await conserved(TOTAL, "after road travel");
   }
 
-  // 8. Faint
+  // 8. Faint → warp to nearest town
   console.log("\n8. Faint");
   await updatePlayer(TEST_ID, { x_coord: 42, y_coord: 42, hunger: 30 });
   await faint(TEST_ID);
   p = await getPlayer(TEST_ID);
-  ok(p?.x_coord === 0 && p?.y_coord === 0 && p?.hunger === 100 && p?.state === "idle", "faint warped & reset");
+  const home = nearestTown(42, 42).town;
+  ok(p?.x_coord === home.cx && p?.y_coord === home.cy && p?.hunger === 100 && p?.state === "idle", `faint warped to ${home.name}`);
   await conserved(TOTAL, "after faint");
 
   // Cleanup

@@ -8,9 +8,9 @@ import {
   TextInputStyle,
   type Interaction,
   type ModalSubmitInteraction,
-  type RepliableInteraction,
 } from "discord.js";
 import { getBalance } from "../balance.js";
+import { SAT } from "./engine.js";
 import { getOwnedItemIds, getPlayer } from "./db.js";
 import {
   buyItem,
@@ -20,18 +20,22 @@ import {
   fight,
   flee,
   move,
+  travelCost,
   travelTo,
   type ActionResult,
 } from "./game.js";
 import {
+  buildKeeperPortrait,
+  buildPortalComponents,
+  buildPortalEmbed,
   buildShopComponents,
   buildShopEmbed,
   parseSqCid,
   sqCid,
   SQ_PREFIX,
 } from "./render.js";
-import { render, setAuto, stop } from "./session.js";
-import { townAt } from "./towns.js";
+import { render, setAuto, stop, type EditableInteraction } from "./session.js";
+import { TOWN_BY_ID, townAt } from "./towns.js";
 import type { Direction } from "./types.js";
 
 export function isSatscapeInteraction(interaction: Interaction): boolean {
@@ -68,6 +72,7 @@ export async function handleSatscapeInteraction(interaction: Interaction): Promi
       const res = await equipItem(discordId, chosen);
       return renderShop(interaction, discordId, res.note);
     }
+    if (action === "portalpick") return showPortalConfirm(interaction, discordId, chosen);
     return;
   }
 
@@ -94,6 +99,12 @@ export async function handleSatscapeInteraction(interaction: Interaction): Promi
   }
   if (action === "shopclose") return render(discordId, interaction);
 
+  // Roads / portal network.
+  if (action === "roads") {
+    stop(discordId);
+    return renderPortals(interaction, discordId);
+  }
+
   // Auto-explore toggles.
   if (action === "auto") {
     setAuto(discordId, true);
@@ -104,9 +115,10 @@ export async function handleSatscapeInteraction(interaction: Interaction): Promi
     return render(discordId, interaction, "⏹️ Auto-explore stopped.");
   }
 
-  // Travel confirm / cancel.
+  // Travel confirm / cancel. A 3rd part "p" marks a road/portal trip (discounted).
   if (action === "travelgo") {
-    const res = await travelTo(discordId, Number(parts[0]), Number(parts[1]));
+    const opts = parts[2] === "p" ? { discountMul: SAT.PORTAL_DISCOUNT } : {};
+    const res = await travelTo(discordId, Number(parts[0]), Number(parts[1]), opts);
     return render(discordId, interaction, res.note);
   }
   if (action === "travelcancel") return render(discordId, interaction, "Travel cancelled.");
@@ -125,7 +137,7 @@ export async function handleSatscapeInteraction(interaction: Interaction): Promi
 
 /** Open/refresh the shop view on the current message (map image cleared). */
 export async function renderShop(
-  interaction: RepliableInteraction,
+  interaction: EditableInteraction,
   discordId: string,
   note?: string,
 ): Promise<void> {
@@ -144,7 +156,55 @@ export async function renderShop(
     ...(note !== undefined ? { content: note || "" } : {}),
     embeds: [buildShopEmbed(town, player, hp, owned)],
     components: buildShopComponents(town, owned),
+    files: [buildKeeperPortrait(town)],
+  });
+}
+
+/** Open the road network picker (town only). */
+export async function renderPortals(interaction: EditableInteraction, discordId: string): Promise<void> {
+  const player = await getPlayer(discordId);
+  if (!player) {
+    await interaction.editReply({ content: "Use `/satscape join` first.", embeds: [], components: [], files: [] });
+    return;
+  }
+  const town = townAt(player.x_coord, player.y_coord);
+  if (!town) {
+    await interaction.editReply({ content: "🛣️ Roads depart from towns only.", embeds: [], components: [], files: [] });
+    return;
+  }
+  await interaction.editReply({
+    content: "",
+    embeds: [buildPortalEmbed(town, player)],
+    components: buildPortalComponents(town, player),
     files: [],
+  });
+}
+
+/** Confirm a discounted road trip to the chosen town. */
+async function showPortalConfirm(interaction: EditableInteraction, discordId: string, townId: string): Promise<void> {
+  const player = await getPlayer(discordId);
+  const dest = TOWN_BY_ID.get(townId);
+  if (!player || !dest) return render(discordId, interaction, "That road leads nowhere.");
+  const est = estimateTravel(player, dest.cx, dest.cy);
+  const cost = travelCost(est, SAT.PORTAL_DISCOUNT);
+  const embed = new EmbedBuilder()
+    .setColor(0x6d28d9)
+    .setTitle(`🛣️ Road to ${dest.name}`)
+    .setDescription(`**${est.steps} tiles** by road.`)
+    .addFields(
+      { name: "Road fare (½)", value: `~${cost} sats`, inline: true },
+      { name: "Normal fare", value: `~${est.satCost} sats`, inline: true },
+    );
+  await interaction.editReply({
+    content: "",
+    embeds: [embed],
+    files: [],
+    components: [
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder().setCustomId(sqCid("travelgo", dest.cx, dest.cy, "p")).setLabel(`Take the road (${cost} sats)`).setEmoji("🛣️").setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(sqCid("travelcancel")).setLabel("Cancel").setStyle(ButtonStyle.Secondary),
+      ),
+    ],
   });
 }
 
