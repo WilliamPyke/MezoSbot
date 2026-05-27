@@ -1,0 +1,149 @@
+import {
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  EmbedBuilder,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+  type Interaction,
+  type ModalSubmitInteraction,
+} from "discord.js";
+import { getPlayer } from "./db.js";
+import {
+  attack,
+  eat,
+  estimateTravel,
+  flee,
+  move,
+  travelTo,
+  type ActionResult,
+} from "./game.js";
+import { parseSqCid, sqCid, SQ_PREFIX } from "./render.js";
+import { isAutoExploring, render, setAuto, stop } from "./session.js";
+import type { Direction } from "./types.js";
+
+export function isSatscapeInteraction(interaction: Interaction): boolean {
+  if (interaction.isButton() || interaction.isModalSubmit()) {
+    return interaction.customId.startsWith(`${SQ_PREFIX}:`);
+  }
+  return false;
+}
+
+const DIRECTIONS = new Set(["up", "down", "left", "right"]);
+
+export async function handleSatscapeInteraction(interaction: Interaction): Promise<void> {
+  const customId = "customId" in interaction ? interaction.customId : "";
+  const parsed = parseSqCid(customId);
+  if (!parsed) return;
+  const { action, parts } = parsed;
+  const discordId = interaction.user.id;
+
+  // Modal submit: the travel coordinate form.
+  if (interaction.isModalSubmit()) {
+    if (action === "travelmodal") return showTravelEstimate(interaction);
+    return;
+  }
+  if (!interaction.isButton()) return;
+
+  // "Travel" opens a modal, which must happen on a fresh (undeferred) interaction.
+  if (action === "travel") {
+    await interaction.showModal(buildTravelModal()).catch(() => {});
+    return;
+  }
+
+  try {
+    if (!interaction.deferred && !interaction.replied) await interaction.deferUpdate();
+  } catch (err) {
+    if ((err as { code?: number })?.code === 10062) return; // token expired
+    console.warn(`[SatScape] defer failed for ${action}:`, (err as Error)?.message ?? err);
+    return;
+  }
+
+  // Auto-explore toggles.
+  if (action === "auto") {
+    setAuto(discordId, true);
+    return render(discordId, interaction, "🤖 Auto-explore on — sit back. It stops when you hit a monster.");
+  }
+  if (action === "autostop") {
+    setAuto(discordId, false);
+    return render(discordId, interaction, "⏹️ Auto-explore stopped.");
+  }
+
+  // Travel confirm / cancel.
+  if (action === "travelgo") {
+    const tx = Number(parts[0]);
+    const ty = Number(parts[1]);
+    const res = await travelTo(discordId, tx, ty);
+    return render(discordId, interaction, res.note);
+  }
+  if (action === "travelcancel") {
+    return render(discordId, interaction, "Travel cancelled.");
+  }
+
+  // Movement / combat actions.
+  let result: ActionResult | null = null;
+  if (DIRECTIONS.has(action)) result = await move(discordId, action as Direction);
+  else if (action === "attack") result = await attack(discordId);
+  else if (action === "flee") result = await flee(discordId);
+  else if (action === "eat") result = await eat(discordId);
+  if (!result) return;
+
+  if (result.enteredCombat) setAuto(discordId, false);
+  await render(discordId, interaction, result.note);
+}
+
+function buildTravelModal(): ModalBuilder {
+  return new ModalBuilder()
+    .setCustomId(sqCid("travelmodal"))
+    .setTitle("Fast Travel")
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder().setCustomId("x").setLabel("Destination X").setStyle(TextInputStyle.Short).setRequired(true),
+      ),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder().setCustomId("y").setLabel("Destination Y").setStyle(TextInputStyle.Short).setRequired(true),
+      ),
+    );
+}
+
+/** Validate the typed coordinates, compute the cost, and show a confirm/cancel preview. */
+async function showTravelEstimate(interaction: ModalSubmitInteraction): Promise<void> {
+  await interaction.deferUpdate().catch(() => {});
+  const discordId = interaction.user.id;
+  const tx = Math.trunc(Number(interaction.fields.getTextInputValue("x")));
+  const ty = Math.trunc(Number(interaction.fields.getTextInputValue("y")));
+  if (!Number.isFinite(tx) || !Number.isFinite(ty)) {
+    return render(discordId, interaction, "❌ Coordinates must be whole numbers.");
+  }
+
+  const player = await getPlayer(discordId);
+  if (!player) return render(discordId, interaction, "Use `/satscape join` first.");
+  const est = estimateTravel(player, tx, ty);
+  if (est.steps === 0) return render(discordId, interaction, "You're already there.");
+
+  const embed = new EmbedBuilder()
+    .setColor(0x1d4ed8)
+    .setTitle("🧭 Fast Travel — estimate")
+    .setDescription(`Walk to **(${tx}, ${ty})** — about **${est.steps} tiles**.`)
+    .addFields(
+      { name: "Stamina now", value: `${player.hunger}%`, inline: true },
+      { name: "Bread needed", value: est.breadNeeded > 0 ? `${est.breadNeeded} 🍞` : "none", inline: true },
+      { name: "Estimated cost", value: est.satCost > 0 ? `~${est.satCost} sats` : "free (stamina covers it)", inline: true },
+    )
+    .setFooter({ text: est.hpOnlyCost > 0 ? `Skip the bread and you'd lose ~${est.hpOnlyCost} sats of HP instead. Encounters en route are skipped.` : "Encounters en route are skipped." });
+
+  await interaction.editReply({
+    content: "",
+    embeds: [embed],
+    files: [],
+    components: [
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder().setCustomId(sqCid("travelgo", tx, ty)).setLabel("Confirm Travel").setEmoji("✅").setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(sqCid("travelcancel")).setLabel("Cancel").setStyle(ButtonStyle.Secondary),
+      ),
+    ],
+  });
+}
+
+export { stop as stopSatscapeSession, isAutoExploring };

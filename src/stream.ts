@@ -19,7 +19,7 @@ import {
 import { config } from "./config.js";
 import { handleArcadeWebRequest, ensureMatchRuntimeLoaded } from "./arcade/web.js";
 import { handleWalletWebRequest } from "./web/routes.js";
-import { handleSatquestWebRequest } from "./web/satquest.js";
+import { handleSatscapeWebRequest } from "./web/satscape.js";
 import { addSpectator, buildSpectatorSnapshot } from "./arcade/spectate.js";
 import { getMatch } from "./arcade/db.js";
 
@@ -345,8 +345,8 @@ async function handleHttpRequest(req: IncomingMessage, res: ServerResponse): Pro
     if (handled) return;
   }
 
-  if (url.pathname === "/satquest" || url.pathname.startsWith("/api/satquest")) {
-    const handled = await handleSatquestWebRequest(req, res, url);
+  if (url.pathname === "/satscape" || url.pathname.startsWith("/api/satscape")) {
+    const handled = await handleSatscapeWebRequest(req, res, url);
     if (handled) return;
   }
 

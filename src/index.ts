@@ -49,9 +49,9 @@ import {
   updateMatchFeed,
 } from "./arcade/interactions.js";
 import {
-  handleSatquestInteraction,
-  isSatquestInteraction,
-} from "./satquest/interactions.js";
+  handleSatscapeInteraction,
+  isSatscapeInteraction,
+} from "./satscape/interactions.js";
 import {
   handleEventQuestScheduledEventUpdate,
   handleEventQuestScheduledEventUserChange,
@@ -382,15 +382,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return;
   }
 
-  if (isSatquestInteraction(interaction)) {
+  if (isSatscapeInteraction(interaction)) {
     const cid = ("customId" in interaction && interaction.customId) || "";
-    console.log(`[Discord] SatQuest interaction ${cid} from ${tag} (arrivalLag=${arrivalLagMs}ms)`);
+    console.log(`[Discord] SatScape interaction ${cid} from ${tag} (arrivalLag=${arrivalLagMs}ms)`);
     try {
-      await handleSatquestInteraction(interaction);
+      await handleSatscapeInteraction(interaction);
     } catch (err) {
-      console.warn(`[SatQuest] Interaction ${cid} failed:`, (err as Error)?.message ?? err);
+      console.warn(`[SatScape] Interaction ${cid} failed:`, (err as Error)?.message ?? err);
     }
-    console.log(`[Discord] SatQuest ${cid} done in ${Date.now() - startMs}ms`);
+    console.log(`[Discord] SatScape ${cid} done in ${Date.now() - startMs}ms`);
     return;
   }
 

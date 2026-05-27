@@ -1,6 +1,5 @@
-export type Biome = "town" | "jungle" | "desert" | "winter";
+export type Biome = "town" | "jungle" | "desert" | "winter" | "india";
 export type PlayerState = "idle" | "combat" | "fainted";
-export type EntityType = "chest" | "monster" | "cleared";
 export type Direction = "up" | "down" | "left" | "right";
 
 export interface SatPlayerRow {
@@ -8,20 +7,11 @@ export interface SatPlayerRow {
   avatar_id: string;
   x_coord: number;
   y_coord: number;
-  hunger: number;
+  hunger: number; // displayed as "Stamina"
   display_max_hp: number;
   state: PlayerState;
   active: boolean;
   last_move_at: string;
-  created_at: string;
-}
-
-export interface WorldEntityRow {
-  id: number;
-  x: number;
-  y: number;
-  entity_type: EntityType;
-  entity_data: Record<string, unknown>;
   created_at: string;
 }
 
@@ -38,10 +28,27 @@ export interface CombatSessionRow {
   created_at: string;
 }
 
+/** A computed (non-persisted) entity sitting on a tile. */
+export interface TileEntity {
+  x: number;
+  y: number;
+  type: "chest" | "monster";
+  data: Record<string, unknown>;
+}
+
+/** Another player visible within the viewport. */
+export interface OtherPlayer {
+  name: string;
+  x: number;
+  y: number;
+  state: PlayerState;
+}
+
 /** Everything needed to render one frame for a player. */
 export interface ViewModel {
   player: SatPlayerRow;
   hp: number; // live balance_sats
-  entities: WorldEntityRow[]; // active entities within the viewport
+  entities: TileEntity[]; // active (non-cleared) entities within the viewport
+  others: OtherPlayer[]; // other adventurers within the viewport
   combat: CombatSessionRow | null;
 }

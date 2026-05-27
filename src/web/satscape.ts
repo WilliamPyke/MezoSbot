@@ -1,24 +1,24 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { URL } from "node:url";
 import { supabase } from "../db.js";
-import { SAT, biomeAt } from "../satquest/engine.js";
+import { SAT, biomeAt } from "../satscape/engine.js";
 
 /**
- * Public, view-only companion map for SatQuest. Served as a self-contained
+ * Public, view-only companion map for SatScape. Served as a self-contained
  * HTML+canvas page (no auth, no wallet) plus a JSON feed of live positions.
  *
  * Privacy: HP *is* a player's real withdrawable balance, so we never expose
  * absolute sats or discord_id — only display name, coordinates, state, and a
  * coarse HP percentage relative to the player's run high-water mark.
  */
-export async function handleSatquestWebRequest(
+export async function handleSatscapeWebRequest(
   req: IncomingMessage,
   res: ServerResponse,
   url: URL,
 ): Promise<boolean> {
   const method = (req.method ?? "GET").toUpperCase();
 
-  if (method === "GET" && url.pathname === "/satquest") {
+  if (method === "GET" && url.pathname === "/satscape") {
     res.statusCode = 200;
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.setHeader("Cache-Control", "no-store");
@@ -26,7 +26,7 @@ export async function handleSatquestWebRequest(
     return true;
   }
 
-  if (method === "GET" && url.pathname === "/api/satquest/players") {
+  if (method === "GET" && url.pathname === "/api/satscape/players") {
     try {
       const { data: players, error } = await supabase
         .from("sat_players")
@@ -84,7 +84,7 @@ const PAGE_HTML = /* html */ `<!doctype html>
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>SatQuest — Global Map</title>
+<title>SatScape — Global Map</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -101,7 +101,7 @@ const PAGE_HTML = /* html */ `<!doctype html>
 </head>
 <body>
   <header>
-    <h1>SATQUEST · GLOBAL MAP</h1>
+    <h1>SATSCAPE · GLOBAL MAP</h1>
     <span class="meta" id="meta">connecting…</span>
   </header>
   <div class="wrap"><canvas id="map" width="900" height="640"></canvas></div>
@@ -119,7 +119,8 @@ const PAGE_HTML = /* html */ `<!doctype html>
   }
   function biomeColor(b) {
     return b === "town" ? "#1e3a8a" : b === "jungle" ? "#15803d"
-         : b === "desert" ? "#a16207" : b === "winter" ? "#64748b" : "#1f2937";
+         : b === "desert" ? "#ca8a04" : b === "winter" ? "#cbd5e1"
+         : b === "india" ? "#be185d" : "#1f2937";
   }
   function draw() {
     ctx.fillStyle = "#020617"; ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -158,7 +159,7 @@ const PAGE_HTML = /* html */ `<!doctype html>
   }
 
   function fetchPlayers() {
-    fetch("/api/satquest/players").then(function (r) { return r.json(); }).then(function (d) {
+    fetch("/api/satscape/players").then(function (r) { return r.json(); }).then(function (d) {
       if (d && d.players) {
         state = d;
         meta.textContent = state.players.length + " adventurer" + (state.players.length === 1 ? "" : "s") + " in the wilds";
