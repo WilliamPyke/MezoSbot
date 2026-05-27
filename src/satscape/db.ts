@@ -41,6 +41,7 @@ export async function startRun(discordId: string): Promise<SatPlayerRow> {
     .select("*")
     .single();
   if (error) throw new Error(error.message);
+  await revealAround(discordId, 0, 0); // light up the spawn town
   return data as SatPlayerRow;
 }
 
@@ -142,6 +143,40 @@ export async function setEquipped(
   await supabase.from("sat_players").update({ [col]: itemId }).eq("discord_id", discordId);
 }
 
+/* ─────────── fog of war ─────────── */
+
+/** Reveal (persist) the vision disc around a coordinate. One bulk upsert. */
+export async function revealAround(discordId: string, cx: number, cy: number): Promise<void> {
+  const r = SAT.SIGHT;
+  const rows: Array<{ discord_id: string; x: number; y: number }> = [];
+  for (let dy = -r; dy <= r; dy++) {
+    for (let dx = -r; dx <= r; dx++) {
+      if (dx * dx + dy * dy <= r * r + r) rows.push({ discord_id: discordId, x: cx + dx, y: cy + dy });
+    }
+  }
+  if (rows.length) {
+    await supabase.from("sat_explored").upsert(rows, { onConflict: "discord_id,x,y", ignoreDuplicates: true });
+  }
+}
+
+async function exploredInBox(
+  discordId: string,
+  minX: number,
+  maxX: number,
+  minY: number,
+  maxY: number,
+): Promise<Set<string>> {
+  const { data } = await supabase
+    .from("sat_explored")
+    .select("x, y")
+    .eq("discord_id", discordId)
+    .gte("x", minX)
+    .lte("x", maxX)
+    .gte("y", minY)
+    .lte("y", maxY);
+  return new Set((data ?? []).map((r) => `${r.x},${r.y}`));
+}
+
 /** Mark a tile consumed (looted/killed) so its deterministic spawn never returns. */
 export async function clearTile(x: number, y: number): Promise<void> {
   await supabase
@@ -229,12 +264,13 @@ export async function loadView(discordId: string): Promise<ViewModel | null> {
   const player = await getPlayer(discordId);
   if (!player) return null;
   const b = viewportBounds(player.x_coord, player.y_coord);
-  const [hp, combat, entities, others] = await Promise.all([
+  const [hp, combat, entities, others, explored] = await Promise.all([
     getBalance(discordId),
     getCombat(discordId),
     loadViewportEntities(player.x_coord, player.y_coord),
     othersInBox(discordId, b.minX, b.maxX, b.minY, b.maxY),
+    exploredInBox(discordId, b.minX, b.maxX, b.minY, b.maxY),
   ]);
   await refreshDisplayMaxHp(player, hp);
-  return { player, hp, entities, others, combat };
+  return { player, hp, entities, others, combat, explored };
 }

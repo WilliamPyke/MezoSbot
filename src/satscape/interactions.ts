@@ -31,6 +31,7 @@ import {
   SQ_PREFIX,
 } from "./render.js";
 import { render, setAuto, stop } from "./session.js";
+import { townAt } from "./towns.js";
 import type { Direction } from "./types.js";
 
 export function isSatscapeInteraction(interaction: Interaction): boolean {
@@ -133,11 +134,16 @@ export async function renderShop(
     await interaction.editReply({ content: "Use `/satscape join` first.", embeds: [], components: [], files: [] });
     return;
   }
+  const town = townAt(player.x_coord, player.y_coord);
+  if (!town) {
+    await interaction.editReply({ content: "🛒 The shop is only open inside a town.", embeds: [], components: [], files: [] });
+    return;
+  }
   const [hp, owned] = await Promise.all([getBalance(discordId), getOwnedItemIds(discordId)]);
   await interaction.editReply({
     ...(note !== undefined ? { content: note || "" } : {}),
-    embeds: [buildShopEmbed(player, hp, owned)],
-    components: buildShopComponents(owned),
+    embeds: [buildShopEmbed(town, player, hp, owned)],
+    components: buildShopComponents(town, owned),
     files: [],
   });
 }

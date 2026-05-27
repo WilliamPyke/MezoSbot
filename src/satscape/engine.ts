@@ -1,13 +1,15 @@
-import type { Biome, TileEntity } from "./types.js";
+import { nearestTown } from "./towns.js";
+import type { Terrain } from "./towns.js";
+import type { TileEntity } from "./types.js";
 
 /** Tunables for the game loop. */
 export const SAT = {
-  TOWN_RADIUS: 15, // tiles from origin that stay a safe town
   VIEW_W: 16, // viewport width in tiles
   VIEW_H: 16, // viewport height in tiles
   VIEW_OX: 8, // player column offset from the left edge (so dx ∈ [-8, 7])
   VIEW_OY: 8, // player row offset from the top edge
-  REGION_SIZE: 22, // tiles per biome region cell (large contiguous zones)
+  REGION_SIZE: 22, // tiles per biome region cell (contiguous zones within a territory)
+  SIGHT: 3, // fog-of-war vision radius around the player
   BUYIN_SATS: 50, // paid on /join, seeds the prize pool
   DEATH_PENALTY_SATS: 50, // taken on faint (clamped to remaining balance)
   CHEST_SPAWN: 0.03, // per-tile spawn probability in the wilds
@@ -21,51 +23,43 @@ function hash01(a: number, b: number, salt: number): number {
 }
 
 /**
- * Biome is computed from coordinates and never stored. The world is carved into
- * large contiguous regions (REGION_SIZE tiles), so you walk through a jungle,
- * then a desert, rather than a per-tile checkerboard. Region borders are warped
- * with a low-frequency wave so they aren't hard squares.
+ * Terrain is computed from coordinates, never stored. Every tile belongs to its
+ * nearest town's territory; inside the safe radius it's "town", otherwise it's
+ * one of that town's three palette biomes, chosen by a warped region grid so
+ * each territory reads as a few large contiguous zones.
  */
-export function biomeAt(x: number, y: number): Biome {
-  if (Math.hypot(x, y) <= SAT.TOWN_RADIUS) return "town";
+export function biomeAt(x: number, y: number): Terrain {
+  const { town, dist } = nearestTown(x, y);
+  if (dist <= town.safeRadius) return "town";
   const wx = x + Math.sin(y * 0.12) * 4; // domain warp → wavy borders
   const wy = y + Math.cos(x * 0.12) * 4;
   const cx = Math.floor(wx / SAT.REGION_SIZE);
   const cy = Math.floor(wy / SAT.REGION_SIZE);
   const h = hash01(cx * 1.7, cy * 2.3, 99);
-  if (h < 0.3) return "jungle";
-  if (h < 0.55) return "desert";
-  if (h < 0.78) return "winter";
-  return "india";
+  const idx = h < 0.34 ? 0 : h < 0.67 ? 1 : 2;
+  return town.palette[idx];
 }
 
 export interface MonsterSpec {
   name: string;
-  level: number; // challenge rating, 1..8 — rises with distance from town
+  level: number; // challenge rating, 1..8 — rises with distance from the nearest town
   reward: number; // sats looted on a win (from the pool)
 }
 
-const MONSTERS: Record<Exclude<Biome, "town">, string[]> = {
-  jungle: ["Vine Stalker", "Jaguar Wraith", "Spore Beast"],
-  desert: ["Sand Lurker", "Dune Scorpion", "Mirage Hound"],
-  winter: ["Frost Gnoll", "Ice Revenant", "Snow Troll"],
-  india: ["Bengal Tiger", "Rakshasa Fiend", "River Naga"],
-};
-
-/** Challenge rating climbs the farther you stray from town. */
+/** Challenge rating climbs the farther you stray from any town's safety. */
 export function monsterLevelAt(x: number, y: number): number {
-  const dist = Math.hypot(x, y);
+  const { dist } = nearestTown(x, y);
   const base = 1 + Math.floor(dist / 35);
   const bump = hash01(x, y, 23) < 0.3 ? 1 : 0;
   return Math.max(1, Math.min(8, base + bump));
 }
 
-function monsterFor(x: number, y: number, biome: Biome): MonsterSpec {
-  const r = hash01(x, y, 7);
-  const pool = MONSTERS[biome as Exclude<Biome, "town">] ?? MONSTERS.jungle;
+function monsterFor(x: number, y: number): MonsterSpec {
+  const { town } = nearestTown(x, y);
+  const pool = town.monsters;
   const level = monsterLevelAt(x, y);
   return {
-    name: pool[Math.floor(r * pool.length)],
+    name: pool[Math.floor(hash01(x, y, 7) * pool.length)],
     level,
     reward: 40 + level * 25 + Math.floor(hash01(x, y, 17) * 30), // grows with CR
   };
@@ -77,15 +71,14 @@ function monsterFor(x: number, y: number, biome: Biome): MonsterSpec {
  * still there. Town tiles never spawn anything.
  */
 export function entityAt(x: number, y: number): TileEntity | null {
-  const biome = biomeAt(x, y);
-  if (biome === "town") return null;
+  if (biomeAt(x, y) === "town") return null;
   const r = hash01(x, y, 3);
   if (r < SAT.CHEST_SPAWN) {
     const reward = 20 + Math.floor(hash01(x, y, 5) * 80); // 20..99
     return { x, y, type: "chest", data: { reward } };
   }
   if (r < SAT.MONSTER_SPAWN) {
-    return { x, y, type: "monster", data: { ...monsterFor(x, y, biome) } };
+    return { x, y, type: "monster", data: { ...monsterFor(x, y) } };
   }
   return null;
 }

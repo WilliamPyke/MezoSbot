@@ -1,4 +1,3 @@
-export type Biome = "town" | "jungle" | "desert" | "winter" | "india";
 export type PlayerState = "idle" | "combat" | "fainted";
 export type Direction = "up" | "down" | "left" | "right";
 
@@ -55,4 +54,5 @@ export interface ViewModel {
   entities: TileEntity[]; // active (non-cleared) entities within the viewport
   others: OtherPlayer[]; // other adventurers within the viewport
   combat: CombatSessionRow | null;
+  explored: Set<string>; // revealed tiles ("x,y") within the viewport (fog of war)
 }

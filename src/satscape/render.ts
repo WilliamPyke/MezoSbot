@@ -9,8 +9,18 @@ import {
 } from "discord.js";
 import { formatSats } from "../format.js";
 import { biomeAt, SAT, viewportBounds } from "./engine.js";
-import { gearScore, ITEM_BY_ID, ITEMS, lossFor, winChance } from "./items.js";
-import type { Biome, SatPlayerRow, ViewModel } from "./types.js";
+import { lossFor, winChance } from "./items.js";
+import {
+  effectivePrice,
+  gearScore,
+  ITEM_BY_ID,
+  nearestTown,
+  TERRAIN_COLOR,
+  townAt,
+  type Terrain,
+  type Town,
+} from "./towns.js";
+import type { SatPlayerRow, ViewModel } from "./types.js";
 
 /* ─────────── custom-id helpers (mirrors arcade/ui.ts) ─────────── */
 export const SQ_PREFIX = "satscape";
@@ -24,46 +34,59 @@ export function parseSqCid(customId: string): { action: string; parts: string[] 
 
 export const MAP_FILE = "satscape-map.png";
 
-const BIOME_COLOR: Record<Biome, string> = {
-  town: "#1e3a8a",
-  jungle: "#166534",
-  desert: "#ca8a04",
-  winter: "#cbd5e1",
-  india: "#be185d",
-};
-const BIOME_LABEL: Record<Biome, string> = {
-  town: "Town (safe)",
-  jungle: "Jungle",
-  desert: "Desert",
-  winter: "Winter",
-  india: "India",
-};
-
 const TILE = 26;
 const LEGEND_H = 24;
+const FOG = "#060a14";
 
-/** Render the 16×16 viewport to a PNG attachment. */
+function terrainLabel(t: Terrain): string {
+  return t === "town" ? "Town" : t.charAt(0).toUpperCase() + t.slice(1);
+}
+
+/** Where am I, in words: town name if in a safe zone, else "terrain · near Town". */
+function locationLabel(x: number, y: number): string {
+  const here = townAt(x, y);
+  if (here) return `🏙️ ${here.name}`;
+  return `${terrainLabel(biomeAt(x, y))} · near ${nearestTown(x, y).town.name}`;
+}
+
+/** Render the 16×16 viewport to a PNG attachment, with fog of war. */
 export function buildMapImage(view: ViewModel): AttachmentBuilder {
-  const { player, entities, others, combat } = view;
+  const { player, entities, others, combat, explored } = view;
   const w = SAT.VIEW_W * TILE;
   const h = SAT.VIEW_H * TILE + LEGEND_H;
   const canvas = createCanvas(w, h);
   const ctx = canvas.getContext("2d");
   const b = viewportBounds(player.x_coord, player.y_coord);
+  const r2 = SAT.SIGHT * SAT.SIGHT + SAT.SIGHT;
+  const inSight = (x: number, y: number) => {
+    const dx = x - player.x_coord;
+    const dy = y - player.y_coord;
+    return dx * dx + dy * dy <= r2;
+  };
 
-  // terrain
   for (let row = 0; row < SAT.VIEW_H; row++) {
     for (let col = 0; col < SAT.VIEW_W; col++) {
       const tx = b.minX + col;
       const ty = b.minY + row;
       const px = col * TILE;
       const py = row * TILE;
-      ctx.fillStyle = BIOME_COLOR[biomeAt(tx, ty)];
+      const seen = inSight(tx, ty);
+      const known = seen || explored.has(`${tx},${ty}`);
+      if (!known) {
+        ctx.fillStyle = FOG;
+        ctx.fillRect(px, py, TILE, TILE);
+        continue;
+      }
+      ctx.fillStyle = TERRAIN_COLOR[biomeAt(tx, ty)];
       ctx.fillRect(px, py, TILE, TILE);
-      // subtle deterministic shading so regions aren't flat
       const jitter = Math.abs(Math.sin(tx * 1.3 + ty * 2.7)) * 0.12;
       ctx.fillStyle = `rgba(0,0,0,${jitter.toFixed(3)})`;
       ctx.fillRect(px, py, TILE, TILE);
+      if (!seen) {
+        // explored but out of current sight → dim "memory"
+        ctx.fillStyle = "rgba(2,6,23,0.5)";
+        ctx.fillRect(px, py, TILE, TILE);
+      }
       ctx.strokeStyle = "rgba(2,6,23,0.35)";
       ctx.lineWidth = 1;
       ctx.strokeRect(px + 0.5, py + 0.5, TILE, TILE);
@@ -72,8 +95,9 @@ export function buildMapImage(view: ViewModel): AttachmentBuilder {
 
   const toPx = (x: number, y: number) => [(x - b.minX) * TILE, (y - b.minY) * TILE] as const;
 
-  // entities
+  // entities — only what's currently in sight
   for (const e of entities) {
+    if (!inSight(e.x, e.y)) continue;
     const [px, py] = toPx(e.x, e.y);
     const cx = px + TILE / 2;
     const cy = py + TILE / 2;
@@ -93,9 +117,10 @@ export function buildMapImage(view: ViewModel): AttachmentBuilder {
     }
   }
 
-  // other players
+  // other players — only what's currently in sight
   ctx.font = "9px sans-serif";
   for (const o of others) {
+    if (!inSight(o.x, o.y)) continue;
     const [px, py] = toPx(o.x, o.y);
     const cx = px + TILE / 2;
     const cy = py + TILE / 2;
@@ -116,7 +141,7 @@ export function buildMapImage(view: ViewModel): AttachmentBuilder {
     ctx.textAlign = "left";
   }
 
-  // self (always centred)
+  // self (always centred & visible)
   {
     const [px, py] = toPx(player.x_coord, player.y_coord);
     const cx = px + TILE / 2;
@@ -136,12 +161,11 @@ export function buildMapImage(view: ViewModel): AttachmentBuilder {
   }
 
   // legend strip
-  const biome = biomeAt(player.x_coord, player.y_coord);
   ctx.fillStyle = "#0f172a";
   ctx.fillRect(0, SAT.VIEW_H * TILE, w, LEGEND_H);
   ctx.fillStyle = "#e2e8f0";
   ctx.font = "12px sans-serif";
-  ctx.fillText(`${BIOME_LABEL[biome]}  ·  (${player.x_coord}, ${player.y_coord})`, 8, SAT.VIEW_H * TILE + 16);
+  ctx.fillText(`${locationLabel(player.x_coord, player.y_coord)}  ·  (${player.x_coord}, ${player.y_coord})`, 8, SAT.VIEW_H * TILE + 16);
 
   return new AttachmentBuilder(canvas.toBuffer("image/png"), { name: MAP_FILE });
 }
@@ -154,17 +178,17 @@ function bar(value: number, max: number, width = 12): string {
 
 export function buildMapEmbed(view: ViewModel): EmbedBuilder {
   const { player, hp, others, combat } = view;
-  const biome = biomeAt(player.x_coord, player.y_coord);
+  const here = townAt(player.x_coord, player.y_coord);
   const maxRef = Math.max(player.display_max_hp, hp, 1);
 
   const embed = new EmbedBuilder()
-    .setColor(combat ? 0xf43f5e : biome === "town" ? 0x1d4ed8 : 0x15803d)
+    .setColor(combat ? 0xf43f5e : here ? 0x1d4ed8 : 0x15803d)
     .setTitle(combat ? "⚔️ SatScape — Combat" : "🗺️ SatScape")
     .setImage(`attachment://${MAP_FILE}`)
     .addFields(
       { name: "HP (your sats)", value: `${bar(hp, maxRef)}\n${formatSats(hp)}`, inline: true },
       { name: "Stamina", value: `${bar(player.hunger, 100)}\n${player.hunger}%`, inline: true },
-      { name: "Location", value: `${BIOME_LABEL[biome]} \`(${player.x_coord}, ${player.y_coord})\``, inline: true },
+      { name: "Location", value: `${locationLabel(player.x_coord, player.y_coord)} \`(${player.x_coord}, ${player.y_coord})\``, inline: true },
     );
 
   if (combat) {
@@ -175,7 +199,7 @@ export function buildMapEmbed(view: ViewModel): EmbedBuilder {
       inline: false,
     });
   } else if (others.length > 0) {
-    embed.setFooter({ text: `👥 ${others.length} adventurer${others.length === 1 ? "" : "s"} nearby` });
+    embed.setFooter({ text: `👥 ${others.length} adventurer${others.length === 1 ? "" : "s"} in sight` });
   }
 
   return embed;
@@ -202,7 +226,7 @@ export function buildComponents(
     new ButtonBuilder().setCustomId(sqCid("travel")).setLabel("Travel").setEmoji("🧭").setStyle(ButtonStyle.Primary),
     auto,
   );
-  if (biomeAt(view.player.x_coord, view.player.y_coord) === "town") {
+  if (townAt(view.player.x_coord, view.player.y_coord)) {
     actionRow.addComponents(
       new ButtonBuilder().setCustomId(sqCid("shop")).setLabel("Shop").setEmoji("🛒").setStyle(ButtonStyle.Secondary),
     );
@@ -220,42 +244,43 @@ export function buildComponents(
   ];
 }
 
-/* ─────────── shop view ─────────── */
+/* ─────────── shop view (per town / keeper) ─────────── */
 
 const SLOT_EMOJI = { weapon: "🗡️", armor: "🛡️", accessory: "💍" } as const;
 
-function equippedName(player: SatPlayerRow, id: string | null): string {
+function equippedName(id: string | null): string {
   if (!id) return "—";
   const it = ITEM_BY_ID.get(id);
   return it ? `${it.emoji} ${it.name} (+${it.power})` : "—";
 }
 
-export function buildShopEmbed(player: SatPlayerRow, hp: number, ownedIds: string[]): EmbedBuilder {
+export function buildShopEmbed(town: Town, player: SatPlayerRow, hp: number, _ownedIds: string[]): EmbedBuilder {
   const gear = gearScore(player);
   return new EmbedBuilder()
     .setColor(0x1d4ed8)
-    .setTitle("🛒 Town Item Shop")
+    .setTitle(`🛒 ${town.name} — ${town.keeper.name}`)
     .setDescription(
-      `Balance: **${formatSats(hp)}**  ·  Gear score: **${gear}**\n` +
+      `*"${town.keeper.blurb}"*\n\n` +
+        `Balance: **${formatSats(hp)}**  ·  Gear score: **${gear}**\n` +
         `Win chance: Lv1 **${Math.round(winChance(gear, 1) * 100)}%** · Lv4 **${Math.round(winChance(gear, 4) * 100)}%** · Lv8 **${Math.round(winChance(gear, 8) * 100)}%**`,
     )
     .addFields(
-      { name: `${SLOT_EMOJI.weapon} Weapon`, value: equippedName(player, player.equipped_weapon), inline: true },
-      { name: `${SLOT_EMOJI.armor} Armor`, value: equippedName(player, player.equipped_armor), inline: true },
-      { name: `${SLOT_EMOJI.accessory} Accessory`, value: equippedName(player, player.equipped_accessory), inline: true },
+      { name: `${SLOT_EMOJI.weapon} Weapon`, value: equippedName(player.equipped_weapon), inline: true },
+      { name: `${SLOT_EMOJI.armor} Armor`, value: equippedName(player.equipped_armor), inline: true },
+      { name: `${SLOT_EMOJI.accessory} Accessory`, value: equippedName(player.equipped_accessory), inline: true },
     )
-    .setFooter({ text: "Buy from the first menu, equip owned gear from the second." });
+    .setFooter({ text: `${town.name} stocks gear you can't find elsewhere. Buy above, equip below.` });
 }
 
-export function buildShopComponents(ownedIds: string[]): ActionRowBuilder<StringSelectMenuBuilder | ButtonBuilder>[] {
+export function buildShopComponents(town: Town, ownedIds: string[]): ActionRowBuilder<StringSelectMenuBuilder | ButtonBuilder>[] {
   const owned = new Set(ownedIds);
   const buy = new StringSelectMenuBuilder()
     .setCustomId(sqCid("buy"))
-    .setPlaceholder("Buy an item…")
+    .setPlaceholder(`Buy from ${town.keeper.name}…`)
     .addOptions(
-      ITEMS.map((it) => ({
+      town.catalog.map((it) => ({
         label: `${it.name} (+${it.power})${owned.has(it.id) ? " — owned" : ""}`,
-        description: `${it.price} sats · ${it.slot}`,
+        description: `${effectivePrice(it, town.keeper)} sats · ${it.slot}`,
         value: it.id,
         emoji: it.emoji,
       })),

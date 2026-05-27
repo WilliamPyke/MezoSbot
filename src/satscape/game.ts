@@ -11,11 +11,13 @@ import {
   getPlayer,
   isTileCleared,
   ownsItem,
+  revealAround,
   setEquipped,
   setStateIf,
   updatePlayer,
 } from "./db.js";
-import { gearScore, ITEM_BY_ID, lossFor, winChance } from "./items.js";
+import { lossFor, winChance } from "./items.js";
+import { effectivePrice, gearScore, ITEM_BY_ID, nearestTown, townAt } from "./towns.js";
 import type { Direction, SatPlayerRow } from "./types.js";
 
 const BREAD_COST = 1; // sats → pool
@@ -61,6 +63,7 @@ export async function move(discordId: string, dir: Direction): Promise<ActionRes
     hunger,
     last_move_at: new Date().toISOString(),
   });
+  await revealAround(discordId, nx, ny);
 
   if ((await getBalance(discordId)) <= 0) {
     return { ok: true, note: note + (await faint(discordId)).note };
@@ -164,12 +167,15 @@ export async function eat(discordId: string): Promise<ActionResult> {
   return { ok: true, note: `🍞 Ate bread (−${paid} sat). +${SAT.BREAD_STAMINA} stamina.` };
 }
 
-/** Faint: fixed penalty (clamped to balance, → pool), warp to town, restore stamina. */
+/** Faint: fixed penalty (clamped to balance, → pool), warp to the nearest town, restore stamina. */
 export async function faint(discordId: string): Promise<ActionResult> {
   const lost = await takeDamage(discordId, SAT.DEATH_PENALTY_SATS);
   await deleteCombat(discordId);
-  await updatePlayer(discordId, { x_coord: 0, y_coord: 0, hunger: 100, state: "idle" });
-  return { ok: true, note: `☠️ You fainted! Lost ${lost} sats and woke up back in town.` };
+  const player = await getPlayer(discordId);
+  const { town } = nearestTown(player?.x_coord ?? 0, player?.y_coord ?? 0);
+  await updatePlayer(discordId, { x_coord: town.cx, y_coord: town.cy, hunger: 100, state: "idle" });
+  await revealAround(discordId, town.cx, town.cy);
+  return { ok: true, note: `☠️ You fainted! Lost ${lost} sats and woke up in **${town.name}**.` };
 }
 
 export async function chargeBuyIn(discordId: string): Promise<boolean> {
@@ -181,28 +187,30 @@ export async function chargeBuyIn(discordId: string): Promise<boolean> {
 
 /* ─────────── shop ─────────── */
 
-/** Buy a catalogue item (town only). Price flows to the pool; item lands in inventory. */
+/** Buy an item from the current town's catalogue. Price (keeper-adjusted) flows to the pool. */
 export async function buyItem(discordId: string, itemId: string): Promise<ActionResult> {
-  const item = ITEM_BY_ID.get(itemId);
-  if (!item) return { ok: false, note: "Unknown item." };
   const player = await getPlayer(discordId);
   if (!player) return { ok: false, note: "Use `/satscape join` first." };
-  if (biomeAt(player.x_coord, player.y_coord) !== "town") {
-    return { ok: false, note: "The shop is only open in town." };
-  }
+  const town = townAt(player.x_coord, player.y_coord);
+  if (!town) return { ok: false, note: "The shop is only open in town." };
+  const item = town.catalog.find((i) => i.id === itemId);
+  if (!item) return { ok: false, note: `${town.keeper.name} doesn't stock that here.` };
   if (await ownsItem(discordId, itemId)) return { ok: false, note: `You already own a ${item.name}.` };
-  const paid = await subtractBalance(discordId, item.price);
-  if (!paid) return { ok: false, note: `Not enough sats for ${item.name} (${formatSats(item.price)}).` };
-  await addToPool(item.price);
+  const price = effectivePrice(item, town.keeper);
+  const paid = await subtractBalance(discordId, price);
+  if (!paid) return { ok: false, note: `Not enough sats for ${item.name} (${formatSats(price)}).` };
+  await addToPool(price);
   await addInventoryItem(discordId, itemId);
-  return { ok: true, note: `🛒 Bought ${item.emoji} **${item.name}** for ${formatSats(item.price)}. Equip it below.` };
+  return { ok: true, note: `🛒 Bought ${item.emoji} **${item.name}** for ${formatSats(price)}. Equip it below.` };
 }
 
-/** Equip an owned item into its slot. */
+/** Equip an owned item into its slot (allowed anywhere — gear up before heading out). */
 export async function equipItem(discordId: string, itemId: string): Promise<ActionResult> {
+  const player = await getPlayer(discordId);
+  if (!player) return { ok: false, note: "No run in progress." };
+  if (!(await ownsItem(discordId, itemId))) return { ok: false, note: "You don't own that item." };
   const item = ITEM_BY_ID.get(itemId);
   if (!item) return { ok: false, note: "Unknown item." };
-  if (!(await ownsItem(discordId, itemId))) return { ok: false, note: `You don't own a ${item.name}.` };
   await setEquipped(discordId, item.slot, itemId);
   return { ok: true, note: `✅ Equipped ${item.emoji} **${item.name}** (${item.slot}).` };
 }
@@ -261,6 +269,7 @@ export async function travelTo(discordId: string, tx: number, ty: number): Promi
 
   const endStamina = Math.max(0, Math.min(100, player.hunger - est.steps + est.breadNeeded * SAT.BREAD_STAMINA));
   await updatePlayer(discordId, { x_coord: tx, y_coord: ty, hunger: endStamina, last_move_at: new Date().toISOString() });
+  await revealAround(discordId, tx, ty);
 
   if ((await getBalance(discordId)) <= 0) {
     return { ok: true, note: paidNote + (await faint(discordId)).note };
