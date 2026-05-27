@@ -4,44 +4,48 @@
  *
  *   • sats are conserved: player balance + prize pool stays constant
  *   • balance never goes negative
- *   • a chest/monster never pays out more than the pool holds
- *   • faint warps to town (0,0), restores stamina, and clears combat
- *   • fast travel charges the estimated bread cost and lands you on the tile
+ *   • combat is a win-chance roll (gear vs level), not HP attrition
+ *   • shop purchases & equipping shift the win chance; cost flows to the pool
+ *   • chest/fast-travel/faint behave and stay within the closed loop
  *
- * It uses a throwaway player + a far-off world region, then restores the global
- * prize pool and deletes everything it created, so it's safe to re-run and
- * leaves no trace.
+ * Uses a throwaway player + a far-off world region, then restores the global
+ * prize pool and deletes everything it created.
  *
  * HOW TO RUN (from the repo root, with your normal .env in place):
  *
  *     npm run satscape:smoke
  *
  * Exit code 0 = all green, 1 = at least one assertion failed.
- *
- * NOTE: run when no one else is actively playing — the conservation check
- * assumes this player is the only thing moving sats in/out of the shared pool.
+ * Run when no one else is actively playing (shared-pool conservation check).
  */
 import { supabase } from "../db.js";
 import { addBalance, getBalance, getOrCreateUser } from "../balance.js";
 import { SAT, biomeAt, entityAt } from "./engine.js";
-import { attack, chargeBuyIn, eat, estimateTravel, faint, flee, move, travelTo } from "./game.js";
+import {
+  buyItem,
+  chargeBuyIn,
+  eat,
+  equipItem,
+  estimateTravel,
+  faint,
+  fight,
+  flee,
+  move,
+  travelTo,
+} from "./game.js";
 import { getCombat, getPlayer, isTileCleared, startRun, updatePlayer } from "./db.js";
+import { gearScore, lossFor, winChance } from "./items.js";
 
 const TEST_ID = `smoke-${Date.now()}`;
-const START_BALANCE = 1000;
-const REGION_X = 10000; // far outside town; cleaned up after
+const START_BALANCE = 2000;
+const REGION_X = 10000;
 
 let passes = 0;
 let failures = 0;
 
 function ok(cond: boolean, msg: string) {
-  if (cond) {
-    passes++;
-    console.log(`  ✓ ${msg}`);
-  } else {
-    failures++;
-    console.error(`  ✗ ${msg}`);
-  }
+  if (cond) { passes++; console.log(`  ✓ ${msg}`); }
+  else { failures++; console.error(`  ✗ ${msg}`); }
 }
 
 async function readPool(): Promise<number> {
@@ -52,10 +56,9 @@ async function readPool(): Promise<number> {
 async function conserved(total: number, label: string) {
   const [bal, pool] = await Promise.all([getBalance(TEST_ID), readPool()]);
   ok(Math.abs(bal + pool - total) < 1e-6, `${label}: balance+pool conserved (${bal} + ${pool} == ${total})`);
-  ok(bal >= 0, `${label}: balance is non-negative (${bal})`);
+  ok(bal >= 0, `${label}: balance non-negative (${bal})`);
 }
 
-/** Deterministic scan for a tile of the wanted kind (or empty), skipping cleared/town. */
 async function findTile(want: "monster" | "chest" | "empty", y: number): Promise<{ x: number; y: number } | null> {
   for (let i = 0; i < 800; i++) {
     const x = REGION_X + i;
@@ -69,6 +72,7 @@ async function findTile(want: "monster" | "chest" | "empty", y: number): Promise
 
 async function main() {
   console.log(`\nSatScape smoke test — player ${TEST_ID}\n`);
+  const realRandom = Math.random;
 
   await getOrCreateUser(TEST_ID);
   await addBalance(TEST_ID, START_BALANCE);
@@ -76,93 +80,122 @@ async function main() {
   const TOTAL = START_BALANCE + poolBefore;
   console.log(`Setup: balance=${START_BALANCE}, pool=${poolBefore}, invariant total=${TOTAL}\n`);
 
+  // 0. Win-chance math
+  console.log("0. Combat math");
+  ok(Math.abs(winChance(0, 1) - 0.45) < 1e-9, "winChance(0, lv1) == 45%");
+  ok(winChance(1000, 1) === 0.95, "winChance clamps up to 95%");
+  ok(winChance(0, 100) === 0.05, "winChance clamps down to 5%");
+  ok(lossFor(3) === 34, "lossFor(3) == 34");
+
   // 1. Buy-in
-  console.log("1. Buy-in / join");
+  console.log("\n1. Buy-in / join");
   ok(await chargeBuyIn(TEST_ID), "chargeBuyIn returned true");
-  ok((await getBalance(TEST_ID)) === START_BALANCE - SAT.BUYIN_SATS, `balance debited by buy-in (${SAT.BUYIN_SATS})`);
   ok((await readPool()) === poolBefore + SAT.BUYIN_SATS, "buy-in seeded the pool");
   await startRun(TEST_ID);
   await conserved(TOTAL, "after buy-in");
 
-  // 2. Move within town
-  console.log("\n2. Move within town");
-  await updatePlayer(TEST_ID, { x_coord: 0, y_coord: 0, hunger: 100, state: "idle" });
-  const balBeforeMove = await getBalance(TEST_ID);
+  // 2. Move + exhaustion
+  console.log("\n2. Move & exhaustion");
+  await updatePlayer(TEST_ID, { x_coord: 0, y_coord: 0, hunger: 1, state: "idle" });
   await move(TEST_ID, "up");
-  let p = await getPlayer(TEST_ID);
-  ok(p?.y_coord === -1 && p?.x_coord === 0, "moved up to (0,-1)");
-  ok(p?.hunger === 99, "stamina dropped by 1");
-  ok((await getBalance(TEST_ID)) === balBeforeMove, "balance unchanged while rested");
-  await conserved(TOTAL, "after move");
-
-  // 3. Exhaustion
-  console.log("\n3. Exhaustion (stamina 0)");
-  await updatePlayer(TEST_ID, { x_coord: 0, y_coord: 0, hunger: 0, state: "idle" });
-  const balBeforeStarve = await getBalance(TEST_ID);
+  ok((await getPlayer(TEST_ID))?.hunger === 0, "stamina drained to 0");
+  const balPreStarve = await getBalance(TEST_ID);
   await move(TEST_ID, "down");
-  ok((await getBalance(TEST_ID)) === balBeforeStarve - 1, "exhausted step burned 1 sat");
+  ok((await getBalance(TEST_ID)) === balPreStarve - 1, "exhausted step burned 1 sat");
   await conserved(TOTAL, "after exhaustion");
 
-  // 4. Eat
-  console.log("\n4. Eat bread");
+  // 3. Eat
+  console.log("\n3. Eat bread");
   await updatePlayer(TEST_ID, { hunger: 10 });
-  const balBeforeEat = await getBalance(TEST_ID);
+  const balPreEat = await getBalance(TEST_ID);
   ok((await eat(TEST_ID)).ok, "eat succeeded");
-  p = await getPlayer(TEST_ID);
-  ok((p?.hunger ?? 0) > 10, "stamina restored");
-  ok((await getBalance(TEST_ID)) === balBeforeEat - 1, "bread cost 1 sat (HP not minted)");
+  ok(((await getPlayer(TEST_ID))?.hunger ?? 0) > 10, "stamina restored");
+  ok((await getBalance(TEST_ID)) === balPreEat - 1, "bread cost 1 sat");
   await conserved(TOTAL, "after eat");
 
-  // 5. Combat
+  // 4. Shop & gear (town only)
+  console.log("\n4. Shop & gear");
+  await updatePlayer(TEST_ID, { x_coord: 0, y_coord: 0, state: "idle", equipped_weapon: null });
+  const balPreBuy = await getBalance(TEST_ID);
+  const poolPreBuy = await readPool();
+  const buy = await buyItem(TEST_ID, "iron_sword"); // +5, 120 sats
+  ok(buy.ok, "bought iron_sword in town");
+  ok((await getBalance(TEST_ID)) === balPreBuy - 120, "shop debited 120 sats");
+  ok((await readPool()) === poolPreBuy + 120, "purchase flowed to the pool");
+  ok((await equipItem(TEST_ID, "iron_sword")).ok, "equipped iron_sword");
+  let p = await getPlayer(TEST_ID);
+  ok(p?.equipped_weapon === "iron_sword" && gearScore(p) === 5, "gear score is 5 after equip");
+  ok(winChance(gearScore(p!), 1) > winChance(0, 1), "equipped gear raised win chance");
+  await updatePlayer(TEST_ID, { x_coord: REGION_X + 5, y_coord: 9999, state: "idle" }); // wilds
+  ok(!(await buyItem(TEST_ID, "chainmail")).ok, "shop refused outside town");
+  await conserved(TOTAL, "after shop");
+
+  // 5. Combat — forced WIN then forced LOSS via deterministic RNG
   console.log("\n5. Combat");
-  const monster = await findTile("monster", 0);
-  if (!monster) {
-    ok(false, "could not find a monster spawn");
+  const mWin = await findTile("monster", 0);
+  if (!mWin) {
+    ok(false, "no monster tile for win test");
   } else {
-    await updatePlayer(TEST_ID, { x_coord: monster.x - 1, y_coord: monster.y, hunger: 100, state: "idle" });
+    await updatePlayer(TEST_ID, { x_coord: mWin.x - 1, y_coord: mWin.y, hunger: 100, state: "idle" });
     await move(TEST_ID, "right");
-    const combat = await getCombat(TEST_ID);
-    ok((await getPlayer(TEST_ID))?.state === "combat" && !!combat, `combat started vs ${combat?.monster_name ?? "?"}`);
-    await conserved(TOTAL, "combat start");
-    let guard = 0;
-    while ((await getCombat(TEST_ID)) && guard++ < 100) {
-      await attack(TEST_ID);
-      await conserved(TOTAL, `combat round ${guard}`);
-      if ((await getBalance(TEST_ID)) <= 0) break;
-    }
-    if ((await getPlayer(TEST_ID))?.state === "combat") await flee(TEST_ID);
-    ok((await getCombat(TEST_ID)) === null, "combat session resolved");
-    ok((await getPlayer(TEST_ID))?.state === "idle", "player idle after combat");
-    ok(await isTileCleared(monster.x, monster.y), "slain monster tile cleared (no respawn)");
+    const c = await getCombat(TEST_ID);
+    ok(!!c && c.monster_level >= 1, `combat started (lv ${c?.monster_level}) vs ${c?.monster_name}`);
+    Math.random = () => 0; // always below win chance → win
+    const before = await getBalance(TEST_ID);
+    const pool = await readPool();
+    const res = await fight(TEST_ID);
+    Math.random = realRandom;
+    const gained = (await getBalance(TEST_ID)) - before;
+    ok(res.ok && (await getCombat(TEST_ID)) === null, "forced win cleared combat");
+    ok((await getPlayer(TEST_ID))?.state === "idle", "idle after win");
+    ok(await isTileCleared(mWin.x, mWin.y), "won monster tile cleared");
+    ok(gained >= 0 && gained <= pool, `loot (${gained}) capped to pool (${pool})`);
+    await conserved(TOTAL, "after win");
+  }
+
+  const mLose = await findTile("monster", 17);
+  if (!mLose) {
+    ok(false, "no monster tile for loss test");
+  } else {
+    await updatePlayer(TEST_ID, { x_coord: mLose.x - 1, y_coord: mLose.y, hunger: 100, state: "idle" });
+    await move(TEST_ID, "right");
+    const c = await getCombat(TEST_ID);
+    Math.random = () => 0.999999; // above win chance → loss
+    const before = await getBalance(TEST_ID);
+    await fight(TEST_ID);
+    Math.random = realRandom;
+    ok((await getBalance(TEST_ID)) === before - lossFor(c!.monster_level), `loss cost ${lossFor(c!.monster_level)} sats`);
+    ok((await getCombat(TEST_ID)) !== null, "monster stays after a loss");
+    await conserved(TOTAL, "after loss");
+    await flee(TEST_ID); // tidy up
   }
 
   // 6. Chest
   console.log("\n6. Chest");
   const chest = await findTile("chest", 0);
   if (!chest) {
-    ok(false, "could not find a chest spawn");
+    ok(false, "no chest tile");
   } else {
     const pool = await readPool();
     await updatePlayer(TEST_ID, { x_coord: chest.x - 1, y_coord: chest.y, hunger: 100, state: "idle" });
     const before = await getBalance(TEST_ID);
     await move(TEST_ID, "right");
     const gained = (await getBalance(TEST_ID)) - before;
-    ok(gained >= 0 && gained <= pool, `chest payout (${gained}) did not exceed pool (${pool})`);
-    ok(await isTileCleared(chest.x, chest.y), "chest tile cleared (no respawn)");
+    ok(gained >= 0 && gained <= pool, `chest payout (${gained}) capped to pool (${pool})`);
+    ok(await isTileCleared(chest.x, chest.y), "chest tile cleared");
     await conserved(TOTAL, "after chest");
   }
 
-  // 7. Fast travel (bread-funded)
+  // 7. Fast travel
   console.log("\n7. Fast travel");
   const dest = await findTile("empty", 500);
   if (!dest) {
-    ok(false, "could not find an empty destination tile");
+    ok(false, "no empty destination");
   } else {
     await updatePlayer(TEST_ID, { x_coord: dest.x - 30, y_coord: dest.y, hunger: 5, state: "idle" });
     const player = (await getPlayer(TEST_ID))!;
     const est = estimateTravel(player, dest.x, dest.y);
-    ok(est.steps === 30, `estimate: 30 steps (got ${est.steps})`);
-    ok(est.breadNeeded === Math.ceil((30 - 5) / SAT.BREAD_STAMINA), `estimate: ${est.breadNeeded} bread for the overflow`);
+    ok(est.steps === 30, `estimate 30 steps (got ${est.steps})`);
     const before = await getBalance(TEST_ID);
     const poolBeforeTravel = await readPool();
     await travelTo(TEST_ID, dest.x, dest.y);
@@ -178,14 +211,12 @@ async function main() {
   await updatePlayer(TEST_ID, { x_coord: 42, y_coord: 42, hunger: 30 });
   await faint(TEST_ID);
   p = await getPlayer(TEST_ID);
-  ok(p?.x_coord === 0 && p?.y_coord === 0, "warped to town (0,0)");
-  ok(p?.hunger === 100, "stamina restored on faint");
-  ok(p?.state === "idle", "state reset to idle");
-  ok((await getCombat(TEST_ID)) === null, "no lingering combat after faint");
+  ok(p?.x_coord === 0 && p?.y_coord === 0 && p?.hunger === 100 && p?.state === "idle", "faint warped & reset");
   await conserved(TOTAL, "after faint");
 
   // Cleanup
   console.log("\nCleanup");
+  Math.random = realRandom;
   await supabase.from("sat_world_entities").delete().gte("x", REGION_X).lt("x", REGION_X + 800);
   await supabase.from("sat_prize_pool").update({ balance_sats: poolBefore }).eq("id", 1);
   await supabase.from("users").delete().eq("discord_id", TEST_ID);

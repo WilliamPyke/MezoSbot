@@ -1,9 +1,10 @@
 import { EmbedBuilder, MessageFlags, type ChatInputCommandInteraction } from "discord.js";
 import { formatSats } from "../format.js";
-import { SAT } from "../satscape/engine.js";
+import { SAT, biomeAt } from "../satscape/engine.js";
 import { chargeBuyIn } from "../satscape/game.js";
 import { getPlayer, startRun } from "../satscape/db.js";
-import { render } from "../satscape/session.js";
+import { render, stop } from "../satscape/session.js";
+import { renderShop } from "../satscape/interactions.js";
 
 export const data = {
   name: "satscape",
@@ -18,6 +19,11 @@ export const data = {
       name: "map",
       type: 1 as const,
       description: "Show your live map and controls",
+    },
+    {
+      name: "shop",
+      type: 1 as const,
+      description: "Open the town item shop (must be in town)",
     },
   ],
 };
@@ -42,6 +48,15 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     }
   } else if (!(await getPlayer(discordId))?.active) {
     return interaction.editReply({ content: "Use `/satscape join` to start a run." });
+  }
+
+  if (sub === "shop") {
+    const player = await getPlayer(discordId);
+    if (biomeAt(player!.x_coord, player!.y_coord) !== "town") {
+      return interaction.editReply({ content: "🛒 The item shop is only open in town (near the origin)." });
+    }
+    stop(discordId); // pause any live map session while shopping
+    return renderShop(interaction, discordId);
   }
 
   await render(

@@ -11,6 +11,9 @@ export interface SatPlayerRow {
   display_max_hp: number;
   state: PlayerState;
   active: boolean;
+  equipped_weapon: string | null;
+  equipped_armor: string | null;
+  equipped_accessory: string | null;
   last_move_at: string;
   created_at: string;
 }
@@ -18,6 +21,7 @@ export interface SatPlayerRow {
 export interface CombatSessionRow {
   discord_id: string;
   monster_name: string;
+  monster_level: number;
   monster_max_hp: number;
   monster_current_hp: number;
   monster_attack: number;

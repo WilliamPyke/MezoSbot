@@ -98,6 +98,50 @@ export async function deleteCombat(discordId: string): Promise<void> {
   await supabase.from("sat_combat_sessions").delete().eq("discord_id", discordId);
 }
 
+/* ─────────── inventory & equipment ─────────── */
+
+export async function getOwnedItemIds(discordId: string): Promise<string[]> {
+  const { data } = await supabase
+    .from("sat_inventories")
+    .select("item_id")
+    .eq("discord_id", discordId)
+    .gt("quantity", 0);
+  return (data ?? []).map((r) => r.item_id as string);
+}
+
+export async function ownsItem(discordId: string, itemId: string): Promise<boolean> {
+  const { data } = await supabase
+    .from("sat_inventories")
+    .select("quantity")
+    .eq("discord_id", discordId)
+    .eq("item_id", itemId)
+    .maybeSingle();
+  return !!data && (data.quantity ?? 0) > 0;
+}
+
+export async function addInventoryItem(discordId: string, itemId: string): Promise<void> {
+  const { data } = await supabase
+    .from("sat_inventories")
+    .select("quantity")
+    .eq("discord_id", discordId)
+    .eq("item_id", itemId)
+    .maybeSingle();
+  if (data) {
+    await supabase.from("sat_inventories").update({ quantity: (data.quantity ?? 0) + 1 }).eq("discord_id", discordId).eq("item_id", itemId);
+  } else {
+    await supabase.from("sat_inventories").insert({ discord_id: discordId, item_id: itemId, quantity: 1 });
+  }
+}
+
+export async function setEquipped(
+  discordId: string,
+  slot: "weapon" | "armor" | "accessory",
+  itemId: string,
+): Promise<void> {
+  const col = slot === "weapon" ? "equipped_weapon" : slot === "armor" ? "equipped_armor" : "equipped_accessory";
+  await supabase.from("sat_players").update({ [col]: itemId }).eq("discord_id", discordId);
+}
+
 /** Mark a tile consumed (looted/killed) so its deterministic spawn never returns. */
 export async function clearTile(x: number, y: number): Promise<void> {
   await supabase

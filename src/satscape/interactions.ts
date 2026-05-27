@@ -8,23 +8,33 @@ import {
   TextInputStyle,
   type Interaction,
   type ModalSubmitInteraction,
+  type RepliableInteraction,
 } from "discord.js";
-import { getPlayer } from "./db.js";
+import { getBalance } from "../balance.js";
+import { getOwnedItemIds, getPlayer } from "./db.js";
 import {
-  attack,
+  buyItem,
   eat,
+  equipItem,
   estimateTravel,
+  fight,
   flee,
   move,
   travelTo,
   type ActionResult,
 } from "./game.js";
-import { parseSqCid, sqCid, SQ_PREFIX } from "./render.js";
-import { isAutoExploring, render, setAuto, stop } from "./session.js";
+import {
+  buildShopComponents,
+  buildShopEmbed,
+  parseSqCid,
+  sqCid,
+  SQ_PREFIX,
+} from "./render.js";
+import { render, setAuto, stop } from "./session.js";
 import type { Direction } from "./types.js";
 
 export function isSatscapeInteraction(interaction: Interaction): boolean {
-  if (interaction.isButton() || interaction.isModalSubmit()) {
+  if (interaction.isButton() || interaction.isModalSubmit() || interaction.isStringSelectMenu()) {
     return interaction.customId.startsWith(`${SQ_PREFIX}:`);
   }
   return false;
@@ -39,14 +49,30 @@ export async function handleSatscapeInteraction(interaction: Interaction): Promi
   const { action, parts } = parsed;
   const discordId = interaction.user.id;
 
-  // Modal submit: the travel coordinate form.
+  // Modal submit: travel coordinates form.
   if (interaction.isModalSubmit()) {
     if (action === "travelmodal") return showTravelEstimate(interaction);
     return;
   }
+
+  // Shop select menus.
+  if (interaction.isStringSelectMenu()) {
+    await interaction.deferUpdate().catch(() => {});
+    const chosen = interaction.values[0];
+    if (action === "buy") {
+      const res = await buyItem(discordId, chosen);
+      return renderShop(interaction, discordId, res.note);
+    }
+    if (action === "equip") {
+      const res = await equipItem(discordId, chosen);
+      return renderShop(interaction, discordId, res.note);
+    }
+    return;
+  }
+
   if (!interaction.isButton()) return;
 
-  // "Travel" opens a modal, which must happen on a fresh (undeferred) interaction.
+  // "Travel" opens a modal — must happen on a fresh (undeferred) interaction.
   if (action === "travel") {
     await interaction.showModal(buildTravelModal()).catch(() => {});
     return;
@@ -60,6 +86,13 @@ export async function handleSatscapeInteraction(interaction: Interaction): Promi
     return;
   }
 
+  // Shop open/close.
+  if (action === "shop") {
+    stop(discordId); // pause the live map timer while shopping
+    return renderShop(interaction, discordId);
+  }
+  if (action === "shopclose") return render(discordId, interaction);
+
   // Auto-explore toggles.
   if (action === "auto") {
     setAuto(discordId, true);
@@ -72,25 +105,41 @@ export async function handleSatscapeInteraction(interaction: Interaction): Promi
 
   // Travel confirm / cancel.
   if (action === "travelgo") {
-    const tx = Number(parts[0]);
-    const ty = Number(parts[1]);
-    const res = await travelTo(discordId, tx, ty);
+    const res = await travelTo(discordId, Number(parts[0]), Number(parts[1]));
     return render(discordId, interaction, res.note);
   }
-  if (action === "travelcancel") {
-    return render(discordId, interaction, "Travel cancelled.");
-  }
+  if (action === "travelcancel") return render(discordId, interaction, "Travel cancelled.");
 
-  // Movement / combat actions.
+  // Movement / combat.
   let result: ActionResult | null = null;
   if (DIRECTIONS.has(action)) result = await move(discordId, action as Direction);
-  else if (action === "attack") result = await attack(discordId);
+  else if (action === "fight") result = await fight(discordId);
   else if (action === "flee") result = await flee(discordId);
   else if (action === "eat") result = await eat(discordId);
   if (!result) return;
 
   if (result.enteredCombat) setAuto(discordId, false);
   await render(discordId, interaction, result.note);
+}
+
+/** Open/refresh the shop view on the current message (map image cleared). */
+export async function renderShop(
+  interaction: RepliableInteraction,
+  discordId: string,
+  note?: string,
+): Promise<void> {
+  const player = await getPlayer(discordId);
+  if (!player) {
+    await interaction.editReply({ content: "Use `/satscape join` first.", embeds: [], components: [], files: [] });
+    return;
+  }
+  const [hp, owned] = await Promise.all([getBalance(discordId), getOwnedItemIds(discordId)]);
+  await interaction.editReply({
+    ...(note !== undefined ? { content: note || "" } : {}),
+    embeds: [buildShopEmbed(player, hp, owned)],
+    components: buildShopComponents(owned),
+    files: [],
+  });
 }
 
 function buildTravelModal(): ModalBuilder {
@@ -107,7 +156,6 @@ function buildTravelModal(): ModalBuilder {
     );
 }
 
-/** Validate the typed coordinates, compute the cost, and show a confirm/cancel preview. */
 async function showTravelEstimate(interaction: ModalSubmitInteraction): Promise<void> {
   await interaction.deferUpdate().catch(() => {});
   const discordId = interaction.user.id;
@@ -145,5 +193,3 @@ async function showTravelEstimate(interaction: ModalSubmitInteraction): Promise<
     ],
   });
 }
-
-export { stop as stopSatscapeSession, isAutoExploring };

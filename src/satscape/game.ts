@@ -1,18 +1,21 @@
 import { getBalance, subtractBalance } from "../balance.js";
 import { formatSats } from "../format.js";
 import { addToPool, payoutFromPool, takeDamage } from "./economy.js";
-import { SAT, biomeAt, entityAt, rollPlayerDamage } from "./engine.js";
+import { SAT, biomeAt, entityAt } from "./engine.js";
 import {
+  addInventoryItem,
   clearTile,
   createCombat,
   deleteCombat,
   getCombat,
   getPlayer,
   isTileCleared,
+  ownsItem,
+  setEquipped,
   setStateIf,
-  updateCombat,
   updatePlayer,
 } from "./db.js";
+import { gearScore, ITEM_BY_ID, lossFor, winChance } from "./items.js";
 import type { Direction, SatPlayerRow } from "./types.js";
 
 const BREAD_COST = 1; // sats → pool
@@ -91,49 +94,54 @@ export async function resolveTile(discordId: string, x: number, y: number): Prom
   if (!(await setStateIf(discordId, "idle", "combat"))) {
     return { ok: true, note: "Something interrupted you." };
   }
-  const m = entity.data as { name: string; max_hp: number; attack: number; reward: number };
+  const m = entity.data as { name: string; level: number; reward: number };
   await createCombat({
     discord_id: discordId,
     monster_name: m.name,
-    monster_max_hp: m.max_hp,
-    monster_current_hp: m.max_hp,
-    monster_attack: m.attack,
+    monster_level: m.level,
+    monster_max_hp: 1,
+    monster_current_hp: 1,
+    monster_attack: 0,
     reward_sats: m.reward,
     enemy_x: x,
     enemy_y: y,
     turn_number: 1,
     created_at: new Date().toISOString(),
   });
-  return { ok: true, note: `👹 A **${m.name}** blocks your path!`, enteredCombat: true };
+  return { ok: true, note: `👹 A level ${m.level} **${m.name}** blocks your path!`, enteredCombat: true };
 }
 
-/** One combat round: player hits, then (if it survives) the monster hits back. */
-export async function attack(discordId: string): Promise<ActionResult> {
-  const combat = await getCombat(discordId);
-  if (!combat) return { ok: false, note: "No active fight." };
+/**
+ * One decisive fight: a single win-chance roll (gear vs monster level). Winning
+ * loots the pool and clears the tile; losing costs level-scaled sats but the
+ * monster stays, so you can re-roll, equip up, or flee. A loss that empties the
+ * wallet faints you.
+ */
+export async function fight(discordId: string): Promise<ActionResult> {
+  const [combat, player] = await Promise.all([getCombat(discordId), getPlayer(discordId)]);
+  if (!combat || !player) return { ok: false, note: "No active fight." };
 
-  const dmg = rollPlayerDamage();
-  const monsterHp = combat.monster_current_hp - dmg;
-
-  if (monsterHp <= 0) {
+  const chance = winChance(gearScore(player), combat.monster_level);
+  if (Math.random() < chance) {
     const granted = await payoutFromPool(discordId, combat.reward_sats);
     await clearTile(combat.enemy_x, combat.enemy_y);
     await deleteCombat(discordId);
     await updatePlayer(discordId, { state: "idle" });
     return {
       ok: true,
-      note:
-        `⚔️ You hit for ${dmg} and slew the **${combat.monster_name}**! ` +
+      note: `🏆 You defeated the **${combat.monster_name}**! ` +
         (granted > 0 ? `Looted **${formatSats(granted)}**.` : "(Prize pool was empty — no loot.)"),
     };
   }
 
-  const taken = await takeDamage(discordId, combat.monster_attack);
+  const lost = await takeDamage(discordId, lossFor(combat.monster_level));
   if ((await getBalance(discordId)) <= 0) {
-    return { ok: true, note: `⚔️ You hit for ${dmg}. The ${combat.monster_name} struck back… ` + (await faint(discordId)).note };
+    return { ok: true, note: `🩸 The **${combat.monster_name}** bested you… ` + (await faint(discordId)).note };
   }
-  await updateCombat(discordId, { monster_current_hp: monsterHp, turn_number: combat.turn_number + 1 });
-  return { ok: true, note: `⚔️ You hit for ${dmg}; the **${combat.monster_name}** hit back for ${taken} sats.` };
+  return {
+    ok: true,
+    note: `🩸 The **${combat.monster_name}** bested you — lost ${lost} sats. It's still here; fight again or flee.`,
+  };
 }
 
 export async function flee(discordId: string): Promise<ActionResult> {
@@ -169,6 +177,34 @@ export async function chargeBuyIn(discordId: string): Promise<boolean> {
   if (!paid) return false;
   await addToPool(SAT.BUYIN_SATS);
   return true;
+}
+
+/* ─────────── shop ─────────── */
+
+/** Buy a catalogue item (town only). Price flows to the pool; item lands in inventory. */
+export async function buyItem(discordId: string, itemId: string): Promise<ActionResult> {
+  const item = ITEM_BY_ID.get(itemId);
+  if (!item) return { ok: false, note: "Unknown item." };
+  const player = await getPlayer(discordId);
+  if (!player) return { ok: false, note: "Use `/satscape join` first." };
+  if (biomeAt(player.x_coord, player.y_coord) !== "town") {
+    return { ok: false, note: "The shop is only open in town." };
+  }
+  if (await ownsItem(discordId, itemId)) return { ok: false, note: `You already own a ${item.name}.` };
+  const paid = await subtractBalance(discordId, item.price);
+  if (!paid) return { ok: false, note: `Not enough sats for ${item.name} (${formatSats(item.price)}).` };
+  await addToPool(item.price);
+  await addInventoryItem(discordId, itemId);
+  return { ok: true, note: `🛒 Bought ${item.emoji} **${item.name}** for ${formatSats(item.price)}. Equip it below.` };
+}
+
+/** Equip an owned item into its slot. */
+export async function equipItem(discordId: string, itemId: string): Promise<ActionResult> {
+  const item = ITEM_BY_ID.get(itemId);
+  if (!item) return { ok: false, note: "Unknown item." };
+  if (!(await ownsItem(discordId, itemId))) return { ok: false, note: `You don't own a ${item.name}.` };
+  await setEquipped(discordId, item.slot, itemId);
+  return { ok: true, note: `✅ Equipped ${item.emoji} **${item.name}** (${item.slot}).` };
 }
 
 /* ─────────── Fast travel ─────────── */

@@ -5,10 +5,12 @@ import {
   ButtonBuilder,
   ButtonStyle,
   EmbedBuilder,
+  StringSelectMenuBuilder,
 } from "discord.js";
 import { formatSats } from "../format.js";
 import { biomeAt, SAT, viewportBounds } from "./engine.js";
-import type { Biome, ViewModel } from "./types.js";
+import { gearScore, ITEM_BY_ID, ITEMS, lossFor, winChance } from "./items.js";
+import type { Biome, SatPlayerRow, ViewModel } from "./types.js";
 
 /* ─────────── custom-id helpers (mirrors arcade/ui.ts) ─────────── */
 export const SQ_PREFIX = "satscape";
@@ -166,9 +168,10 @@ export function buildMapEmbed(view: ViewModel): EmbedBuilder {
     );
 
   if (combat) {
+    const chance = Math.round(winChance(gearScore(player), combat.monster_level) * 100);
     embed.addFields({
-      name: `👹 ${combat.monster_name}`,
-      value: `${bar(combat.monster_current_hp, combat.monster_max_hp)}\n${combat.monster_current_hp}/${combat.monster_max_hp} HP · ⚔️ ${combat.monster_attack} atk`,
+      name: `👹 ${combat.monster_name} — level ${combat.monster_level}`,
+      value: `🎯 Win chance: **${chance}%**\n🏆 Loot: up to ${formatSats(combat.reward_sats)} · 🩸 Defeat: −${lossFor(combat.monster_level)} sats`,
       inline: false,
     });
   } else if (others.length > 0) {
@@ -185,15 +188,25 @@ export function buildComponents(
   if (view.combat) {
     return [
       new ActionRowBuilder<ButtonBuilder>().addComponents(
-        new ButtonBuilder().setCustomId(sqCid("attack")).setLabel("Attack").setEmoji("⚔️").setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId(sqCid("fight")).setLabel("Fight").setEmoji("⚔️").setStyle(ButtonStyle.Danger),
         new ButtonBuilder().setCustomId(sqCid("flee")).setLabel("Flee").setEmoji("🏃").setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId(sqCid("eat")).setLabel("Eat Bread").setEmoji("🍞").setStyle(ButtonStyle.Success),
       ),
     ];
   }
   const auto = opts.autoExploring
     ? new ButtonBuilder().setCustomId(sqCid("autostop")).setLabel("Stop").setEmoji("⏹️").setStyle(ButtonStyle.Danger)
     : new ButtonBuilder().setCustomId(sqCid("auto")).setLabel("Auto-Explore").setEmoji("🤖").setStyle(ButtonStyle.Secondary);
+
+  const actionRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId(sqCid("eat")).setLabel("Eat").setEmoji("🍞").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(sqCid("travel")).setLabel("Travel").setEmoji("🧭").setStyle(ButtonStyle.Primary),
+    auto,
+  );
+  if (biomeAt(view.player.x_coord, view.player.y_coord) === "town") {
+    actionRow.addComponents(
+      new ButtonBuilder().setCustomId(sqCid("shop")).setLabel("Shop").setEmoji("🛒").setStyle(ButtonStyle.Secondary),
+    );
+  }
   return [
     new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId(sqCid("up")).setEmoji("⬆️").setStyle(ButtonStyle.Primary),
@@ -203,10 +216,72 @@ export function buildComponents(
       new ButtonBuilder().setCustomId(sqCid("down")).setEmoji("⬇️").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId(sqCid("right")).setEmoji("➡️").setStyle(ButtonStyle.Primary),
     ),
-    new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder().setCustomId(sqCid("eat")).setLabel("Eat").setEmoji("🍞").setStyle(ButtonStyle.Success),
-      new ButtonBuilder().setCustomId(sqCid("travel")).setLabel("Travel").setEmoji("🧭").setStyle(ButtonStyle.Primary),
-      auto,
-    ),
+    actionRow,
   ];
+}
+
+/* ─────────── shop view ─────────── */
+
+const SLOT_EMOJI = { weapon: "🗡️", armor: "🛡️", accessory: "💍" } as const;
+
+function equippedName(player: SatPlayerRow, id: string | null): string {
+  if (!id) return "—";
+  const it = ITEM_BY_ID.get(id);
+  return it ? `${it.emoji} ${it.name} (+${it.power})` : "—";
+}
+
+export function buildShopEmbed(player: SatPlayerRow, hp: number, ownedIds: string[]): EmbedBuilder {
+  const gear = gearScore(player);
+  return new EmbedBuilder()
+    .setColor(0x1d4ed8)
+    .setTitle("🛒 Town Item Shop")
+    .setDescription(
+      `Balance: **${formatSats(hp)}**  ·  Gear score: **${gear}**\n` +
+        `Win chance: Lv1 **${Math.round(winChance(gear, 1) * 100)}%** · Lv4 **${Math.round(winChance(gear, 4) * 100)}%** · Lv8 **${Math.round(winChance(gear, 8) * 100)}%**`,
+    )
+    .addFields(
+      { name: `${SLOT_EMOJI.weapon} Weapon`, value: equippedName(player, player.equipped_weapon), inline: true },
+      { name: `${SLOT_EMOJI.armor} Armor`, value: equippedName(player, player.equipped_armor), inline: true },
+      { name: `${SLOT_EMOJI.accessory} Accessory`, value: equippedName(player, player.equipped_accessory), inline: true },
+    )
+    .setFooter({ text: "Buy from the first menu, equip owned gear from the second." });
+}
+
+export function buildShopComponents(ownedIds: string[]): ActionRowBuilder<StringSelectMenuBuilder | ButtonBuilder>[] {
+  const owned = new Set(ownedIds);
+  const buy = new StringSelectMenuBuilder()
+    .setCustomId(sqCid("buy"))
+    .setPlaceholder("Buy an item…")
+    .addOptions(
+      ITEMS.map((it) => ({
+        label: `${it.name} (+${it.power})${owned.has(it.id) ? " — owned" : ""}`,
+        description: `${it.price} sats · ${it.slot}`,
+        value: it.id,
+        emoji: it.emoji,
+      })),
+    );
+
+  const rows: ActionRowBuilder<StringSelectMenuBuilder | ButtonBuilder>[] = [
+    new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(buy),
+  ];
+
+  if (ownedIds.length > 0) {
+    const equip = new StringSelectMenuBuilder()
+      .setCustomId(sqCid("equip"))
+      .setPlaceholder("Equip owned gear…")
+      .addOptions(
+        ownedIds
+          .map((id) => ITEM_BY_ID.get(id))
+          .filter((it): it is NonNullable<typeof it> => !!it)
+          .map((it) => ({ label: `${it.name} (+${it.power})`, description: `equip as ${it.slot}`, value: it.id, emoji: it.emoji })),
+      );
+    rows.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(equip));
+  }
+
+  rows.push(
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId(sqCid("shopclose")).setLabel("Back to map").setEmoji("🗺️").setStyle(ButtonStyle.Primary),
+    ),
+  );
+  return rows;
 }

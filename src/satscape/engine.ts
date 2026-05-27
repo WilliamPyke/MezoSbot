@@ -12,8 +12,6 @@ export const SAT = {
   DEATH_PENALTY_SATS: 50, // taken on faint (clamped to remaining balance)
   CHEST_SPAWN: 0.03, // per-tile spawn probability in the wilds
   MONSTER_SPAWN: 0.08, // cumulative upper bound (monster occupies 0.03..0.08)
-  PLAYER_DMG_MIN: 8,
-  PLAYER_DMG_MAX: 16,
   BREAD_STAMINA: 20, // stamina restored per 1-sat loaf
 } as const;
 
@@ -43,9 +41,8 @@ export function biomeAt(x: number, y: number): Biome {
 
 export interface MonsterSpec {
   name: string;
-  max_hp: number;
-  attack: number;
-  reward: number;
+  level: number; // challenge rating, 1..8 — rises with distance from town
+  reward: number; // sats looted on a win (from the pool)
 }
 
 const MONSTERS: Record<Exclude<Biome, "town">, string[]> = {
@@ -55,14 +52,22 @@ const MONSTERS: Record<Exclude<Biome, "town">, string[]> = {
   india: ["Bengal Tiger", "Rakshasa Fiend", "River Naga"],
 };
 
+/** Challenge rating climbs the farther you stray from town. */
+export function monsterLevelAt(x: number, y: number): number {
+  const dist = Math.hypot(x, y);
+  const base = 1 + Math.floor(dist / 35);
+  const bump = hash01(x, y, 23) < 0.3 ? 1 : 0;
+  return Math.max(1, Math.min(8, base + bump));
+}
+
 function monsterFor(x: number, y: number, biome: Biome): MonsterSpec {
   const r = hash01(x, y, 7);
   const pool = MONSTERS[biome as Exclude<Biome, "town">] ?? MONSTERS.jungle;
+  const level = monsterLevelAt(x, y);
   return {
     name: pool[Math.floor(r * pool.length)],
-    max_hp: 30 + Math.floor(hash01(x, y, 11) * 40), // 30..69
-    attack: 6 + Math.floor(hash01(x, y, 13) * 12), // 6..17
-    reward: 30 + Math.floor(hash01(x, y, 17) * 90), // 30..119
+    level,
+    reward: 40 + level * 25 + Math.floor(hash01(x, y, 17) * 30), // grows with CR
   };
 }
 
@@ -83,10 +88,6 @@ export function entityAt(x: number, y: number): TileEntity | null {
     return { x, y, type: "monster", data: { ...monsterFor(x, y, biome) } };
   }
   return null;
-}
-
-export function rollPlayerDamage(): number {
-  return SAT.PLAYER_DMG_MIN + Math.floor(Math.random() * (SAT.PLAYER_DMG_MAX - SAT.PLAYER_DMG_MIN + 1));
 }
 
 /** Inclusive tile bounds of the viewport centred on (cx, cy). */
