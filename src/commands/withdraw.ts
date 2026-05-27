@@ -38,6 +38,19 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     });
   }
 
+  // 0. Block withdrawals while mid-combat in SatQuest (HP = balance, so this
+  //    would otherwise let a player yank sats out to dodge an in-progress loss).
+  const { data: sq } = await supabase
+    .from("sat_players")
+    .select("state")
+    .eq("discord_id", interaction.user.id)
+    .maybeSingle();
+  if (sq?.state === "combat") {
+    return interaction.editReply({
+      content: "⚔️ You can't withdraw mid-combat in SatQuest. Win the fight, flee, or faint first.",
+    });
+  }
+
   // 1. Block concurrent withdrawals (only consider pending records < 10 min old)
   const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000).toISOString();
   const { data: pending } = await supabase
