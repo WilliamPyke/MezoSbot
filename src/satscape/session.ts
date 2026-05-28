@@ -132,6 +132,10 @@ function scheduleNext(discordId: string): void {
  *      text+components first (fast, ~150 ms perceived response), then follow
  *      up with the image attachment. A gen counter aborts the image follow-up
  *      if a newer paint has already overwritten the text.
+ *
+ * In the two-phase path we kick off the text edit and the image encode *in
+ * parallel* — `canvas.encode` runs on libuv, and the text-edit HTTP request
+ * goes out the moment we call editReply, so both pieces of work overlap.
  */
 async function paint(session: Session, view: ViewModel, note?: string): Promise<void> {
   const interaction = session.interaction; // snapshot — bind() may swap it mid-paint
@@ -153,21 +157,32 @@ async function paint(session: Session, view: ViewModel, note?: string): Promise<
 
   // (2) First paint of the session: no prior image to preserve.
   if (!hasExistingImage) {
-    await interaction.editReply({ ...baseEdit, files: [buildMapImage(view)] });
+    const image = await buildMapImage(view, visualSig);
+    await interaction.editReply({ ...baseEdit, files: [image] });
     session.lastVisualSig = visualSig;
     return;
   }
 
-  // (3) Two-phase: text first for snap, image follow-up.
+  // (3) Two-phase: text first for snap, image follow-up. Run both concurrently.
   session.paintGen += 1;
   const gen = session.paintGen;
-  await interaction.editReply(baseEdit);
-  if (gen !== session.paintGen) return; // a newer paint already took over
+  const textEditPromise = interaction.editReply(baseEdit);
+  const imagePromise = buildMapImage(view, visualSig);
+
+  await textEditPromise;
+  if (gen !== session.paintGen) {
+    // A newer paint already took over the text; let its image win, drop ours.
+    // We still await the encode so it populates the cache for future reuse.
+    imagePromise.catch(() => {});
+    return;
+  }
   try {
-    await interaction.editReply({ ...baseEdit, files: [buildMapImage(view)] });
+    const image = await imagePromise;
+    if (gen !== session.paintGen) return;
+    await interaction.editReply({ ...baseEdit, files: [image] });
     session.lastVisualSig = visualSig;
   } catch {
-    // Token expired / message dismissed — the next tick will recover.
+    // Token expired / message dismissed / encode failed — the next tick will recover.
   }
 }
 

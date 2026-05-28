@@ -37,11 +37,32 @@ export function parseSqCid(customId: string): { action: string; parts: string[] 
   return { action, parts };
 }
 
-export const MAP_FILE = "satscape-map.png";
+export const MAP_FILE = "satscape-map.webp";
 
-const TILE = 26;
-const LEGEND_H = 24;
+const TILE = 22;
+const LEGEND_H = 22;
 const FOG = "#060a14";
+
+/**
+ * FIFO cache of encoded WebP buffers keyed by a visual signature supplied by
+ * the caller. When the same scene recurs (player walks back to a tile they
+ * just left, neighbor stands still, etc.) we skip both canvas drawing and
+ * re-encoding. Bounded so it never grows without limit.
+ */
+const IMG_CACHE_MAX = 32;
+const mapImageCache = new Map<string, Buffer>();
+
+function cacheMapImage(key: string, buf: Buffer): void {
+  mapImageCache.set(key, buf);
+  while (mapImageCache.size > IMG_CACHE_MAX) {
+    const oldest = mapImageCache.keys().next().value;
+    if (oldest === undefined) break;
+    mapImageCache.delete(oldest);
+  }
+}
+
+/** WebP encode quality; high enough that flat-color tile art looks identical to PNG. */
+const WEBP_QUALITY = 90;
 
 function terrainLabel(t: Terrain): string {
   return t === "town" ? "Town" : t.charAt(0).toUpperCase() + t.slice(1);
@@ -54,8 +75,20 @@ function locationLabel(x: number, y: number): string {
   return `${terrainLabel(biomeAt(x, y))} · near ${nearestTown(x, y).town.name}`;
 }
 
-/** Render the 16×16 viewport to a PNG attachment, with fog of war. */
-export function buildMapImage(view: ViewModel): AttachmentBuilder {
+/**
+ * Render the viewport and encode it as WebP. Async because canvas.encode runs
+ * the heavy compression step on the libuv thread pool — frees the main event
+ * loop to handle other Discord interactions while a frame is being encoded.
+ *
+ * `cacheKey` (typically the caller's visual signature) lets us reuse a buffer
+ * when the same scene recurs. Pass an empty string to disable caching.
+ */
+export async function buildMapImage(view: ViewModel, cacheKey = ""): Promise<AttachmentBuilder> {
+  if (cacheKey) {
+    const hit = mapImageCache.get(cacheKey);
+    if (hit) return new AttachmentBuilder(hit, { name: MAP_FILE });
+  }
+
   const { player, entities, others, combat, explored } = view;
   const w = SAT.VIEW_W * TILE;
   const h = SAT.VIEW_H * TILE + LEGEND_H;
@@ -69,6 +102,10 @@ export function buildMapImage(view: ViewModel): AttachmentBuilder {
     return dx * dx + dy * dy <= r2;
   };
 
+  // Flat tiles only — no per-tile noise or stroke. WebP compresses large
+  // solid-color regions trivially; the previous jitter overlay and tile
+  // borders sabotaged that, bloating the file with high-frequency detail.
+  // The wavy biome borders supplied by biomeAt are still the visual identity.
   for (let row = 0; row < SAT.VIEW_H; row++) {
     for (let col = 0; col < SAT.VIEW_W; col++) {
       const tx = b.minX + col;
@@ -84,17 +121,11 @@ export function buildMapImage(view: ViewModel): AttachmentBuilder {
       }
       ctx.fillStyle = TERRAIN_COLOR[biomeAt(tx, ty)];
       ctx.fillRect(px, py, TILE, TILE);
-      const jitter = Math.abs(Math.sin(tx * 1.3 + ty * 2.7)) * 0.12;
-      ctx.fillStyle = `rgba(0,0,0,${jitter.toFixed(3)})`;
-      ctx.fillRect(px, py, TILE, TILE);
       if (!seen) {
         // explored but out of current sight → dim "memory"
         ctx.fillStyle = "rgba(2,6,23,0.5)";
         ctx.fillRect(px, py, TILE, TILE);
       }
-      ctx.strokeStyle = "rgba(2,6,23,0.35)";
-      ctx.lineWidth = 1;
-      ctx.strokeRect(px + 0.5, py + 0.5, TILE, TILE);
     }
   }
 
@@ -170,7 +201,9 @@ export function buildMapImage(view: ViewModel): AttachmentBuilder {
   const legend = `${locationLabel(player.x_coord, player.y_coord)}  ·  (${player.x_coord}, ${player.y_coord})`.replace(/\p{Extended_Pictographic}/gu, "").trim();
   ctx.fillText(legend, 8, SAT.VIEW_H * TILE + 16);
 
-  return new AttachmentBuilder(canvas.toBuffer("image/png"), { name: MAP_FILE });
+  const buf = await canvas.encode("webp", WEBP_QUALITY);
+  if (cacheKey) cacheMapImage(cacheKey, buf);
+  return new AttachmentBuilder(buf, { name: MAP_FILE });
 }
 
 /* ─────────── sprites (drawn procedurally — no binary art) ─────────── */
@@ -248,10 +281,19 @@ function drawKeeper(ctx: SKRSContext2D, cx: number, cy: number, persona: KeeperP
   ctx.fillRect(cx - 2, cy - 11, 4, 3);
 }
 
-export const KEEPER_FILE = "satscape-keeper.png";
+export const KEEPER_FILE = "satscape-keeper.webp";
+
+/**
+ * Per-town keeper portrait cache. Bounded by the (small, finite) town count, so
+ * no eviction needed — first call per town encodes once, subsequent calls reuse.
+ */
+const keeperImageCache = new Map<string, Buffer>();
 
 /** A small keeper portrait for the shop embed thumbnail. */
-export function buildKeeperPortrait(town: Town): AttachmentBuilder {
+export async function buildKeeperPortrait(town: Town): Promise<AttachmentBuilder> {
+  const cached = keeperImageCache.get(town.id);
+  if (cached) return new AttachmentBuilder(cached, { name: KEEPER_FILE });
+
   const canvas = createCanvas(96, 96);
   const ctx = canvas.getContext("2d");
   ctx.fillStyle = "#0f172a";
@@ -266,7 +308,9 @@ export function buildKeeperPortrait(town: Town): AttachmentBuilder {
   ctx.font = "bold 11px sans-serif";
   ctx.textAlign = "center";
   ctx.fillText(town.keeper.name.slice(0, 14), 48, 90);
-  return new AttachmentBuilder(canvas.toBuffer("image/png"), { name: KEEPER_FILE });
+  const buf = await canvas.encode("webp", WEBP_QUALITY);
+  keeperImageCache.set(town.id, buf);
+  return new AttachmentBuilder(buf, { name: KEEPER_FILE });
 }
 
 function bar(value: number, max: number, width = 12): string {

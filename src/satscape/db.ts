@@ -148,8 +148,8 @@ export async function setEquipped(
 
 /* ─────────── fog of war ─────────── */
 
-/** Reveal (persist) the shared world vision disc around a coordinate. One bulk upsert. */
-export async function revealAround(_discordId: string, cx: number, cy: number): Promise<void> {
+/** Reveal the vision disc for shared fog plus the player's personal cartography progress. */
+export async function revealAround(discordId: string, cx: number, cy: number): Promise<void> {
   const r = SAT.SIGHT;
   const rows: Array<{ x: number; y: number }> = [];
   for (let dy = -r; dy <= r; dy++) {
@@ -158,7 +158,12 @@ export async function revealAround(_discordId: string, cx: number, cy: number): 
     }
   }
   if (rows.length) {
-    await supabase.from("sat_world_explored").upsert(rows, { onConflict: "x,y", ignoreDuplicates: true });
+    await Promise.all([
+      supabase.from("sat_world_explored").upsert(rows, { onConflict: "x,y", ignoreDuplicates: true }),
+      supabase
+        .from("sat_explored")
+        .upsert(rows.map((row) => ({ discord_id: discordId, ...row })), { onConflict: "discord_id,x,y", ignoreDuplicates: true }),
+    ]);
   }
 }
 

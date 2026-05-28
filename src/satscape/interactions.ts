@@ -192,12 +192,17 @@ export async function renderShop(
     await interaction.editReply({ content: "🛒 The shop is only open inside a town.", embeds: [], components: [], files: [] });
     return;
   }
-  const [hp, owned, rep] = await Promise.all([getBalance(discordId), getOwnedItemIds(discordId), getRep(discordId, town.id)]);
+  const [hp, owned, rep, portrait] = await Promise.all([
+    getBalance(discordId),
+    getOwnedItemIds(discordId),
+    getRep(discordId, town.id),
+    buildKeeperPortrait(town),
+  ]);
   await interaction.editReply({
     ...(note !== undefined ? { content: note || "" } : {}),
     embeds: [buildShopEmbed(town, player, hp, owned, rep)],
     components: buildShopComponents(town, owned, rep),
-    files: [buildKeeperPortrait(town)],
+    files: [portrait],
   });
 }
 
@@ -213,12 +218,17 @@ export async function renderQuests(interaction: EditableInteraction, discordId: 
     await interaction.editReply({ content: "📜 Quest boards are posted in towns.", embeds: [], components: [], files: [] });
     return;
   }
-  const [board, rep, titles] = await Promise.all([questBoard(discordId, town.id), getRep(discordId, town.id), titlesFor(discordId)]);
+  const [board, rep, titles, portrait] = await Promise.all([
+    questBoard(discordId, town.id),
+    getRep(discordId, town.id),
+    titlesFor(discordId),
+    buildKeeperPortrait(town),
+  ]);
   await interaction.editReply({
     ...(note !== undefined ? { content: note || "" } : {}),
     embeds: [buildQuestEmbed(town, board, rep, titles)],
     components: buildQuestComponents(board),
-    files: [buildKeeperPortrait(town)],
+    files: [portrait],
   });
 }
 

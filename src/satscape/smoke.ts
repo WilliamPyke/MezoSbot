@@ -111,8 +111,11 @@ async function main() {
   ok((await getBalance(TEST_ID)) === balPreStarve - 1, "exhausted step burned 1 sat");
   await conserved(TOTAL, "after exhaustion");
   const { count: explored } = await supabase
+    .from("sat_explored").select("*", { count: "exact", head: true }).eq("discord_id", TEST_ID);
+  ok((explored ?? 0) > 0, `personal cartography: ${explored} tiles revealed after moving`);
+  const { count: sharedExplored } = await supabase
     .from("sat_world_explored").select("*", { count: "exact", head: true });
-  ok((explored ?? 0) > 0, `shared fog: ${explored} world tiles revealed after moving`);
+  ok((sharedExplored ?? 0) > 0, `shared fog: ${sharedExplored} world tiles revealed after moving`);
 
   // 3. Eat
   console.log("\n3. Eat bread");

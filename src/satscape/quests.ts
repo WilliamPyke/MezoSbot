@@ -132,10 +132,11 @@ async function getQuestRows(discordId: string): Promise<Map<string, QuestRow>> {
   return new Map((data ?? []).map((r) => [r.quest_key as string, r as QuestRow]));
 }
 
-export async function getExploredCount(_discordId: string): Promise<number> {
+export async function getExploredCount(discordId: string): Promise<number> {
   const { count } = await supabase
-    .from("sat_world_explored")
-    .select("*", { count: "exact", head: true });
+    .from("sat_explored")
+    .select("*", { count: "exact", head: true })
+    .eq("discord_id", discordId);
   return count ?? 0;
 }
 
