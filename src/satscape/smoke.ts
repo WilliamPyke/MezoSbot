@@ -30,13 +30,18 @@ import {
   faint,
   fight,
   flee,
+  maxStepsFor,
   move,
+  moveMany,
+  resolveTile,
+  setStepsPerMove,
   travelCost,
   travelTo,
 } from "./game.js";
 import { getCombat, getPlayer, isTileCleared, startRun, updatePlayer } from "./db.js";
 import { lossFor, winChance } from "./items.js";
-import { gearScore, nearestTown } from "./towns.js";
+import { effectivePrice, gearScore, nearestTown, TOWN_BY_ID } from "./towns.js";
+import { acceptQuest, claimQuest, getRep, payTribute, questBoard } from "./quests.js";
 
 const TEST_ID = `smoke-${Date.now()}`;
 const START_BALANCE = 2000;
@@ -106,8 +111,8 @@ async function main() {
   ok((await getBalance(TEST_ID)) === balPreStarve - 1, "exhausted step burned 1 sat");
   await conserved(TOTAL, "after exhaustion");
   const { count: explored } = await supabase
-    .from("sat_explored").select("*", { count: "exact", head: true }).eq("discord_id", TEST_ID);
-  ok((explored ?? 0) > 0, `fog: ${explored} tiles revealed after moving`);
+    .from("sat_world_explored").select("*", { count: "exact", head: true });
+  ok((explored ?? 0) > 0, `shared fog: ${explored} world tiles revealed after moving`);
 
   // 3. Eat
   console.log("\n3. Eat bread");
@@ -231,6 +236,88 @@ async function main() {
   const home = nearestTown(42, 42).town;
   ok(p?.x_coord === home.cx && p?.y_coord === home.cy && p?.hunger === 100 && p?.state === "idle", `faint warped to ${home.name}`);
   await conserved(TOTAL, "after faint");
+
+  // 9. Quests & reputation
+  console.log("\n9. Quests & reputation");
+  await updatePlayer(TEST_ID, { x_coord: 0, y_coord: 0, state: "idle", hunger: 100 });
+  // bounty: 3 kills
+  ok((await acceptQuest(TEST_ID, "rest_cull")).ok, "accepted bounty quest");
+  for (let i = 0; i < 3; i++) {
+    const m = await findTile("monster", 30 + i);
+    if (!m) { ok(false, "no monster for bounty"); break; }
+    await updatePlayer(TEST_ID, { x_coord: m.x - 1, y_coord: m.y, hunger: 100, state: "idle" });
+    await move(TEST_ID, "right");
+    Math.random = () => 0;
+    await fight(TEST_ID);
+    Math.random = realRandom;
+  }
+  const board = await questBoard(TEST_ID, "rest");
+  ok(board.offered.find((v) => v.def.key === "rest_cull")?.status === "claimable", "bounty claimable after 3 kills");
+  const repBefore = await getRep(TEST_ID, "rest");
+  await claimQuest(TEST_ID, "rest_cull");
+  ok((await getRep(TEST_ID, "rest")) === repBefore + 1, "bounty claim granted +1 rep");
+  await conserved(TOTAL, "after bounty claim");
+
+  // reputation discount
+  const restKeeper = TOWN_BY_ID.get("rest")!.keeper;
+  const restItem = TOWN_BY_ID.get("rest")!.catalog[0];
+  ok(effectivePrice(restItem, restKeeper, 5) < effectivePrice(restItem, restKeeper, 0), "reputation lowers shop prices");
+
+  // tribute → Greta
+  await updatePlayer(TEST_ID, { x_coord: 0, y_coord: 0, state: "idle" });
+  const balPreT = await getBalance(TEST_ID);
+  ok((await payTribute(TEST_ID, "frosthold_tribute")).ok, "paid tribute to Greta");
+  ok((await getBalance(TEST_ID)) === balPreT - 300, "tribute debited 300 sats");
+  ok((await getRep(TEST_ID, "frosthold")) === 4, "tribute granted +4 Frosthold rep");
+  await conserved(TOTAL, "after tribute");
+
+  // delivery: accept at Rest, complete by arriving in Jaipur
+  ok((await acceptQuest(TEST_ID, "rest_invoice")).ok, "accepted delivery quest");
+  const jaipur = TOWN_BY_ID.get("jaipur")!;
+  await updatePlayer(TEST_ID, { x_coord: jaipur.cx, y_coord: jaipur.cy, state: "idle" });
+  await resolveTile(TEST_ID, jaipur.cx, jaipur.cy); // fires onArriveTown
+  const board2 = await questBoard(TEST_ID, "jaipur");
+  ok(board2.carry.find((v) => v.def.key === "rest_invoice")?.status === "claimable", "delivery claimable on arrival at Jaipur");
+  ok((await claimQuest(TEST_ID, "rest_invoice")).ok, "claimed delivery");
+  await conserved(TOTAL, "after delivery");
+
+  // gear unlock gate
+  ok(!(await buyItem(TEST_ID, "jaipur_unlock")).ok, "Maharaja Blade locked at 0 Jaipur rep");
+
+  // 10. Boots & multi-step movement
+  console.log("\n10. Boots & multi-step movement");
+  await updatePlayer(TEST_ID, { x_coord: 0, y_coord: 0, state: "idle", hunger: 100, equipped_boots: null, steps_per_move: 1 });
+  let bp = (await getPlayer(TEST_ID))!;
+  ok(maxStepsFor(bp) === SAT.MAX_STEPS_BASE, `base max steps is ${SAT.MAX_STEPS_BASE}`);
+  ok((await buyItem(TEST_ID, "rest_boots")).ok, "bought Worn Boots in town");
+  ok((await equipItem(TEST_ID, "rest_boots")).ok, "equipped Worn Boots");
+  bp = (await getPlayer(TEST_ID))!;
+  ok(maxStepsFor(bp) === SAT.MAX_STEPS_BASE + 1, "boots raised max steps by stepBonus(1)");
+  const set = await setStepsPerMove(TEST_ID, 999);
+  ok(set.ok && set.value === maxStepsFor(bp), `setStepsPerMove clamps to ${maxStepsFor(bp)} (got ${set.value})`);
+  await setStepsPerMove(TEST_ID, 4);
+
+  // walk 4 tiles in one press through empty wilds
+  let start: { x: number; y: number } | null = null;
+  outer: for (let y = 350; y < 360; y++) {
+    for (let x = REGION_X; x < REGION_X + 200; x++) {
+      let allEmpty = true;
+      for (let k = 0; k < 5; k++) {
+        if (biomeAt(x + k, y) === "town" || entityAt(x + k, y) !== null || await isTileCleared(x + k, y)) { allEmpty = false; break; }
+      }
+      if (allEmpty) { start = { x, y }; break outer; }
+    }
+  }
+  if (!start) { ok(false, "no empty 5-tile stretch for multi-step"); }
+  else {
+    await updatePlayer(TEST_ID, { x_coord: start.x, y_coord: start.y, hunger: 100, state: "idle", steps_per_move: 4 });
+    const res = await moveMany(TEST_ID, "right");
+    const after = (await getPlayer(TEST_ID))!;
+    ok(res.ok, "moveMany returned ok");
+    ok(after.x_coord === start.x + 4, `moved 4 tiles right (from ${start.x} → ${after.x_coord})`);
+    ok(res.note.startsWith("🏃 ×4"), `note prefixed with ×4 (got "${res.note.slice(0, 20)}…")`);
+    await conserved(TOTAL, "after multi-step");
+  }
 
   // Cleanup
   console.log("\nCleanup");

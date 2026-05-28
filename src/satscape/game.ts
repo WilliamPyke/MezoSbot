@@ -1,7 +1,7 @@
 import { getBalance, subtractBalance } from "../balance.js";
 import { formatSats } from "../format.js";
 import { addToPool, payoutFromPool, takeDamage } from "./economy.js";
-import { SAT, biomeAt, entityAt } from "./engine.js";
+import { SAT, entityAt } from "./engine.js";
 import {
   addInventoryItem,
   clearTile,
@@ -17,7 +17,9 @@ import {
   updatePlayer,
 } from "./db.js";
 import { lossFor, winChance } from "./items.js";
-import { effectivePrice, gearScore, ITEM_BY_ID, nearestTown, townAt } from "./towns.js";
+import { bootBonus, effectivePrice, gearScore, ITEM_BY_ID, nearestTown, townAt } from "./towns.js";
+import { getRep, onArriveTown, onCombatWin } from "./quests.js";
+import { keeperLine } from "./lines.js";
 import type { Direction, SatPlayerRow } from "./types.js";
 
 const BREAD_COST = 1; // sats → pool
@@ -36,6 +38,51 @@ const DELTA: Record<Direction, [number, number]> = {
   left: [-1, 0],
   right: [1, 0],
 };
+
+/** The most tiles a single directional press can cover, given equipped boots. */
+export function maxStepsFor(player: SatPlayerRow): number {
+  return Math.min(SAT.MAX_STEPS_CAP, SAT.MAX_STEPS_BASE + bootBonus(player));
+}
+
+/** Persist a player's steps-per-press setting, clamped to their current allowance. */
+export async function setStepsPerMove(discordId: string, n: number): Promise<{ ok: boolean; note: string; value?: number }> {
+  const player = await getPlayer(discordId);
+  if (!player) return { ok: false, note: "Use `/satscape join` first." };
+  const max = maxStepsFor(player);
+  const clamped = Math.max(1, Math.min(max, Math.trunc(n)));
+  await updatePlayer(discordId, { steps_per_move: clamped });
+  return { ok: true, note: `⚙️ Steps-per-press set to **${clamped}** (max ${max}).`, value: clamped };
+}
+
+/**
+ * Walk in a single direction for `steps_per_move` tiles, stopping early on
+ * combat, faint, or any failed step. Notes from each step are gathered and
+ * shown together so chests/towns/exhaustion along the way aren't lost.
+ */
+export async function moveMany(discordId: string, dir: Direction): Promise<ActionResult> {
+  const player = await getPlayer(discordId);
+  if (!player) return { ok: false, note: "Use `/satscape join` first." };
+  const n = Math.max(1, Math.min(maxStepsFor(player), player.steps_per_move ?? 1));
+  if (n === 1) return move(discordId, dir);
+
+  const events: string[] = [];
+  let entered = false;
+  let actual = 0;
+  for (let i = 0; i < n; i++) {
+    const res = await move(discordId, dir);
+    if (!res.ok) {
+      if (res.note) events.push(res.note);
+      break;
+    }
+    actual++;
+    if (res.note && res.note !== "…nothing here.") events.push(res.note);
+    if (res.enteredCombat) { entered = true; break; }
+    if (res.note.includes("fainted")) break;
+  }
+  const header = `🏃 ×${actual}`;
+  const note = events.length ? `${header}\n${events.join("\n")}` : header;
+  return { ok: true, note, enteredCombat: entered };
+}
 
 /** Move one tile, applying stamina/starvation, then resolve whatever is there. */
 export async function move(discordId: string, dir: Direction): Promise<ActionResult> {
@@ -75,7 +122,11 @@ export async function move(discordId: string, dir: Direction): Promise<ActionRes
 
 /** Resolve whatever sits on a tile the player just arrived on (chest/monster/empty). */
 export async function resolveTile(discordId: string, x: number, y: number): Promise<ActionResult> {
-  if (biomeAt(x, y) === "town") return { ok: true, note: "🏙️ Town — safe." };
+  const town = townAt(x, y);
+  if (town) {
+    await onArriveTown(discordId, town); // completes delivery / discover quests
+    return { ok: true, note: `🏙️ ${town.name} — safe.` };
+  }
   if (await isTileCleared(x, y)) return { ok: true, note: "…nothing here." };
 
   const entity = entityAt(x, y);
@@ -130,6 +181,7 @@ export async function fight(discordId: string): Promise<ActionResult> {
     await clearTile(combat.enemy_x, combat.enemy_y);
     await deleteCombat(discordId);
     await updatePlayer(discordId, { state: "idle" });
+    await onCombatWin(discordId, combat.monster_level); // advance bounty quests
     return {
       ok: true,
       note: `🏆 You defeated the **${combat.monster_name}**! ` +
@@ -195,13 +247,17 @@ export async function buyItem(discordId: string, itemId: string): Promise<Action
   if (!town) return { ok: false, note: "The shop is only open in town." };
   const item = town.catalog.find((i) => i.id === itemId);
   if (!item) return { ok: false, note: `${town.keeper.name} doesn't stock that here.` };
-  if (await ownsItem(discordId, itemId)) return { ok: false, note: `You already own a ${item.name}.` };
-  const price = effectivePrice(item, town.keeper);
+  if (await ownsItem(discordId, itemId)) return { ok: false, note: `You already own a ${item.name}. *"${keeperLine(town.keeper.persona, "owned")}"*` };
+  const rep = await getRep(discordId, town.id);
+  if (item.repReq && rep < item.repReq) {
+    return { ok: false, note: `🔒 ${item.name} is locked — reach ${item.repReq} rep with ${town.keeper.name} first.` };
+  }
+  const price = effectivePrice(item, town.keeper, rep);
   const paid = await subtractBalance(discordId, price);
-  if (!paid) return { ok: false, note: `Not enough sats for ${item.name} (${formatSats(price)}).` };
+  if (!paid) return { ok: false, note: `Not enough sats for ${item.name} (${formatSats(price)}). *"${keeperLine(town.keeper.persona, "poor")}"*` };
   await addToPool(price);
   await addInventoryItem(discordId, itemId);
-  return { ok: true, note: `🛒 Bought ${item.emoji} **${item.name}** for ${formatSats(price)}. Equip it below.` };
+  return { ok: true, note: `🛒 Bought ${item.emoji} **${item.name}** for ${formatSats(price)}. *"${keeperLine(town.keeper.persona, "buy")}"*` };
 }
 
 /** Equip an owned item into its slot (allowed anywhere — gear up before heading out). */

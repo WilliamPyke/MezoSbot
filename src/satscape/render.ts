@@ -9,8 +9,10 @@ import {
 } from "discord.js";
 import { formatSats } from "../format.js";
 import { biomeAt, SAT, viewportBounds } from "./engine.js";
-import { estimateTravel, travelCost, type TravelEstimate } from "./game.js";
-import { lossFor, winChance } from "./items.js";
+import { estimateTravel, travelCost } from "./game.js";
+import { lossFor, winChance, type ItemSlot } from "./items.js";
+import { keeperLine } from "./lines.js";
+import type { QuestView } from "./quests.js";
 import {
   effectivePrice,
   gearScore,
@@ -318,28 +320,42 @@ export function buildComponents(
     ? new ButtonBuilder().setCustomId(sqCid("autostop")).setLabel("Stop").setEmoji("⏹️").setStyle(ButtonStyle.Danger)
     : new ButtonBuilder().setCustomId(sqCid("auto")).setLabel("Auto-Explore").setEmoji("🤖").setStyle(ButtonStyle.Secondary);
 
-  const actionRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId(sqCid("eat")).setLabel("Eat").setEmoji("🍞").setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId(sqCid("travel")).setLabel("Travel").setEmoji("🧭").setStyle(ButtonStyle.Primary),
-    auto,
-  );
+  const steps = Math.max(1, view.player.steps_per_move ?? 1);
+  const stride = steps > 1 ? `×${steps}` : null;
+  const dirBtn = (action: string, emoji: string) => {
+    const b = new ButtonBuilder().setCustomId(sqCid(action)).setEmoji(emoji).setStyle(ButtonStyle.Primary);
+    if (stride) b.setLabel(stride);
+    return b;
+  };
+
+  const rows: ActionRowBuilder<ButtonBuilder>[] = [
+    new ActionRowBuilder<ButtonBuilder>().addComponents(dirBtn("up", "⬆️")),
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      dirBtn("left", "⬅️"),
+      dirBtn("down", "⬇️"),
+      dirBtn("right", "➡️"),
+    ),
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId(sqCid("eat")).setLabel("Eat").setEmoji("🍞").setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId(sqCid("travel")).setLabel("Travel").setEmoji("🧭").setStyle(ButtonStyle.Primary),
+      auto,
+    ),
+    // Utility row — always available, anywhere in the world.
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId(sqCid("settings")).setLabel("Settings").setEmoji("⚙️").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(sqCid("inventory")).setLabel("Inventory").setEmoji("🎒").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(sqCid("quests")).setLabel("Quests").setEmoji("📜").setStyle(ButtonStyle.Secondary),
+    ),
+  ];
   if (townAt(view.player.x_coord, view.player.y_coord)) {
-    actionRow.addComponents(
-      new ButtonBuilder().setCustomId(sqCid("shop")).setLabel("Shop").setEmoji("🛒").setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId(sqCid("roads")).setLabel("Roads").setEmoji("🛣️").setStyle(ButtonStyle.Secondary),
+    rows.push(
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder().setCustomId(sqCid("shop")).setLabel("Shop").setEmoji("🛒").setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId(sqCid("roads")).setLabel("Roads").setEmoji("🛣️").setStyle(ButtonStyle.Secondary),
+      ),
     );
   }
-  return [
-    new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder().setCustomId(sqCid("up")).setEmoji("⬆️").setStyle(ButtonStyle.Primary),
-    ),
-    new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder().setCustomId(sqCid("left")).setEmoji("⬅️").setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId(sqCid("down")).setEmoji("⬇️").setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId(sqCid("right")).setEmoji("➡️").setStyle(ButtonStyle.Primary),
-    ),
-    actionRow,
-  ];
+  return rows;
 }
 
 /* ─────────── shop view (per town / keeper) ─────────── */
@@ -352,15 +368,17 @@ function equippedName(id: string | null): string {
   return it ? `${it.emoji} ${it.name} (+${it.power})` : "—";
 }
 
-export function buildShopEmbed(town: Town, player: SatPlayerRow, hp: number, _ownedIds: string[]): EmbedBuilder {
+export function buildShopEmbed(town: Town, player: SatPlayerRow, hp: number, _ownedIds: string[], rep = 0): EmbedBuilder {
   const gear = gearScore(player);
+  const discount = Math.round((1 - Math.max(0.5, 1 - rep * 0.05)) * 100);
   return new EmbedBuilder()
     .setColor(0x1d4ed8)
     .setTitle(`🛒 ${town.name} — ${town.keeper.name}`)
     .setThumbnail(`attachment://${KEEPER_FILE}`)
     .setDescription(
-      `*"${town.keeper.blurb}"*\n\n` +
+      `*"${keeperLine(town.keeper.persona, "greet")}"*\n\n` +
         `Balance: **${formatSats(hp)}**  ·  Gear score: **${gear}**\n` +
+        `Reputation: **${rep}**${discount > 0 ? ` (−${discount}% prices)` : ""}\n` +
         `Win chance: Lv1 **${Math.round(winChance(gear, 1) * 100)}%** · Lv4 **${Math.round(winChance(gear, 4) * 100)}%** · Lv8 **${Math.round(winChance(gear, 8) * 100)}%**`,
     )
     .addFields(
@@ -368,21 +386,24 @@ export function buildShopEmbed(town: Town, player: SatPlayerRow, hp: number, _ow
       { name: `${SLOT_EMOJI.armor} Armor`, value: equippedName(player.equipped_armor), inline: true },
       { name: `${SLOT_EMOJI.accessory} Accessory`, value: equippedName(player.equipped_accessory), inline: true },
     )
-    .setFooter({ text: `${town.name} stocks gear you can't find elsewhere. Buy above, equip below.` });
+    .setFooter({ text: `${town.name} stocks gear found nowhere else. Earn reputation via quests for discounts & unlocks.` });
 }
 
-export function buildShopComponents(town: Town, ownedIds: string[]): ActionRowBuilder<StringSelectMenuBuilder | ButtonBuilder>[] {
+export function buildShopComponents(town: Town, ownedIds: string[], rep = 0): ActionRowBuilder<StringSelectMenuBuilder | ButtonBuilder>[] {
   const owned = new Set(ownedIds);
   const buy = new StringSelectMenuBuilder()
     .setCustomId(sqCid("buy"))
     .setPlaceholder(`Buy from ${town.keeper.name}…`)
     .addOptions(
-      town.catalog.map((it) => ({
-        label: `${it.name} (+${it.power})${owned.has(it.id) ? " — owned" : ""}`,
-        description: `${effectivePrice(it, town.keeper)} sats · ${it.slot}`,
-        value: it.id,
-        emoji: it.emoji,
-      })),
+      town.catalog.map((it) => {
+        const locked = it.repReq != null && rep < it.repReq;
+        return {
+          label: `${locked ? "🔒 " : ""}${it.name} (+${it.power})${owned.has(it.id) ? " — owned" : ""}`,
+          description: locked ? `locked · needs ${it.repReq} rep` : `${effectivePrice(it, town.keeper, rep)} sats · ${it.slot}`,
+          value: it.id,
+          emoji: it.emoji,
+        };
+      }),
     );
 
   const rows: ActionRowBuilder<StringSelectMenuBuilder | ButtonBuilder>[] = [
@@ -445,4 +466,170 @@ export function buildPortalComponents(currentTown: Town, player: SatPlayerRow): 
       new ButtonBuilder().setCustomId(sqCid("shopclose")).setLabel("Back to map").setEmoji("🗺️").setStyle(ButtonStyle.Primary),
     ),
   ];
+}
+
+/* ─────────── quest board ─────────── */
+
+const QUEST_ICON: Record<string, string> = { available: "⚪", active: "🔄", claimable: "✅", claimed: "☑️" };
+
+function questLine(v: QuestView): string {
+  const icon = QUEST_ICON[v.status] ?? "•";
+  const prog = v.def.type === "tribute"
+    ? `${v.def.target} sats`
+    : v.def.target > 1 && (v.status === "active" || v.status === "claimable")
+      ? ` — ${v.progress}/${v.def.target}`
+      : "";
+  const rw = [v.def.reward.sats ? `${v.def.reward.sats}s` : null, `+${v.def.reward.rep}rep`, v.def.reward.title ? `title` : null, v.def.reward.unlocks ? `unlock` : null].filter(Boolean).join(" ");
+  return `${icon} **${v.def.title}**${prog} — _${v.def.desc}_ (${rw})`;
+}
+
+export function buildQuestEmbed(
+  town: Town,
+  board: { offered: QuestView[]; carry: QuestView[] },
+  rep: number,
+  titles: string[],
+): EmbedBuilder {
+  const embed = new EmbedBuilder()
+    .setColor(0xb45309)
+    .setTitle(`📜 ${town.name} — ${town.keeper.name}'s Quests`)
+    .setThumbnail(`attachment://${KEEPER_FILE}`)
+    .setDescription(`Reputation with ${town.keeper.name}: **${rep}**${titles.length ? `\n🎖️ Titles: ${titles.join(", ")}` : ""}`);
+
+  embed.addFields({ name: "Available here", value: board.offered.map(questLine).join("\n") || "— none —", inline: false });
+  if (board.carry.length) {
+    embed.addFields({ name: "Your journeys", value: board.carry.map(questLine).join("\n"), inline: false });
+  }
+  return embed;
+}
+
+export function buildQuestComponents(board: { offered: QuestView[]; carry: QuestView[] }): ActionRowBuilder<StringSelectMenuBuilder | ButtonBuilder>[] {
+  const rows: ActionRowBuilder<StringSelectMenuBuilder | ButtonBuilder>[] = [];
+
+  const acceptable = board.offered.filter((v) => v.status === "available" && v.def.type !== "tribute");
+  if (acceptable.length) {
+    rows.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+      new StringSelectMenuBuilder().setCustomId(sqCid("qaccept")).setPlaceholder("Accept a quest…")
+        .addOptions(acceptable.map((v) => ({ label: v.def.title, description: v.def.desc.slice(0, 90), value: v.def.key }))),
+    ));
+  }
+
+  const claimable = [...board.offered, ...board.carry].filter((v) => v.status === "claimable");
+  if (claimable.length) {
+    rows.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+      new StringSelectMenuBuilder().setCustomId(sqCid("qclaim")).setPlaceholder("Claim a finished quest…")
+        .addOptions(claimable.map((v) => ({ label: v.def.title, description: "Claim your reward", value: v.def.key, emoji: "🏆" }))),
+    ));
+  }
+
+  const tribute = board.offered.filter((v) => v.def.type === "tribute" && v.status !== "claimed");
+  const lastRow = new ActionRowBuilder<ButtonBuilder>();
+  for (const v of tribute.slice(0, 4)) {
+    lastRow.addComponents(new ButtonBuilder().setCustomId(sqCid("qtribute", v.def.key)).setLabel(`Pay ${v.def.target}`).setEmoji("💰").setStyle(ButtonStyle.Danger));
+  }
+  lastRow.addComponents(new ButtonBuilder().setCustomId(sqCid("shopclose")).setLabel("Back to map").setEmoji("🗺️").setStyle(ButtonStyle.Primary));
+  rows.push(lastRow);
+  return rows;
+}
+
+/* ─────────── settings (cog) ─────────── */
+
+export function buildSettingsEmbed(player: SatPlayerRow, maxSteps: number): EmbedBuilder {
+  const boots = player.equipped_boots ? ITEM_BY_ID.get(player.equipped_boots) : null;
+  const bootLine = boots ? `${boots.emoji} **${boots.name}** (+${boots.stepBonus} tiles · ${boots.rarity})` : "— none equipped —";
+  return new EmbedBuilder()
+    .setColor(0x475569)
+    .setTitle("⚙️ Settings")
+    .setDescription(
+      `**Steps per directional press**\nCurrent: **${player.steps_per_move}** · Max: **${maxSteps}** (8 base + ${maxSteps - 8} from boots)\n\n` +
+        `**Boots**\n${bootLine}`,
+    )
+    .setFooter({ text: "Pick a stride below. Higher = cover ground faster but blow past loot if you're not paying attention." });
+}
+
+export function buildSettingsComponents(player: SatPlayerRow, maxSteps: number): ActionRowBuilder<StringSelectMenuBuilder | ButtonBuilder>[] {
+  const opts = [];
+  for (let i = 1; i <= maxSteps; i++) {
+    opts.push({
+      label: `${i} tile${i === 1 ? "" : "s"} per press`,
+      description: i === player.steps_per_move ? "current" : "",
+      value: String(i),
+      default: i === player.steps_per_move,
+    });
+  }
+  return [
+    new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+      new StringSelectMenuBuilder().setCustomId(sqCid("stepselect")).setPlaceholder("Stride…").addOptions(opts),
+    ),
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId(sqCid("shopclose")).setLabel("Back to map").setEmoji("🗺️").setStyle(ButtonStyle.Primary),
+    ),
+  ];
+}
+
+/* ─────────── inventory ─────────── */
+
+function inventoryListFor(slot: ItemSlot, ownedIds: string[], player: SatPlayerRow): string {
+  const equippedId = slot === "weapon" ? player.equipped_weapon
+    : slot === "armor" ? player.equipped_armor
+    : slot === "accessory" ? player.equipped_accessory
+    : player.equipped_boots;
+  const owned = ownedIds.map((id) => ITEM_BY_ID.get(id)).filter((i): i is NonNullable<typeof i> => !!i && i.slot === slot);
+  if (owned.length === 0) return "— none —";
+  return owned.map((it) => {
+    const star = it.id === equippedId ? "★ " : "  ";
+    const extra = it.slot === "boots" ? ` · +${it.stepBonus} tiles` : ` · +${it.power}`;
+    return `${star}${it.emoji} **${it.name}**${extra}`;
+  }).join("\n");
+}
+
+export function buildInventoryEmbed(player: SatPlayerRow, ownedIds: string[]): EmbedBuilder {
+  return new EmbedBuilder()
+    .setColor(0x475569)
+    .setTitle("🎒 Inventory")
+    .setDescription("★ = currently equipped")
+    .addFields(
+      { name: "🗡️ Weapons", value: inventoryListFor("weapon", ownedIds, player), inline: true },
+      { name: "🛡️ Armor", value: inventoryListFor("armor", ownedIds, player), inline: true },
+      { name: "💍 Accessories", value: inventoryListFor("accessory", ownedIds, player), inline: true },
+      { name: "🥾 Boots", value: inventoryListFor("boots", ownedIds, player), inline: false },
+    );
+}
+
+export function buildInventoryComponents(ownedIds: string[]): ActionRowBuilder<StringSelectMenuBuilder | ButtonBuilder>[] {
+  const rows: ActionRowBuilder<StringSelectMenuBuilder | ButtonBuilder>[] = [];
+  if (ownedIds.length > 0) {
+    rows.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+      new StringSelectMenuBuilder().setCustomId(sqCid("invequip")).setPlaceholder("Equip an item…").addOptions(
+        ownedIds.map((id) => ITEM_BY_ID.get(id))
+          .filter((it): it is NonNullable<typeof it> => !!it)
+          .map((it) => ({
+            label: `${it.name}${it.slot === "boots" ? ` (+${it.stepBonus} tiles)` : ` (+${it.power})`}`,
+            description: `equip as ${it.slot}`,
+            value: it.id,
+            emoji: it.emoji,
+          })),
+      ),
+    ));
+  }
+  rows.push(new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId(sqCid("shopclose")).setLabel("Back to map").setEmoji("🗺️").setStyle(ButtonStyle.Primary),
+  ));
+  return rows;
+}
+
+/* ─────────── active quests (read-only, anywhere) ─────────── */
+
+export function buildActiveQuestsEmbed(carry: QuestView[], titles: string[]): EmbedBuilder {
+  const lines = carry.length ? carry.map(questLine).join("\n") : "— no active quests. Visit a town's quest board to accept one. —";
+  return new EmbedBuilder()
+    .setColor(0xb45309)
+    .setTitle("📜 Your Active Quests")
+    .setDescription(titles.length ? `🎖️ Titles: ${titles.join(", ")}\n\n${lines}` : lines)
+    .setFooter({ text: "Visit a town to accept or claim quests." });
+}
+
+export function buildActiveQuestsComponents(): ActionRowBuilder<ButtonBuilder>[] {
+  return [new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId(sqCid("shopclose")).setLabel("Back to map").setEmoji("🗺️").setStyle(ButtonStyle.Primary),
+  )];
 }

@@ -19,6 +19,7 @@ const profile_js_1 = require("./profile.js");
 const notifications_js_1 = require("./notifications.js");
 const badges_js_1 = require("./badges.js");
 const interactions_js_1 = require("./arcade/interactions.js");
+const interactions_js_2 = require("./satscape/interactions.js");
 const eventQuests_js_1 = require("./eventQuests.js");
 const runtime_js_1 = require("./quests/runtime.js");
 const notify_js_1 = require("./arcade/notify.js");
@@ -282,6 +283,18 @@ client.on(discord_js_1.Events.InteractionCreate, async (interaction) => {
         console.log(`[Discord] Arcade interaction ${cid} from ${tag} (arrivalLag=${arrivalLagMs}ms)`);
         await (0, interactions_js_1.handleArcadeInteraction)(interaction);
         console.log(`[Discord] Arcade ${cid} done in ${Date.now() - startMs}ms`);
+        return;
+    }
+    if ((0, interactions_js_2.isSatscapeInteraction)(interaction)) {
+        const cid = ("customId" in interaction && interaction.customId) || "";
+        console.log(`[Discord] SatScape interaction ${cid} from ${tag} (arrivalLag=${arrivalLagMs}ms)`);
+        try {
+            await (0, interactions_js_2.handleSatscapeInteraction)(interaction);
+        }
+        catch (err) {
+            console.warn(`[SatScape] Interaction ${cid} failed:`, err?.message ?? err);
+        }
+        console.log(`[Discord] SatScape ${cid} done in ${Date.now() - startMs}ms`);
         return;
     }
     if ((0, quest_js_1.isQuestBuilderInteraction)(interaction)) {

@@ -136,40 +136,42 @@ export async function addInventoryItem(discordId: string, itemId: string): Promi
 
 export async function setEquipped(
   discordId: string,
-  slot: "weapon" | "armor" | "accessory",
+  slot: "weapon" | "armor" | "accessory" | "boots",
   itemId: string,
 ): Promise<void> {
-  const col = slot === "weapon" ? "equipped_weapon" : slot === "armor" ? "equipped_armor" : "equipped_accessory";
+  const col = slot === "weapon" ? "equipped_weapon"
+    : slot === "armor" ? "equipped_armor"
+    : slot === "accessory" ? "equipped_accessory"
+    : "equipped_boots";
   await supabase.from("sat_players").update({ [col]: itemId }).eq("discord_id", discordId);
 }
 
 /* ─────────── fog of war ─────────── */
 
-/** Reveal (persist) the vision disc around a coordinate. One bulk upsert. */
-export async function revealAround(discordId: string, cx: number, cy: number): Promise<void> {
+/** Reveal (persist) the shared world vision disc around a coordinate. One bulk upsert. */
+export async function revealAround(_discordId: string, cx: number, cy: number): Promise<void> {
   const r = SAT.SIGHT;
-  const rows: Array<{ discord_id: string; x: number; y: number }> = [];
+  const rows: Array<{ x: number; y: number }> = [];
   for (let dy = -r; dy <= r; dy++) {
     for (let dx = -r; dx <= r; dx++) {
-      if (dx * dx + dy * dy <= r * r + r) rows.push({ discord_id: discordId, x: cx + dx, y: cy + dy });
+      if (dx * dx + dy * dy <= r * r + r) rows.push({ x: cx + dx, y: cy + dy });
     }
   }
   if (rows.length) {
-    await supabase.from("sat_explored").upsert(rows, { onConflict: "discord_id,x,y", ignoreDuplicates: true });
+    await supabase.from("sat_world_explored").upsert(rows, { onConflict: "x,y", ignoreDuplicates: true });
   }
 }
 
 async function exploredInBox(
-  discordId: string,
+  _discordId: string,
   minX: number,
   maxX: number,
   minY: number,
   maxY: number,
 ): Promise<Set<string>> {
   const { data } = await supabase
-    .from("sat_explored")
+    .from("sat_world_explored")
     .select("x, y")
-    .eq("discord_id", discordId)
     .gte("x", minX)
     .lte("x", maxX)
     .gte("y", minY)
@@ -208,6 +210,12 @@ async function clearedInBox(minX: number, maxX: number, minY: number, maxY: numb
   return new Set((data ?? []).map((r) => `${r.x},${r.y}`));
 }
 
+/**
+ * Process-wide cache of discord_id → display name. Names change rarely; caching them
+ * spares us a second `users` query on every tick of the passive map refresh.
+ */
+const userNameCache = new Map<string, string>();
+
 /** Other active adventurers within a bounding box (with display names). */
 async function othersInBox(
   selfId: string,
@@ -228,20 +236,38 @@ async function othersInBox(
     .lte("y_coord", maxY);
   if (!rows || rows.length === 0) return [];
 
-  const ids = rows.map((r) => r.discord_id);
-  const { data: users } = await supabase
-    .from("users")
-    .select("discord_id, username, display_name")
-    .in("discord_id", ids);
-  const nameById = new Map<string, string>();
-  for (const u of users ?? []) nameById.set(u.discord_id, u.display_name || u.username || "Adventurer");
+  // Only look up names we haven't cached yet.
+  const missing = rows.filter((r) => !userNameCache.has(r.discord_id)).map((r) => r.discord_id);
+  if (missing.length > 0) {
+    const { data: users } = await supabase
+      .from("users")
+      .select("discord_id, username, display_name")
+      .in("discord_id", missing);
+    for (const u of users ?? []) {
+      userNameCache.set(u.discord_id, u.display_name || u.username || "Adventurer");
+    }
+  }
 
   return rows.map((r) => ({
-    name: nameById.get(r.discord_id) ?? "Adventurer",
+    name: userNameCache.get(r.discord_id) ?? "Adventurer",
     x: r.x_coord,
     y: r.y_coord,
     state: r.state as PlayerState,
   }));
+}
+
+/**
+ * Lightweight viewport refresh: only the neighbors-in-box query (with name cache).
+ * Cheap path for passive-tick refreshes — everything else in the view is either
+ * driven by the player's own actions or stale-tolerant.
+ */
+export async function loadOthersInView(
+  discordId: string,
+  cx: number,
+  cy: number,
+): Promise<OtherPlayer[]> {
+  const b = viewportBounds(cx, cy);
+  return othersInBox(discordId, b.minX, b.maxX, b.minY, b.maxY);
 }
 
 /** Compute the active (non-cleared) entities visible in the viewport — DB-free except one cleared-set query. */

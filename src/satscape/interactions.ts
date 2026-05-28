@@ -19,21 +19,39 @@ import {
   estimateTravel,
   fight,
   flee,
-  move,
+  maxStepsFor,
+  moveMany,
+  setStepsPerMove,
   travelCost,
   travelTo,
   type ActionResult,
 } from "./game.js";
 import {
+  buildActiveQuestsComponents,
+  buildActiveQuestsEmbed,
+  buildInventoryComponents,
+  buildInventoryEmbed,
   buildKeeperPortrait,
   buildPortalComponents,
   buildPortalEmbed,
+  buildQuestComponents,
+  buildQuestEmbed,
+  buildSettingsComponents,
+  buildSettingsEmbed,
   buildShopComponents,
   buildShopEmbed,
   parseSqCid,
   sqCid,
   SQ_PREFIX,
 } from "./render.js";
+import {
+  acceptQuest,
+  claimQuest,
+  getRep,
+  payTribute,
+  questBoard,
+  titlesFor,
+} from "./quests.js";
 import { render, setAuto, stop, type EditableInteraction } from "./session.js";
 import { TOWN_BY_ID, townAt } from "./towns.js";
 import type { Direction } from "./types.js";
@@ -73,6 +91,10 @@ export async function handleSatscapeInteraction(interaction: Interaction): Promi
       return renderShop(interaction, discordId, res.note);
     }
     if (action === "portalpick") return showPortalConfirm(interaction, discordId, chosen);
+    if (action === "qaccept") return renderQuests(interaction, discordId, (await acceptQuest(discordId, chosen)).note);
+    if (action === "qclaim") return renderQuests(interaction, discordId, (await claimQuest(discordId, chosen)).note);
+    if (action === "invequip") return renderInventory(interaction, discordId, (await equipItem(discordId, chosen)).note);
+    if (action === "stepselect") return renderSettings(interaction, discordId, (await setStepsPerMove(discordId, Number(chosen))).note);
     return;
   }
 
@@ -105,6 +127,25 @@ export async function handleSatscapeInteraction(interaction: Interaction): Promi
     return renderPortals(interaction, discordId);
   }
 
+  // Quest board (in town) / active-quests view (outside town).
+  if (action === "quests") {
+    stop(discordId);
+    const player = await getPlayer(discordId);
+    if (player && townAt(player.x_coord, player.y_coord)) return renderQuests(interaction, discordId);
+    return renderActiveQuests(interaction, discordId);
+  }
+  if (action === "qtribute") return renderQuests(interaction, discordId, (await payTribute(discordId, parts[0])).note);
+
+  // Settings / inventory (utility row, anywhere).
+  if (action === "settings") {
+    stop(discordId);
+    return renderSettings(interaction, discordId);
+  }
+  if (action === "inventory") {
+    stop(discordId);
+    return renderInventory(interaction, discordId);
+  }
+
   // Auto-explore toggles.
   if (action === "auto") {
     setAuto(discordId, true);
@@ -123,9 +164,9 @@ export async function handleSatscapeInteraction(interaction: Interaction): Promi
   }
   if (action === "travelcancel") return render(discordId, interaction, "Travel cancelled.");
 
-  // Movement / combat.
+  // Movement / combat. Directional presses respect the player's steps_per_move.
   let result: ActionResult | null = null;
-  if (DIRECTIONS.has(action)) result = await move(discordId, action as Direction);
+  if (DIRECTIONS.has(action)) result = await moveMany(discordId, action as Direction);
   else if (action === "fight") result = await fight(discordId);
   else if (action === "flee") result = await flee(discordId);
   else if (action === "eat") result = await eat(discordId);
@@ -151,12 +192,82 @@ export async function renderShop(
     await interaction.editReply({ content: "🛒 The shop is only open inside a town.", embeds: [], components: [], files: [] });
     return;
   }
-  const [hp, owned] = await Promise.all([getBalance(discordId), getOwnedItemIds(discordId)]);
+  const [hp, owned, rep] = await Promise.all([getBalance(discordId), getOwnedItemIds(discordId), getRep(discordId, town.id)]);
   await interaction.editReply({
     ...(note !== undefined ? { content: note || "" } : {}),
-    embeds: [buildShopEmbed(town, player, hp, owned)],
-    components: buildShopComponents(town, owned),
+    embeds: [buildShopEmbed(town, player, hp, owned, rep)],
+    components: buildShopComponents(town, owned, rep),
     files: [buildKeeperPortrait(town)],
+  });
+}
+
+/** Open/refresh the quest board for the current town's keeper. */
+export async function renderQuests(interaction: EditableInteraction, discordId: string, note?: string): Promise<void> {
+  const player = await getPlayer(discordId);
+  if (!player) {
+    await interaction.editReply({ content: "Use `/satscape join` first.", embeds: [], components: [], files: [] });
+    return;
+  }
+  const town = townAt(player.x_coord, player.y_coord);
+  if (!town) {
+    await interaction.editReply({ content: "📜 Quest boards are posted in towns.", embeds: [], components: [], files: [] });
+    return;
+  }
+  const [board, rep, titles] = await Promise.all([questBoard(discordId, town.id), getRep(discordId, town.id), titlesFor(discordId)]);
+  await interaction.editReply({
+    ...(note !== undefined ? { content: note || "" } : {}),
+    embeds: [buildQuestEmbed(town, board, rep, titles)],
+    components: buildQuestComponents(board),
+    files: [buildKeeperPortrait(town)],
+  });
+}
+
+/** Read-only active-quests view (used outside towns). */
+export async function renderActiveQuests(interaction: EditableInteraction, discordId: string, note?: string): Promise<void> {
+  const player = await getPlayer(discordId);
+  if (!player) {
+    await interaction.editReply({ content: "Use `/satscape join` first.", embeds: [], components: [], files: [] });
+    return;
+  }
+  // Pass any town id; only `carry` (your active/claimable across keepers) is used here.
+  const [board, titles] = await Promise.all([questBoard(discordId, "rest"), titlesFor(discordId)]);
+  await interaction.editReply({
+    ...(note !== undefined ? { content: note || "" } : {}),
+    embeds: [buildActiveQuestsEmbed(board.carry, titles)],
+    components: buildActiveQuestsComponents(),
+    files: [],
+  });
+}
+
+/** ⚙️ Settings panel — set steps-per-press, view boots/max. */
+export async function renderSettings(interaction: EditableInteraction, discordId: string, note?: string): Promise<void> {
+  const player = await getPlayer(discordId);
+  if (!player) {
+    await interaction.editReply({ content: "Use `/satscape join` first.", embeds: [], components: [], files: [] });
+    return;
+  }
+  const max = maxStepsFor(player);
+  await interaction.editReply({
+    ...(note !== undefined ? { content: note || "" } : {}),
+    embeds: [buildSettingsEmbed(player, max)],
+    components: buildSettingsComponents(player, max),
+    files: [],
+  });
+}
+
+/** 🎒 Inventory panel — view owned gear, equip from anywhere. */
+export async function renderInventory(interaction: EditableInteraction, discordId: string, note?: string): Promise<void> {
+  const player = await getPlayer(discordId);
+  if (!player) {
+    await interaction.editReply({ content: "Use `/satscape join` first.", embeds: [], components: [], files: [] });
+    return;
+  }
+  const owned = await getOwnedItemIds(discordId);
+  await interaction.editReply({
+    ...(note !== undefined ? { content: note || "" } : {}),
+    embeds: [buildInventoryEmbed(player, owned)],
+    components: buildInventoryComponents(owned),
+    files: [],
   });
 }
 

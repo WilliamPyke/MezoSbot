@@ -9,13 +9,15 @@ export const SAT = {
   VIEW_OX: 8, // player column offset from the left edge (so dx ∈ [-8, 7])
   VIEW_OY: 8, // player row offset from the top edge
   REGION_SIZE: 22, // tiles per biome region cell (contiguous zones within a territory)
-  SIGHT: 3, // fog-of-war vision radius around the player
+  SIGHT: 5, // fog-of-war vision radius around the player (~10x10 discovery footprint)
   BUYIN_SATS: 50, // paid on /join, seeds the prize pool
   DEATH_PENALTY_SATS: 50, // taken on faint (clamped to remaining balance)
   CHEST_SPAWN: 0.03, // per-tile spawn probability in the wilds
   MONSTER_SPAWN: 0.08, // cumulative upper bound (monster occupies 0.03..0.08)
   BREAD_STAMINA: 20, // stamina restored per 1-sat loaf
   PORTAL_DISCOUNT: 0.5, // town↔town road/portal travel costs this fraction of the normal fare
+  MAX_STEPS_BASE: 8, // tiles per directional press without boots
+  MAX_STEPS_CAP: 15, // hard ceiling regardless of boots
 } as const;
 
 /** Deterministic [0,1) hash. */

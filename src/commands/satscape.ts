@@ -4,7 +4,7 @@ import { SAT, biomeAt } from "../satscape/engine.js";
 import { chargeBuyIn } from "../satscape/game.js";
 import { getPlayer, startRun } from "../satscape/db.js";
 import { render, stop } from "../satscape/session.js";
-import { renderShop } from "../satscape/interactions.js";
+import { renderQuests, renderShop } from "../satscape/interactions.js";
 
 export const data = {
   name: "satscape",
@@ -24,6 +24,11 @@ export const data = {
       name: "shop",
       type: 1 as const,
       description: "Open the town item shop (must be in town)",
+    },
+    {
+      name: "quests",
+      type: 1 as const,
+      description: "Open the town keeper's quest board (must be in town)",
     },
   ],
 };
@@ -50,13 +55,13 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     return interaction.editReply({ content: "Use `/satscape join` to start a run." });
   }
 
-  if (sub === "shop") {
+  if (sub === "shop" || sub === "quests") {
     const player = await getPlayer(discordId);
     if (biomeAt(player!.x_coord, player!.y_coord) !== "town") {
-      return interaction.editReply({ content: "🛒 The item shop is only open in town (near the origin)." });
+      return interaction.editReply({ content: `${sub === "shop" ? "🛒 The item shop" : "📜 The quest board"} is only available in a town.` });
     }
-    stop(discordId); // pause any live map session while shopping
-    return renderShop(interaction, discordId);
+    stop(discordId); // pause any live map session
+    return sub === "shop" ? renderShop(interaction, discordId) : renderQuests(interaction, discordId);
   }
 
   await render(

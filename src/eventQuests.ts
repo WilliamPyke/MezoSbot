@@ -383,17 +383,6 @@ async function tryAwardQuest(client: Client, quest: EventQuestRow, userId: strin
     customMessage: `Completed event quest: ${quest.event_name}`,
   });
 
-  const channel = await client.channels.fetch(quest.channel_id).catch(() => null);
-  if (channel && "send" in channel) {
-    const embed = new EmbedBuilder()
-      .setColor(0x00cc6a)
-      .setTitle("Quest Reward Earned")
-      .setDescription(`<@${userId}> earned **${formatSats(quest.reward_sats)}** for completing **${quest.event_name}**.`)
-      .setTimestamp();
-
-    await channel.send({ embeds: [embed], allowedMentions: { parse: [] } }).catch(() => {});
-  }
-
   await refreshQuestMessage(client, quest.id);
 }
 

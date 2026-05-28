@@ -55,6 +55,7 @@ const sweep = __importStar(require("./sweep.js"));
 const arcade = __importStar(require("./arcade.js"));
 const quest = __importStar(require("./quest.js"));
 const wallet = __importStar(require("./wallet.js"));
+const satscape = __importStar(require("./satscape.js"));
 const gameboy_js_1 = require("./gameboy.js");
 const config_js_1 = require("../config.js");
 const baseCommands = [
@@ -79,6 +80,7 @@ const baseCommands = [
     arcade,
     quest,
     wallet,
+    satscape,
 ];
 // Merge base commands + gameboy button commands into a single list
 exports.commands = [

@@ -4,9 +4,26 @@ import { supabase } from "../db.js";
 import { biomeAt } from "../satscape/engine.js";
 import { TERRAIN_COLOR, TOWNS } from "../satscape/towns.js";
 
+async function loadExploredTiles(): Promise<Array<{ x: number; y: number }>> {
+  const pageSize = 1000;
+  const tiles: Array<{ x: number; y: number }> = [];
+  for (let from = 0; ; from += pageSize) {
+    const { data, error } = await supabase
+      .from("sat_world_explored")
+      .select("x, y")
+      .order("x", { ascending: true })
+      .order("y", { ascending: true })
+      .range(from, from + pageSize - 1);
+    if (error) throw error;
+    const page = (data ?? []).map((tile) => ({ x: tile.x, y: tile.y }));
+    tiles.push(...page);
+    if (page.length < pageSize) return tiles;
+  }
+}
+
 /**
  * Public, view-only companion map for SatScape. Self-contained HTML+canvas page
- * (no auth) plus a JSON feed. The omniscient spectator view has NO fog of war.
+ * (no auth) plus a JSON feed. Fog is the shared co-op discovery state.
  *
  * Privacy: HP *is* a player's real withdrawable balance, so we never expose
  * absolute sats or discord_id — only display name, coordinates, state, and a
@@ -35,6 +52,8 @@ export async function handleSatscapeWebRequest(
         .eq("active", true)
         .neq("state", "fainted");
       if (error) throw error;
+
+      const explored = await loadExploredTiles();
 
       const ids = (players ?? []).map((p) => p.discord_id);
       const nameById = new Map<string, string>();
@@ -70,6 +89,7 @@ export async function handleSatscapeWebRequest(
         JSON.stringify({
           towns: TOWNS.map((t) => ({ name: t.name, cx: t.cx, cy: t.cy, safeRadius: t.safeRadius, palette: t.palette })),
           terrainColors: TERRAIN_COLOR,
+          explored,
           players: payload,
         }),
       );
@@ -117,7 +137,7 @@ const PAGE_HTML = /* html */ `<!doctype html>
   var canvas = document.getElementById("map");
   var ctx = canvas.getContext("2d");
   var meta = document.getElementById("meta");
-  var state = { towns: [], terrainColors: {}, players: [] };
+  var state = { towns: [], terrainColors: {}, explored: [], exploredKeys: {}, players: [] };
   var scale = 3, ox = 0, oy = 0, dragging = false, lastX = 0, lastY = 0;
 
   function worldToScreen(wx, wy) {
@@ -141,6 +161,8 @@ const PAGE_HTML = /* html */ `<!doctype html>
     return best.palette[idx];
   }
   function color(t) { return state.terrainColors[t] || "#1f2937"; }
+  function key(x, y) { return x + "," + y; }
+  function isExplored(x, y) { return !!state.exploredKeys[key(x, y)]; }
 
   function draw() {
     ctx.fillStyle = "#020617"; ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -151,6 +173,11 @@ const PAGE_HTML = /* html */ `<!doctype html>
     var minTY = Math.floor((0 - cyp) / scale - 0.5), maxTY = Math.ceil((canvas.height - cyp) / scale + 0.5);
     for (var ty = minTY; ty <= maxTY; ty++) {
       for (var tx = minTX; tx <= maxTX; tx++) {
+        if (!isExplored(tx, ty)) {
+          ctx.fillStyle = "#060a14";
+          ctx.fillRect(cxp + (tx - 0.5) * scale, cyp + (ty - 0.5) * scale, scale + 1, scale + 1);
+          continue;
+        }
         ctx.fillStyle = color(biomeAt(tx, ty));
         ctx.fillRect(cxp + (tx - 0.5) * scale, cyp + (ty - 0.5) * scale, scale + 1, scale + 1);
       }
@@ -159,6 +186,7 @@ const PAGE_HTML = /* html */ `<!doctype html>
     // town markers
     ctx.textAlign = "center";
     state.towns.forEach(function (t) {
+      if (!isExplored(t.cx, t.cy)) return;
       var c = worldToScreen(t.cx, t.cy);
       ctx.strokeStyle = "#bfdbfe"; ctx.lineWidth = 2;
       ctx.beginPath(); ctx.arc(c[0], c[1], t.safeRadius * scale, 0, Math.PI * 2); ctx.stroke();
@@ -169,6 +197,7 @@ const PAGE_HTML = /* html */ `<!doctype html>
     // players
     ctx.textAlign = "left";
     state.players.forEach(function (p) {
+      if (!isExplored(p.x, p.y)) return;
       var s = worldToScreen(p.x, p.y);
       ctx.fillStyle = p.state === "combat" ? "#f97316" : "#f43f5e";
       ctx.beginPath(); ctx.arc(s[0], s[1], 5, 0, Math.PI * 2); ctx.fill();
@@ -186,7 +215,9 @@ const PAGE_HTML = /* html */ `<!doctype html>
     fetch("/api/satscape/players").then(function (r) { return r.json(); }).then(function (d) {
       if (d && d.players) {
         state = d;
-        meta.textContent = state.players.length + " adventurer" + (state.players.length === 1 ? "" : "s") + " across " + state.towns.length + " realms";
+        state.exploredKeys = {};
+        (state.explored || []).forEach(function (tile) { state.exploredKeys[key(tile.x, tile.y)] = true; });
+        meta.textContent = state.players.length + " adventurer" + (state.players.length === 1 ? "" : "s") + " - " + (state.explored || []).length + " tiles charted";
       }
       draw();
     }).catch(function () { meta.textContent = "offline"; });

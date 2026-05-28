@@ -28,21 +28,25 @@ export interface Keeper {
   blurb: string;
 }
 
-/** Price a keeper charges for an item (their personality quirk). */
-export function effectivePrice(item: ShopItem, keeper: Keeper): number {
+/** Price a keeper charges for an item: persona quirk × reputation discount. */
+export function effectivePrice(item: ShopItem, keeper: Keeper, rep = 0): number {
+  let base: number;
   switch (keeper.persona) {
-    case "business": return Math.round(item.price * 1.25);
-    case "greedy": return Math.round(item.price * 1.4);
+    case "business": base = item.price * 1.25; break;
+    case "greedy": base = item.price * 1.4; break;
     case "bargain": {
       // "Miscounts" — half the stock is deterministically half-price.
       let h = 0;
       for (const ch of item.id) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
-      return h % 2 === 0 ? Math.round(item.price * 0.5) : item.price;
+      base = h % 2 === 0 ? item.price * 0.5 : item.price;
+      break;
     }
     case "fair":
     default:
-      return item.price;
+      base = item.price;
   }
+  const repMul = Math.max(0.5, 1 - rep * 0.05); // 5% off per rep point, floored at -50%
+  return Math.round(base * repMul);
 }
 
 /* ─────────── towns ─────────── */
@@ -61,9 +65,11 @@ export interface Town {
   catalog: ShopItem[];
 }
 
-/** Build a town's themed 3-item catalogue (one per slot) at a given tier. */
-function catalog(townId: string, power: number, price: number, names: Record<ItemSlot, string>, emoji: Record<ItemSlot, string>): ShopItem[] {
-  return (["weapon", "armor", "accessory"] as ItemSlot[]).map((slot) => ({
+type GearCatalogSlot = Exclude<ItemSlot, "boots">;
+
+/** Build a town's themed 3-item gear catalogue (boots are added separately). */
+function catalog(townId: string, power: number, price: number, names: Record<GearCatalogSlot, string>, emoji: Record<GearCatalogSlot, string>): ShopItem[] {
+  return (["weapon", "armor", "accessory"] as GearCatalogSlot[]).map((slot) => ({
     id: `${townId}_${slot}`,
     name: names[slot],
     slot,
@@ -83,9 +89,12 @@ export const TOWNS: Town[] = [
     monsterColor: "#6b7280",
     monsters: ["Highway Bandit", "Dire Wolf", "Stone Golem"],
     keeper: { name: "Hodlnaur", persona: "business", blurb: "Time is sats. What'll it be?" },
-    catalog: catalog("rest", 3, 40,
-      { weapon: "Iron Shortsword", armor: "Town Guard Vest", accessory: "Copper Band" },
-      { weapon: "🗡️", armor: "🦺", accessory: "💍" }),
+    catalog: [
+      ...catalog("rest", 3, 40,
+        { weapon: "Iron Shortsword", armor: "Town Guard Vest", accessory: "Copper Band" },
+        { weapon: "🗡️", armor: "🦺", accessory: "💍" }),
+      { id: "rest_boots", name: "Worn Boots", slot: "boots", power: 0, price: 60, emoji: "🥾", stepBonus: 1, rarity: "common" },
+    ],
   },
   {
     id: "jaipur",
@@ -96,9 +105,14 @@ export const TOWNS: Town[] = [
     monsterColor: "#b45309",
     monsters: ["Bengal Tiger", "Rakshasa Fiend", "River Naga"],
     keeper: { name: "Ravi the Fair", persona: "fair", blurb: "Browse freely, traveller. Honest prices here." },
-    catalog: catalog("jaipur", 6, 160,
-      { weapon: "Tiger Talwar", armor: "Silk-Steel Kurta", accessory: "Jade Tilak" },
-      { weapon: "⚔️", armor: "🥋", accessory: "🟢" }),
+    catalog: [
+      ...catalog("jaipur", 6, 160,
+        { weapon: "Tiger Talwar", armor: "Silk-Steel Kurta", accessory: "Jade Tilak" },
+        { weapon: "⚔️", armor: "🥋", accessory: "🟢" }),
+      { id: "jaipur_boots", name: "Trail Sandals", slot: "boots", power: 0, price: 200, emoji: "👡", stepBonus: 3, rarity: "uncommon" },
+      // unlocked by the "Tiger Trouble" quest (rep ≥ 3)
+      { id: "jaipur_unlock", name: "Maharaja Blade", slot: "weapon", power: 15, price: 1200, emoji: "👑", repReq: 3 },
+    ],
   },
   {
     id: "dustfall",
@@ -109,9 +123,12 @@ export const TOWNS: Town[] = [
     monsterColor: "#a16207",
     monsters: ["Sand Wraith", "Dune Scorpion", "Mirage Djinn"],
     keeper: { name: "Dim Dougal", persona: "bargain", blurb: "Uhh… prices are whatever. Two-for-one? Sure, why not!" },
-    catalog: catalog("dustfall", 8, 320,
-      { weapon: "Scorpion Khopesh", armor: "Sun-Baked Plate", accessory: "Mirage Charm" },
-      { weapon: "🪒", armor: "🪖", accessory: "🟡" }),
+    catalog: [
+      ...catalog("dustfall", 8, 320,
+        { weapon: "Scorpion Khopesh", armor: "Sun-Baked Plate", accessory: "Mirage Charm" },
+        { weapon: "🪒", armor: "🪖", accessory: "🟡" }),
+      { id: "dustfall_boots", name: "Sand-Strider Greaves", slot: "boots", power: 0, price: 450, emoji: "🩴", stepBonus: 5, rarity: "rare" },
+    ],
   },
   {
     id: "frosthold",
@@ -122,9 +139,12 @@ export const TOWNS: Town[] = [
     monsterColor: "#7c3aed",
     monsters: ["Frost Wyrm", "Ice Revenant", "Yeti"],
     keeper: { name: "Greta the Greedy", persona: "greedy", blurb: "Everything's for sale… at a price you'll hate." },
-    catalog: catalog("frosthold", 11, 640,
-      { weapon: "Frostfang Axe", armor: "Yeti-Hide Coat", accessory: "Aurora Pendant" },
-      { weapon: "🪓", armor: "🧥", accessory: "🔵" }),
+    catalog: [
+      ...catalog("frosthold", 11, 640,
+        { weapon: "Frostfang Axe", armor: "Yeti-Hide Coat", accessory: "Aurora Pendant" },
+        { weapon: "🪓", armor: "🧥", accessory: "🔵" }),
+      { id: "frosthold_boots", name: "Sprinter's Plate", slot: "boots", power: 0, price: 900, emoji: "🥾", stepBonus: 7, rarity: "legendary" },
+    ],
   },
 ];
 
@@ -141,6 +161,13 @@ export function itemPower(id: string | null | undefined): number {
 
 export function gearScore(player: SatPlayerRow): number {
   return itemPower(player.equipped_weapon) + itemPower(player.equipped_armor) + itemPower(player.equipped_accessory);
+}
+
+/** Extra tiles per directional press granted by the equipped boots, if any. */
+export function bootBonus(player: SatPlayerRow): number {
+  const id = player.equipped_boots;
+  if (!id) return 0;
+  return ITEM_BY_ID.get(id)?.stepBonus ?? 0;
 }
 
 /* ─────────── geography ─────────── */

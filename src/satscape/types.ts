@@ -13,6 +13,8 @@ export interface SatPlayerRow {
   equipped_weapon: string | null;
   equipped_armor: string | null;
   equipped_accessory: string | null;
+  equipped_boots: string | null;
+  steps_per_move: number;
   last_move_at: string;
   created_at: string;
 }
@@ -54,5 +56,5 @@ export interface ViewModel {
   entities: TileEntity[]; // active (non-cleared) entities within the viewport
   others: OtherPlayer[]; // other adventurers within the viewport
   combat: CombatSessionRow | null;
-  explored: Set<string>; // revealed tiles ("x,y") within the viewport (fog of war)
+  explored: Set<string>; // shared revealed tiles ("x,y") within the viewport (fog of war)
 }

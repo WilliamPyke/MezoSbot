@@ -18,6 +18,7 @@ const emulator_js_1 = require("./emulator.js");
 const config_js_1 = require("./config.js");
 const web_js_1 = require("./arcade/web.js");
 const routes_js_1 = require("./web/routes.js");
+const satscape_js_1 = require("./web/satscape.js");
 const spectate_js_1 = require("./arcade/spectate.js");
 const db_js_1 = require("./arcade/db.js");
 const deflateAsync = (0, node_util_1.promisify)(node_zlib_1.deflate);
@@ -305,6 +306,11 @@ async function handleHttpRequest(req, res) {
     }
     if (url.pathname.startsWith("/arcade")) {
         const handled = await (0, web_js_1.handleArcadeWebRequest)(req, res, url);
+        if (handled)
+            return;
+    }
+    if (url.pathname === "/satscape" || url.pathname.startsWith("/api/satscape")) {
+        const handled = await (0, satscape_js_1.handleSatscapeWebRequest)(req, res, url);
         if (handled)
             return;
     }

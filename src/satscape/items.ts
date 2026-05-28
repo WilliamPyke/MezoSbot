@@ -1,12 +1,17 @@
-export type ItemSlot = "weapon" | "armor" | "accessory";
+export type ItemSlot = "weapon" | "armor" | "accessory" | "boots";
+
+export type Rarity = "common" | "uncommon" | "rare" | "legendary";
 
 export interface ShopItem {
   id: string;
   name: string;
   slot: ItemSlot;
-  power: number; // contribution to gear score
+  power: number; // contribution to gear score (boots are 0 — mobility only)
   price: number; // base sats (keepers may mark this up/down; flows to the pool)
   emoji: string;
+  repReq?: number; // keeper reputation required to buy (gear unlocked by quests)
+  stepBonus?: number; // boots only: extra tiles per directional press
+  rarity?: Rarity; // display-only flavour
 }
 
 /* ─────────── combat math ─────────── */
