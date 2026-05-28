@@ -10,8 +10,19 @@ import {
 import { formatSats } from "../format.js";
 import { biomeAt, SAT, viewportBounds } from "./engine.js";
 import { estimateTravel, travelCost } from "./game.js";
-import { lossFor, winChance, type ItemSlot } from "./items.js";
+import { type ItemSlot } from "./items.js";
 import { keeperLine } from "./lines.js";
+import {
+  ARENA_SIZE,
+  battleMoveRange,
+  legalBattleMoves,
+  monsterIntent,
+  playerAttackTiles,
+  pointKey,
+  samePoint,
+  weaponFor,
+  type Point,
+} from "./battle.js";
 import type { QuestView } from "./quests.js";
 import {
   effectivePrice,
@@ -40,7 +51,6 @@ export function parseSqCid(customId: string): { action: string; parts: string[] 
 export const MAP_FILE = "satscape-map.webp";
 
 const TILE = 22;
-const LEGEND_H = 22;
 const FOG = "#060a14";
 
 /**
@@ -49,7 +59,7 @@ const FOG = "#060a14";
  * just left, neighbor stands still, etc.) we skip both canvas drawing and
  * re-encoding. Bounded so it never grows without limit.
  */
-const IMG_CACHE_MAX = 32;
+const IMG_CACHE_MAX = 64;
 const mapImageCache = new Map<string, Buffer>();
 
 function cacheMapImage(key: string, buf: Buffer): void {
@@ -61,8 +71,17 @@ function cacheMapImage(key: string, buf: Buffer): void {
   }
 }
 
-/** WebP encode quality; high enough that flat-color tile art looks identical to PNG. */
-const WEBP_QUALITY = 90;
+/** Synchronous cache probe so paint() can decide single-edit vs. two-phase. */
+export function hasMapImageCached(cacheKey: string): boolean {
+  return !!cacheKey && mapImageCache.has(cacheKey);
+}
+
+/**
+ * WebP encode quality. q75 is the sweet spot for flat-color tile art —
+ * indistinguishable from q90 in-game, but typically 25–35 % smaller on the
+ * wire. Drop to q60 if upload latency is still the bottleneck.
+ */
+const WEBP_QUALITY = 75;
 
 function terrainLabel(t: Terrain): string {
   return t === "town" ? "Town" : t.charAt(0).toUpperCase() + t.slice(1);
@@ -91,7 +110,7 @@ export async function buildMapImage(view: ViewModel, cacheKey = ""): Promise<Att
 
   const { player, entities, others, combat, explored } = view;
   const w = SAT.VIEW_W * TILE;
-  const h = SAT.VIEW_H * TILE + LEGEND_H;
+  const h = SAT.VIEW_H * TILE; // no in-image legend — embed's Location field shows the same text
   const canvas = createCanvas(w, h);
   const ctx = canvas.getContext("2d");
   const b = viewportBounds(player.x_coord, player.y_coord);
@@ -191,15 +210,6 @@ export async function buildMapImage(view: ViewModel, cacheKey = ""): Promise<Att
     ctx.fillText("★", cx, cy + 4);
     ctx.textAlign = "left";
   }
-
-  // legend strip
-  ctx.fillStyle = "#0f172a";
-  ctx.fillRect(0, SAT.VIEW_H * TILE, w, LEGEND_H);
-  ctx.fillStyle = "#e2e8f0";
-  ctx.font = "12px sans-serif";
-  // strip emoji (canvas has no colour-emoji font) but keep punctuation like "·"
-  const legend = `${locationLabel(player.x_coord, player.y_coord)}  ·  (${player.x_coord}, ${player.y_coord})`.replace(/\p{Extended_Pictographic}/gu, "").trim();
-  ctx.fillText(legend, 8, SAT.VIEW_H * TILE + 16);
 
   const buf = await canvas.encode("webp", WEBP_QUALITY);
   if (cacheKey) cacheMapImage(cacheKey, buf);
@@ -313,6 +323,12 @@ export async function buildKeeperPortrait(town: Town): Promise<AttachmentBuilder
   return new AttachmentBuilder(buf, { name: KEEPER_FILE });
 }
 
+// Pre-warm every town's keeper portrait at module load — encode work happens
+// in the background on libuv, so the first shop visit per town is instant
+// instead of paying a ~5 ms encode + upload roundtrip then. Errors are
+// swallowed; the lazy path on first real call still works.
+void Promise.all(TOWNS.map((t) => buildKeeperPortrait(t).catch(() => {})));
+
 function bar(value: number, max: number, width = 12): string {
   const ratio = max > 0 ? Math.max(0, Math.min(1, value / max)) : 0;
   const filled = Math.round(ratio * width);
@@ -335,10 +351,10 @@ export function buildMapEmbed(view: ViewModel): EmbedBuilder {
     );
 
   if (combat) {
-    const chance = Math.round(winChance(gearScore(player), combat.monster_level) * 100);
+    const preview = buildBattlePreviewText(view);
     embed.addFields({
       name: `👹 ${combat.monster_name} — level ${combat.monster_level}`,
-      value: `🎯 Win chance: **${chance}%**\n🏆 Loot: up to ${formatSats(combat.reward_sats)} · 🩸 Defeat: −${lossFor(combat.monster_level)} sats`,
+      value: preview,
       inline: false,
     });
   } else if (others.length > 0) {
@@ -348,14 +364,86 @@ export function buildMapEmbed(view: ViewModel): EmbedBuilder {
   return embed;
 }
 
+function buildBattlePreviewText(view: ViewModel): string {
+  const { combat, player } = view;
+  if (!combat) return "";
+  const intent = monsterIntent(combat, player);
+  const weapon = weaponFor(player);
+  const moveRange = battleMoveRange(player);
+  return [
+    renderBattleGrid(view),
+    `**Intent:** ${intent.description}`,
+    `**Weapon:** ${weapon.emoji} ${weapon.name} - ${weapon.summary} (${weapon.damage} dmg)`,
+    `**Monster HP:** ${bar(combat.monster_current_hp, combat.monster_max_hp)} ${combat.monster_current_hp}/${combat.monster_max_hp}`,
+    `**Move:** up to ${moveRange} tile${moveRange === 1 ? "" : "s"} | **Loot:** up to ${formatSats(combat.reward_sats)}`,
+    "`P` you | `M` monster after move | `!` incoming hit | `o` legal destination",
+  ].join("\n");
+}
+
+function renderBattleGrid(view: ViewModel): string {
+  const { combat, player } = view;
+  if (!combat) return "";
+  const intent = monsterIntent(combat, player);
+  const danger = new Set(intent.attackTiles.map(pointKey));
+  const legal = new Set(legalBattleMoves(combat, player).map(pointKey));
+  const p = { x: combat.player_battle_x, y: combat.player_battle_y };
+  const m = intent.to;
+  const rows = ["  A B C D E F G H"];
+  for (let y = 0; y < ARENA_SIZE; y++) {
+    const cells = [];
+    for (let x = 0; x < ARENA_SIZE; x++) {
+      const pt = { x, y };
+      const key = pointKey(pt);
+      if (samePoint(pt, p)) cells.push("P");
+      else if (samePoint(pt, m)) cells.push("M");
+      else if (danger.has(key)) cells.push("!");
+      else if (legal.has(key)) cells.push("o");
+      else cells.push(".");
+    }
+    rows.push(`${y + 1} ${cells.join(" ")}`);
+  }
+  return `\`\`\`\n${rows.join("\n")}\n\`\`\``;
+}
+
+function buildBattleMoveSelect(view: ViewModel): StringSelectMenuBuilder {
+  const { combat, player } = view;
+  if (!combat) {
+    return new StringSelectMenuBuilder().setCustomId(sqCid("battlemove")).setPlaceholder("No battle");
+  }
+  const intent = monsterIntent(combat, player);
+  const danger = new Set(intent.attackTiles.map(pointKey));
+  const weapon = weaponFor(player);
+  const monsterPos = intent.to;
+  const options = legalBattleMoves(combat, player).map((p) => {
+    const risky = danger.has(pointKey(p)) || samePoint(p, monsterPos);
+    const hits = playerAttackTiles(p, monsterPos, weapon).some((tile) => samePoint(tile, monsterPos)) || samePoint(p, monsterPos);
+    const label = `${arenaLabel(p)} ${risky ? "danger" : "safe"}${hits ? " + hit" : ""}`;
+    return {
+      label: label.slice(0, 100),
+      description: `${risky ? "Will take the telegraphed hit" : "Dodges the telegraph"}; ${hits ? "weapon can connect" : "weapon will miss"}`,
+      value: pointKey(p),
+      emoji: risky ? "⚠️" : hits ? weapon.emoji : "👣",
+      default: p.x === combat.player_battle_x && p.y === combat.player_battle_y,
+    };
+  });
+  return new StringSelectMenuBuilder()
+    .setCustomId(sqCid("battlemove"))
+    .setPlaceholder(`Move, then strike with ${weapon.name}...`)
+    .addOptions(options.slice(0, 25));
+}
+
+function arenaLabel(p: Point): string {
+  return `${String.fromCharCode(65 + p.x)}${p.y + 1}`;
+}
+
 export function buildComponents(
   view: ViewModel,
   opts: { autoExploring?: boolean } = {},
-): ActionRowBuilder<ButtonBuilder>[] {
+): ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>[] {
   if (view.combat) {
     return [
+      new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(buildBattleMoveSelect(view)),
       new ActionRowBuilder<ButtonBuilder>().addComponents(
-        new ButtonBuilder().setCustomId(sqCid("fight")).setLabel("Fight").setEmoji("⚔️").setStyle(ButtonStyle.Danger),
         new ButtonBuilder().setCustomId(sqCid("flee")).setLabel("Flee").setEmoji("🏃").setStyle(ButtonStyle.Secondary),
       ),
     ];
@@ -372,7 +460,7 @@ export function buildComponents(
     return b;
   };
 
-  const rows: ActionRowBuilder<ButtonBuilder>[] = [
+  const rows: ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>[] = [
     new ActionRowBuilder<ButtonBuilder>().addComponents(dirBtn("up", "⬆️")),
     new ActionRowBuilder<ButtonBuilder>().addComponents(
       dirBtn("left", "⬅️"),
@@ -414,6 +502,8 @@ function equippedName(id: string | null): string {
 
 export function buildShopEmbed(town: Town, player: SatPlayerRow, hp: number, _ownedIds: string[], rep = 0): EmbedBuilder {
   const gear = gearScore(player);
+  const weapon = weaponFor(player);
+  const move = battleMoveRange(player);
   const discount = Math.round((1 - Math.max(0.5, 1 - rep * 0.05)) * 100);
   return new EmbedBuilder()
     .setColor(0x1d4ed8)
@@ -423,7 +513,7 @@ export function buildShopEmbed(town: Town, player: SatPlayerRow, hp: number, _ow
       `*"${keeperLine(town.keeper.persona, "greet")}"*\n\n` +
         `Balance: **${formatSats(hp)}**  ·  Gear score: **${gear}**\n` +
         `Reputation: **${rep}**${discount > 0 ? ` (−${discount}% prices)` : ""}\n` +
-        `Win chance: Lv1 **${Math.round(winChance(gear, 1) * 100)}%** · Lv4 **${Math.round(winChance(gear, 4) * 100)}%** · Lv8 **${Math.round(winChance(gear, 8) * 100)}%**`,
+        `Battle: **${weapon.name}** (${weapon.summary}, ${weapon.damage} dmg) · Move **${move}**`,
     )
     .addFields(
       { name: `${SLOT_EMOJI.weapon} Weapon`, value: equippedName(player.equipped_weapon), inline: true },

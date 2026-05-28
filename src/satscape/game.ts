@@ -14,10 +14,11 @@ import {
   revealAround,
   setEquipped,
   setStateIf,
+  updateCombat,
   updatePlayer,
 } from "./db.js";
-import { lossFor, winChance } from "./items.js";
-import { bootBonus, effectivePrice, gearScore, ITEM_BY_ID, nearestTown, townAt } from "./towns.js";
+import { battleMoveRange, legalBattleMoves, monsterIntent, playerAttackTiles, samePoint, startingBattlePositions, weaponFor } from "./battle.js";
+import { bootBonus, effectivePrice, ITEM_BY_ID, nearestTown, townAt } from "./towns.js";
 import { getRep, onArriveTown, onCombatWin } from "./quests.js";
 import { keeperLine } from "./lines.js";
 import type { Direction, SatPlayerRow } from "./types.js";
@@ -38,6 +39,10 @@ const DELTA: Record<Direction, [number, number]> = {
   left: [-1, 0],
   right: [1, 0],
 };
+
+function arenaLabel(x: number, y: number): string {
+  return `${String.fromCharCode(65 + x)}${y + 1}`;
+}
 
 /** The most tiles a single directional press can cover, given equipped boots. */
 export function maxStepsFor(player: SatPlayerRow): number {
@@ -88,7 +93,7 @@ export async function moveMany(discordId: string, dir: Direction): Promise<Actio
 export async function move(discordId: string, dir: Direction): Promise<ActionResult> {
   const player = await getPlayer(discordId);
   if (!player || !player.active) return { ok: false, note: "Use `/satscape join` to start a run first." };
-  if (player.state === "combat") return { ok: false, note: "You're in combat — Attack or Flee." };
+  if (player.state === "combat") return { ok: false, note: "You're in combat — pick a battle move or flee." };
 
   const [dx, dy] = DELTA[dir];
   const nx = player.x_coord + dx;
@@ -149,34 +154,66 @@ export async function resolveTile(discordId: string, x: number, y: number): Prom
     return { ok: true, note: "Something interrupted you." };
   }
   const m = entity.data as { name: string; level: number; reward: number };
+  const positions = startingBattlePositions(x, y);
+  const monsterHp = 18 + m.level * 8;
   await createCombat({
     discord_id: discordId,
     monster_name: m.name,
     monster_level: m.level,
-    monster_max_hp: 1,
-    monster_current_hp: 1,
-    monster_attack: 0,
+    monster_max_hp: monsterHp,
+    monster_current_hp: monsterHp,
+    monster_attack: 3 + m.level * 2,
     reward_sats: m.reward,
     enemy_x: x,
     enemy_y: y,
+    player_battle_x: positions.player.x,
+    player_battle_y: positions.player.y,
+    monster_battle_x: positions.monster.x,
+    monster_battle_y: positions.monster.y,
     turn_number: 1,
     created_at: new Date().toISOString(),
   });
   return { ok: true, note: `👹 A level ${m.level} **${m.name}** blocks your path!`, enteredCombat: true };
 }
 
-/**
- * One decisive fight: a single win-chance roll (gear vs monster level). Winning
- * loots the pool and clears the tile; losing costs level-scaled sats but the
- * monster stays, so you can re-roll, equip up, or flee. A loss that empties the
- * wallet faints you.
- */
-export async function fight(discordId: string): Promise<ActionResult> {
+/** Resolve one tactical arena turn: move, dodge the telegraph, then strike. */
+export async function battleTurn(discordId: string, destX: number, destY: number): Promise<ActionResult> {
   const [combat, player] = await Promise.all([getCombat(discordId), getPlayer(discordId)]);
   if (!combat || !player) return { ok: false, note: "No active fight." };
 
-  const chance = winChance(gearScore(player), combat.monster_level);
-  if (Math.random() < chance) {
+  const destination = { x: destX, y: destY };
+  const legal = legalBattleMoves(combat, player);
+  if (!legal.some((p) => samePoint(p, destination))) {
+    return { ok: false, note: `Pick a highlighted destination within your move range (${battleMoveRange(player)}).` };
+  }
+
+  const intent = monsterIntent(combat, player);
+  const weapon = weaponFor(player);
+  const monsterPos = intent.to;
+  const bodyChecked = samePoint(destination, monsterPos);
+  const wasHit = bodyChecked || intent.attackTiles.some((p) => samePoint(p, destination));
+  const hitTiles = playerAttackTiles(destination, monsterPos, weapon);
+  const hitMonster = hitTiles.some((p) => samePoint(p, monsterPos)) || bodyChecked;
+
+  let note = `Moved to **${arenaLabel(destination.x, destination.y)}**.`;
+  if (wasHit) {
+    const lost = await takeDamage(discordId, intent.damage);
+    note += ` 🩸 ${combat.monster_name}'s ${intent.name} hit you for ${lost} sats.`;
+    if ((await getBalance(discordId)) <= 0) {
+      return { ok: true, note: `${note} ` + (await faint(discordId)).note };
+    }
+  } else {
+    note += ` ✨ Dodged ${combat.monster_name}'s ${intent.name}.`;
+  }
+
+  const nextHp = hitMonster ? Math.max(0, combat.monster_current_hp - weapon.damage) : combat.monster_current_hp;
+  if (hitMonster) {
+    note += ` ${weapon.emoji} ${weapon.name} landed for **${weapon.damage}**.`;
+  } else {
+    note += ` ${weapon.emoji} ${weapon.name} missed.`;
+  }
+
+  if (nextHp <= 0) {
     const granted = await payoutFromPool(discordId, combat.reward_sats);
     await clearTile(combat.enemy_x, combat.enemy_y);
     await deleteCombat(discordId);
@@ -184,19 +221,28 @@ export async function fight(discordId: string): Promise<ActionResult> {
     await onCombatWin(discordId, combat.monster_level); // advance bounty quests
     return {
       ok: true,
-      note: `🏆 You defeated the **${combat.monster_name}**! ` +
+      note: `${note}\n🏆 You defeated the **${combat.monster_name}**! ` +
         (granted > 0 ? `Looted **${formatSats(granted)}**.` : "(Prize pool was empty — no loot.)"),
     };
   }
 
-  const lost = await takeDamage(discordId, lossFor(combat.monster_level));
-  if ((await getBalance(discordId)) <= 0) {
-    return { ok: true, note: `🩸 The **${combat.monster_name}** bested you… ` + (await faint(discordId)).note };
-  }
-  return {
-    ok: true,
-    note: `🩸 The **${combat.monster_name}** bested you — lost ${lost} sats. It's still here; fight again or flee.`,
-  };
+  await updateCombat(discordId, {
+    player_battle_x: destination.x,
+    player_battle_y: destination.y,
+    monster_battle_x: monsterPos.x,
+    monster_battle_y: monsterPos.y,
+    monster_current_hp: nextHp,
+    turn_number: combat.turn_number + 1,
+  });
+  return { ok: true, note };
+}
+
+/** Back-compat for older smoke helpers: take the first legal tactical move. */
+export async function fight(discordId: string): Promise<ActionResult> {
+  const [combat, player] = await Promise.all([getCombat(discordId), getPlayer(discordId)]);
+  if (!combat || !player) return { ok: false, note: "No active fight." };
+  const choice = legalBattleMoves(combat, player)[0] ?? { x: combat.player_battle_x, y: combat.player_battle_y };
+  return battleTurn(discordId, choice.x, choice.y);
 }
 
 export async function flee(discordId: string): Promise<ActionResult> {

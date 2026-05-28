@@ -29,6 +29,10 @@ export interface CombatSessionRow {
   reward_sats: number;
   enemy_x: number;
   enemy_y: number;
+  player_battle_x: number;
+  player_battle_y: number;
+  monster_battle_x: number;
+  monster_battle_y: number;
   turn_number: number;
   created_at: string;
 }
