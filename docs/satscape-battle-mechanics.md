@@ -1,27 +1,23 @@
 # SatScape Tactical Battle Mechanics
 
-Monster encounters now open an 8x8 tactical arena inside the Discord embed.
+Monster encounters replace the normal map image with an 8x8 tactical arena.
 
 ## Turn Loop
 
 1. The monster telegraphs its next intent.
-2. The embed marks incoming hit tiles with `!`.
-3. The player chooses one legal destination from the move menu.
-4. The monster moves and attacks the telegraphed pattern.
-5. The player attacks toward the monster with their equipped weapon.
+2. The battle image paints incoming monster danger in red.
+3. The player moves with the arrow buttons. Green tiles show reachable movement.
+4. The player chooses a weapon from the weapon menu. Blue tiles preview that weapon's attack.
+5. Pressing Attack resolves the monster telegraph, then the player's selected weapon.
 6. If the monster reaches 0 HP, the world tile is cleared and loot pays out from the prize pool.
 
-## Arena Symbols
+## Arena Colors
 
-```txt
-P = player
-M = monster after its telegraphed move
-! = incoming monster attack
-o = legal player destination
-. = empty tile
-```
-
-Columns are labeled `A-H`; rows are labeled `1-8`, so destinations look like `D6`.
+- Green: reachable movement tiles
+- Red: incoming monster attack
+- Blue: current weapon attack preview
+- White/blue marker: player
+- Monster sprite: monster's telegraphed destination
 
 ## Movement
 
@@ -31,11 +27,11 @@ Base battle movement is 1 tile per turn. Boots improve tactical movement, capped
 - Mid-tier boots: 2 tiles
 - High-tier boots: 3 tiles
 
-The player selects a destination within Manhattan distance of their current tile. The menu labels whether that destination dodges the telegraph and whether the equipped weapon can hit from there.
+The player moves one tile per arrow press until their movement for the turn is spent. Attack ends the turn and refreshes movement for the next telegraph.
 
 ## Weapons
 
-The current shop weapons map to tactical attack shapes:
+The current shop weapons map to tactical attack shapes and can be selected during battle:
 
 - No weapon: Training Dagger, 1 tile toward the monster
 - Iron Shortsword: Longsword, 2 tiles in a line

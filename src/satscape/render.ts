@@ -14,12 +14,13 @@ import { type ItemSlot } from "./items.js";
 import { keeperLine } from "./lines.js";
 import {
   ARENA_SIZE,
+  battleMovePoints,
   battleMoveRange,
   legalBattleMoves,
   monsterIntent,
   playerAttackTiles,
   pointKey,
-  samePoint,
+  selectedWeaponId,
   weaponFor,
   type Point,
 } from "./battle.js";
@@ -106,6 +107,12 @@ export async function buildMapImage(view: ViewModel, cacheKey = ""): Promise<Att
   if (cacheKey) {
     const hit = mapImageCache.get(cacheKey);
     if (hit) return new AttachmentBuilder(hit, { name: MAP_FILE });
+  }
+
+  if (view.combat) {
+    const image = await buildBattleImage(view);
+    if (cacheKey) cacheMapImage(cacheKey, image);
+    return new AttachmentBuilder(image, { name: MAP_FILE });
   }
 
   const { player, entities, others, combat, explored } = view;
@@ -217,6 +224,88 @@ export async function buildMapImage(view: ViewModel, cacheKey = ""): Promise<Att
 }
 
 /* ─────────── sprites (drawn procedurally — no binary art) ─────────── */
+
+async function buildBattleImage(view: ViewModel): Promise<Buffer> {
+  const combat = view.combat;
+  if (!combat) throw new Error("No combat to render");
+
+  const size = SAT.VIEW_W * TILE;
+  const tile = size / ARENA_SIZE;
+  const canvas = createCanvas(size, size);
+  const ctx = canvas.getContext("2d");
+  const intent = monsterIntent(combat, view.player);
+  const weapon = weaponFor(view.player, selectedWeaponId(combat, view.player));
+  const player = { x: combat.player_battle_x, y: combat.player_battle_y };
+  const monster = intent.to;
+  const legal = new Set(legalBattleMoves(combat, view.player).map(pointKey));
+  const danger = new Set(intent.attackTiles.map(pointKey));
+  const attack = new Set(playerAttackTiles(player, monster, weapon).map(pointKey));
+  const town = nearestTown(combat.enemy_x, combat.enemy_y).town;
+
+  ctx.fillStyle = "#07111f";
+  ctx.fillRect(0, 0, size, size);
+
+  for (let y = 0; y < ARENA_SIZE; y++) {
+    for (let x = 0; x < ARENA_SIZE; x++) {
+      const key = `${x},${y}`;
+      const px = x * tile;
+      const py = y * tile;
+      ctx.fillStyle = TERRAIN_COLOR[biomeAt(combat.enemy_x + x - 4, combat.enemy_y + y - 4)];
+      ctx.fillRect(px, py, tile, tile);
+
+      if (legal.has(key)) {
+        ctx.fillStyle = "rgba(34,197,94,0.30)";
+        ctx.fillRect(px, py, tile, tile);
+      }
+      if (attack.has(key)) {
+        ctx.fillStyle = "rgba(56,189,248,0.40)";
+        ctx.fillRect(px, py, tile, tile);
+      }
+      if (danger.has(key)) {
+        ctx.fillStyle = "rgba(239,68,68,0.52)";
+        ctx.fillRect(px, py, tile, tile);
+      }
+
+      ctx.strokeStyle = "rgba(15,23,42,0.45)";
+      ctx.lineWidth = 1;
+      ctx.strokeRect(px + 0.5, py + 0.5, tile - 1, tile - 1);
+    }
+  }
+
+  drawTileOutlines(ctx, [...attack].map(keyToPoint), tile, "#38bdf8", 3);
+  drawTileOutlines(ctx, [...danger].map(keyToPoint), tile, "#ef4444", 3);
+
+  const playerCx = player.x * tile + tile / 2;
+  const playerCy = player.y * tile + tile / 2;
+  ctx.fillStyle = "#f8fafc";
+  ctx.beginPath();
+  ctx.arc(playerCx, playerCy, tile * 0.28, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = "#2563eb";
+  ctx.lineWidth = 4;
+  ctx.stroke();
+  ctx.fillStyle = "#0f172a";
+  ctx.beginPath();
+  ctx.arc(playerCx, playerCy - tile * 0.06, tile * 0.08, 0, Math.PI * 2);
+  ctx.fill();
+
+  drawMonster(ctx, monster.x * tile + tile / 2, monster.y * tile + tile / 2, town.monsterColor, nameVariant(combat.monster_name));
+
+  return canvas.encode("webp", WEBP_QUALITY);
+}
+
+function keyToPoint(key: string): Point {
+  const [x, y] = key.split(",").map(Number);
+  return { x, y };
+}
+
+function drawTileOutlines(ctx: SKRSContext2D, points: Point[], tile: number, color: string, width: number): void {
+  ctx.strokeStyle = color;
+  ctx.lineWidth = width;
+  for (const p of points) {
+    ctx.strokeRect(p.x * tile + width / 2, p.y * tile + width / 2, tile - width, tile - width);
+  }
+}
 
 const ROBE: Record<KeeperPersona, string> = {
   business: "#1e40af",
@@ -368,72 +457,45 @@ function buildBattlePreviewText(view: ViewModel): string {
   const { combat, player } = view;
   if (!combat) return "";
   const intent = monsterIntent(combat, player);
-  const weapon = weaponFor(player);
-  const moveRange = battleMoveRange(player);
+  const weapon = weaponFor(player, selectedWeaponId(combat, player));
+  const moveLeft = battleMovePoints(combat, player);
   return [
-    renderBattleGrid(view),
     `**Intent:** ${intent.description}`,
     `**Weapon:** ${weapon.emoji} ${weapon.name} - ${weapon.summary} (${weapon.damage} dmg)`,
     `**Monster HP:** ${bar(combat.monster_current_hp, combat.monster_max_hp)} ${combat.monster_current_hp}/${combat.monster_max_hp}`,
-    `**Move:** up to ${moveRange} tile${moveRange === 1 ? "" : "s"} | **Loot:** up to ${formatSats(combat.reward_sats)}`,
-    "`P` you | `M` monster after move | `!` incoming hit | `o` legal destination",
+    `**Move left:** ${moveLeft} | **Loot:** up to ${formatSats(combat.reward_sats)}`,
+    "Red tiles are danger. Blue tiles are your attack preview. Green tiles are reachable.",
   ].join("\n");
 }
 
-function renderBattleGrid(view: ViewModel): string {
-  const { combat, player } = view;
-  if (!combat) return "";
-  const intent = monsterIntent(combat, player);
-  const danger = new Set(intent.attackTiles.map(pointKey));
-  const legal = new Set(legalBattleMoves(combat, player).map(pointKey));
-  const p = { x: combat.player_battle_x, y: combat.player_battle_y };
-  const m = intent.to;
-  const rows = ["  A B C D E F G H"];
-  for (let y = 0; y < ARENA_SIZE; y++) {
-    const cells = [];
-    for (let x = 0; x < ARENA_SIZE; x++) {
-      const pt = { x, y };
-      const key = pointKey(pt);
-      if (samePoint(pt, p)) cells.push("P");
-      else if (samePoint(pt, m)) cells.push("M");
-      else if (danger.has(key)) cells.push("!");
-      else if (legal.has(key)) cells.push("o");
-      else cells.push(".");
-    }
-    rows.push(`${y + 1} ${cells.join(" ")}`);
-  }
-  return `\`\`\`\n${rows.join("\n")}\n\`\`\``;
+function dirButton(action: string, label: string): ButtonBuilder {
+  const emoji = action === "up" ? "⬆️" : action === "down" ? "⬇️" : action === "left" ? "⬅️" : "➡️";
+  return new ButtonBuilder().setCustomId(sqCid(action)).setLabel(label).setEmoji(emoji).setStyle(ButtonStyle.Primary);
 }
 
-function buildBattleMoveSelect(view: ViewModel): StringSelectMenuBuilder {
-  const { combat, player } = view;
-  if (!combat) {
-    return new StringSelectMenuBuilder().setCustomId(sqCid("battlemove")).setPlaceholder("No battle");
-  }
-  const intent = monsterIntent(combat, player);
-  const danger = new Set(intent.attackTiles.map(pointKey));
-  const weapon = weaponFor(player);
-  const monsterPos = intent.to;
-  const options = legalBattleMoves(combat, player).map((p) => {
-    const risky = danger.has(pointKey(p)) || samePoint(p, monsterPos);
-    const hits = playerAttackTiles(p, monsterPos, weapon).some((tile) => samePoint(tile, monsterPos)) || samePoint(p, monsterPos);
-    const label = `${arenaLabel(p)} ${risky ? "danger" : "safe"}${hits ? " + hit" : ""}`;
-    return {
-      label: label.slice(0, 100),
-      description: `${risky ? "Will take the telegraphed hit" : "Dodges the telegraph"}; ${hits ? "weapon can connect" : "weapon will miss"}`,
-      value: pointKey(p),
-      emoji: risky ? "⚠️" : hits ? weapon.emoji : "👣",
-      default: p.x === combat.player_battle_x && p.y === combat.player_battle_y,
-    };
-  });
+function buildBattleWeaponSelect(view: ViewModel): StringSelectMenuBuilder | null {
+  const combat = view.combat;
+  if (!combat) return null;
+  const weapons = view.ownedItemIds
+    .map((id) => ITEM_BY_ID.get(id))
+    .filter((it): it is NonNullable<typeof it> => !!it && it.slot === "weapon")
+    .slice(0, 25);
+  if (weapons.length === 0) return null;
+
+  const selected = selectedWeaponId(combat, view.player);
   return new StringSelectMenuBuilder()
-    .setCustomId(sqCid("battlemove"))
-    .setPlaceholder(`Move, then strike with ${weapon.name}...`)
-    .addOptions(options.slice(0, 25));
-}
-
-function arenaLabel(p: Point): string {
-  return `${String.fromCharCode(65 + p.x)}${p.y + 1}`;
+    .setCustomId(sqCid("battleweapon"))
+    .setPlaceholder("Choose weapon preview...")
+    .addOptions(weapons.map((it) => {
+      const profile = weaponFor(view.player, it.id);
+      return {
+        label: it.name,
+        description: `${profile.summary} - ${profile.damage} dmg`,
+        value: it.id,
+        emoji: it.emoji,
+        default: it.id === selected,
+      };
+    }));
 }
 
 export function buildComponents(
@@ -441,12 +503,21 @@ export function buildComponents(
   opts: { autoExploring?: boolean } = {},
 ): ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>[] {
   if (view.combat) {
-    return [
-      new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(buildBattleMoveSelect(view)),
+    const rows: ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>[] = [
+      new ActionRowBuilder<ButtonBuilder>().addComponents(dirButton("up", "Up")),
       new ActionRowBuilder<ButtonBuilder>().addComponents(
-        new ButtonBuilder().setCustomId(sqCid("flee")).setLabel("Flee").setEmoji("🏃").setStyle(ButtonStyle.Secondary),
+        dirButton("left", "Left"),
+        dirButton("down", "Down"),
+        dirButton("right", "Right"),
       ),
     ];
+    const weaponSelect = buildBattleWeaponSelect(view);
+    if (weaponSelect) rows.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(weaponSelect));
+    rows.push(new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId(sqCid("battleattack")).setLabel("Attack").setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId(sqCid("flee")).setLabel("Flee").setStyle(ButtonStyle.Secondary),
+    ));
+    return rows;
   }
   const auto = opts.autoExploring
     ? new ButtonBuilder().setCustomId(sqCid("autostop")).setLabel("Stop").setEmoji("⏹️").setStyle(ButtonStyle.Danger)

@@ -8,6 +8,7 @@ import {
   createCombat,
   deleteCombat,
   getCombat,
+  getOwnedItemIds,
   getPlayer,
   isTileCleared,
   ownsItem,
@@ -17,7 +18,7 @@ import {
   updateCombat,
   updatePlayer,
 } from "./db.js";
-import { battleMoveRange, legalBattleMoves, monsterIntent, playerAttackTiles, samePoint, startingBattlePositions, weaponFor } from "./battle.js";
+import { battleMovePoints, battleMoveRange, legalBattleMoves, monsterIntent, moveByButton, playerAttackTiles, samePoint, selectedWeaponId, startingBattlePositions, weaponFor, type BattleMove } from "./battle.js";
 import { bootBonus, effectivePrice, ITEM_BY_ID, nearestTown, townAt } from "./towns.js";
 import { getRep, onArriveTown, onCombatWin } from "./quests.js";
 import { keeperLine } from "./lines.js";
@@ -154,6 +155,7 @@ export async function resolveTile(discordId: string, x: number, y: number): Prom
     return { ok: true, note: "Something interrupted you." };
   }
   const m = entity.data as { name: string; level: number; reward: number };
+  const fighter = await getPlayer(discordId);
   const positions = startingBattlePositions(x, y);
   const monsterHp = 18 + m.level * 8;
   await createCombat({
@@ -170,25 +172,44 @@ export async function resolveTile(discordId: string, x: number, y: number): Prom
     player_battle_y: positions.player.y,
     monster_battle_x: positions.monster.x,
     monster_battle_y: positions.monster.y,
+    battle_move_points: fighter ? battleMoveRange(fighter) : 1,
+    selected_battle_weapon: null,
     turn_number: 1,
     created_at: new Date().toISOString(),
   });
   return { ok: true, note: `👹 A level ${m.level} **${m.name}** blocks your path!`, enteredCombat: true };
 }
 
-/** Resolve one tactical arena turn: move, dodge the telegraph, then strike. */
-export async function battleTurn(discordId: string, destX: number, destY: number): Promise<ActionResult> {
+/** Preview movement inside combat. Arrows spend movement; Attack resolves the turn. */
+export async function battleMove(discordId: string, move: BattleMove): Promise<ActionResult> {
+  const [combat, player] = await Promise.all([getCombat(discordId), getPlayer(discordId)]);
+  if (!combat || !player) return { ok: false, note: "No active fight." };
+  const points = battleMovePoints(combat, player);
+  if (points <= 0) return { ok: false, note: "No movement left this turn. Attack or flee." };
+
+  const destination = moveByButton(combat, move, player);
+  const monster = { x: combat.monster_battle_x, y: combat.monster_battle_y };
+  if (samePoint(destination, monster)) return { ok: false, note: "The monster blocks that tile." };
+  if (samePoint(destination, { x: combat.player_battle_x, y: combat.player_battle_y })) {
+    return { ok: false, note: "You are already at the edge of the arena." };
+  }
+
+  await updateCombat(discordId, {
+    player_battle_x: destination.x,
+    player_battle_y: destination.y,
+    battle_move_points: points - 1,
+  });
+  return { ok: true, note: `Moved to **${arenaLabel(destination.x, destination.y)}**. ${points - 1} move left.` };
+}
+
+/** Resolve the monster telegraph and the currently selected weapon. */
+export async function battleAttack(discordId: string): Promise<ActionResult> {
   const [combat, player] = await Promise.all([getCombat(discordId), getPlayer(discordId)]);
   if (!combat || !player) return { ok: false, note: "No active fight." };
 
-  const destination = { x: destX, y: destY };
-  const legal = legalBattleMoves(combat, player);
-  if (!legal.some((p) => samePoint(p, destination))) {
-    return { ok: false, note: `Pick a highlighted destination within your move range (${battleMoveRange(player)}).` };
-  }
-
+  const destination = { x: combat.player_battle_x, y: combat.player_battle_y };
   const intent = monsterIntent(combat, player);
-  const weapon = weaponFor(player);
+  const weapon = weaponFor(player, selectedWeaponId(combat, player));
   const monsterPos = intent.to;
   const bodyChecked = samePoint(destination, monsterPos);
   const wasHit = bodyChecked || intent.attackTiles.some((p) => samePoint(p, destination));
@@ -232,9 +253,25 @@ export async function battleTurn(discordId: string, destX: number, destY: number
     monster_battle_x: monsterPos.x,
     monster_battle_y: monsterPos.y,
     monster_current_hp: nextHp,
+    battle_move_points: battleMoveRange(player),
     turn_number: combat.turn_number + 1,
   });
   return { ok: true, note };
+}
+
+export async function selectBattleWeapon(discordId: string, itemId: string): Promise<ActionResult> {
+  const [combat, player, owned] = await Promise.all([getCombat(discordId), getPlayer(discordId), getOwnedItemIds(discordId)]);
+  if (!combat || !player) return { ok: false, note: "No active fight." };
+  if (!owned.includes(itemId)) return { ok: false, note: "You don't own that weapon." };
+  const item = ITEM_BY_ID.get(itemId);
+  if (!item || item.slot !== "weapon") return { ok: false, note: "That is not a weapon." };
+  await updateCombat(discordId, { selected_battle_weapon: itemId });
+  return { ok: true, note: `Readied ${item.emoji} **${item.name}**.` };
+}
+
+/** Back-compat for older callers: attack from the current preview position. */
+export async function battleTurn(discordId: string, _destX: number, _destY: number): Promise<ActionResult> {
+  return battleAttack(discordId);
 }
 
 /** Back-compat for older smoke helpers: take the first legal tactical move. */

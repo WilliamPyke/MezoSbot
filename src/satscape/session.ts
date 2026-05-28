@@ -6,7 +6,7 @@ import type {
 } from "discord.js";
 import { loadOthersInView, loadView } from "./db.js";
 import { move } from "./game.js";
-import { buildComponents, buildMapEmbed, buildMapImage } from "./render.js";
+import { buildComponents, buildMapEmbed, buildMapImage, hasMapImageCached } from "./render.js";
 import type { Direction, ViewModel } from "./types.js";
 
 /** Any SatScape interaction we deferUpdate then editReply on. */
@@ -163,6 +163,17 @@ async function paint(session: Session, view: ViewModel, note?: string): Promise<
     return;
   }
 
+  // (2.5) Cache-hit fast path: encode is effectively free, so collapse to a
+  // SINGLE editReply (text + image in one HTTP call). Saves a full roundtrip
+  // versus two-phase — biggest single-press snappiness win when revisiting
+  // tiles or when speculative pre-encoding has populated the cache.
+  if (hasMapImageCached(visualSig)) {
+    const image = await buildMapImage(view, visualSig); // resolves instantly from cache
+    await interaction.editReply({ ...baseEdit, files: [image] });
+    session.lastVisualSig = visualSig;
+    return;
+  }
+
   // (3) Two-phase: text first for snap, image follow-up. Run both concurrently.
   session.paintGen += 1;
   const gen = session.paintGen;
@@ -304,7 +315,10 @@ function toVisualSig(view: ViewModel | null): string {
   if (!view) return "";
   const ents = view.entities.map((e) => `${e.type}@${e.x},${e.y}`).sort().join("|");
   const others = view.others.map((o) => `${o.state[0]}@${o.x},${o.y}`).sort().join("|");
-  return `${view.player.x_coord},${view.player.y_coord};${view.combat ? "c" : "i"};${ents};${others}`;
+  const combat = view.combat
+    ? `c:${view.combat.turn_number}:${view.combat.monster_current_hp}:${view.combat.player_battle_x},${view.combat.player_battle_y}:${view.combat.monster_battle_x},${view.combat.monster_battle_y}:${view.combat.battle_move_points}:${view.combat.selected_battle_weapon ?? ""}`
+    : "i";
+  return `${view.player.x_coord},${view.player.y_coord};${combat};${ents};${others}`;
 }
 
 /** Cheap fingerprint of what's on screen, to detect changes between ticks. */
@@ -314,6 +328,8 @@ function toSig(view: ViewModel | null): string {
     .map((o) => `${o.name}@${o.x},${o.y}:${o.state}`)
     .sort()
     .join("|");
-  const combat = view.combat ? `${view.combat.monster_name}:${view.combat.monster_current_hp}` : "";
+  const combat = view.combat
+    ? `${view.combat.monster_name}:${view.combat.turn_number}:${view.combat.monster_current_hp}:${view.combat.player_battle_x},${view.combat.player_battle_y}:${view.combat.monster_battle_x},${view.combat.monster_battle_y}:${view.combat.battle_move_points}:${view.combat.selected_battle_weapon ?? ""}`
+    : "";
   return `${view.player.x_coord},${view.player.y_coord};${view.hp};${view.player.hunger};${combat};${others}`;
 }

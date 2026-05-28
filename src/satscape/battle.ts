@@ -75,6 +75,10 @@ export function battleMoveRange(player: SatPlayerRow): number {
   return Math.min(3, 1 + Math.floor(bootBonus(player) / 3));
 }
 
+export function battleMovePoints(combat: CombatSessionRow, player: SatPlayerRow): number {
+  return Math.max(0, Math.min(battleMoveRange(player), combat.battle_move_points ?? battleMoveRange(player)));
+}
+
 export function startingBattlePositions(worldX: number, worldY: number): {
   player: Point;
   monster: Point;
@@ -89,7 +93,7 @@ export function startingBattlePositions(worldX: number, worldY: number): {
 export function legalBattleMoves(combat: CombatSessionRow, player: SatPlayerRow): Point[] {
   const origin = { x: combat.player_battle_x, y: combat.player_battle_y };
   const occupied = { x: combat.monster_battle_x, y: combat.monster_battle_y };
-  const range = battleMoveRange(player);
+  const range = battleMovePoints(combat, player);
   const out: Point[] = [];
   for (let y = 0; y < ARENA_SIZE; y++) {
     for (let x = 0; x < ARENA_SIZE; x++) {
@@ -102,16 +106,20 @@ export function legalBattleMoves(combat: CombatSessionRow, player: SatPlayerRow)
 }
 
 export function moveByButton(combat: CombatSessionRow, move: BattleMove, player: SatPlayerRow): Point {
-  const range = battleMoveRange(player);
   const d = MOVE_DELTA[move];
   return {
-    x: clampArena(combat.player_battle_x + d.x * range),
-    y: clampArena(combat.player_battle_y + d.y * range),
+    x: clampArena(combat.player_battle_x + d.x),
+    y: clampArena(combat.player_battle_y + d.y),
   };
 }
 
-export function weaponFor(player: SatPlayerRow): WeaponProfile {
-  const item = player.equipped_weapon ? ITEM_BY_ID.get(player.equipped_weapon) : null;
+export function selectedWeaponId(combat: CombatSessionRow | null, player: SatPlayerRow): string | null {
+  return combat?.selected_battle_weapon ?? player.equipped_weapon ?? null;
+}
+
+export function weaponFor(player: SatPlayerRow, weaponId?: string | null): WeaponProfile {
+  const id = weaponId === undefined ? player.equipped_weapon : weaponId;
+  const item = id ? ITEM_BY_ID.get(id) : null;
   const pattern = weaponPatternFor(item);
   const power = item?.power ?? 0;
   const damage = Math.max(5, Math.round(5 + power * 1.2));

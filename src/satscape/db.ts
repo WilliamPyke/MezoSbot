@@ -295,13 +295,14 @@ export async function loadView(discordId: string): Promise<ViewModel | null> {
   const player = await getPlayer(discordId);
   if (!player) return null;
   const b = viewportBounds(player.x_coord, player.y_coord);
-  const [hp, combat, entities, others, explored] = await Promise.all([
+  const [hp, combat, entities, others, explored, ownedItemIds] = await Promise.all([
     getBalance(discordId),
     getCombat(discordId),
     loadViewportEntities(player.x_coord, player.y_coord),
     othersInBox(discordId, b.minX, b.maxX, b.minY, b.maxY),
     exploredInBox(discordId, b.minX, b.maxX, b.minY, b.maxY),
+    getOwnedItemIds(discordId),
   ]);
   await refreshDisplayMaxHp(player, hp);
-  return { player, hp, entities, others, combat, explored };
+  return { player, hp, entities, others, combat, ownedItemIds, explored };
 }

@@ -14,7 +14,8 @@ import { SAT } from "./engine.js";
 import { getOwnedItemIds, getPlayer } from "./db.js";
 import {
   buyItem,
-  battleTurn,
+  battleAttack,
+  battleMove,
   eat,
   equipItem,
   estimateTravel,
@@ -24,6 +25,7 @@ import {
   setStepsPerMove,
   travelCost,
   travelTo,
+  selectBattleWeapon,
   type ActionResult,
 } from "./game.js";
 import {
@@ -95,10 +97,7 @@ export async function handleSatscapeInteraction(interaction: Interaction): Promi
     if (action === "qclaim") return renderQuests(interaction, discordId, (await claimQuest(discordId, chosen)).note);
     if (action === "invequip") return renderInventory(interaction, discordId, (await equipItem(discordId, chosen)).note);
     if (action === "stepselect") return renderSettings(interaction, discordId, (await setStepsPerMove(discordId, Number(chosen))).note);
-    if (action === "battlemove") {
-      const [x, y] = chosen.split(",").map(Number);
-      return render(discordId, interaction, (await battleTurn(discordId, x, y)).note);
-    }
+    if (action === "battleweapon") return render(discordId, interaction, (await selectBattleWeapon(discordId, chosen)).note);
     return;
   }
 
@@ -168,9 +167,15 @@ export async function handleSatscapeInteraction(interaction: Interaction): Promi
   }
   if (action === "travelcancel") return render(discordId, interaction, "Travel cancelled.");
 
-  // Movement / combat. Directional presses respect the player's steps_per_move.
+  // Movement / combat. Directional presses move in the battle arena while fighting.
   let result: ActionResult | null = null;
-  if (DIRECTIONS.has(action)) result = await moveMany(discordId, action as Direction);
+  if (DIRECTIONS.has(action)) {
+    const player = await getPlayer(discordId);
+    result = player?.state === "combat"
+      ? await battleMove(discordId, action as Direction)
+      : await moveMany(discordId, action as Direction);
+  }
+  else if (action === "battleattack") result = await battleAttack(discordId);
   else if (action === "flee") result = await flee(discordId);
   else if (action === "eat") result = await eat(discordId);
   if (!result) return;

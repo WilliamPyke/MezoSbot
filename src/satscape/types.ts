@@ -33,6 +33,8 @@ export interface CombatSessionRow {
   player_battle_y: number;
   monster_battle_x: number;
   monster_battle_y: number;
+  battle_move_points: number;
+  selected_battle_weapon: string | null;
   turn_number: number;
   created_at: string;
 }
@@ -60,5 +62,6 @@ export interface ViewModel {
   entities: TileEntity[]; // active (non-cleared) entities within the viewport
   others: OtherPlayer[]; // other adventurers within the viewport
   combat: CombatSessionRow | null;
+  ownedItemIds: string[]; // inventory ids used for combat weapon menus
   explored: Set<string>; // shared revealed tiles ("x,y") within the viewport (fog of war)
 }
