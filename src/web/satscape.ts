@@ -511,6 +511,15 @@ const PLAY_HTML = /* html */ `<!doctype html>
   .item:first-child { border-top:0; padding-top:0; }
   .muted { color:var(--muted); font-size:12px; }
   .note { min-height:34px; max-height:86px; overflow:auto; color:#dbeafe; white-space:pre-wrap; font-size:13px; }
+  .turn-track { display:grid; gap:6px; margin-top:8px; }
+  .turn-step { border:1px solid var(--line); border-radius:6px; padding:6px; background:#111820; font-size:12px; }
+  .turn-step.attack { border-color:#fb7185; color:#fecdd3; }
+  .turn-step.advance { border-color:#facc15; color:#fef08a; }
+  .turn-step.rest { color:#cbd5e1; }
+  .turn-slot { display:inline-flex; align-items:center; justify-content:center; min-width:42px; height:30px; margin:0 4px 4px 0; border:1px solid var(--line); border-radius:6px; background:#111820; font-size:12px; }
+  .turn-slot.filled { border-color:#60a5fa; color:#dbeafe; }
+  .toggle { display:flex; align-items:center; gap:7px; margin-top:7px; color:var(--muted); font-size:12px; }
+  .toggle input { width:auto; }
   @media (max-width: 860px) { .app { grid-template-columns:1fr; } .side { max-height:none; overflow:visible; } canvas { max-height:none; } }
 </style>
 </head>
@@ -548,10 +557,14 @@ const PLAY_HTML = /* html */ `<!doctype html>
       <div class="row" style="margin-top:6px"><select id="strikeMode"></select><button id="strike" class="primary">Strike</button></div>
       <div class="row" style="margin-top:6px"><select id="weapon"></select><button id="weaponBtn">Ready</button></div>
       <div class="row" style="margin-top:6px"><button id="wait">Wait</button><button id="undo">Undo</button><button id="resolve" class="primary">Resolve</button><button id="flee" class="danger">Flee</button></div>
+      <div class="muted" id="battleTurnText" style="margin-top:7px"></div>
+      <div id="battlePlan" style="margin-top:6px"></div>
+      <div class="turn-track" id="monsterPlan"></div>
     </div>
     <div class="panel">
       <h2>Travel</h2>
       <div class="row"><input id="tx" type="number" placeholder="x"><input id="ty" type="number" placeholder="y"></div>
+      <label class="toggle"><input id="clickTravel" type="checkbox"> Click map to fast travel</label>
       <div class="row" style="margin-top:6px"><button id="estimate">Estimate</button><button id="travel" class="primary">Travel</button></div>
       <div class="muted" id="travelText"></div>
     </div>
@@ -566,6 +579,8 @@ const PLAY_HTML = /* html */ `<!doctype html>
   var token = new URLSearchParams(location.search).get("t") || localStorage.getItem("satscapeToken") || "";
   if (token) localStorage.setItem("satscapeToken", token);
   var state = null, activeTab = location.hash === "#quests" ? "quests" : location.hash === "#shop" ? "shop" : "gear";
+  var clickTravel = false, showWorldMap = false, battleAnimStart = performance.now(), lastCombatKey = "";
+  var reduceMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   var play = document.getElementById("play"), ctx = play.getContext("2d");
   var minimap = document.getElementById("minimap"), mini = minimap.getContext("2d");
   var note = document.getElementById("note");
@@ -575,6 +590,8 @@ const PLAY_HTML = /* html */ `<!doctype html>
   }
   function setState(s) {
     state = s.state || s;
+    var combatKey = state && state.combat ? state.combat.turn + ":" + state.combat.monster.hp + ":" + (state.combat.plan || []).length : "";
+    if (combatKey !== lastCombatKey) { battleAnimStart = performance.now(); lastCombatKey = combatKey; }
     if (s.estimate) {
       document.getElementById("travelText").textContent = s.estimate.steps + " steps, " + s.estimate.breadNeeded + " bread, " + s.estimate.satCost + " sats.";
     }
@@ -624,11 +641,23 @@ const PLAY_HTML = /* html */ `<!doctype html>
     var c = state && state.combat;
     if(!c) return;
     var s = play.width / 8;
+    var intents = c.intents || [];
+    var frameMs = 1200;
+    var anim = reduceMotion || !intents.length ? 0 : (performance.now() - battleAnimStart) % (frameMs * intents.length);
+    var active = intents.length ? Math.floor(anim / frameMs) : 0;
+    var local = reduceMotion || !intents.length ? 0 : (anim % frameMs) / frameMs;
+    var pulse = reduceMotion ? 0.35 : 0.25 + Math.sin(local * Math.PI) * 0.35;
     ctx.fillStyle="#10151c"; ctx.fillRect(0,0,play.width,play.height);
     for(var y=0;y<8;y++) for(var x=0;x<8;x++){ ctx.fillStyle=(x+y)%2?"#17212c":"#1f2a36"; ctx.fillRect(x*s,y*s,s,s); ctx.strokeStyle="#304052"; ctx.strokeRect(x*s,y*s,s,s); }
-    (c.intents||[]).forEach(function(intent){
-      (intent.attackTiles||[]).forEach(function(t){ ctx.fillStyle="rgba(248,113,113,.55)"; ctx.fillRect(t.x*s,t.y*s,s,s); });
-      ctx.fillStyle="#facc15"; ctx.font="14px sans-serif"; ctx.fillText(String(intent.order), intent.to.x*s+6, intent.to.y*s+16);
+    intents.forEach(function(intent, idx){
+      var isActive = idx === active;
+      if(intent.attackTiles && intent.attackTiles.length){
+        intent.attackTiles.forEach(function(t){ ctx.fillStyle=isActive ? "rgba(248,113,113," + (0.38 + pulse) + ")" : "rgba(248,113,113,.24)"; ctx.fillRect(t.x*s,t.y*s,s,s); });
+      }
+      ctx.strokeStyle = intent.act === "attack" ? "#fb7185" : intent.act === "advance" ? "#facc15" : "#64748b";
+      ctx.lineWidth = isActive ? 4 : 2;
+      ctx.beginPath(); ctx.moveTo(intent.from.x*s+s/2,intent.from.y*s+s/2); ctx.lineTo(intent.to.x*s+s/2,intent.to.y*s+s/2); ctx.stroke();
+      ctx.fillStyle = isActive ? "#f8fafc" : "#facc15"; ctx.font="bold 14px sans-serif"; ctx.fillText(String(intent.order), intent.to.x*s+6, intent.to.y*s+16);
     });
     if(c.projected){
       ctx.strokeStyle="#fde047"; ctx.lineWidth=3; ctx.setLineDash([6,4]);
@@ -636,40 +665,107 @@ const PLAY_HTML = /* html */ `<!doctype html>
     }
     ctx.fillStyle="#60a5fa"; ctx.beginPath(); ctx.arc(c.player.x*s+s/2,c.player.y*s+s/2,s*.28,0,Math.PI*2); ctx.fill();
     if(c.projected && (c.projected.x !== c.player.x || c.projected.y !== c.player.y)){ ctx.fillStyle="#93c5fd"; ctx.beginPath(); ctx.arc(c.projected.x*s+s/2,c.projected.y*s+s/2,s*.2,0,Math.PI*2); ctx.fill(); }
-    ctx.fillStyle="#fb923c"; ctx.beginPath(); ctx.arc(c.monster.x*s+s/2,c.monster.y*s+s/2,s*.3,0,Math.PI*2); ctx.fill();
+    var monsterDraw = { x:c.monster.x, y:c.monster.y };
+    var activeIntent = intents[active];
+    if(activeIntent && !reduceMotion){
+      var ease = 1 - Math.pow(1 - Math.min(1, local * 1.35), 3);
+      monsterDraw.x = activeIntent.from.x + (activeIntent.to.x - activeIntent.from.x) * ease;
+      monsterDraw.y = activeIntent.from.y + (activeIntent.to.y - activeIntent.from.y) * ease;
+    }
+    ctx.fillStyle="#fb923c"; ctx.beginPath(); ctx.arc(monsterDraw.x*s+s/2,monsterDraw.y*s+s/2,s*.3,0,Math.PI*2); ctx.fill();
+    if(activeIntent && activeIntent.act === "attack" && !reduceMotion){ ctx.strokeStyle="rgba(248,113,113," + (0.55 + pulse * 0.4) + ")"; ctx.lineWidth=4; ctx.beginPath(); ctx.arc(monsterDraw.x*s+s/2,monsterDraw.y*s+s/2,s*(.38 + pulse*.16),0,Math.PI*2); ctx.stroke(); }
     ctx.fillStyle="#e5e7eb"; ctx.font="14px sans-serif"; ctx.fillText(c.monster.name + " " + c.monster.hp + "/" + c.monster.maxHp, 10, play.height - 12);
   }
-  function drawMinimap(){
-    if(!state) return;
+  function drawKnownMap(target, width, height, pad, labels){
     var tiles = state.minimap && state.minimap.explored || [];
-    var p = state.player, b = state.viewport.bounds, pad = 8;
-    mini.fillStyle = "#070b11"; mini.fillRect(0,0,minimap.width,minimap.height);
+    var p = state.player, b = state.viewport.bounds;
+    target.fillStyle = "#070b11"; target.fillRect(0,0,width,height);
     if(!tiles.length) return;
     var minX=p.x, maxX=p.x, minY=p.y, maxY=p.y;
     tiles.forEach(function(t){ if(t.x<minX)minX=t.x; if(t.x>maxX)maxX=t.x; if(t.y<minY)minY=t.y; if(t.y>maxY)maxY=t.y; });
     (state.minimap.towns||[]).forEach(function(t){ if(t.cx<minX)minX=t.cx; if(t.cx>maxX)maxX=t.cx; if(t.cy<minY)minY=t.cy; if(t.cy>maxY)maxY=t.cy; });
-    var sx = (minimap.width - pad*2) / Math.max(1, maxX - minX + 1);
-    var sy = (minimap.height - pad*2) / Math.max(1, maxY - minY + 1);
-    var scale = Math.max(1, Math.min(sx, sy));
-    var ox = (minimap.width - (maxX - minX + 1) * scale) / 2;
-    var oy = (minimap.height - (maxY - minY + 1) * scale) / 2;
+    var sx = (width - pad*2) / Math.max(1, maxX - minX + 1);
+    var sy = (height - pad*2) / Math.max(1, maxY - minY + 1);
+    var scale = Math.min(sx, sy);
+    if(!Number.isFinite(scale) || scale <= 0) scale = 1;
+    var ox = (width - (maxX - minX + 1) * scale) / 2;
+    var oy = (height - (maxY - minY + 1) * scale) / 2;
     function mx(x){ return ox + (x - minX) * scale; }
     function my(y){ return oy + (y - minY) * scale; }
     tiles.forEach(function(t){
       var inView = t.x >= b.minX && t.x <= b.maxX && t.y >= b.minY && t.y <= b.maxY;
-      mini.globalAlpha = inView ? 1 : 0.28;
-      mini.fillStyle = state.viewport.terrainColors[biomeAt(t.x,t.y)] || "#334155";
-      mini.fillRect(mx(t.x), my(t.y), Math.ceil(scale), Math.ceil(scale));
+      target.globalAlpha = inView ? 1 : 0.32;
+      target.fillStyle = state.viewport.terrainColors[biomeAt(t.x,t.y)] || "#334155";
+      target.fillRect(mx(t.x), my(t.y), Math.max(1, Math.ceil(scale)), Math.max(1, Math.ceil(scale)));
     });
-    mini.globalAlpha = 1;
-    mini.strokeStyle = "#f8fafc"; mini.lineWidth = 1.5;
-    mini.strokeRect(mx(b.minX), my(b.minY), (b.maxX - b.minX + 1) * scale, (b.maxY - b.minY + 1) * scale);
+    target.globalAlpha = 1;
+    target.strokeStyle = "#f8fafc"; target.lineWidth = labels ? 2 : 1.5;
+    target.strokeRect(mx(b.minX), my(b.minY), (b.maxX - b.minX + 1) * scale, (b.maxY - b.minY + 1) * scale);
     (state.minimap.towns||[]).forEach(function(t){
-      mini.fillStyle = "#bfdbfe";
-      mini.fillRect(mx(t.cx)-2, my(t.cy)-2, 4, 4);
+      target.fillStyle = "#bfdbfe";
+      target.fillRect(mx(t.cx)-3, my(t.cy)-3, 6, 6);
+      if(labels && scale > 2){
+        target.fillStyle = "#e5e7eb";
+        target.font = "12px sans-serif";
+        target.fillText(t.name, mx(t.cx) + 6, my(t.cy) - 6);
+      }
     });
-    mini.fillStyle = "#fb7185";
-    mini.beginPath(); mini.arc(mx(p.x)+scale/2, my(p.y)+scale/2, 4, 0, Math.PI*2); mini.fill();
+    target.fillStyle = "#fb7185";
+    target.beginPath(); target.arc(mx(p.x)+scale/2, my(p.y)+scale/2, labels ? 7 : 4, 0, Math.PI*2); target.fill();
+    if(labels){
+      target.strokeStyle = "#f8fafc"; target.lineWidth = 2; target.stroke();
+      target.fillStyle = "rgba(7,11,17,.78)"; target.fillRect(10, 10, 168, 26);
+      target.fillStyle = "#e5e7eb"; target.font = "13px sans-serif"; target.fillText("Hold M: world map", 18, 28);
+    }
+  }
+  function drawMinimap(){
+    if(!state) return;
+    drawKnownMap(mini, minimap.width, minimap.height, 8, false);
+  }
+  function drawExpandedMap(){
+    if(!state) return;
+    drawKnownMap(ctx, play.width, play.height, 18, true);
+  }
+  function tileLabel(p){ return String.fromCharCode(65 + p.x) + (p.y + 1); }
+  function actionLabel(a){
+    if(!a) return "Empty";
+    if(a.kind === "move") return a.dir.charAt(0).toUpperCase() + a.dir.slice(1);
+    if(a.kind === "strike") return "Strike " + a.mode;
+    return "Wait";
+  }
+  function renderBattleSummary(){
+    var c = state && state.combat, planEl = document.getElementById("battlePlan"), monsterEl = document.getElementById("monsterPlan"), turnEl = document.getElementById("battleTurnText");
+    planEl.innerHTML = ""; monsterEl.innerHTML = "";
+    if(!c){
+      turnEl.textContent = "Not in combat.";
+      document.getElementById("resolve").disabled = true;
+      document.querySelectorAll("[data-bmove]").forEach(function(b){ b.disabled = true; });
+      document.getElementById("strike").disabled = true;
+      document.getElementById("wait").disabled = true;
+      document.getElementById("undo").disabled = true;
+      return;
+    }
+    var plan = c.plan || [], full = plan.length >= 3;
+    turnEl.textContent = full ? "Turn " + c.turn + " ready. Resolve to play all 3 actions." : "Turn " + c.turn + ": choose " + (3 - plan.length) + " more action" + (3 - plan.length === 1 ? "" : "s") + ".";
+    for(var i=0;i<3;i++){
+      var slot = document.createElement("span");
+      slot.className = "turn-slot" + (plan[i] ? " filled" : "");
+      slot.textContent = (i + 1) + ". " + actionLabel(plan[i]);
+      planEl.appendChild(slot);
+    }
+    (c.intents || []).forEach(function(intent){
+      var el = document.createElement("div");
+      el.className = "turn-step " + intent.act;
+      var target = tileLabel(intent.to);
+      var detail = intent.act === "attack" ? "hits " + (intent.attackTiles || []).length + " tiles for " + intent.damage + " dmg" : intent.description;
+      el.textContent = intent.order + ". " + intent.name + " -> " + target + " - " + detail;
+      monsterEl.appendChild(el);
+    });
+    document.getElementById("resolve").disabled = !full;
+    document.querySelectorAll("[data-bmove]").forEach(function(b){ b.disabled = full; });
+    document.getElementById("strike").disabled = full;
+    document.getElementById("wait").disabled = full;
+    document.getElementById("undo").disabled = plan.length === 0;
   }
   function renderPanels(){
     var p = state.player, needed = Math.max(0, Math.min(p.maxHp - p.hp, p.balance - p.hp));
@@ -686,6 +782,8 @@ const PLAY_HTML = /* html */ `<!doctype html>
     ((state.combat && state.combat.attackModes) || []).forEach(function(m){ var o=document.createElement("option"); o.value=m.mode; o.textContent=m.name; sm.appendChild(o); });
     var weap = document.getElementById("weapon"); weap.innerHTML = "";
     (state.inventory.items||[]).filter(function(i){ return i.slot === "weapon"; }).forEach(function(i){ var o=document.createElement("option"); o.value=i.id; o.textContent=i.name; weap.appendChild(o); });
+    if(state.combat && state.combat.selectedWeaponId) weap.value = state.combat.selectedWeaponId;
+    renderBattleSummary();
     renderList();
   }
   function renderList(){
@@ -704,7 +802,7 @@ const PLAY_HTML = /* html */ `<!doctype html>
     }
   }
   function addItem(label, button, cb){ var el=document.createElement("div"); el.className="item"; var s=document.createElement("span"); s.textContent=label; var b=document.createElement("button"); b.textContent=button; b.onclick=cb; el.appendChild(s); el.appendChild(b); document.getElementById("list").appendChild(el); }
-  function render(){ if(!state || state.error) return; if(state.combat) drawBattle(); else drawMap(); drawMinimap(); renderPanels(); }
+  function render(){ if(!state || state.error) return; if(showWorldMap) drawExpandedMap(); else if(state.combat) drawBattle(); else drawMap(); drawMinimap(); renderPanels(); }
   document.querySelectorAll("[data-move]").forEach(function(b){ b.onclick=function(){ act("/satscape/api/move", { dir:b.dataset.move }); }; });
   document.querySelectorAll("[data-bmove]").forEach(function(b){ b.onclick=function(){ act("/satscape/api/battle", { action:"move", dir:b.dataset.bmove }); }; });
   document.getElementById("eat").onclick=function(){ act("/satscape/api/eat", {}); };
@@ -718,20 +816,31 @@ const PLAY_HTML = /* html */ `<!doctype html>
   document.getElementById("flee").onclick=function(){ act("/satscape/api/battle", { action:"flee" }); };
   document.getElementById("estimate").onclick=function(){ act("/satscape/api/travel", { estimate:true, tx:Number(document.getElementById("tx").value), ty:Number(document.getElementById("ty").value) }); };
   document.getElementById("travel").onclick=function(){ act("/satscape/api/travel", { tx:Number(document.getElementById("tx").value), ty:Number(document.getElementById("ty").value) }); };
+  document.getElementById("clickTravel").onchange=function(e){ clickTravel = !!e.target.checked; document.getElementById("travelText").textContent = clickTravel ? "Click any visible map tile to travel immediately." : ""; };
   play.addEventListener("click", function(e){
-    if(!state || state.combat) return;
+    if(!state || state.combat || showWorldMap) return;
     var r = play.getBoundingClientRect(), b = state.viewport.bounds;
     var x = Math.floor((e.clientX - r.left) / r.width * 16) + b.minX;
     var y = Math.floor((e.clientY - r.top) / r.height * 16) + b.minY;
     document.getElementById("tx").value = String(x);
     document.getElementById("ty").value = String(y);
-    document.getElementById("travelText").textContent = "Target set to (" + x + ", " + y + ").";
+    if(clickTravel){
+      document.getElementById("travelText").textContent = "Travelling to (" + x + ", " + y + ")...";
+      act("/satscape/api/travel", { tx:x, ty:y });
+    } else {
+      document.getElementById("travelText").textContent = "Target set to (" + x + ", " + y + ").";
+    }
   });
   ["Shop","Quests","Gear"].forEach(function(n){ document.getElementById("tab"+n).onclick=function(){ activeTab=n.toLowerCase(); renderList(); }; });
   function typingTarget(el){ return el && (el.tagName === "INPUT" || el.tagName === "SELECT" || el.tagName === "TEXTAREA" || el.isContentEditable); }
   function directionKey(e){ return { ArrowUp:"up", ArrowDown:"down", ArrowLeft:"left", ArrowRight:"right", w:"up", W:"up", s:"down", S:"down", a:"left", A:"left", d:"right", D:"right" }[e.key]; }
   window.addEventListener("keydown", function(e){
     if(typingTarget(document.activeElement)) return;
+    if(e.key === "m" || e.key === "M"){
+      e.preventDefault();
+      if(!showWorldMap){ showWorldMap = true; render(); }
+      return;
+    }
     var d = directionKey(e);
     if(d){
       e.preventDefault();
@@ -756,6 +865,17 @@ const PLAY_HTML = /* html */ `<!doctype html>
       act("/satscape/api/battle", { action:"strike", mode:mode });
     }
   });
+  window.addEventListener("keyup", function(e){
+    if(e.key !== "m" && e.key !== "M") return;
+    if(typingTarget(document.activeElement)) return;
+    e.preventDefault();
+    if(showWorldMap){ showWorldMap = false; render(); }
+  });
+  function animate(){
+    if(!document.hidden && state && state.combat && !showWorldMap && !reduceMotion) drawBattle();
+    requestAnimationFrame(animate);
+  }
+  requestAnimationFrame(animate);
   api("/satscape/api/state").then(setState).catch(function(e){ note.textContent=e.message; });
   setInterval(function(){ api("/satscape/api/state").then(setState).catch(function(){}); }, 2000);
 })();

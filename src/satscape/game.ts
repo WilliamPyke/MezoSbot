@@ -294,6 +294,13 @@ export async function resolvePlan(discordId: string): Promise<ActionResult> {
 
   const weapon = weaponFor(player, selectedWeaponId(combat, player));
   const plan = parsePlan(combat.battle_plan);
+  if (plan.length < MAX_PLAN) {
+    const remaining = MAX_PLAN - plan.length;
+    return {
+      ok: false,
+      note: `Queue ${remaining} more action${remaining === 1 ? "" : "s"} before resolving this turn.`,
+    };
+  }
   const res = simulateBattle(combat, weapon, plan);
 
   let note = res.steps.map((s) => s.line).join("\n");
@@ -356,6 +363,7 @@ export async function fight(discordId: string): Promise<ActionResult> {
   const combat = await getCombat(discordId);
   if (!combat) return { ok: false, note: "No active fight." };
   await queueStrike(discordId);
+  for (let i = 1; i < MAX_PLAN; i++) await queueWait(discordId);
   return resolvePlan(discordId);
 }
 

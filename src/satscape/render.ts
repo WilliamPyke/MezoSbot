@@ -555,10 +555,15 @@ function buildBattlePreviewText(view: ViewModel): string {
       (res.monsterDead ? " — 💀 **kills it!**" : ` → monster ${res.monsterHp}/${combat.monster_max_hp} HP`)
     : "_Move (arrows), pick a strike (🗡️ Line · 🔨 Slam · 🪓 Cleave), ⏳ Wait — then Resolve._";
 
+  const turnPrompt = queued.length >= MAX_PLAN
+    ? "**Turn ready:** Resolve to run your 3 actions against the monster's 3 moves."
+    : `**Turn planning:** choose ${MAX_PLAN - queued.length} more action${MAX_PLAN - queued.length === 1 ? "" : "s"} before Resolve.`;
+
   return [
     `**Incoming:**\n${telegraph}`,
     `**Weapon:** ${weapon.emoji} ${weapon.name} (${weapon.damage} dmg per strike)`,
     `**Your plan:** ${slots}`,
+    turnPrompt,
     projection,
     `**Monster HP:** ${bar(combat.monster_current_hp, combat.monster_max_hp)} ${combat.monster_current_hp}/${combat.monster_max_hp} · **Loot:** up to ${formatSats(combat.reward_sats)}`,
     "🟡 dashed line = your path · 🔵 blue = your strike · 🔴 red = the one incoming attack.",

@@ -219,6 +219,8 @@ async function main() {
     });
     const before = await getBalance(TEST_ID);
     await queueWait(TEST_ID);
+    await queueWait(TEST_ID);
+    await queueWait(TEST_ID);
     await resolvePlan(TEST_ID);
     ok((await getBalance(TEST_ID)) < before, "waiting into the monster cost sats");
     ok((await getCombat(TEST_ID)) !== null, "monster stays after a non-lethal round");
