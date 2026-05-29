@@ -11,7 +11,8 @@ export const SAT = {
   REGION_SIZE: 22, // tiles per biome region cell (contiguous zones within a territory)
   SIGHT: 5, // fog-of-war vision radius around the player (~10x10 discovery footprint)
   BUYIN_SATS: 50, // paid on /join, seeds the prize pool
-  DEATH_PENALTY_SATS: 50, // taken on faint (clamped to remaining balance)
+  DEATH_PENALTY_SATS: 50, // (legacy) flat faint penalty — no longer charged; HP burn is the cost
+  HP_MAX_DEFAULT: 250, // default HP-bar cap: the at-risk slice of your sats (items may raise it)
   CHEST_SPAWN: 0.03, // per-tile spawn probability in the wilds
   MONSTER_SPAWN: 0.08, // cumulative upper bound (monster occupies 0.03..0.08)
   BREAD_STAMINA: 20, // stamina restored per 1-sat loaf

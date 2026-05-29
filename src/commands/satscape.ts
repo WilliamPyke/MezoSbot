@@ -1,24 +1,30 @@
-import { EmbedBuilder, MessageFlags, type ChatInputCommandInteraction } from "discord.js";
+import {
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  EmbedBuilder,
+  MessageFlags,
+  type ChatInputCommandInteraction,
+} from "discord.js";
 import { formatSats } from "../format.js";
 import { SAT, biomeAt } from "../satscape/engine.js";
 import { chargeBuyIn } from "../satscape/game.js";
 import { getPlayer, startRun } from "../satscape/db.js";
-import { render, stop } from "../satscape/session.js";
-import { renderQuests, renderShop } from "../satscape/interactions.js";
+import { buildSatscapePlayUrl } from "../satscape/web_tokens.js";
 
 export const data = {
   name: "satscape",
-  description: "Grid RPG — explore the wilds, fight monsters, and loot sats",
+  description: "Grid RPG - explore the wilds, fight monsters, and loot sats",
   options: [
     {
       name: "join",
-      type: 1 as const, // SUB_COMMAND
+      type: 1 as const,
       description: `Start a run (costs a ${SAT.BUYIN_SATS}-sat buy-in that seeds the prize pool)`,
     },
     {
       name: "map",
       type: 1 as const,
-      description: "Show your live map and controls",
+      description: "Show your live browser map and controls",
     },
     {
       name: "shop",
@@ -58,17 +64,29 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   if (sub === "shop" || sub === "quests") {
     const player = await getPlayer(discordId);
     if (biomeAt(player!.x_coord, player!.y_coord) !== "town") {
-      return interaction.editReply({ content: `${sub === "shop" ? "🛒 The item shop" : "📜 The quest board"} is only available in a town.` });
+      return interaction.editReply({ content: `${sub === "shop" ? "The item shop" : "The quest board"} is only available in a town.` });
     }
-    stop(discordId); // pause any live map session
-    return sub === "shop" ? renderShop(interaction, discordId) : renderQuests(interaction, discordId);
+    return interaction.editReply(buildPlayReply(discordId, sub));
   }
 
-  await render(
-    discordId,
-    interaction,
-    sub === "join"
-      ? "🗺️ Welcome to SatScape! Your HP **is** your sats balance. Head past the town walls to find chests and monsters."
-      : undefined,
+  return interaction.editReply(buildPlayReply(discordId, sub === "join" ? "join" : "map"));
+}
+
+function buildPlayReply(discordId: string, target: "join" | "map" | "shop" | "quests") {
+  const url = buildSatscapePlayUrl(discordId) + (target === "shop" || target === "quests" ? `#${target}` : "");
+  const embed = new EmbedBuilder()
+    .setColor(0x22c55e)
+    .setTitle(target === "join" ? "Welcome to SatScape" : "SatScape is ready")
+    .setDescription(
+      target === "join"
+        ? "Your HP is now a capped at-risk slice of your sats. Open the browser map for instant movement, combat, shops, quests, and HP refills."
+        : "Open your browser map to keep playing without Discord edit latency.",
+    );
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setStyle(ButtonStyle.Link)
+      .setURL(url)
+      .setLabel("Play SatScape in your browser"),
   );
+  return { embeds: [embed], components: [row] };
 }

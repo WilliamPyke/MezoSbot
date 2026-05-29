@@ -14,7 +14,7 @@ import { type ItemSlot } from "./items.js";
 import { keeperLine } from "./lines.js";
 import {
   ARENA_SIZE,
-  battleMoveRange,
+  ATTACK_MODES,
   MAX_PLAN,
   monsterPlan,
   parsePlan,
@@ -226,13 +226,19 @@ export async function buildMapImage(view: ViewModel, cacheKey = ""): Promise<Att
 
 /* ─────────── sprites (drawn procedurally — no binary art) ─────────── */
 
-// Per-order telegraph colors (strike ①②③) — fill alpha fades with distance in
-// the sequence so the imminent strike reads strongest.
-const TELEGRAPH = [
-  { fill: "rgba(239,68,68,0.50)", ring: "#ef4444" }, // ① now
-  { fill: "rgba(249,115,22,0.34)", ring: "#f97316" }, // ② next
-  { fill: "rgba(234,179,8,0.24)", ring: "#eab308" }, // ③ later
-];
+const DANGER = { fill: "rgba(239,68,68,0.50)", ring: "#ef4444" };
+const PLAYER_HIT = { fill: "rgba(56,189,248,0.42)", ring: "#38bdf8" };
+const PATH_COLOR = "#fde047";
+
+const MONSTER_BADGE: Record<string, string> = {
+  attack: "#ef4444", // red — the one strike this round
+  advance: "#94a3b8", // slate — closing in
+  rest: "#475569", // dim — recovering
+};
+
+function tileCenter(p: Point, tile: number): [number, number] {
+  return [p.x * tile + tile / 2, p.y * tile + tile / 2];
+}
 
 async function buildBattleImage(view: ViewModel): Promise<Buffer> {
   const combat = view.combat;
@@ -243,7 +249,10 @@ async function buildBattleImage(view: ViewModel): Promise<Buffer> {
   const canvas = createCanvas(size, size);
   const ctx = canvas.getContext("2d");
   const plan = monsterPlan(combat, view.player);
-  const player = { x: combat.player_battle_x, y: combat.player_battle_y };
+  const weapon = weaponFor(view.player, selectedWeaponId(combat, view.player));
+  const queued = parsePlan(combat.battle_plan);
+  const preview = simulateBattle(combat, weapon, queued);
+  const start = { x: combat.player_battle_x, y: combat.player_battle_y };
   const monster = { x: combat.monster_battle_x, y: combat.monster_battle_y };
   const town = nearestTown(combat.enemy_x, combat.enemy_y).town;
 
@@ -263,20 +272,57 @@ async function buildBattleImage(view: ViewModel): Promise<Buffer> {
     }
   }
 
-  // Telegraphed strikes, painted later→earlier so ① layers on top.
-  for (let i = plan.length - 1; i >= 0; i--) {
-    const intent = plan[i];
-    const c = TELEGRAPH[i] ?? TELEGRAPH[TELEGRAPH.length - 1];
+  // Monster danger (red) — only the single attack tick has tiles this round.
+  for (const intent of plan) {
+    if (intent.act !== "attack") continue;
     for (const p of intent.attackTiles) {
-      ctx.fillStyle = c.fill;
+      ctx.fillStyle = DANGER.fill;
       ctx.fillRect(p.x * tile, p.y * tile, tile, tile);
     }
-    drawTileOutlines(ctx, intent.attackTiles, tile, c.ring, 2);
+    drawTileOutlines(ctx, intent.attackTiles, tile, DANGER.ring, 2);
   }
 
-  // Player marker (round-start position).
-  const playerCx = player.x * tile + tile / 2;
-  const playerCy = player.y * tile + tile / 2;
+  // Player attack preview (blue) — union of every queued strike's tiles.
+  const attackTiles = preview.steps.flatMap((s) => s.attackTiles);
+  for (const p of attackTiles) {
+    ctx.fillStyle = PLAYER_HIT.fill;
+    ctx.fillRect(p.x * tile, p.y * tile, tile, tile);
+  }
+  drawTileOutlines(ctx, attackTiles, tile, PLAYER_HIT.ring, 2);
+
+  // Planned movement path: start → each tick's position, drawn as a yellow trail.
+  const path = [start, ...preview.steps.map((s) => s.playerPos)];
+  if (path.length > 1) {
+    ctx.strokeStyle = PATH_COLOR;
+    ctx.lineWidth = 3;
+    ctx.setLineDash([6, 4]);
+    ctx.beginPath();
+    ctx.moveTo(...tileCenter(path[0], tile));
+    for (let i = 1; i < path.length; i++) ctx.lineTo(...tileCenter(path[i], tile));
+    ctx.stroke();
+    ctx.setLineDash([]);
+    // Faded waypoint dots for the intermediate tiles.
+    for (let i = 1; i < path.length - 1; i++) {
+      const [cx, cy] = tileCenter(path[i], tile);
+      ctx.fillStyle = "rgba(253,224,71,0.85)";
+      ctx.beginPath();
+      ctx.arc(cx, cy, tile * 0.1, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  // Round-start ghost (where you are now) when the plan moves you elsewhere.
+  const end = path[path.length - 1];
+  if (!(end.x === start.x && end.y === start.y)) {
+    const [sx, sy] = tileCenter(start, tile);
+    ctx.fillStyle = "rgba(248,250,252,0.25)";
+    ctx.beginPath();
+    ctx.arc(sx, sy, tile * 0.22, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // Player marker at the projected end-of-plan position.
+  const [playerCx, playerCy] = tileCenter(end, tile);
   ctx.fillStyle = "#f8fafc";
   ctx.beginPath();
   ctx.arc(playerCx, playerCy, tile * 0.28, 0, Math.PI * 2);
@@ -289,11 +335,10 @@ async function buildBattleImage(view: ViewModel): Promise<Buffer> {
   ctx.arc(playerCx, playerCy - tile * 0.06, tile * 0.08, 0, Math.PI * 2);
   ctx.fill();
 
-  // Monster at its current tile, plus numbered badges tracing its strike path.
+  // Monster at its current tile, plus badges tracing its telegraphed acts.
   drawMonster(ctx, monster.x * tile + tile / 2, monster.y * tile + tile / 2, town.monsterColor, nameVariant(combat.monster_name));
-  for (let i = 0; i < plan.length; i++) {
-    const c = TELEGRAPH[i] ?? TELEGRAPH[TELEGRAPH.length - 1];
-    drawOrderBadge(ctx, plan[i].to, tile, i + 1, c.ring);
+  for (const intent of plan) {
+    drawOrderBadge(ctx, intent.to, tile, intent.order, MONSTER_BADGE[intent.act] ?? "#475569");
   }
 
   return canvas.encode("webp", WEBP_QUALITY);
@@ -446,18 +491,20 @@ function bar(value: number, max: number, width = 12): string {
 }
 
 export function buildMapEmbed(view: ViewModel): EmbedBuilder {
-  const { player, hp, others, combat } = view;
+  const { player, hp, maxHp, balance, others, combat } = view;
   const here = townAt(player.x_coord, player.y_coord);
-  const maxRef = Math.max(player.display_max_hp, hp, 1);
+  const maxRef = Math.max(maxHp, 1);
+  const banked = Math.max(0, balance - hp);
 
   const embed = new EmbedBuilder()
     .setColor(combat ? 0xf43f5e : here ? 0x1d4ed8 : 0x15803d)
     .setTitle(combat ? "⚔️ SatScape — Combat" : "🗺️ SatScape")
     .setImage(`attachment://${MAP_FILE}`)
     .addFields(
-      { name: "HP (your sats)", value: `${bar(hp, maxRef)}\n${formatSats(hp)}`, inline: true },
+      { name: "HP", value: `${bar(hp, maxRef)}\n${formatSats(hp)} / ${formatSats(maxRef)}`, inline: true },
       { name: "Stamina", value: `${bar(player.hunger, 100)}\n${player.hunger}%`, inline: true },
       { name: "Location", value: `${locationLabel(player.x_coord, player.y_coord)} \`(${player.x_coord}, ${player.y_coord})\``, inline: true },
+      { name: "💰 Sats", value: `${formatSats(balance)}${banked > 0 ? `\n_${formatSats(banked)} banked_` : ""}`, inline: true },
     );
 
   if (combat) {
@@ -480,6 +527,13 @@ function intentTargetTag(intent: MonsterIntent): string {
   return `${String.fromCharCode(65 + intent.to.x)}${intent.to.y + 1}`;
 }
 
+function intentLine(intent: MonsterIntent): string {
+  const mark = ORDER_MARK[intent.order - 1] ?? `${intent.order}.`;
+  if (intent.act === "attack") return `${mark} 🔴 **${intent.name}** → ${intentTargetTag(intent)} · ${intent.damage} dmg`;
+  if (intent.act === "advance") return `${mark} 👣 Advances → ${intentTargetTag(intent)}`;
+  return `${mark} 💤 Rests`;
+}
+
 function buildBattlePreviewText(view: ViewModel): string {
   const { combat, player } = view;
   if (!combat) return "";
@@ -488,10 +542,8 @@ function buildBattlePreviewText(view: ViewModel): string {
   const queued = parsePlan(combat.battle_plan);
   const res = simulateBattle(combat, weapon, queued);
 
-  // Monster's next 3 telegraphed strikes.
-  const telegraph = plan
-    .map((i) => `${ORDER_MARK[i.order - 1] ?? `${i.order}.`} **${i.name}** → ${intentTargetTag(i)} · ${i.damage} dmg`)
-    .join("\n");
+  // Monster telegraph — exactly one of the three ticks is an attack.
+  const telegraph = plan.map(intentLine).join("\n");
 
   // The player's plan strip: filled slots + empty placeholders.
   const slots = Array.from({ length: MAX_PLAN }, (_, k) =>
@@ -501,15 +553,15 @@ function buildBattlePreviewText(view: ViewModel): string {
   const projection = queued.length
     ? `**If you resolve:** deal ${res.totalDealt}, take ${res.totalTaken}` +
       (res.monsterDead ? " — 💀 **kills it!**" : ` → monster ${res.monsterHp}/${combat.monster_max_hp} HP`)
-    : "_Queue moves (arrows), ⚔️ strikes and ⏳ waits, then Resolve._";
+    : "_Move (arrows), pick a strike (🗡️ Line · 🔨 Slam · 🪓 Cleave), ⏳ Wait — then Resolve._";
 
   return [
-    `**Incoming (next ${plan.length}):**\n${telegraph}`,
-    `**Weapon:** ${weapon.emoji} ${weapon.name} — ${weapon.summary} (${weapon.damage} dmg)`,
+    `**Incoming:**\n${telegraph}`,
+    `**Weapon:** ${weapon.emoji} ${weapon.name} (${weapon.damage} dmg per strike)`,
     `**Your plan:** ${slots}`,
     projection,
     `**Monster HP:** ${bar(combat.monster_current_hp, combat.monster_max_hp)} ${combat.monster_current_hp}/${combat.monster_max_hp} · **Loot:** up to ${formatSats(combat.reward_sats)}`,
-    "🔴① imminent · 🟠② next · 🟡③ later — move first each tick to dodge.",
+    "🟡 dashed line = your path · 🔵 blue = your strike · 🔴 red = the one incoming attack.",
   ].join("\n");
 }
 
@@ -530,12 +582,12 @@ function buildBattleWeaponSelect(view: ViewModel): StringSelectMenuBuilder | nul
   const selected = selectedWeaponId(combat, view.player);
   return new StringSelectMenuBuilder()
     .setCustomId(sqCid("battleweapon"))
-    .setPlaceholder("Choose weapon for strikes...")
+    .setPlaceholder("Weapon (sets strike damage)...")
     .addOptions(weapons.map((it) => {
       const profile = weaponFor(view.player, it.id);
       return {
         label: it.name,
-        description: `${profile.summary} - ${profile.damage} dmg`,
+        description: `${profile.damage} dmg per strike`,
         value: it.id,
         emoji: it.emoji,
         default: it.id === selected,
@@ -562,17 +614,21 @@ export function buildComponents(
         move("right", "Right"),
       ),
     ];
-    const weaponSelect = buildBattleWeaponSelect(view);
-    if (weaponSelect) rows.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(weaponSelect));
-    rows.push(new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder().setCustomId(sqCid("battlestrike")).setLabel("Strike").setEmoji("⚔️").setStyle(ButtonStyle.Primary).setDisabled(full),
+    // Attack-mode buttons (default shapes, weapon-agnostic) + Wait + Undo.
+    const strikeRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      ...ATTACK_MODES.map((m) =>
+        new ButtonBuilder().setCustomId(sqCid("battlestrike", m.mode)).setLabel(m.name).setEmoji(m.emoji).setStyle(ButtonStyle.Primary).setDisabled(full),
+      ),
       new ButtonBuilder().setCustomId(sqCid("battlewait")).setLabel("Wait").setEmoji("⏳").setStyle(ButtonStyle.Secondary).setDisabled(full),
       new ButtonBuilder().setCustomId(sqCid("battleundo")).setLabel("Undo").setEmoji("↩️").setStyle(ButtonStyle.Secondary).setDisabled(empty),
-    ));
+    );
+    rows.push(strikeRow);
     rows.push(new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder().setCustomId(sqCid("battleresolve")).setLabel(empty ? "Resolve (wait)" : `Resolve ${queued.length}/${MAX_PLAN}`).setEmoji("✅").setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId(sqCid("battleresolve")).setLabel(empty ? "Resolve (wait out)" : `Resolve ${queued.length}/${MAX_PLAN}`).setEmoji("✅").setStyle(ButtonStyle.Danger),
       new ButtonBuilder().setCustomId(sqCid("flee")).setLabel("Flee").setEmoji("🏃").setStyle(ButtonStyle.Secondary),
     ));
+    const weaponSelect = buildBattleWeaponSelect(view);
+    if (weaponSelect) rows.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(weaponSelect));
     return rows;
   }
   const auto = opts.autoExploring
@@ -630,7 +686,6 @@ function equippedName(id: string | null): string {
 export function buildShopEmbed(town: Town, player: SatPlayerRow, hp: number, _ownedIds: string[], rep = 0): EmbedBuilder {
   const gear = gearScore(player);
   const weapon = weaponFor(player);
-  const move = battleMoveRange(player);
   const discount = Math.round((1 - Math.max(0.5, 1 - rep * 0.05)) * 100);
   return new EmbedBuilder()
     .setColor(0x1d4ed8)
@@ -640,7 +695,7 @@ export function buildShopEmbed(town: Town, player: SatPlayerRow, hp: number, _ow
       `*"${keeperLine(town.keeper.persona, "greet")}"*\n\n` +
         `Balance: **${formatSats(hp)}**  ·  Gear score: **${gear}**\n` +
         `Reputation: **${rep}**${discount > 0 ? ` (−${discount}% prices)` : ""}\n` +
-        `Battle: **${weapon.name}** (${weapon.summary}, ${weapon.damage} dmg) · Move **${move}**`,
+        `Battle: **${weapon.name}** · ${weapon.damage} dmg/strike · modes 🗡️ Line · 🔨 Slam · 🪓 Cleave`,
     )
     .addFields(
       { name: `${SLOT_EMOJI.weapon} Weapon`, value: equippedName(player.equipped_weapon), inline: true },

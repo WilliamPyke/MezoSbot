@@ -59,6 +59,7 @@ import {
 } from "./quests.js";
 import { render, setAuto, stop, type EditableInteraction } from "./session.js";
 import { TOWN_BY_ID, townAt } from "./towns.js";
+import type { AttackMode } from "./battle.js";
 import type { Direction } from "./types.js";
 
 export function isSatscapeInteraction(interaction: Interaction): boolean {
@@ -178,7 +179,7 @@ export async function handleSatscapeInteraction(interaction: Interaction): Promi
       ? await battleMove(discordId, action as Direction)
       : await moveMany(discordId, action as Direction);
   }
-  else if (action === "battlestrike") result = await queueStrike(discordId);
+  else if (action === "battlestrike") result = await queueStrike(discordId, parts[0] as AttackMode);
   else if (action === "battlewait") result = await queueWait(discordId);
   else if (action === "battleundo") result = await undoPlanAction(discordId);
   else if (action === "battleresolve" || action === "battleattack") result = await resolvePlan(discordId);

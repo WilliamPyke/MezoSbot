@@ -1,69 +1,67 @@
 # SatScape Tactical Battle Mechanics
 
 Monster encounters replace the normal map image with an 8x8 tactical arena. Combat is
-**plan-ahead**: you see the monster's next three attacks and queue your own three actions to
-defeat it or dodge it.
+**plan-ahead**: you see the monster's next three telegraphed acts and queue your own three actions,
+with a live preview of exactly what will happen before you commit.
 
 ## Turn Loop
 
-1. The monster reveals its **next 3 strikes** as fixed tile-telegraphs (①②③), computed
-   deterministically and painted on the board. They aim at your round-start position and **will**
-   hit those tiles regardless of where you move — so the forecast is always honest.
+1. The monster reveals its **next 3 acts** (①②③). Crucially, **only one of the three is an
+   attack** — the monster advances toward you before it and rests (recovers) after it. That gives
+   you two safe ticks every round to reposition and strike. The single attack is painted red and
+   aims at fixed tiles (honest telegraph: it hits those tiles whether or not you're still on them).
 2. You build a plan of up to **3 actions**. Each slot is a **Move** (one tile via the arrows), a
-   **Strike** (your selected weapon), or a **Wait**. Queueing only updates the embed text/buttons —
-   the board image stays put until you resolve.
+   **Strike** in one of your default attack modes, or a **Wait**. As you queue, the board updates
+   live: your planned path is drawn as a dashed yellow trail and your strike tiles glow blue.
 3. Press **Resolve**. The two queues run interleaved, tick by tick. On each tick **you act first**,
-   then the monster executes that tick's telegraphed strike:
-   - A Strike hits the monster if it stands on your weapon's pattern tiles at that moment.
-   - The monster's strike hits you only if you're standing on its marked tiles when it lands —
-     so a Move on the same tick can dodge it, but that's a slot you didn't spend attacking.
+   then the monster executes that tick's act:
+   - A Strike hits the monster if it stands on your attack mode's tiles at that moment.
+   - The monster only deals damage on its single attack tick, and only if you're standing on the
+     marked tiles when it lands — so a Move on that tick dodges it.
 4. After resolving, your plan clears and the monster telegraphs a fresh set of 3.
 5. If the monster reaches 0 HP, the world tile is cleared and loot pays out from the prize pool.
 
-The tension: dodging a telegraphed tile costs a slot you could have used to strike. Position well
-and you can land multiple hits; play greedy and you eat the telegraph.
+## Attack Modes
+
+Every player has three default attack shapes, independent of the equipped weapon. Pick one per
+queued strike (you can mix them across your three slots):
+
+- **🗡️ Line** — 3 tiles straight toward the monster (reach; good for poking before it closes in)
+- **🔨 Slam** — all 8 tiles around you (hits a monster adjacent in any direction; great panic button)
+- **🪓 Cleave** — a 3-tile arc directly in front (covers a monster that's slightly off-axis)
+
+The equipped **weapon only sets the damage number** per strike — shop progression (`power`) still
+matters, but the shape is your choice each time.
 
 ## Arena Colors
 
-- 🔴 ① imminent strike (lands first), 🟠 ② next, 🟡 ③ later — fill fades with distance in the sequence
-- Numbered badges (①②③) trace where the monster moves before each strike
-- White/blue marker: you, at your round-start tile
-- Monster sprite: the monster's current tile
+- 🔴 red tiles + outline: the monster's one incoming attack this round
+- 🔵 blue tiles + outline: your queued strike(s) — where your blades will land
+- 🟡 dashed yellow line + dots: your planned movement path; the solid marker is where you end up
+- faded white dot: where you're standing now (when your plan moves you elsewhere)
+- Numbered badges (①②③) on the monster: red = its attack tick, slate = advancing, dim = resting
 
 ## Movement
 
 Movement is queued, not spent tile-by-tile. Each arrow press appends a one-tile step to your plan
 (up to the 3-slot cap), and Undo pops the last queued action. Steps that would leave the arena or
-land on the monster's tile are rejected. Boots no longer change movement range inside battle — the
-3-slot plan is the budget.
-
-## Weapons
-
-The current shop weapons map to tactical attack shapes and can be selected during battle:
-
-- No weapon: Training Dagger, 1 tile toward the monster
-- Iron Shortsword: Longsword, 2 tiles in a line
-- Tiger Talwar: Spear, 3 tiles in a line
-- Scorpion Khopesh: Hammer, 2x2 impact
-- Frostfang Axe: Arc cleave, 3 front tiles
-- Maharaja Blade: Star burst, diagonal burst plus reach
-
-A Strike uses your selected weapon's pattern, oriented toward the monster from wherever you stand
-at that tick. Damage scales from the weapon's existing `power`, so old shop progression still
-matters.
+land on the monster's tile are rejected. The 3-slot plan is the whole movement budget — dodging the
+attack costs a slot you could have spent striking.
 
 ## Monster Intents
 
-Monsters choose deterministic patterns from their type, level, world tile, turn number, and strike
-index. The three telegraphed strikes are forward-simulated: the monster's position after strike k
-is where strike k+1 begins. Common patterns are:
+Monsters choose deterministic patterns from their type, level, world tile, and turn number, and the
+three telegraphed acts are forward-simulated (the monster's position after act k is where act k+1
+begins). The lone attack uses one of:
 
 - Line Strike: move, then attack a full row or column
 - Raking Cone: move, then hit a cone
 - Ground Slam: hold position, then hit adjacent tiles
 - Dash Bite: move up to 2 tiles, then lunge forward
 
-Monster hits remove sats through the existing closed-loop economy and send them to the prize pool.
+The other two acts are an **Advance** (close distance toward you) and a **Rest** (recover, no
+attack). Monster hits remove sats through the existing closed-loop economy and send them to the
+prize pool.
 
 ## Economy And Quests
 

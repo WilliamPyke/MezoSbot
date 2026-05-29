@@ -21,9 +21,13 @@ export interface WeaponProfile {
   summary: string;
 }
 
+/** What the monster does on a telegraphed tick. Only ONE per round is "attack". */
+export type MonsterAct = "attack" | "advance" | "rest";
+
 export interface MonsterIntent {
   /** 1-based position in the telegraphed sequence (①②③). */
   order: number;
+  act: MonsterAct;
   pattern: MonsterPattern;
   name: string;
   description: string;
@@ -33,18 +37,47 @@ export interface MonsterIntent {
   damage: number;
 }
 
+/** Default attack shapes every player has, independent of the equipped weapon. */
+export type AttackMode = "line" | "slam" | "cleave";
+
+export interface AttackModeProfile {
+  mode: AttackMode;
+  name: string;
+  emoji: string;
+  summary: string;
+}
+
+export const ATTACK_MODES: AttackModeProfile[] = [
+  { mode: "line", name: "Line", emoji: "🗡️", summary: "3 tiles straight toward the monster" },
+  { mode: "slam", name: "Slam", emoji: "🔨", summary: "all 8 tiles around you" },
+  { mode: "cleave", name: "Cleave", emoji: "🪓", summary: "3-tile arc in front" },
+];
+
+export const DEFAULT_ATTACK_MODE: AttackMode = "line";
+const ATTACK_MODE_BY = new Map<AttackMode, AttackModeProfile>(ATTACK_MODES.map((m) => [m.mode, m]));
+
+export function attackModeProfile(mode: AttackMode): AttackModeProfile {
+  return ATTACK_MODE_BY.get(mode) ?? ATTACK_MODES[0];
+}
+
 export type PlanAction =
   | { kind: "move"; dir: Direction }
-  | { kind: "strike" }
+  | { kind: "strike"; mode: AttackMode }
   | { kind: "wait" };
 
-/** Max queued actions per round (the player's "next 3 attacks"). */
+/** Max queued actions per round (the player's "next 3 actions"). */
 export const MAX_PLAN = 3;
 
-/** One step of the interleaved resolution, for the embed log + image. */
+/** One step of the interleaved resolution, for the embed log + board preview. */
 export interface ResolutionStep {
   /** What the player did this tick. */
   player: PlanAction | null;
+  /** Player tile after acting this tick. */
+  playerPos: Point;
+  /** Tiles the player's strike covered this tick (empty if not a strike). */
+  attackTiles: Point[];
+  /** Monster tile after acting this tick. */
+  monsterPos: Point;
   /** Damage the player dealt to the monster this tick (0 if none). */
   dealt: number;
   /** Damage the player took from the monster's strike this tick (0 if dodged). */
@@ -113,16 +146,21 @@ export function battleMovePoints(combat: CombatSessionRow, player: SatPlayerRow)
 
 const MOVE_TOKENS = new Set<Direction>(["up", "down", "left", "right"]);
 
-/** Decode the persisted plan string into an action list (capped at MAX_PLAN). */
+/**
+ * Decode the persisted plan string into an action list (capped at MAX_PLAN).
+ * Strike tokens carry their mode: `strike-slam`. Bare `strike` (legacy) → line.
+ */
 export function parsePlan(plan: string | null | undefined): PlanAction[] {
   if (!plan) return [];
   const out: PlanAction[] = [];
   for (const raw of plan.split(",")) {
     const tok = raw.trim();
     if (!tok) continue;
-    if (tok === "strike") out.push({ kind: "strike" });
-    else if (tok === "wait") out.push({ kind: "wait" });
-    else if (MOVE_TOKENS.has(tok as Direction)) out.push({ kind: "move", dir: tok as Direction });
+    if (tok === "wait") out.push({ kind: "wait" });
+    else if (tok === "strike" || tok.startsWith("strike-")) {
+      const m = tok.slice(7) as AttackMode;
+      out.push({ kind: "strike", mode: ATTACK_MODE_BY.has(m) ? m : DEFAULT_ATTACK_MODE });
+    } else if (MOVE_TOKENS.has(tok as Direction)) out.push({ kind: "move", dir: tok as Direction });
     if (out.length >= MAX_PLAN) break;
   }
   return out;
@@ -132,13 +170,13 @@ export function parsePlan(plan: string | null | undefined): PlanAction[] {
 export function serializePlan(actions: PlanAction[]): string {
   return actions
     .slice(0, MAX_PLAN)
-    .map((a) => (a.kind === "move" ? a.dir : a.kind))
+    .map((a) => (a.kind === "move" ? a.dir : a.kind === "strike" ? `strike-${a.mode}` : "wait"))
     .join(",");
 }
 
 /** Compact glyph for a plan action — used in the embed plan strip. */
 export function planGlyph(action: PlanAction): string {
-  if (action.kind === "strike") return "⚔️";
+  if (action.kind === "strike") return attackModeProfile(action.mode).emoji;
   if (action.kind === "wait") return "⏳";
   return action.dir === "up" ? "⬆️" : action.dir === "down" ? "⬇️" : action.dir === "left" ? "⬅️" : "➡️";
 }
@@ -284,6 +322,38 @@ export function playerAttackTiles(from: Point, target: Point, weapon: WeaponProf
 }
 
 /**
+ * Tiles hit by a default attack mode, oriented toward the monster from `from`.
+ * These are available to every player regardless of the equipped weapon (the
+ * weapon only sets the damage number).
+ */
+export function attackTilesForMode(from: Point, target: Point, mode: AttackMode): Point[] {
+  const dir = attackDirection(from, target);
+  const d = DIR_DELTA[dir];
+  const forward = (n: number) => ({ x: from.x + d.x * n, y: from.y + d.y * n });
+  const lateral = dir === "up" || dir === "down" ? { x: 1, y: 0 } : { x: 0, y: 1 };
+
+  const raw: Point[] = [];
+  switch (mode) {
+    case "line":
+      raw.push(forward(1), forward(2), forward(3));
+      break;
+    case "slam":
+      for (let yy = from.y - 1; yy <= from.y + 1; yy++) {
+        for (let xx = from.x - 1; xx <= from.x + 1; xx++) {
+          if (xx !== from.x || yy !== from.y) raw.push({ x: xx, y: yy });
+        }
+      }
+      break;
+    case "cleave": {
+      const c = forward(1);
+      raw.push(c, { x: c.x + lateral.x, y: c.y + lateral.y }, { x: c.x - lateral.x, y: c.y - lateral.y });
+      break;
+    }
+  }
+  return uniquePoints(raw.filter(inArena));
+}
+
+/**
  * The monster's next MAX_PLAN telegraphed strikes, forward-simulated from its
  * current tile. Each strike aims at the player's round-start tile — fixed at
  * telegraph time so the preview is honest: the marked tiles WILL be struck
@@ -292,27 +362,61 @@ export function playerAttackTiles(from: Point, target: Point, weapon: WeaponProf
 export function monsterPlan(combat: CombatSessionRow, _player?: SatPlayerRow): MonsterIntent[] {
   const target = { x: combat.player_battle_x, y: combat.player_battle_y };
   const damage = Math.max(3, 3 + combat.monster_level * 2);
+  const base = `${combat.monster_name}:${combat.monster_level}:${combat.turn_number}:${combat.enemy_x}:${combat.enemy_y}`;
+  // Exactly one of the three telegraphed ticks is an attack — the monster
+  // advances toward the player before it, then rests (recovers) after. This
+  // gives the player two safe ticks each round to reposition and strike.
+  const attackIndex = hash(base) % MAX_PLAN;
   const out: MonsterIntent[] = [];
   let from = { x: combat.monster_battle_x, y: combat.monster_battle_y };
+
   for (let k = 0; k < MAX_PLAN; k++) {
-    const seed = hash(`${combat.monster_name}:${combat.monster_level}:${combat.turn_number}:${combat.enemy_x}:${combat.enemy_y}:${k}`);
-    const pattern = monsterPatternFor(combat.monster_name, seed);
-    const move = monsterStep(from, target, pattern, seed);
-    const to = { x: clampArena(from.x + move.x), y: clampArena(from.y + move.y) };
-    const dir = attackDirection(to, target);
-    out.push({
-      order: k + 1,
-      pattern,
-      name: monsterIntentName(pattern),
-      description: monsterIntentDescription(pattern, move, dir),
-      from,
-      to,
-      attackTiles: monsterAttackTiles(to, dir, pattern, seed),
-      damage,
-    });
-    from = to; // chain the next strike off where this one ended
+    const seed = hash(`${base}:${k}`);
+    if (k === attackIndex) {
+      const pattern = monsterPatternFor(combat.monster_name, seed);
+      const move = monsterStep(from, target, pattern, seed);
+      const to = { x: clampArena(from.x + move.x), y: clampArena(from.y + move.y) };
+      const dir = attackDirection(to, target);
+      out.push({
+        order: k + 1, act: "attack", pattern,
+        name: monsterIntentName(pattern),
+        description: monsterIntentDescription(pattern, move, dir),
+        from, to,
+        attackTiles: monsterAttackTiles(to, dir, pattern, seed),
+        damage,
+      });
+      from = to;
+    } else {
+      const advancing = k < attackIndex; // close in before the strike, rest after
+      const move = advancing ? stepToward(from, target) : { x: 0, y: 0 };
+      const to = { x: clampArena(from.x + move.x), y: clampArena(from.y + move.y) };
+      out.push({
+        order: k + 1, act: advancing ? "advance" : "rest", pattern: "line",
+        name: advancing ? "Advance" : "Rest",
+        description: advancing ? `Will close in ${dirWord(move)} — no attack.` : "Resting — no attack.",
+        from, to, attackTiles: [], damage: 0,
+      });
+      from = to;
+    }
   }
   return out;
+}
+
+/** One step toward the target, stopping when already adjacent (won't overlap). */
+function stepToward(from: Point, target: Point): Point {
+  const dx = target.x - from.x;
+  const dy = target.y - from.y;
+  if (Math.abs(dx) + Math.abs(dy) <= 1) return { x: 0, y: 0 };
+  if (Math.abs(dx) >= Math.abs(dy)) return { x: Math.sign(dx), y: 0 };
+  return { x: 0, y: Math.sign(dy) };
+}
+
+function dirWord(move: Point): string {
+  if (move.x > 0) return "east";
+  if (move.x < 0) return "west";
+  if (move.y > 0) return "south";
+  if (move.y < 0) return "north";
+  return "in place";
 }
 
 /** Back-compat single-intent accessor (the next strike only). */
@@ -343,23 +447,25 @@ export function simulateBattle(
     const action = plan[k] ?? null;
     let dealt = 0;
     let taken = 0;
+    let attackTiles: Point[] = [];
     const parts: string[] = [];
 
-    // 1) Player acts first.
+    // 1) Player acts first (so a move can dodge this tick's strike).
     if (action?.kind === "move") {
       const d = DIR_DELTA[action.dir];
       const next = { x: clampArena(playerPos.x + d.x), y: clampArena(playerPos.y + d.y) };
       if (!samePoint(next, monsterPos)) playerPos = next;
       parts.push(`${planGlyph(action)} to ${arenaTag(playerPos)}`);
     } else if (action?.kind === "strike") {
-      const tiles = playerAttackTiles(playerPos, monsterPos, weapon);
-      const onTarget = tiles.some((p) => samePoint(p, monsterPos));
+      const profile = attackModeProfile(action.mode);
+      attackTiles = attackTilesForMode(playerPos, monsterPos, action.mode);
+      const onTarget = attackTiles.some((p) => samePoint(p, monsterPos));
       if (onTarget && monsterHp > 0) {
         dealt = weapon.damage;
         monsterHp = Math.max(0, monsterHp - dealt);
-        parts.push(`⚔️ ${weapon.name} hit for ${dealt}`);
+        parts.push(`${profile.emoji} ${profile.name} hit for ${dealt}`);
       } else {
-        parts.push(`⚔️ ${weapon.name} whiffed`);
+        parts.push(`${profile.emoji} ${profile.name} whiffed`);
       }
     } else if (action?.kind === "wait") {
       parts.push("⏳ hold");
@@ -367,22 +473,26 @@ export function simulateBattle(
       parts.push("— idle");
     }
 
-    // 2) Monster executes its k-th telegraphed strike (move, then hit marked tiles).
+    // 2) Monster executes its k-th telegraphed act. Only an "attack" deals damage.
     const intent = intents[k];
     if (intent) {
       monsterPos = intent.to;
-      const struck = samePoint(playerPos, monsterPos) || intent.attackTiles.some((p) => samePoint(p, playerPos));
-      if (struck && monsterHp > 0) {
-        taken = intent.damage;
-        parts.push(`🩸 ${intent.name} hit you for ${taken}`);
+      if (intent.act === "attack") {
+        const struck = samePoint(playerPos, monsterPos) || intent.attackTiles.some((p) => samePoint(p, playerPos));
+        if (struck && monsterHp > 0) {
+          taken = intent.damage;
+          parts.push(`🩸 ${intent.name} hit you for ${taken}`);
+        } else if (monsterHp > 0) {
+          parts.push(`✨ dodged ${intent.name}`);
+        }
       } else if (monsterHp > 0) {
-        parts.push(`✨ dodged ${intent.name}`);
+        parts.push(intent.act === "rest" ? "💤 it rests" : "👣 it advances");
       }
     }
 
     totalDealt += dealt;
     totalTaken += taken;
-    steps.push({ player: action, dealt, taken, line: `${k + 1}. ${parts.join(" · ")}` });
+    steps.push({ player: action, playerPos, attackTiles, monsterPos, dealt, taken, line: `${k + 1}. ${parts.join(" · ")}` });
 
     if (monsterHp <= 0) break; // monster dead — remaining ticks moot
   }

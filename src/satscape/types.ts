@@ -7,7 +7,9 @@ export interface SatPlayerRow {
   x_coord: number;
   y_coord: number;
   hunger: number; // displayed as "Stamina"
-  display_max_hp: number;
+  display_max_hp: number; // legacy high-water mark — superseded by hp/max_hp, no longer written
+  hp: number | null; // current HP: the at-risk slice of balance. NULL = derive min(balance, max_hp)
+  max_hp: number; // HP-bar cap (default SAT.HP_MAX_DEFAULT; items may raise it)
   state: PlayerState;
   active: boolean;
   equipped_weapon: string | null;
@@ -60,7 +62,9 @@ export interface OtherPlayer {
 /** Everything needed to render one frame for a player. */
 export interface ViewModel {
   player: SatPlayerRow;
-  hp: number; // live balance_sats
+  hp: number; // current HP — the at-risk slice of balance (0..maxHp)
+  maxHp: number; // HP-bar cap
+  balance: number; // real withdrawable sats balance (HP + banked)
   entities: TileEntity[]; // active (non-cleared) entities within the viewport
   others: OtherPlayer[]; // other adventurers within the viewport
   combat: CombatSessionRow | null;

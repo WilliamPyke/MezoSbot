@@ -7,6 +7,7 @@ import {
   clearTile,
   createCombat,
   deleteCombat,
+  effectiveHp,
   getCombat,
   getOwnedItemIds,
   getPlayer,
@@ -20,6 +21,7 @@ import {
 } from "./db.js";
 import {
   battleMoveRange,
+  DEFAULT_ATTACK_MODE,
   MAX_PLAN,
   parsePlan,
   planGlyph,
@@ -30,6 +32,7 @@ import {
   simulateBattle,
   startingBattlePositions,
   weaponFor,
+  type AttackMode,
   type BattleMove,
   type PlanAction,
 } from "./battle.js";
@@ -46,6 +49,44 @@ export interface ActionResult {
   note: string;
   /** True when this action put the player into combat (used to stop auto-explore). */
   enteredCombat?: boolean;
+}
+
+/**
+ * Take a hit: burn `dmg` sats balance→pool (closed-loop, unchanged) AND lower the
+ * player's at-risk HP by the same amount. This is the single "got hurt" path.
+ * Faint when the returned `hp` reaches 0 (the burned sats ARE the cost of fainting).
+ */
+export async function loseHp(discordId: string, dmg: number): Promise<{ burned: number; hp: number }> {
+  const burned = await takeDamage(discordId, dmg);
+  const [player, balance] = await Promise.all([getPlayer(discordId), getBalance(discordId)]);
+  if (!player) return { burned, hp: 0 };
+  if (burned <= 0) return { burned: 0, hp: effectiveHp(player, balance) };
+  // `balance` is already post-damage; reconstruct the pre-damage HP, then subtract.
+  const prevHp = effectiveHp(player, balance + burned);
+  const cap = Math.min(balance, player.max_hp ?? SAT.HP_MAX_DEFAULT);
+  const hp = Math.max(0, Math.min(prevHp - burned, cap));
+  await updatePlayer(discordId, { hp });
+  return { burned, hp };
+}
+
+/**
+ * Refill HP by re-exposing the player's own *banked* sats (balance unchanged — no pool
+ * transfer). Caller picks `n`; it's clamped to `min(max_hp − hp, balance − hp)`.
+ */
+export async function refillHp(discordId: string, n: number): Promise<{ ok: boolean; added: number; hp: number; maxHp: number; note: string }> {
+  const [player, balance] = await Promise.all([getPlayer(discordId), getBalance(discordId)]);
+  if (!player || !player.active) return { ok: false, added: 0, hp: 0, maxHp: SAT.HP_MAX_DEFAULT, note: "Use `/satscape join` first." };
+  const maxHp = player.max_hp ?? SAT.HP_MAX_DEFAULT;
+  const cur = effectiveHp(player, balance);
+  const headroom = Math.max(0, Math.min(maxHp - cur, balance - cur)); // banked sats available to commit
+  const add = Math.max(0, Math.min(Math.floor(n), headroom));
+  if (add <= 0) {
+    const why = cur >= maxHp ? "HP is already full." : "No banked sats to commit.";
+    return { ok: false, added: 0, hp: cur, maxHp, note: why };
+  }
+  const hp = cur + add;
+  await updatePlayer(discordId, { hp });
+  return { ok: true, added: add, hp, maxHp, note: `🩹 Committed ${formatSats(add)} to HP (${formatSats(hp)}/${formatSats(maxHp)}).` };
 }
 
 const DELTA: Record<Direction, [number, number]> = {
@@ -110,14 +151,16 @@ export async function move(discordId: string, dir: Direction): Promise<ActionRes
   const nx = player.x_coord + dx;
   const ny = player.y_coord + dy;
 
-  // Stamina first; once it's gone each step burns 1 sat (HP) into the pool.
+  // Stamina first; once it's gone each step burns 1 sat of HP into the pool.
   let note = "";
   let hunger = player.hunger;
+  let hpAfter: number | null = null;
   if (hunger > 0) {
     hunger -= 1;
   } else {
-    const burned = await takeDamage(discordId, 1);
-    if (burned > 0) note = "💀 Exhausted! Lost 1 sat. ";
+    const { burned, hp } = await loseHp(discordId, 1);
+    hpAfter = hp;
+    if (burned > 0) note = "💀 Exhausted! Lost 1 sat of HP. ";
   }
 
   await updatePlayer(discordId, {
@@ -128,7 +171,7 @@ export async function move(discordId: string, dir: Direction): Promise<ActionRes
   });
   await revealAround(discordId, nx, ny);
 
-  if ((await getBalance(discordId)) <= 0) {
+  if (hpAfter !== null && hpAfter <= 0) {
     return { ok: true, note: note + (await faint(discordId)).note };
   }
 
@@ -219,9 +262,9 @@ export async function battleMove(discordId: string, move: BattleMove): Promise<A
   return queueAction(discordId, { kind: "move", dir: move });
 }
 
-/** Queue a weapon strike into the plan. */
-export async function queueStrike(discordId: string): Promise<ActionResult> {
-  return queueAction(discordId, { kind: "strike" });
+/** Queue a strike of the given attack mode (defaults to line). */
+export async function queueStrike(discordId: string, mode: AttackMode = DEFAULT_ATTACK_MODE): Promise<ActionResult> {
+  return queueAction(discordId, { kind: "strike", mode });
 }
 
 /** Queue a wait (hold position one tick) into the plan. */
@@ -255,10 +298,10 @@ export async function resolvePlan(discordId: string): Promise<ActionResult> {
 
   let note = res.steps.map((s) => s.line).join("\n");
 
-  // Apply damage the player took (closed-loop economy: sats → pool).
+  // Apply damage the player took: burn sats → pool AND lower HP. Faint at 0 HP.
   if (res.totalTaken > 0) {
-    await takeDamage(discordId, res.totalTaken);
-    if ((await getBalance(discordId)) <= 0) {
+    const { hp } = await loseHp(discordId, res.totalTaken);
+    if (hp <= 0) {
       return { ok: true, note: `${note}\n` + (await faint(discordId)).note };
     }
   }
@@ -336,15 +379,25 @@ export async function eat(discordId: string): Promise<ActionResult> {
   return { ok: true, note: `🍞 Ate bread (−${paid} sat). +${SAT.BREAD_STAMINA} stamina.` };
 }
 
-/** Faint: fixed penalty (clamped to balance, → pool), warp to the nearest town, restore stamina. */
+/**
+ * Faint at 0 HP: the sats already burned to the pool ARE the cost (no extra flat penalty,
+ * so banked sats above the HP line stay safe). Warp to the nearest town, restore stamina,
+ * and re-arm HP from whatever balance survived (up to the cap) so the run can continue.
+ */
 export async function faint(discordId: string): Promise<ActionResult> {
-  const lost = await takeDamage(discordId, SAT.DEATH_PENALTY_SATS);
   await deleteCombat(discordId);
-  const player = await getPlayer(discordId);
+  const [player, balance] = await Promise.all([getPlayer(discordId), getBalance(discordId)]);
   const { town } = nearestTown(player?.x_coord ?? 0, player?.y_coord ?? 0);
-  await updatePlayer(discordId, { x_coord: town.cx, y_coord: town.cy, hunger: 100, state: "idle" });
+  const maxHp = player?.max_hp ?? SAT.HP_MAX_DEFAULT;
+  const rearmed = Math.min(balance, maxHp);
+  await updatePlayer(discordId, { x_coord: town.cx, y_coord: town.cy, hunger: 100, state: "idle", hp: rearmed });
   await revealAround(discordId, town.cx, town.cy);
-  return { ok: true, note: `☠️ You fainted! Lost ${lost} sats and woke up in **${town.name}**.` };
+  const banked = balance - rearmed;
+  return {
+    ok: true,
+    note: `☠️ You fainted and woke up in **${town.name}**. HP re-armed to ${formatSats(rearmed)}` +
+      (banked > 0 ? ` (${formatSats(banked)} banked sats kept safe).` : "."),
+  };
 }
 
 export async function chargeBuyIn(discordId: string): Promise<boolean> {
@@ -456,7 +509,8 @@ export async function travelTo(
   await updatePlayer(discordId, { x_coord: tx, y_coord: ty, hunger: endStamina, last_move_at: new Date().toISOString() });
   await revealAround(discordId, tx, ty);
 
-  if ((await getBalance(discordId)) <= 0) {
+  const [balAfter, plAfter] = await Promise.all([getBalance(discordId), getPlayer(discordId)]);
+  if (plAfter && effectiveHp(plAfter, balAfter) <= 0) {
     return { ok: true, note: paidNote + (await faint(discordId)).note };
   }
   const arrival = await resolveTile(discordId, tx, ty);

@@ -10,6 +10,20 @@ import type {
   ViewModel,
 } from "./types.js";
 
+/**
+ * Resolve a player's current HP, enforcing the invariant `0 ≤ hp ≤ min(balance, max_hp)`.
+ *
+ * HP is the *at-risk* slice of the player's sats balance (capped at `max_hp`, default
+ * `SAT.HP_MAX_DEFAULT`). A NULL `hp` column means "not yet armed" → derive `min(balance, max_hp)`.
+ * Balance-only spends (bread, flee, shop) may leave the stored `hp` momentarily above the
+ * balance; this clamp keeps every read consistent without a write on every spend.
+ */
+export function effectiveHp(player: Pick<SatPlayerRow, "hp" | "max_hp">, balance: number): number {
+  const cap = Math.min(balance, player.max_hp ?? SAT.HP_MAX_DEFAULT);
+  const cur = player.hp ?? cap;
+  return Math.max(0, Math.min(cur, cap));
+}
+
 export async function getPlayer(discordId: string): Promise<SatPlayerRow | null> {
   const { data } = await supabase
     .from("sat_players")
@@ -33,7 +47,8 @@ export async function startRun(discordId: string): Promise<SatPlayerRow> {
         hunger: 100,
         state: "idle",
         active: true,
-        display_max_hp: balance,
+        hp: Math.min(balance, SAT.HP_MAX_DEFAULT), // arm HP from balance, up to the cap
+        max_hp: SAT.HP_MAX_DEFAULT,
         last_move_at: new Date().toISOString(),
       },
       { onConflict: "discord_id" },
@@ -66,13 +81,6 @@ export async function updatePlayer(
   patch: Partial<SatPlayerRow>,
 ): Promise<void> {
   await supabase.from("sat_players").update(patch).eq("discord_id", discordId);
-}
-
-export async function refreshDisplayMaxHp(player: SatPlayerRow, hp: number): Promise<void> {
-  if (hp > player.display_max_hp) {
-    await updatePlayer(player.discord_id, { display_max_hp: hp });
-    player.display_max_hp = hp;
-  }
 }
 
 export async function getCombat(discordId: string): Promise<CombatSessionRow | null> {
@@ -295,7 +303,7 @@ export async function loadView(discordId: string): Promise<ViewModel | null> {
   const player = await getPlayer(discordId);
   if (!player) return null;
   const b = viewportBounds(player.x_coord, player.y_coord);
-  const [hp, combat, entities, others, explored, ownedItemIds] = await Promise.all([
+  const [balance, combat, entities, others, explored, ownedItemIds] = await Promise.all([
     getBalance(discordId),
     getCombat(discordId),
     loadViewportEntities(player.x_coord, player.y_coord),
@@ -303,6 +311,7 @@ export async function loadView(discordId: string): Promise<ViewModel | null> {
     exploredInBox(discordId, b.minX, b.maxX, b.minY, b.maxY),
     getOwnedItemIds(discordId),
   ]);
-  await refreshDisplayMaxHp(player, hp);
-  return { player, hp, entities, others, combat, ownedItemIds, explored };
+  const maxHp = player.max_hp ?? SAT.HP_MAX_DEFAULT;
+  const hp = effectiveHp(player, balance);
+  return { player, hp, maxHp, balance, entities, others, combat, ownedItemIds, explored };
 }

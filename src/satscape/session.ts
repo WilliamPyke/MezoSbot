@@ -315,11 +315,11 @@ function toVisualSig(view: ViewModel | null): string {
   if (!view) return "";
   const ents = view.entities.map((e) => `${e.type}@${e.x},${e.y}`).sort().join("|");
   const others = view.others.map((o) => `${o.state[0]}@${o.x},${o.y}`).sort().join("|");
-  // Board is static within a round (round-start positions + fixed telegraph), so
-  // the plan/weapon are excluded here — editing them is a text-only repaint. Only
-  // positions / hp / turn change the image, which happens on Resolve.
+  // The battle board previews the queued plan (path + strike tiles) and the
+  // selected weapon's damage, so both belong in the visual signature — editing
+  // the plan re-encodes the board so the preview updates live.
   const combat = view.combat
-    ? `c:${view.combat.turn_number}:${view.combat.monster_current_hp}:${view.combat.player_battle_x},${view.combat.player_battle_y}:${view.combat.monster_battle_x},${view.combat.monster_battle_y}`
+    ? `c:${view.combat.turn_number}:${view.combat.monster_current_hp}:${view.combat.player_battle_x},${view.combat.player_battle_y}:${view.combat.monster_battle_x},${view.combat.monster_battle_y}:${view.combat.battle_plan ?? ""}:${view.combat.selected_battle_weapon ?? ""}`
     : "i";
   return `${view.player.x_coord},${view.player.y_coord};${combat};${ents};${others}`;
 }

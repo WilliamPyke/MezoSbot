@@ -30,16 +30,18 @@ import {
   faint,
   fight,
   flee,
+  loseHp,
   maxStepsFor,
   move,
   moveMany,
+  refillHp,
   resolveTile,
   setStepsPerMove,
   travelCost,
   travelTo,
 } from "./game.js";
 import { queueWait, resolvePlan } from "./game.js";
-import { getCombat, getPlayer, isTileCleared, startRun, updateCombat, updatePlayer } from "./db.js";
+import { effectiveHp, getCombat, getPlayer, isTileCleared, startRun, updateCombat, updatePlayer } from "./db.js";
 import { lossFor, winChance } from "./items.js";
 import { effectivePrice, gearScore, nearestTown, TOWN_BY_ID } from "./towns.js";
 import { acceptQuest, claimQuest, getRep, payTribute, questBoard } from "./quests.js";
@@ -101,6 +103,32 @@ async function main() {
   ok((await readPool()) === poolBefore + SAT.BUYIN_SATS, "buy-in seeded the pool");
   await startRun(TEST_ID);
   await conserved(TOTAL, "after buy-in");
+
+  // 1b. HP cap / refill invariant for a wealthy player.
+  console.log("\n1b. HP cap and refill");
+  let hpPlayer = (await getPlayer(TEST_ID))!;
+  ok(hpPlayer.max_hp === SAT.HP_MAX_DEFAULT, `max_hp defaults to ${SAT.HP_MAX_DEFAULT}`);
+  ok(effectiveHp(hpPlayer, await getBalance(TEST_ID)) === SAT.HP_MAX_DEFAULT, "wealthy player loads with capped 250 HP");
+  const balBeforeHit = await getBalance(TEST_ID);
+  const hit = await loseHp(TEST_ID, 30);
+  hpPlayer = (await getPlayer(TEST_ID))!;
+  ok(hit.hp === SAT.HP_MAX_DEFAULT - 30 && effectiveHp(hpPlayer, await getBalance(TEST_ID)) === SAT.HP_MAX_DEFAULT - 30, "30 damage lowers HP to 220");
+  ok((await getBalance(TEST_ID)) === balBeforeHit - 30, "30 damage burns 30 sats from balance");
+  const balBeforeRefill = await getBalance(TEST_ID);
+  const refill = await refillHp(TEST_ID, 30);
+  hpPlayer = (await getPlayer(TEST_ID))!;
+  ok(refill.ok && effectiveHp(hpPlayer, await getBalance(TEST_ID)) === SAT.HP_MAX_DEFAULT, "refill restores HP to 250");
+  ok((await getBalance(TEST_ID)) === balBeforeRefill, "HP refill leaves balance unchanged");
+  const balBeforeDrain = await getBalance(TEST_ID);
+  const drained = await loseHp(TEST_ID, SAT.HP_MAX_DEFAULT);
+  ok(drained.hp === 0, "draining the HP slice reaches 0 HP");
+  const balAfterDrain = await getBalance(TEST_ID);
+  ok(balAfterDrain === balBeforeDrain - SAT.HP_MAX_DEFAULT, "drain burns only the at-risk HP slice");
+  await faint(TEST_ID);
+  hpPlayer = (await getPlayer(TEST_ID))!;
+  ok((await getBalance(TEST_ID)) === balAfterDrain, "faint does not charge an extra flat penalty");
+  ok(effectiveHp(hpPlayer, await getBalance(TEST_ID)) === Math.min(balAfterDrain, SAT.HP_MAX_DEFAULT), "faint re-arms HP from remaining balance");
+  await conserved(TOTAL, "after HP cap/refill/faint");
 
   // 2. Move + exhaustion
   console.log("\n2. Move & exhaustion");

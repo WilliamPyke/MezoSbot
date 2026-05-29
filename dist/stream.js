@@ -197,7 +197,7 @@ async function tryServeWebApp(req, res, url) {
         return false;
     if (url.pathname.startsWith("/api/") || url.pathname === "/healthz" || url.pathname === "/metrics")
         return false;
-    if (url.pathname === "/stream" || url.pathname.startsWith("/arcade") || url.pathname.startsWith("/web/play/"))
+    if (url.pathname === "/stream" || url.pathname.startsWith("/arcade") || url.pathname.startsWith("/satscape") || url.pathname.startsWith("/web/play/"))
         return false;
     const webRoot = (0, node_path_1.join)(process.cwd(), "web", "dist");
     const requestedPath = url.pathname === "/" ? "index.html" : decodeURIComponent(url.pathname.slice(1));
@@ -309,7 +309,7 @@ async function handleHttpRequest(req, res) {
         if (handled)
             return;
     }
-    if (url.pathname === "/satscape" || url.pathname.startsWith("/api/satscape")) {
+    if (url.pathname === "/satscape" || url.pathname.startsWith("/satscape/") || url.pathname.startsWith("/api/satscape")) {
         const handled = await (0, satscape_js_1.handleSatscapeWebRequest)(req, res, url);
         if (handled)
             return;
