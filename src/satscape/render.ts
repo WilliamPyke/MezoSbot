@@ -15,7 +15,6 @@ import { type ItemSlot } from "./items.js";
 import { keeperLine } from "./lines.js";
 import {
   ARENA_SIZE,
-  ATTACK_MODES,
   MAX_PLAN,
   monsterPlan,
   parsePlan,
@@ -26,6 +25,7 @@ import {
   type MonsterIntent,
   type Point,
 } from "./battle.js";
+import { buildSatscapePlayUrl } from "./web_tokens.js";
 import type { QuestView } from "./quests.js";
 import {
   effectivePrice,
@@ -626,11 +626,9 @@ function buildBattlePreviewText(view: ViewModel): string {
   const projection = queued.length
     ? `**If you resolve:** deal ${res.totalDealt}, take ${res.totalTaken}` +
       (res.monsterDead ? " — 💀 **kills it!**" : ` → monster ${res.monsterHp}/${combat.monster_max_hp} HP`)
-    : "_Move (arrows), pick a strike (🗡️ Line · 🔨 Slam · 🪓 Cleave), ⏳ Wait — then Resolve._";
+    : "_Open the browser playfield to play cards, move, and resolve the fight._";
 
-  const turnPrompt = queued.length >= MAX_PLAN
-    ? "**Turn ready:** Resolve to run your 3 actions against the monster's 3 moves."
-    : `**Turn planning:** choose ${MAX_PLAN - queued.length} more action${MAX_PLAN - queued.length === 1 ? "" : "s"} before Resolve.`;
+  const turnPrompt = "**⚔️ This fight is played in the browser** — tap *Fight in browser* below.";
 
   return [
     `**Incoming:**\n${telegraph}`,
@@ -646,6 +644,14 @@ function buildBattlePreviewText(view: ViewModel): string {
 function dirButton(action: string, label: string): ButtonBuilder {
   const emoji = action === "up" ? "⬆️" : action === "down" ? "⬇️" : action === "left" ? "⬅️" : "➡️";
   return new ButtonBuilder().setCustomId(sqCid(action)).setLabel(label).setEmoji(emoji).setStyle(ButtonStyle.Primary);
+}
+
+/** A single-button row linking to the browser playfield (movement & combat live there). */
+function playInBrowserRow(view: ViewModel): ActionRowBuilder<ButtonBuilder> {
+  const label = view.combat ? "⚔️ Fight in browser" : "🎮 Play in browser";
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setLabel(label).setStyle(ButtonStyle.Link).setURL(buildSatscapePlayUrl(view.player.discord_id)),
+  );
 }
 
 function buildBattleWeaponSelect(view: ViewModel): StringSelectMenuBuilder | null {
@@ -677,57 +683,18 @@ export function buildComponents(
   view: ViewModel,
   opts: { autoExploring?: boolean } = {},
 ): ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>[] {
+  // Combat is browser-only now — Discord shows a launch link instead of arena controls.
   if (view.combat) {
-    const queued = parsePlan(view.combat.battle_plan);
-    const full = queued.length >= MAX_PLAN;
-    const empty = queued.length === 0;
-    const move = (action: string, label: string) =>
-      dirButton(action, label).setDisabled(full);
-
-    const rows: ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>[] = [
-      new ActionRowBuilder<ButtonBuilder>().addComponents(move("up", "Up")),
-      new ActionRowBuilder<ButtonBuilder>().addComponents(
-        move("left", "Left"),
-        move("down", "Down"),
-        move("right", "Right"),
-      ),
-    ];
-    // Attack-mode buttons (default shapes, weapon-agnostic) + Wait + Undo.
-    const strikeRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      ...ATTACK_MODES.map((m) =>
-        new ButtonBuilder().setCustomId(sqCid("battlestrike", m.mode)).setLabel(m.name).setEmoji(m.emoji).setStyle(ButtonStyle.Primary).setDisabled(full),
-      ),
-      new ButtonBuilder().setCustomId(sqCid("battlewait")).setLabel("Wait").setEmoji("⏳").setStyle(ButtonStyle.Secondary).setDisabled(full),
-      new ButtonBuilder().setCustomId(sqCid("battleundo")).setLabel("Undo").setEmoji("↩️").setStyle(ButtonStyle.Secondary).setDisabled(empty),
-    );
-    rows.push(strikeRow);
-    rows.push(new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder().setCustomId(sqCid("battleresolve")).setLabel(empty ? "Resolve (wait out)" : `Resolve ${queued.length}/${MAX_PLAN}`).setEmoji("✅").setStyle(ButtonStyle.Danger),
-      new ButtonBuilder().setCustomId(sqCid("flee")).setLabel("Flee").setEmoji("🏃").setStyle(ButtonStyle.Secondary),
-    ));
-    const weaponSelect = buildBattleWeaponSelect(view);
-    if (weaponSelect) rows.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(weaponSelect));
-    return rows;
+    return [playInBrowserRow(view)];
   }
   const auto = opts.autoExploring
     ? new ButtonBuilder().setCustomId(sqCid("autostop")).setLabel("Stop").setEmoji("⏹️").setStyle(ButtonStyle.Danger)
     : new ButtonBuilder().setCustomId(sqCid("auto")).setLabel("Auto-Explore").setEmoji("🤖").setStyle(ButtonStyle.Secondary);
 
-  const steps = Math.max(1, view.player.steps_per_move ?? 1);
-  const stride = steps > 1 ? `×${steps}` : null;
-  const dirBtn = (action: string, emoji: string) => {
-    const b = new ButtonBuilder().setCustomId(sqCid(action)).setEmoji(emoji).setStyle(ButtonStyle.Primary);
-    if (stride) b.setLabel(stride);
-    return b;
-  };
-
+  // Step-by-step movement now lives in the browser playfield; Discord keeps the
+  // launch link plus the non-movement utilities (eat, travel, shop, quests…).
   const rows: ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>[] = [
-    new ActionRowBuilder<ButtonBuilder>().addComponents(dirBtn("up", "⬆️")),
-    new ActionRowBuilder<ButtonBuilder>().addComponents(
-      dirBtn("left", "⬅️"),
-      dirBtn("down", "⬇️"),
-      dirBtn("right", "➡️"),
-    ),
+    playInBrowserRow(view),
     new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId(sqCid("eat")).setLabel("Eat").setEmoji("🍞").setStyle(ButtonStyle.Success),
       new ButtonBuilder().setCustomId(sqCid("travel")).setLabel("Travel").setEmoji("🧭").setStyle(ButtonStyle.Primary),

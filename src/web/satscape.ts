@@ -7,15 +7,22 @@ const CHUNKS_DIR = join(__dirname, "..", "satscape", "world_gen", "chunks");
 import { supabase } from "../db.js";
 import { biomeAt, SAT } from "../satscape/engine.js";
 import {
-  ATTACK_MODES,
+  MAX_PLAN,
   monsterPlan,
   parsePlan,
+  planAP,
   projectedPlayerPos,
   selectedWeaponId,
   weaponFor,
-  type AttackMode,
   type BattleMove,
 } from "../satscape/battle.js";
+import {
+  basePlayerAP,
+  effectivePlayerAP,
+  parseStatuses,
+  playerKit,
+  STATUS_META,
+} from "../satscape/cards.js";
 import { effectiveHp, getPlayer, loadView } from "../satscape/db.js";
 import {
   battleMove,
@@ -25,7 +32,7 @@ import {
   estimateTravel,
   flee,
   moveMany,
-  queueStrike,
+  queueCard,
   queueWait,
   refillHp,
   resolvePlan,
@@ -34,7 +41,7 @@ import {
   undoPlanAction,
 } from "../satscape/game.js";
 import { acceptQuest, claimQuest, getRep, payTribute, questBoard } from "../satscape/quests.js";
-import { ALL_ITEMS, effectivePrice, TERRAIN_COLOR, townAt, TOWNS } from "../satscape/towns.js";
+import { ALL_ITEMS, effectivePrice, fastTravelRadius, TERRAIN_COLOR, townAt, TOWNS } from "../satscape/towns.js";
 import { verifyPlayToken } from "../satscape/web_tokens.js";
 import type { Direction, ViewModel } from "../satscape/types.js";
 
@@ -147,7 +154,7 @@ export async function handleSatscapeWebRequest(
     await respondAction(req, res, async (claim, body) => {
       const action = strField(body, "action");
       if (action === "move") return battleMove(claim.userId, strField(body, "dir") as BattleMove);
-      if (action === "strike") return queueStrike(claim.userId, (body.mode as AttackMode | undefined) ?? "line");
+      if (action === "card") return queueCard(claim.userId, strField(body, "cardId"));
       if (action === "wait") return queueWait(claim.userId);
       if (action === "undo") return undoPlanAction(claim.userId);
       if (action === "resolve") return resolvePlan(claim.userId);
@@ -304,6 +311,7 @@ function playerState(view: ViewModel): Record<string, unknown> {
     stamina: view.player.hunger,
     state: view.player.state,
     stepsPerMove: view.player.steps_per_move,
+    travelRadius: fastTravelRadius(view.player),
     equipped: {
       weapon: view.player.equipped_weapon,
       armor: view.player.equipped_armor,
@@ -318,6 +326,19 @@ function combatState(view: ViewModel): Record<string, unknown> | null {
   if (!combat) return null;
   const plan = parsePlan(combat.battle_plan);
   const weapon = weaponFor(view.player, selectedWeaponId(combat, view.player));
+  const playerStatus = parseStatuses(combat.player_status);
+  const maxAp = basePlayerAP(view.player);
+  const availableAp = effectivePlayerAP(view.player, playerStatus);
+  const spentAp = planAP(plan);
+  const kit = playerKit(view.player).map((c) => ({
+    id: c.id,
+    name: c.name,
+    emoji: c.emoji,
+    apCost: c.apCost,
+    kind: c.kind,
+    desc: c.desc,
+    affordable: c.apCost <= availableAp - spentAp,
+  }));
   return {
     monster: {
       name: combat.monster_name,
@@ -334,10 +355,18 @@ function combatState(view: ViewModel): Record<string, unknown> | null {
     plan,
     projected: projectedPlayerPos(combat, plan),
     intents: monsterPlan(combat, view.player),
-    attackModes: ATTACK_MODES,
+    kit,
+    ap: { max: maxAp, available: availableAp, spent: spentAp, ticks: plan.length, maxTicks: MAX_PLAN },
+    playerStatus: statusBadges(playerStatus),
+    monsterStatus: statusBadges(parseStatuses(combat.monster_status)),
     weapon,
     selectedWeaponId: selectedWeaponId(combat, view.player),
   };
+}
+
+/** Compact status descriptors for the UI badges. */
+function statusBadges(list: ReturnType<typeof parseStatuses>): Array<{ kind: string; emoji: string; label: string; amount: number; turns: number }> {
+  return list.map((s) => ({ kind: s.kind, emoji: STATUS_META[s.kind].emoji, label: STATUS_META[s.kind].label, amount: s.amount, turns: s.turns }));
 }
 
 function inventoryState(view: ViewModel): Record<string, unknown> {
@@ -591,10 +620,12 @@ const PLAY_HTML = /* html */ `<!doctype html>
     </div>
     <div class="panel" id="battleControls">
       <h2>Battle</h2>
-      <div class="row"><button data-bmove="up" title="Queue north">Up</button><button data-bmove="down" title="Queue south">Down</button><button data-bmove="left" title="Queue west">Left</button><button data-bmove="right" title="Queue east">Right</button></div>
-      <div class="row" style="margin-top:6px"><select id="strikeMode"></select><button id="strike" class="primary">Strike</button></div>
+      <div class="muted" id="apText" style="margin-bottom:6px"></div>
+      <div id="cardTray" style="display:flex;flex-wrap:wrap;gap:6px"></div>
+      <div class="row" style="margin-top:6px"><button data-bmove="up" title="Queue north (1 AP)">Up</button><button data-bmove="down" title="Queue south (1 AP)">Down</button><button data-bmove="left" title="Queue west (1 AP)">Left</button><button data-bmove="right" title="Queue east (1 AP)">Right</button></div>
       <div class="row" style="margin-top:6px"><select id="weapon"></select><button id="weaponBtn">Ready</button></div>
       <div class="row" style="margin-top:6px"><button id="wait">Wait</button><button id="undo">Undo</button><button id="resolve" class="primary">Resolve</button><button id="flee" class="danger">Flee</button></div>
+      <div id="statusRow" style="margin-top:7px;font-size:12px"></div>
       <div class="muted" id="battleTurnText" style="margin-top:7px"></div>
       <div id="battlePlan" style="margin-top:6px"></div>
       <div class="turn-track" id="monsterPlan"></div>
@@ -772,6 +803,14 @@ const PLAY_HTML = /* html */ `<!doctype html>
     var px=(p.x-b.minX+.5)*tw, py=(p.y-b.minY+.5)*th;
     ctx.fillStyle = "#f43f5e"; ctx.beginPath(); ctx.arc(px, py, Math.max(7, tw*.22), 0, Math.PI*2); ctx.fill();
     ctx.strokeStyle = "#fff"; ctx.lineWidth = 2; ctx.stroke();
+
+    // Fast-travel reach — a Chebyshev square around the player (boots widen it).
+    var rad = p.travelRadius || 0;
+    if(rad > 0){
+      var rx = (p.x - rad - b.minX) * tw, ry = (p.y - rad - b.minY) * th, side = rad * 2 + 1;
+      ctx.strokeStyle = "rgba(253,224,71,.55)"; ctx.lineWidth = 2; ctx.setLineDash([5,4]);
+      ctx.strokeRect(rx, ry, side * tw, side * th); ctx.setLineDash([]);
+    }
   }
   function drawBattle(){
     var c = state && state.combat;
@@ -863,44 +902,55 @@ const PLAY_HTML = /* html */ `<!doctype html>
     drawKnownMap(ctx, play.width, play.height, 18, true);
   }
   function tileLabel(p){ return String.fromCharCode(65 + p.x) + (p.y + 1); }
+  function cardName(id){ var k = (state.combat && state.combat.kit) || []; for(var i=0;i<k.length;i++) if(k[i].id===id) return k[i].emoji + " " + k[i].name; return id; }
   function actionLabel(a){
     if(!a) return "Empty";
     if(a.kind === "move") return a.dir.charAt(0).toUpperCase() + a.dir.slice(1);
-    if(a.kind === "strike") return "Strike " + a.mode;
+    if(a.kind === "card") return cardName(a.cardId);
     return "Wait";
   }
   function renderBattleSummary(){
-    var c = state && state.combat, planEl = document.getElementById("battlePlan"), monsterEl = document.getElementById("monsterPlan"), turnEl = document.getElementById("battleTurnText");
-    planEl.innerHTML = ""; monsterEl.innerHTML = "";
+    var c = state && state.combat, planEl = document.getElementById("battlePlan"), monsterEl = document.getElementById("monsterPlan"), turnEl = document.getElementById("battleTurnText"), statusEl = document.getElementById("statusRow"), apEl = document.getElementById("apText");
+    planEl.innerHTML = ""; monsterEl.innerHTML = ""; statusEl.innerHTML = "";
     if(!c){
-      turnEl.textContent = "Not in combat.";
+      turnEl.textContent = "Not in combat."; apEl.textContent = "";
       document.getElementById("resolve").disabled = true;
       document.querySelectorAll("[data-bmove]").forEach(function(b){ b.disabled = true; });
-      document.getElementById("strike").disabled = true;
       document.getElementById("wait").disabled = true;
       document.getElementById("undo").disabled = true;
       return;
     }
-    var plan = c.plan || [], full = plan.length >= 3;
-    turnEl.textContent = full ? "Turn " + c.turn + " ready. Resolve to play all 3 actions." : "Turn " + c.turn + ": choose " + (3 - plan.length) + " more action" + (3 - plan.length === 1 ? "" : "s") + ".";
-    for(var i=0;i<3;i++){
+    var plan = c.plan || [], ap = c.ap || { max:3, available:3, spent:0, ticks:0, maxTicks:3 };
+    var remainingAp = ap.available - ap.spent, ticksLeft = ap.maxTicks - ap.ticks;
+    apEl.textContent = "⚡ AP " + ap.spent + "/" + ap.available + (ap.available < ap.max ? " (stunned)" : "") + " · " + ticksLeft + " action" + (ticksLeft === 1 ? "" : "s") + " left";
+    turnEl.textContent = "Turn " + c.turn + " — play cards & moves, then Resolve.";
+    for(var i=0;i<ap.maxTicks;i++){
       var slot = document.createElement("span");
       slot.className = "turn-slot" + (plan[i] ? " filled" : "");
       slot.textContent = (i + 1) + ". " + actionLabel(plan[i]);
       planEl.appendChild(slot);
     }
+    function badgeRow(label, arr){
+      if(!arr || !arr.length) return;
+      var d = document.createElement("div");
+      d.textContent = label + ": " + arr.map(function(s){ return s.emoji + " " + s.label + " " + s.amount + " (" + s.turns + ")"; }).join("   ");
+      statusEl.appendChild(d);
+    }
+    badgeRow("You", c.playerStatus);
+    badgeRow(c.monster.name, c.monsterStatus);
     (c.intents || []).forEach(function(intent){
       var el = document.createElement("div");
       el.className = "turn-step " + intent.act;
       var target = tileLabel(intent.to);
-      var detail = intent.act === "attack" ? "hits " + (intent.attackTiles || []).length + " tiles for " + intent.damage + " dmg" : intent.description;
+      var fx = intent.apply && intent.apply.length ? " +" + intent.apply.map(function(e){ return e.kind; }).join("/") : "";
+      var detail = intent.act === "attack" ? "hits " + (intent.attackTiles || []).length + " tiles for " + intent.damage + fx : intent.description;
       el.textContent = intent.order + ". " + intent.name + " -> " + target + " - " + detail;
       monsterEl.appendChild(el);
     });
-    document.getElementById("resolve").disabled = !full;
-    document.querySelectorAll("[data-bmove]").forEach(function(b){ b.disabled = full; });
-    document.getElementById("strike").disabled = full;
-    document.getElementById("wait").disabled = full;
+    document.getElementById("resolve").disabled = false;
+    var noTicks = ticksLeft <= 0;
+    document.querySelectorAll("[data-bmove]").forEach(function(b){ b.disabled = noTicks || remainingAp < 1; });
+    document.getElementById("wait").disabled = noTicks;
     document.getElementById("undo").disabled = plan.length === 0;
   }
   function renderPanels(){
@@ -914,8 +964,16 @@ const PLAY_HTML = /* html */ `<!doctype html>
     document.getElementById("hpInput").placeholder = String(needed);
     document.getElementById("bankText").textContent = needed > 0 ? needed + " banked sats can be committed to HP." : "No HP refill available.";
     document.getElementById("battleControls").style.opacity = state.combat ? "1" : ".45";
-    var sm = document.getElementById("strikeMode"); sm.innerHTML = "";
-    ((state.combat && state.combat.attackModes) || []).forEach(function(m){ var o=document.createElement("option"); o.value=m.mode; o.textContent=m.name; sm.appendChild(o); });
+    var tray = document.getElementById("cardTray"); tray.innerHTML = "";
+    ((state.combat && state.combat.kit) || []).forEach(function(card){
+      var b = document.createElement("button");
+      b.textContent = card.emoji + " " + card.name + " " + card.apCost + "⚡";
+      b.title = card.desc;
+      b.className = card.kind === "buff" ? "" : "primary";
+      b.disabled = !card.affordable;
+      b.onclick = function(){ act("/satscape/api/battle", { action:"card", cardId:card.id }); };
+      tray.appendChild(b);
+    });
     var weap = document.getElementById("weapon"); weap.innerHTML = "";
     (state.inventory.items||[]).filter(function(i){ return i.slot === "weapon"; }).forEach(function(i){ var o=document.createElement("option"); o.value=i.id; o.textContent=i.name; weap.appendChild(o); });
     if(state.combat && state.combat.selectedWeaponId) weap.value = state.combat.selectedWeaponId;
@@ -944,7 +1002,6 @@ const PLAY_HTML = /* html */ `<!doctype html>
   document.getElementById("eat").onclick=function(){ act("/satscape/api/eat", {}); };
   document.getElementById("refresh").onclick=function(){ api("/satscape/api/state").then(setState).catch(function(e){ note.textContent=e.message; }); };
   document.getElementById("refill").onclick=function(){ act("/satscape/api/refill-hp", { sats:Number(document.getElementById("hpInput").value || 0) }); };
-  document.getElementById("strike").onclick=function(){ act("/satscape/api/battle", { action:"strike", mode:document.getElementById("strikeMode").value || "line" }); };
   document.getElementById("weaponBtn").onclick=function(){ act("/satscape/api/battle", { action:"weapon", itemId:document.getElementById("weapon").value }); };
   document.getElementById("wait").onclick=function(){ act("/satscape/api/battle", { action:"wait" }); };
   document.getElementById("undo").onclick=function(){ act("/satscape/api/battle", { action:"undo" }); };
@@ -960,11 +1017,14 @@ const PLAY_HTML = /* html */ `<!doctype html>
     var y = Math.floor((e.clientY - r.top) / r.height * 16) + b.minY;
     document.getElementById("tx").value = String(x);
     document.getElementById("ty").value = String(y);
+    var rad = state.player.travelRadius || 0;
+    var reach = Math.max(Math.abs(x - state.player.x), Math.abs(y - state.player.y));
     if(clickTravel){
+      if(reach > rad){ document.getElementById("travelText").textContent = "Out of fast-travel range (" + (rad*2+1) + "×" + (rad*2+1) + ")."; return; }
       document.getElementById("travelText").textContent = "Travelling to (" + x + ", " + y + ")...";
       act("/satscape/api/travel", { tx:x, ty:y });
     } else {
-      document.getElementById("travelText").textContent = "Target set to (" + x + ", " + y + ").";
+      document.getElementById("travelText").textContent = "Target (" + x + ", " + y + ")" + (reach > rad ? " — out of range" : "") + ".";
     }
   });
   ["Shop","Quests","Gear"].forEach(function(n){ document.getElementById("tab"+n).onclick=function(){ activeTab=n.toLowerCase(); renderList(); }; });
@@ -992,13 +1052,11 @@ const PLAY_HTML = /* html */ `<!doctype html>
     if(e.key === "q" || e.key === "Q"){ e.preventDefault(); act("/satscape/api/battle", { action:"wait" }); return; }
     if(e.key === "z" || e.key === "Z" || e.key === "u" || e.key === "U"){ e.preventDefault(); act("/satscape/api/battle", { action:"undo" }); return; }
     if(e.key === "f" || e.key === "F"){ e.preventDefault(); act("/satscape/api/battle", { action:"flee" }); return; }
-    var modeIndex = { "1":0, "2":1, "3":2 }[e.key];
-    if(modeIndex !== undefined){
+    var cardIdx = "123456789".indexOf(e.key);
+    if(cardIdx >= 0){
       e.preventDefault();
-      var modes = state.combat.attackModes || [];
-      var mode = modes[modeIndex] && modes[modeIndex].mode || "line";
-      document.getElementById("strikeMode").value = mode;
-      act("/satscape/api/battle", { action:"strike", mode:mode });
+      var kit = state.combat.kit || [];
+      if(kit[cardIdx] && kit[cardIdx].affordable) act("/satscape/api/battle", { action:"card", cardId:kit[cardIdx].id });
     }
   });
   window.addEventListener("keyup", function(e){

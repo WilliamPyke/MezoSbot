@@ -1,4 +1,4 @@
-import type { ShopItem, ItemSlot } from "./items.js";
+import type { ShopItem, ItemSlot, Rarity } from "./items.js";
 import type { SatPlayerRow } from "./types.js";
 
 /* ─────────── terrain ─────────── */
@@ -67,8 +67,19 @@ export interface Town {
 
 type GearCatalogSlot = Exclude<ItemSlot, "boots">;
 
-/** Build a town's themed 3-item gear catalogue (boots are added separately). */
-function catalog(townId: string, power: number, price: number, names: Record<GearCatalogSlot, string>, emoji: Record<GearCatalogSlot, string>): ShopItem[] {
+/**
+ * Build a town's themed 3-item gear catalogue (boots are added separately). Each
+ * piece grants ability cards to the player's battle kit; accessories also carry a
+ * +1 AP passive (their way of "affecting your abilities").
+ */
+function catalog(
+  townId: string,
+  power: number,
+  price: number,
+  names: Record<GearCatalogSlot, string>,
+  emoji: Record<GearCatalogSlot, string>,
+  cards: Record<GearCatalogSlot, string[]>,
+): ShopItem[] {
   return (["weapon", "armor", "accessory"] as GearCatalogSlot[]).map((slot) => ({
     id: `${townId}_${slot}`,
     name: names[slot],
@@ -76,6 +87,8 @@ function catalog(townId: string, power: number, price: number, names: Record<Gea
     power,
     price,
     emoji: emoji[slot],
+    cards: cards[slot],
+    ...(slot === "accessory" ? { passive: { apBonus: 1 } } : {}),
   }));
 }
 
@@ -92,7 +105,8 @@ export const TOWNS: Town[] = [
     catalog: [
       ...catalog("rest", 3, 40,
         { weapon: "Iron Shortsword", armor: "Town Guard Vest", accessory: "Copper Band" },
-        { weapon: "🗡️", armor: "🦺", accessory: "💍" }),
+        { weapon: "🗡️", armor: "🦺", accessory: "💍" },
+        { weapon: ["longsword_slash"], armor: ["bulwark"], accessory: ["ember_bolt"] }),
       { id: "rest_boots", name: "Worn Boots", slot: "boots", power: 0, price: 60, emoji: "🥾", stepBonus: 1, rarity: "common" },
     ],
   },
@@ -108,10 +122,11 @@ export const TOWNS: Town[] = [
     catalog: [
       ...catalog("jaipur", 6, 160,
         { weapon: "Tiger Talwar", armor: "Silk-Steel Kurta", accessory: "Jade Tilak" },
-        { weapon: "⚔️", armor: "🥋", accessory: "🟢" }),
+        { weapon: "⚔️", armor: "🥋", accessory: "🟢" },
+        { weapon: ["spear_thrust"], armor: ["bulwark"], accessory: ["ember_bolt"] }),
       { id: "jaipur_boots", name: "Trail Sandals", slot: "boots", power: 0, price: 200, emoji: "👡", stepBonus: 3, rarity: "uncommon" },
       // unlocked by the "Tiger Trouble" quest (rep ≥ 3)
-      { id: "jaipur_unlock", name: "Maharaja Blade", slot: "weapon", power: 15, price: 1200, emoji: "👑", repReq: 3 },
+      { id: "jaipur_unlock", name: "Maharaja Blade", slot: "weapon", power: 15, price: 1200, emoji: "👑", repReq: 3, cards: ["royal_starburst"] },
     ],
   },
   {
@@ -126,7 +141,8 @@ export const TOWNS: Town[] = [
     catalog: [
       ...catalog("dustfall", 8, 320,
         { weapon: "Scorpion Khopesh", armor: "Sun-Baked Plate", accessory: "Mirage Charm" },
-        { weapon: "🪒", armor: "🪖", accessory: "🟡" }),
+        { weapon: "🪒", armor: "🪖", accessory: "🟡" },
+        { weapon: ["hammer_smash"], armor: ["bulwark"], accessory: ["ember_bolt"] }),
       { id: "dustfall_boots", name: "Sand-Strider Greaves", slot: "boots", power: 0, price: 450, emoji: "🩴", stepBonus: 5, rarity: "rare" },
     ],
   },
@@ -142,7 +158,8 @@ export const TOWNS: Town[] = [
     catalog: [
       ...catalog("frosthold", 11, 640,
         { weapon: "Frostfang Axe", armor: "Yeti-Hide Coat", accessory: "Aurora Pendant" },
-        { weapon: "🪓", armor: "🧥", accessory: "🔵" }),
+        { weapon: "🪓", armor: "🧥", accessory: "🔵" },
+        { weapon: ["frost_cleave"], armor: ["bulwark"], accessory: ["aurora_ward"] }),
       { id: "frosthold_boots", name: "Sprinter's Plate", slot: "boots", power: 0, price: 900, emoji: "🥾", stepBonus: 7, rarity: "legendary" },
     ],
   },
@@ -168,6 +185,19 @@ export function bootBonus(player: SatPlayerRow): number {
   const id = player.equipped_boots;
   if (!id) return 0;
   return ITEM_BY_ID.get(id)?.stepBonus ?? 0;
+}
+
+/** Base fast-travel reach (Chebyshev radius) — a 5×5 hop with no boots. */
+export const BASE_TRAVEL_RADIUS = 2;
+
+/** Boots widen the fast-travel radius by rarity. */
+const RARITY_TRAVEL_BONUS: Record<Rarity, number> = { common: 1, uncommon: 2, rare: 3, legendary: 4 };
+
+/** How far (Chebyshev tiles) a player may fast-travel in one hop, set by boots' rarity. */
+export function fastTravelRadius(player: SatPlayerRow): number {
+  const id = player.equipped_boots;
+  const rarity = id ? ITEM_BY_ID.get(id)?.rarity : undefined;
+  return BASE_TRAVEL_RADIUS + (rarity ? RARITY_TRAVEL_BONUS[rarity] : 0);
 }
 
 /* ─────────── geography ─────────── */

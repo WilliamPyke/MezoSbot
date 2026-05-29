@@ -14,21 +14,13 @@ import { SAT } from "./engine.js";
 import { getOwnedItemIds, getPlayer } from "./db.js";
 import {
   buyItem,
-  battleMove,
   eat,
   equipItem,
   estimateTravel,
-  flee,
   maxStepsFor,
-  moveMany,
-  queueStrike,
-  queueWait,
-  resolvePlan,
   setStepsPerMove,
   travelCost,
   travelTo,
-  selectBattleWeapon,
-  undoPlanAction,
   type ActionResult,
 } from "./game.js";
 import {
@@ -59,8 +51,6 @@ import {
 } from "./quests.js";
 import { render, setAuto, stop, type EditableInteraction } from "./session.js";
 import { TOWN_BY_ID, townAt } from "./towns.js";
-import type { AttackMode } from "./battle.js";
-import type { Direction } from "./types.js";
 
 export function isSatscapeInteraction(interaction: Interaction): boolean {
   if (interaction.isButton() || interaction.isModalSubmit() || interaction.isStringSelectMenu()) {
@@ -70,6 +60,7 @@ export function isSatscapeInteraction(interaction: Interaction): boolean {
 }
 
 const DIRECTIONS = new Set(["up", "down", "left", "right"]);
+const BROWSER_NOTE = "🎮 Movement & combat now happen in the browser playfield — open it from the link to play.";
 
 export async function handleSatscapeInteraction(interaction: Interaction): Promise<void> {
   const customId = "customId" in interaction ? interaction.customId : "";
@@ -101,7 +92,7 @@ export async function handleSatscapeInteraction(interaction: Interaction): Promi
     if (action === "qclaim") return renderQuests(interaction, discordId, (await claimQuest(discordId, chosen)).note);
     if (action === "invequip") return renderInventory(interaction, discordId, (await equipItem(discordId, chosen)).note);
     if (action === "stepselect") return renderSettings(interaction, discordId, (await setStepsPerMove(discordId, Number(chosen))).note);
-    if (action === "battleweapon") return render(discordId, interaction, (await selectBattleWeapon(discordId, chosen)).note);
+    if (action === "battleweapon") return render(discordId, interaction, BROWSER_NOTE);
     return;
   }
 
@@ -171,20 +162,14 @@ export async function handleSatscapeInteraction(interaction: Interaction): Promi
   }
   if (action === "travelcancel") return render(discordId, interaction, "Travel cancelled.");
 
-  // Movement / combat. Directional presses move in the battle arena while fighting.
-  let result: ActionResult | null = null;
-  if (DIRECTIONS.has(action)) {
-    const player = await getPlayer(discordId);
-    result = player?.state === "combat"
-      ? await battleMove(discordId, action as Direction)
-      : await moveMany(discordId, action as Direction);
+  // Movement & combat now live in the browser playfield — deprecated in Discord.
+  const COMBAT_ACTIONS = new Set(["battlestrike", "battlecard", "battlewait", "battleundo", "battleresolve", "battleattack", "flee"]);
+  if (DIRECTIONS.has(action) || COMBAT_ACTIONS.has(action)) {
+    return render(discordId, interaction, BROWSER_NOTE);
   }
-  else if (action === "battlestrike") result = await queueStrike(discordId, parts[0] as AttackMode);
-  else if (action === "battlewait") result = await queueWait(discordId);
-  else if (action === "battleundo") result = await undoPlanAction(discordId);
-  else if (action === "battleresolve" || action === "battleattack") result = await resolvePlan(discordId);
-  else if (action === "flee") result = await flee(discordId);
-  else if (action === "eat") result = await eat(discordId);
+
+  let result: ActionResult | null = null;
+  if (action === "eat") result = await eat(discordId);
   if (!result) return;
 
   if (result.enteredCombat) setAuto(discordId, false);

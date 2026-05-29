@@ -36,9 +36,13 @@ export interface CombatSessionRow {
   monster_battle_x: number;
   monster_battle_y: number;
   battle_move_points: number;
-  /** Comma-joined queued plan tokens: up|down|left|right|strike|wait. Null/"" = empty. */
+  /** Comma-joined queued plan tokens: up|down|left|right|card-<id>|wait. Null/"" = empty. */
   battle_plan: string | null;
   selected_battle_weapon: string | null;
+  /** JSON array of StatusEffect on the player (bleed/poison/stun etc). Null = none. */
+  player_status: string | null;
+  /** JSON array of StatusEffect on the monster. Null = none. */
+  monster_status: string | null;
   turn_number: number;
   created_at: string;
 }

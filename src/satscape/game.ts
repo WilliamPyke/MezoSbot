@@ -21,9 +21,9 @@ import {
 } from "./db.js";
 import {
   battleMoveRange,
-  DEFAULT_ATTACK_MODE,
   MAX_PLAN,
   parsePlan,
+  planAP,
   planGlyph,
   projectedPlayerPos,
   samePoint,
@@ -31,12 +31,18 @@ import {
   serializePlan,
   simulateBattle,
   startingBattlePositions,
-  weaponFor,
-  type AttackMode,
+  weaponPower,
   type BattleMove,
   type PlanAction,
 } from "./battle.js";
-import { bootBonus, effectivePrice, ITEM_BY_ID, nearestTown, townAt } from "./towns.js";
+import {
+  cardById,
+  effectivePlayerAP,
+  parseStatuses,
+  playerCardIds,
+  serializeStatuses,
+} from "./cards.js";
+import { bootBonus, effectivePrice, fastTravelRadius, ITEM_BY_ID, nearestTown, townAt } from "./towns.js";
 import { getRep, onArriveTown, onCombatWin } from "./quests.js";
 import { keeperLine } from "./lines.js";
 import type { Direction, SatPlayerRow } from "./types.js";
@@ -242,43 +248,56 @@ export async function resolveTile(discordId: string, x: number, y: number): Prom
     battle_move_points: fighter ? battleMoveRange(fighter) : 5,
     battle_plan: null,
     selected_battle_weapon: null,
+    player_status: "[]",
+    monster_status: "[]",
     turn_number: 1,
     created_at: new Date().toISOString(),
   });
   return { ok: true, note: `👹 A level ${m.level} **${m.name}** blocks your path!`, enteredCombat: true };
 }
 
-/** Append one action to the combat plan, capped at MAX_PLAN slots. */
+/**
+ * Append one action to the combat plan. Bounded by both the tick cap (MAX_PLAN)
+ * and the player's action-point budget — move = 1 AP, wait = 0, card = its cost.
+ */
 async function queueAction(discordId: string, action: PlanAction): Promise<ActionResult> {
-  const combat = await getCombat(discordId);
-  if (!combat) return { ok: false, note: "No active fight." };
+  const [combat, player] = await Promise.all([getCombat(discordId), getPlayer(discordId)]);
+  if (!combat || !player) return { ok: false, note: "No active fight." };
   const plan = parsePlan(combat.battle_plan);
-  if (plan.length >= MAX_PLAN) return { ok: false, note: `Plan is full (${MAX_PLAN}/${MAX_PLAN}). Resolve or Undo.` };
+  if (plan.length >= MAX_PLAN) return { ok: false, note: `That's all ${MAX_PLAN} actions. Resolve or Undo.` };
+
+  const budget = effectivePlayerAP(player, parseStatuses(combat.player_status));
+  const next = [...plan, action];
+  if (planAP(next) > budget) {
+    return { ok: false, note: `Not enough AP (${planAP(plan)}/${budget} used). Resolve, Undo, or queue a cheaper action.` };
+  }
 
   if (action.kind === "move") {
     const before = projectedPlayerPos(combat, plan);
-    const after = projectedPlayerPos(combat, [...plan, action]);
+    const after = projectedPlayerPos(combat, next);
     if (samePoint(before, after)) {
-      const d = action.dir;
-      const blocked = d === "up" || d === "down" || d === "left" || d === "right";
-      return { ok: false, note: blocked ? "That step is blocked (arena edge or the monster's tile)." : "Can't move there." };
+      return { ok: false, note: "That step is blocked (arena edge or the monster's tile)." };
     }
   }
 
-  const next = [...plan, action];
   await updateCombat(discordId, { battle_plan: serializePlan(next) });
-  return { ok: true, note: `Queued ${planGlyph(action)} (${next.length}/${MAX_PLAN}).` };
+  return { ok: true, note: `Queued ${planGlyph(action)} (${planAP(next)}/${budget} AP).` };
 }
 
-/** Queue a directional step into the plan (arrows). */
+/** Queue a directional step into the plan (costs 1 AP). */
 export async function battleMove(discordId: string, move: BattleMove): Promise<ActionResult> {
   if (move === "stay") return queueAction(discordId, { kind: "wait" });
   return queueAction(discordId, { kind: "move", dir: move });
 }
 
-/** Queue a strike of the given attack mode (defaults to line). */
-export async function queueStrike(discordId: string, mode: AttackMode = DEFAULT_ATTACK_MODE): Promise<ActionResult> {
-  return queueAction(discordId, { kind: "strike", mode });
+/** Queue an ability card the player owns in their kit. */
+export async function queueCard(discordId: string, cardId: string): Promise<ActionResult> {
+  const player = await getPlayer(discordId);
+  if (!player) return { ok: false, note: "No active fight." };
+  const card = cardById(cardId);
+  if (!card) return { ok: false, note: "Unknown ability." };
+  if (!playerCardIds(player).includes(cardId)) return { ok: false, note: `${card.name} isn't in your kit — equip the gear that grants it.` };
+  return queueAction(discordId, { kind: "card", cardId });
 }
 
 /** Queue a wait (hold position one tick) into the plan. */
@@ -299,25 +318,20 @@ export async function undoPlanAction(discordId: string): Promise<ActionResult> {
 
 /**
  * Resolve the queued plan against the monster's 3 telegraphed strikes,
- * interleaved tick-by-tick (see simulateBattle). Persists the outcome, clears
- * the plan, and advances the turn — or ends the fight on a kill / faint.
+ * interleaved tick-by-tick (see simulateBattle). Persists the outcome + statuses,
+ * clears the plan, and advances the turn — or ends the fight on a kill / faint.
+ * The plan may be partial (any unqueued ticks resolve as idle), so the player can
+ * end the turn after spending their AP.
  */
 export async function resolvePlan(discordId: string): Promise<ActionResult> {
   const [combat, player] = await Promise.all([getCombat(discordId), getPlayer(discordId)]);
   if (!combat || !player) return { ok: false, note: "No active fight." };
 
-  const weapon = weaponFor(player, selectedWeaponId(combat, player));
+  const power = weaponPower(player, selectedWeaponId(combat, player));
   const plan = parsePlan(combat.battle_plan);
-  if (plan.length < MAX_PLAN) {
-    const remaining = MAX_PLAN - plan.length;
-    return {
-      ok: false,
-      note: `Queue ${remaining} more action${remaining === 1 ? "" : "s"} before resolving this turn.`,
-    };
-  }
-  const res = simulateBattle(combat, weapon, plan);
+  const res = simulateBattle(combat, { power }, plan);
 
-  let note = res.steps.map((s) => s.line).join("\n");
+  const note = res.steps.map((s) => s.line).join("\n");
 
   // Apply damage the player took: burn sats → pool AND lower HP. Faint at 0 HP.
   if (res.totalTaken > 0) {
@@ -347,9 +361,11 @@ export async function resolvePlan(discordId: string): Promise<ActionResult> {
     monster_battle_y: res.monsterEnd.y,
     monster_current_hp: res.monsterHp,
     battle_plan: null,
+    player_status: serializeStatuses(res.playerStatusEnd),
+    monster_status: serializeStatuses(res.monsterStatusEnd),
     turn_number: combat.turn_number + 1,
   });
-  return { ok: true, note: `${note}\n🗡️ Dealt ${res.totalDealt}, took ${res.totalTaken}. Plan the next 3.` };
+  return { ok: true, note: `${note}\n🗡️ Dealt ${res.totalDealt}, took ${res.totalTaken}. Plan your next move.` };
 }
 
 /** Back-compat alias — older callers used "battleAttack". */
@@ -372,12 +388,11 @@ export async function battleTurn(discordId: string, _destX?: number, _destY?: nu
   return resolvePlan(discordId);
 }
 
-/** Back-compat helper (smoke): queue a strike, then resolve the round. */
+/** Back-compat helper (smoke): queue the baseline Strike, then resolve the round. */
 export async function fight(discordId: string): Promise<ActionResult> {
   const combat = await getCombat(discordId);
   if (!combat) return { ok: false, note: "No active fight." };
-  await queueStrike(discordId);
-  for (let i = 1; i < MAX_PLAN; i++) await queueWait(discordId);
+  await queueCard(discordId, "strike");
   return resolvePlan(discordId);
 }
 
@@ -514,6 +529,16 @@ export async function travelTo(
 
   const est = estimateTravel(player, tx, ty);
   if (est.steps === 0) return { ok: false, note: "You're already there." };
+
+  // Fast-travel is bounded by the player's movement radius (base 5×5, widened by
+  // boots). Long road hops between towns come through a separate discounted path.
+  const radius = fastTravelRadius(player);
+  const reach = Math.max(Math.abs(tx - player.x_coord), Math.abs(ty - player.y_coord)); // Chebyshev
+  const viaRoad = (opts.discountMul ?? 1) < 1;
+  if (!viaRoad && reach > radius) {
+    return { ok: false, note: `🧭 Out of fast-travel range — you can hop within ${radius * 2 + 1}×${radius * 2 + 1} tiles (boots widen it).` };
+  }
+
   const ownsBoatNow = await ownsItem(discordId, "boat");
   const blocked = blockedMoveNote(tx, ty, ownsBoatNow);
   if (blocked) return { ok: false, note: `Can't travel there. ${blocked}` };

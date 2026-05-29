@@ -1,6 +1,19 @@
 import type { ShopItem } from "./items.js";
 import type { CombatSessionRow, Direction, SatPlayerRow } from "./types.js";
 import { bootBonus, ITEM_BY_ID } from "./towns.js";
+import {
+  addStatus,
+  cardById,
+  CARD_BY_ID,
+  decayStatuses,
+  dotDamage,
+  hasStatus,
+  monsterAbility,
+  parseStatuses,
+  totalOf,
+  type CardDef,
+  type StatusEffect,
+} from "./cards.js";
 
 export const ARENA_SIZE = 8;
 
@@ -18,6 +31,7 @@ export interface WeaponProfile {
   emoji: string;
   pattern: WeaponPattern;
   damage: number;
+  power: number;
   summary: string;
 }
 
@@ -35,54 +49,26 @@ export interface MonsterIntent {
   to: Point;
   attackTiles: Point[];
   damage: number;
-}
-
-/** Default attack shapes every player has, independent of the equipped weapon. */
-export type AttackMode = "line" | "slam" | "cleave";
-
-export interface AttackModeProfile {
-  mode: AttackMode;
-  name: string;
-  emoji: string;
-  summary: string;
-}
-
-export const ATTACK_MODES: AttackModeProfile[] = [
-  { mode: "line", name: "Line", emoji: "🗡️", summary: "3 tiles straight toward the monster" },
-  { mode: "slam", name: "Slam", emoji: "🔨", summary: "all 8 tiles around you" },
-  { mode: "cleave", name: "Cleave", emoji: "🪓", summary: "3-tile arc in front" },
-];
-
-export const DEFAULT_ATTACK_MODE: AttackMode = "line";
-const ATTACK_MODE_BY = new Map<AttackMode, AttackModeProfile>(ATTACK_MODES.map((m) => [m.mode, m]));
-
-export function attackModeProfile(mode: AttackMode): AttackModeProfile {
-  return ATTACK_MODE_BY.get(mode) ?? ATTACK_MODES[0];
+  /** Statuses inflicted on the player if this strike connects. */
+  apply: StatusEffect[];
 }
 
 export type PlanAction =
   | { kind: "move"; dir: Direction }
-  | { kind: "strike"; mode: AttackMode }
+  | { kind: "card"; cardId: string }
   | { kind: "wait" };
 
-/** Max queued actions per round (the player's "next 3 actions"). */
+/** Max queued actions (ticks) per round — the monster telegraphs the same count. */
 export const MAX_PLAN = 3;
 
-/** One step of the interleaved resolution, for the embed log + board preview. */
+/** One step of the interleaved resolution, for the log + board preview. */
 export interface ResolutionStep {
-  /** What the player did this tick. */
   player: PlanAction | null;
-  /** Player tile after acting this tick. */
   playerPos: Point;
-  /** Tiles the player's strike covered this tick (empty if not a strike). */
   attackTiles: Point[];
-  /** Monster tile after acting this tick. */
   monsterPos: Point;
-  /** Damage the player dealt to the monster this tick (0 if none). */
   dealt: number;
-  /** Damage the player took from the monster's strike this tick (0 if dodged). */
   taken: number;
-  /** Human-readable line for the combat note. */
   line: string;
 }
 
@@ -94,15 +80,9 @@ export interface BattleResolution {
   totalDealt: number;
   totalTaken: number;
   monsterDead: boolean;
-}
-
-export interface BattlePreview {
-  combat: CombatSessionRow;
-  player: SatPlayerRow;
-  weapon: WeaponProfile;
-  intent: MonsterIntent;
-  playerMoveRange: number;
-  legalMoves: Point[];
+  /** Persist these back onto the combat row for the next round. */
+  playerStatusEnd: StatusEffect[];
+  monsterStatusEnd: StatusEffect[];
 }
 
 const MOVE_DELTA: Record<BattleMove, Point> = {
@@ -148,7 +128,8 @@ const MOVE_TOKENS = new Set<Direction>(["up", "down", "left", "right"]);
 
 /**
  * Decode the persisted plan string into an action list (capped at MAX_PLAN).
- * Strike tokens carry their mode: `strike-slam`. Bare `strike` (legacy) → line.
+ * Card tokens are `card-<id>`. Legacy `strike` / `strike-*` tokens map to the
+ * baseline Strike card so old combat rows keep resolving.
  */
 export function parsePlan(plan: string | null | undefined): PlanAction[] {
   if (!plan) return [];
@@ -157,9 +138,11 @@ export function parsePlan(plan: string | null | undefined): PlanAction[] {
     const tok = raw.trim();
     if (!tok) continue;
     if (tok === "wait") out.push({ kind: "wait" });
-    else if (tok === "strike" || tok.startsWith("strike-")) {
-      const m = tok.slice(7) as AttackMode;
-      out.push({ kind: "strike", mode: ATTACK_MODE_BY.has(m) ? m : DEFAULT_ATTACK_MODE });
+    else if (tok.startsWith("card-")) {
+      const id = tok.slice(5);
+      if (CARD_BY_ID.has(id)) out.push({ kind: "card", cardId: id });
+    } else if (tok === "strike" || tok.startsWith("strike-")) {
+      out.push({ kind: "card", cardId: "strike" }); // legacy
     } else if (MOVE_TOKENS.has(tok as Direction)) out.push({ kind: "move", dir: tok as Direction });
     if (out.length >= MAX_PLAN) break;
   }
@@ -170,22 +153,32 @@ export function parsePlan(plan: string | null | undefined): PlanAction[] {
 export function serializePlan(actions: PlanAction[]): string {
   return actions
     .slice(0, MAX_PLAN)
-    .map((a) => (a.kind === "move" ? a.dir : a.kind === "strike" ? `strike-${a.mode}` : "wait"))
+    .map((a) => (a.kind === "move" ? a.dir : a.kind === "card" ? `card-${a.cardId}` : "wait"))
     .join(",");
+}
+
+/** AP cost of one queued action: move = 1, wait = 0, card = its apCost. */
+export function actionAP(action: PlanAction): number {
+  if (action.kind === "move") return 1;
+  if (action.kind === "wait") return 0;
+  return cardById(action.cardId)?.apCost ?? 0;
+}
+
+/** Total AP a queued plan spends. */
+export function planAP(plan: PlanAction[]): number {
+  return plan.reduce((sum, a) => sum + actionAP(a), 0);
 }
 
 /** Compact glyph for a plan action — used in the embed plan strip. */
 export function planGlyph(action: PlanAction): string {
-  if (action.kind === "strike") return attackModeProfile(action.mode).emoji;
+  if (action.kind === "card") return cardById(action.cardId)?.emoji ?? "✨";
   if (action.kind === "wait") return "⏳";
   return action.dir === "up" ? "⬆️" : action.dir === "down" ? "⬇️" : action.dir === "left" ? "⬅️" : "➡️";
 }
 
 /**
  * Where the player would stand after applying the already-queued moves. Used to
- * validate the next queued move against the *end* of the plan rather than the
- * round-start position. Moves clamp to the arena and can't land on the monster's
- * round-start tile (it hasn't moved yet during planning).
+ * validate the next queued move against the *end* of the plan.
  */
 export function projectedPlayerPos(combat: CombatSessionRow, plan: PlanAction[]): Point {
   let pos = { x: combat.player_battle_x, y: combat.player_battle_y };
@@ -238,6 +231,13 @@ export function selectedWeaponId(combat: CombatSessionRow | null, player: SatPla
   return combat?.selected_battle_weapon ?? player.equipped_weapon ?? null;
 }
 
+/** Raw gear power of the weapon used to scale attack-card damage. */
+export function weaponPower(player: SatPlayerRow, weaponId?: string | null): number {
+  const id = weaponId === undefined ? player.equipped_weapon : weaponId;
+  const item = id ? ITEM_BY_ID.get(id) : null;
+  return item?.power ?? 0;
+}
+
 export function weaponFor(player: SatPlayerRow, weaponId?: string | null): WeaponProfile {
   const id = weaponId === undefined ? player.equipped_weapon : weaponId;
   const item = id ? ITEM_BY_ID.get(id) : null;
@@ -245,10 +245,11 @@ export function weaponFor(player: SatPlayerRow, weaponId?: string | null): Weapo
   const power = item?.power ?? 0;
   const damage = Math.max(5, Math.round(5 + power * 1.2));
   return {
-    name: item?.name ?? "Training Dagger",
-    emoji: item?.emoji ?? "🗡️",
+    name: item?.name ?? "Bare Fists",
+    emoji: item?.emoji ?? "👊",
     pattern,
     damage,
+    power,
     summary: weaponSummary(pattern),
   };
 }
@@ -265,12 +266,12 @@ function weaponPatternFor(item: ShopItem | null | undefined): WeaponPattern {
 
 function weaponSummary(pattern: WeaponPattern): string {
   switch (pattern) {
-    case "dagger": return "1 tile toward the monster, high-risk";
-    case "longsword": return "2 tiles in a straight line";
-    case "hammer": return "2x2 impact near the monster";
-    case "spear": return "3 tiles in a straight line";
-    case "arc": return "3-tile cleave in front";
-    case "star": return "diagonal star burst";
+    case "dagger": return "light, low power";
+    case "longsword": return "balanced reach";
+    case "hammer": return "heavy impact";
+    case "spear": return "long reach";
+    case "arc": return "wide cleave";
+    case "star": return "burst power";
   }
 }
 
@@ -281,17 +282,19 @@ export function attackDirection(from: Point, to: Point): Direction {
   return dy > 0 ? "down" : "up";
 }
 
-export function playerAttackTiles(from: Point, target: Point, weapon: WeaponProfile): Point[] {
+/**
+ * Tiles a card's shape covers, oriented toward the target from `from`. Damage is
+ * decoupled (it comes from the card + weapon power), so the shape is purely
+ * geometric. Unknown shapes fall back to a 3-tile line.
+ */
+export function attackTilesForShape(from: Point, target: Point, shape: string): Point[] {
   const dir = attackDirection(from, target);
   const d = DIR_DELTA[dir];
   const forward = (n: number) => ({ x: from.x + d.x * n, y: from.y + d.y * n });
   const lateral = dir === "up" || dir === "down" ? { x: 1, y: 0 } : { x: 0, y: 1 };
 
   const raw: Point[] = [];
-  switch (weapon.pattern) {
-    case "dagger":
-      raw.push(forward(1));
-      break;
+  switch (shape) {
     case "longsword":
       raw.push(forward(1), forward(2));
       break;
@@ -303,9 +306,10 @@ export function playerAttackTiles(from: Point, target: Point, weapon: WeaponProf
       raw.push(anchor, { x: anchor.x + lateral.x, y: anchor.y + lateral.y }, forward(2), { x: anchor.x + lateral.x + d.x, y: anchor.y + lateral.y + d.y });
       break;
     }
+    case "cleave":
     case "arc": {
-      const center = forward(1);
-      raw.push(center, { x: center.x + lateral.x, y: center.y + lateral.y }, { x: center.x - lateral.x, y: center.y - lateral.y });
+      const c = forward(1);
+      raw.push(c, { x: c.x + lateral.x, y: c.y + lateral.y }, { x: c.x - lateral.x, y: c.y - lateral.y });
       break;
     }
     case "star":
@@ -317,26 +321,6 @@ export function playerAttackTiles(from: Point, target: Point, weapon: WeaponProf
         forward(2),
       );
       break;
-  }
-  return uniquePoints(raw.filter(inArena));
-}
-
-/**
- * Tiles hit by a default attack mode, oriented toward the monster from `from`.
- * These are available to every player regardless of the equipped weapon (the
- * weapon only sets the damage number).
- */
-export function attackTilesForMode(from: Point, target: Point, mode: AttackMode): Point[] {
-  const dir = attackDirection(from, target);
-  const d = DIR_DELTA[dir];
-  const forward = (n: number) => ({ x: from.x + d.x * n, y: from.y + d.y * n });
-  const lateral = dir === "up" || dir === "down" ? { x: 1, y: 0 } : { x: 0, y: 1 };
-
-  const raw: Point[] = [];
-  switch (mode) {
-    case "line":
-      raw.push(forward(1), forward(2), forward(3));
-      break;
     case "slam":
       for (let yy = from.y - 1; yy <= from.y + 1; yy++) {
         for (let xx = from.x - 1; xx <= from.x + 1; xx++) {
@@ -344,28 +328,34 @@ export function attackTilesForMode(from: Point, target: Point, mode: AttackMode)
         }
       }
       break;
-    case "cleave": {
-      const c = forward(1);
-      raw.push(c, { x: c.x + lateral.x, y: c.y + lateral.y }, { x: c.x - lateral.x, y: c.y - lateral.y });
+    case "bolt": // ranged: a straight line all the way across the arena
+      for (let i = 1; i < ARENA_SIZE; i++) raw.push(forward(i));
       break;
-    }
+    case "nova":
+      for (let yy = from.y - 2; yy <= from.y + 2; yy++) {
+        for (let xx = from.x - 2; xx <= from.x + 2; xx++) {
+          if (xx !== from.x || yy !== from.y) raw.push({ x: xx, y: yy });
+        }
+      }
+      break;
+    case "line":
+    default:
+      raw.push(forward(1), forward(2), forward(3));
+      break;
   }
   return uniquePoints(raw.filter(inArena));
 }
 
 /**
- * The monster's next MAX_PLAN telegraphed strikes, forward-simulated from its
- * current tile. Each strike aims at the player's round-start tile — fixed at
- * telegraph time so the preview is honest: the marked tiles WILL be struck
- * regardless of where the player moves, and the player dodges by vacating them.
+ * The monster's next MAX_PLAN telegraphed acts. Exactly one tick is an attack —
+ * the monster advances toward the player before it, then rests after. The attack
+ * tick carries the monster's signature ability (name + inflicted statuses).
  */
 export function monsterPlan(combat: CombatSessionRow, _player?: SatPlayerRow): MonsterIntent[] {
   const target = { x: combat.player_battle_x, y: combat.player_battle_y };
   const damage = Math.max(3, 3 + combat.monster_level * 2);
+  const ability = monsterAbility(combat.monster_name);
   const base = `${combat.monster_name}:${combat.monster_level}:${combat.turn_number}:${combat.enemy_x}:${combat.enemy_y}`;
-  // Exactly one of the three telegraphed ticks is an attack — the monster
-  // advances toward the player before it, then rests (recovers) after. This
-  // gives the player two safe ticks each round to reposition and strike.
   const attackIndex = hash(base) % MAX_PLAN;
   const out: MonsterIntent[] = [];
   let from = { x: combat.monster_battle_x, y: combat.monster_battle_y };
@@ -379,22 +369,23 @@ export function monsterPlan(combat: CombatSessionRow, _player?: SatPlayerRow): M
       const dir = attackDirection(to, target);
       out.push({
         order: k + 1, act: "attack", pattern,
-        name: monsterIntentName(pattern),
-        description: monsterIntentDescription(pattern, move, dir),
+        name: ability.name,
+        description: monsterIntentDescription(pattern, move, dir, ability.apply),
         from, to,
         attackTiles: monsterAttackTiles(to, dir, pattern, seed),
         damage,
+        apply: ability.apply,
       });
       from = to;
     } else {
-      const advancing = k < attackIndex; // close in before the strike, rest after
+      const advancing = k < attackIndex;
       const move = advancing ? stepToward(from, target) : { x: 0, y: 0 };
       const to = { x: clampArena(from.x + move.x), y: clampArena(from.y + move.y) };
       out.push({
         order: k + 1, act: advancing ? "advance" : "rest", pattern: "line",
         name: advancing ? "Advance" : "Rest",
         description: advancing ? `Will close in ${dirWord(move)} — no attack.` : "Resting — no attack.",
-        from, to, attackTiles: [], damage: 0,
+        from, to, attackTiles: [], damage: 0, apply: [],
       });
       from = to;
     }
@@ -402,7 +393,6 @@ export function monsterPlan(combat: CombatSessionRow, _player?: SatPlayerRow): M
   return out;
 }
 
-/** One step toward the target, stopping when already adjacent (won't overlap). */
 function stepToward(from: Point, target: Point): Point {
   const dx = target.x - from.x;
   const dy = target.y - from.y;
@@ -426,22 +416,51 @@ export function monsterIntent(combat: CombatSessionRow, player: SatPlayerRow): M
 
 /**
  * Deterministically resolve a player plan against the monster's telegraph,
- * interleaved tick-by-tick: each tick the player acts first (so a move can
- * dodge that tick's strike), then the monster executes strike k on its
- * pre-marked tiles. Pure — used both to apply the round and to preview it.
+ * interleaved tick-by-tick, with action-point cards and status effects. Pure —
+ * used both to apply the round and to preview it.
+ *
+ * Status timing: DoTs, Stun and Chill read from statuses present at round start;
+ * debuffs inflicted this round persist into the NEXT round (so a Stun fizzles the
+ * monster's following attack). Self-buffs (Shield/Empower) are this-round only.
  */
 export function simulateBattle(
   combat: CombatSessionRow,
-  weapon: WeaponProfile,
+  weapon: { power: number },
   plan: PlanAction[],
 ): BattleResolution {
   const intents = monsterPlan(combat);
   let playerPos = { x: combat.player_battle_x, y: combat.player_battle_y };
   let monsterPos = { x: combat.monster_battle_x, y: combat.monster_battle_y };
   let monsterHp = combat.monster_current_hp;
+
+  // Statuses active at the start of this round (the "old" set that decays at end).
+  const playerOld = parseStatuses(combat.player_status);
+  const monsterOld = parseStatuses(combat.monster_status);
+  // Debuffs inflicted during this round — carried at full duration into next round.
+  const playerAdds: StatusEffect[] = [];
+  const monsterAdds: StatusEffect[] = [];
+
   const steps: ResolutionStep[] = [];
   let totalDealt = 0;
   let totalTaken = 0;
+
+  // Round-start damage-over-time.
+  const monsterDot = monsterHp > 0 ? dotDamage(monsterOld) : 0;
+  if (monsterDot > 0) monsterHp = Math.max(0, monsterHp - monsterDot);
+  const playerDot = dotDamage(playerOld);
+  totalDealt += monsterDot;
+  totalTaken += playerDot;
+  if (monsterDot > 0 || playerDot > 0) {
+    const bits: string[] = [];
+    if (monsterDot > 0) bits.push(`🩸 lingering effects deal ${monsterDot} to ${combat.monster_name}`);
+    if (playerDot > 0) bits.push(`🩸 you take ${playerDot} from lingering effects`);
+    steps.push({ player: null, playerPos, attackTiles: [], monsterPos, dealt: monsterDot, taken: playerDot, line: `• ${bits.join(" · ")}` });
+  }
+
+  let playerShield = 0; // built from self-buff cards played this round (one-round)
+  let empower = 0;
+  const monsterStunned = hasStatus(monsterOld, "stun");
+  const monsterChill = totalOf(monsterOld, "chill"); // flat damage reduction while chilled
 
   for (let k = 0; k < MAX_PLAN; k++) {
     const action = plan[k] ?? null;
@@ -456,16 +475,29 @@ export function simulateBattle(
       const next = { x: clampArena(playerPos.x + d.x), y: clampArena(playerPos.y + d.y) };
       if (!samePoint(next, monsterPos)) playerPos = next;
       parts.push(`${planGlyph(action)} to ${arenaTag(playerPos)}`);
-    } else if (action?.kind === "strike") {
-      const profile = attackModeProfile(action.mode);
-      attackTiles = attackTilesForMode(playerPos, monsterPos, action.mode);
-      const onTarget = attackTiles.some((p) => samePoint(p, monsterPos));
-      if (onTarget && monsterHp > 0) {
-        dealt = weapon.damage;
-        monsterHp = Math.max(0, monsterHp - dealt);
-        parts.push(`${profile.emoji} ${profile.name} hit for ${dealt}`);
+    } else if (action?.kind === "card") {
+      const card = cardById(action.cardId);
+      if (!card) {
+        parts.push("— fizzle");
+      } else if (card.kind === "buff") {
+        for (const eff of card.apply ?? []) {
+          if (eff.kind === "shield") playerShield += eff.amount;
+          else if (eff.kind === "empower") empower += eff.amount;
+        }
+        parts.push(`${card.emoji} ${card.name}`);
       } else {
-        parts.push(`${profile.emoji} ${profile.name} whiffed`);
+        attackTiles = attackTilesForShape(playerPos, monsterPos, card.shape ?? "line");
+        const onTarget = attackTiles.some((p) => samePoint(p, monsterPos));
+        if (onTarget && monsterHp > 0) {
+          dealt = Math.max(1, (card.damage ?? 0) + Math.round(weapon.power) + empower);
+          if (empower > 0) empower = 0; // consumed
+          monsterHp = Math.max(0, monsterHp - dealt);
+          for (const eff of card.apply ?? []) monsterAdds.push({ ...eff });
+          const tag = (card.apply ?? []).length ? ` (+${(card.apply ?? []).map((e) => e.kind).join(",")})` : "";
+          parts.push(`${card.emoji} ${card.name} hit for ${dealt}${tag}`);
+        } else {
+          parts.push(`${card.emoji} ${card.name} whiffed`);
+        }
       }
     } else if (action?.kind === "wait") {
       parts.push("⏳ hold");
@@ -473,17 +505,27 @@ export function simulateBattle(
       parts.push("— idle");
     }
 
-    // 2) Monster executes its k-th telegraphed act. Only an "attack" deals damage.
+    // 2) Monster executes its k-th telegraphed act.
     const intent = intents[k];
     if (intent) {
       monsterPos = intent.to;
-      if (intent.act === "attack") {
-        const struck = samePoint(playerPos, monsterPos) || intent.attackTiles.some((p) => samePoint(p, playerPos));
-        if (struck && monsterHp > 0) {
-          taken = intent.damage;
-          parts.push(`🩸 ${intent.name} hit you for ${taken}`);
-        } else if (monsterHp > 0) {
-          parts.push(`✨ dodged ${intent.name}`);
+      if (intent.act === "attack" && monsterHp > 0) {
+        if (monsterStunned) {
+          parts.push("💫 stunned — its strike fizzles");
+        } else {
+          const struck = samePoint(playerPos, monsterPos) || intent.attackTiles.some((p) => samePoint(p, playerPos));
+          if (struck) {
+            const raw = Math.max(1, intent.damage - monsterChill);
+            const absorbed = Math.min(playerShield, raw);
+            playerShield -= absorbed;
+            taken = raw - absorbed;
+            if (taken > 0) for (const eff of intent.apply ?? []) playerAdds.push({ ...eff });
+            parts.push(absorbed > 0
+              ? `🛡️ shield soaks ${absorbed}${taken > 0 ? `, ${intent.name} took ${taken}` : ""}`
+              : `🩸 ${intent.name} hit you for ${taken}`);
+          } else {
+            parts.push(`✨ dodged ${intent.name}`);
+          }
         }
       } else if (monsterHp > 0) {
         parts.push(intent.act === "rest" ? "💤 it rests" : "👣 it advances");
@@ -494,8 +536,12 @@ export function simulateBattle(
     totalTaken += taken;
     steps.push({ player: action, playerPos, attackTiles, monsterPos, dealt, taken, line: `${k + 1}. ${parts.join(" · ")}` });
 
-    if (monsterHp <= 0) break; // monster dead — remaining ticks moot
+    if (monsterHp <= 0) break;
   }
+
+  // Old statuses age one round; freshly-inflicted debuffs carry over at full duration.
+  const playerStatusEnd = decayStatuses(playerOld).concat(playerAdds);
+  const monsterStatusEnd = decayStatuses(monsterOld).concat(monsterAdds);
 
   return {
     steps,
@@ -505,10 +551,12 @@ export function simulateBattle(
     totalDealt,
     totalTaken,
     monsterDead: monsterHp <= 0,
+    playerStatusEnd,
+    monsterStatusEnd,
   };
 }
 
-/** Arena tag like "C4" for log lines (mirrors game.ts arenaLabel). */
+/** Arena tag like "C4" for log lines. */
 function arenaTag(p: Point): string {
   return `${String.fromCharCode(65 + p.x)}${p.y + 1}`;
 }
@@ -567,24 +615,16 @@ function monsterAttackTiles(from: Point, dir: Direction, pattern: MonsterPattern
   return uniquePoints(raw.filter(inArena));
 }
 
-function monsterIntentName(pattern: MonsterPattern): string {
-  switch (pattern) {
-    case "line": return "Line Strike";
-    case "cone": return "Raking Cone";
-    case "slam": return "Ground Slam";
-    case "dash": return "Dash Bite";
-  }
-}
-
-function monsterIntentDescription(pattern: MonsterPattern, move: Point, dir: Direction): string {
+function monsterIntentDescription(pattern: MonsterPattern, move: Point, dir: Direction, apply: StatusEffect[]): string {
   const moveText = move.x === 0 && move.y === 0
     ? "hold position"
     : `move ${move.x !== 0 ? Math.abs(move.x) : Math.abs(move.y)} ${move.x > 0 ? "east" : move.x < 0 ? "west" : move.y > 0 ? "south" : "north"}`;
+  const fx = apply.length ? ` (inflicts ${apply.map((e) => e.kind).join(", ")})` : "";
   switch (pattern) {
-    case "line": return `Will ${moveText}, then attack a straight ${dir} line.`;
-    case "cone": return `Will ${moveText}, then bite in a ${dir}-facing cone.`;
-    case "slam": return `Will ${moveText}, then slam all adjacent tiles.`;
-    case "dash": return `Will ${moveText}, then lunge ${dir}.`;
+    case "line": return `Will ${moveText}, then strike a straight ${dir} line${fx}.`;
+    case "cone": return `Will ${moveText}, then strike in a ${dir}-facing cone${fx}.`;
+    case "slam": return `Will ${moveText}, then slam all adjacent tiles${fx}.`;
+    case "dash": return `Will ${moveText}, then lunge ${dir}${fx}.`;
   }
 }
 
@@ -608,3 +648,6 @@ function hash(s: string): number {
   }
   return h >>> 0;
 }
+
+// Re-export card-kit helpers so callers can keep importing from battle.ts.
+export type { CardDef } from "./cards.js";

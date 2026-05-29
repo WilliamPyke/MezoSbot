@@ -12,6 +12,10 @@ export interface ShopItem {
   repReq?: number; // keeper reputation required to buy (gear unlocked by quests)
   stepBonus?: number; // boots only: extra tiles per directional press
   rarity?: Rarity; // display-only flavour
+  /** Ability-card ids this item grants to the player's battle kit when equipped (see cards.ts). */
+  cards?: string[];
+  /** Passive battle modifiers granted while equipped. */
+  passive?: { apBonus?: number };
 }
 
 /* ─────────── combat math ─────────── */
