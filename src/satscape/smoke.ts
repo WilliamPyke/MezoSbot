@@ -20,7 +20,7 @@
  */
 import { supabase } from "../db.js";
 import { addBalance, getBalance, getOrCreateUser } from "../balance.js";
-import { SAT, biomeAt, entityAt } from "./engine.js";
+import { SAT, entityAt } from "./engine.js";
 import {
   buyItem,
   chargeBuyIn,
@@ -45,10 +45,12 @@ import { effectiveHp, getCombat, getPlayer, isTileCleared, startRun, updateComba
 import { lossFor, winChance } from "./items.js";
 import { effectivePrice, gearScore, nearestTown, TOWN_BY_ID } from "./towns.js";
 import { acceptQuest, claimQuest, getRep, payTribute, questBoard } from "./quests.js";
+import { canEnter, MAP_H, MAP_W } from "./world.js";
 
 const TEST_ID = `smoke-${Date.now()}`;
 const START_BALANCE = 2000;
-const REGION_X = 10000;
+const REST = TOWN_BY_ID.get("rest")!;
+const TOUCHED_ENTITY_TILES = new Set<string>();
 
 let passes = 0;
 let failures = 0;
@@ -69,13 +71,35 @@ async function conserved(total: number, label: string) {
   ok(bal >= 0, `${label}: balance non-negative (${bal})`);
 }
 
-async function findTile(want: "monster" | "chest" | "empty", y: number): Promise<{ x: number; y: number } | null> {
-  for (let i = 0; i < 800; i++) {
-    const x = REGION_X + i;
-    if (biomeAt(x, y) === "town") continue;
-    if (await isTileCleared(x, y)) continue;
-    const e = entityAt(x, y);
-    if (want === "empty" ? e === null : e?.type === want) return { x, y };
+function rememberTile(p: { x: number; y: number }): void {
+  TOUCHED_ENTITY_TILES.add(`${p.x},${p.y}`);
+}
+
+async function findTile(want: "monster" | "chest" | "empty", startY = 0): Promise<{ x: number; y: number } | null> {
+  for (let oy = 0; oy < MAP_H; oy++) {
+    const y = (startY + oy) % MAP_H;
+    for (let x = 1; x < MAP_W; x++) {
+      if (!canEnter(x, y, { ownsBoat: false }) || !canEnter(x - 1, y, { ownsBoat: false })) continue;
+      if (await isTileCleared(x, y)) continue;
+      const e = entityAt(x, y);
+      if (want === "empty" ? e === null : e?.type === want) return { x, y };
+    }
+  }
+  return null;
+}
+
+async function findEmptyStretch(len: number): Promise<{ x: number; y: number } | null> {
+  for (let y = 0; y < MAP_H; y++) {
+    for (let x = 0; x <= MAP_W - len; x++) {
+      let allEmpty = true;
+      for (let k = 0; k < len; k++) {
+        if (!canEnter(x + k, y, { ownsBoat: false }) || entityAt(x + k, y) !== null || await isTileCleared(x + k, y)) {
+          allEmpty = false;
+          break;
+        }
+      }
+      if (allEmpty) return { x, y };
+    }
   }
   return null;
 }
@@ -132,7 +156,7 @@ async function main() {
 
   // 2. Move + exhaustion
   console.log("\n2. Move & exhaustion");
-  await updatePlayer(TEST_ID, { x_coord: 0, y_coord: 0, hunger: 1, state: "idle" });
+  await updatePlayer(TEST_ID, { x_coord: REST.cx, y_coord: REST.cy, hunger: 1, state: "idle" });
   await move(TEST_ID, "up");
   ok((await getPlayer(TEST_ID))?.hunger === 0, "stamina drained to 0");
   const balPreStarve = await getBalance(TEST_ID);
@@ -157,7 +181,7 @@ async function main() {
 
   // 4. Shop & gear (town-exclusive, keeper pricing)
   console.log("\n4. Shop & gear");
-  await updatePlayer(TEST_ID, { x_coord: 0, y_coord: 0, state: "idle", equipped_weapon: null });
+  await updatePlayer(TEST_ID, { x_coord: REST.cx, y_coord: REST.cy, state: "idle", equipped_weapon: null });
   const balPreBuy = await getBalance(TEST_ID);
   const poolPreBuy = await readPool();
   const buy = await buyItem(TEST_ID, "rest_weapon"); // +3, base 40, business keeper x1.25 = 50
@@ -169,7 +193,9 @@ async function main() {
   ok(p?.equipped_weapon === "rest_weapon" && gearScore(p) === 3, "gear score is 3 after equip");
   ok(winChance(gearScore(p!), 1) > winChance(0, 1), "equipped gear raised win chance");
   ok(!(await buyItem(TEST_ID, "jaipur_weapon")).ok, "spawn keeper doesn't stock Jaipur gear (town-exclusive)");
-  await updatePlayer(TEST_ID, { x_coord: REGION_X + 5, y_coord: 9999, state: "idle" }); // wilds
+  const wilds = await findTile("empty", REST.cy + REST.safeRadius + 2);
+  if (!wilds) throw new Error("no empty wilds tile for shop refusal test");
+  await updatePlayer(TEST_ID, { x_coord: wilds.x, y_coord: wilds.y, state: "idle" }); // wilds
   ok(!(await buyItem(TEST_ID, "rest_weapon")).ok, "shop refused outside town");
   await conserved(TOTAL, "after shop");
 
@@ -194,6 +220,7 @@ async function main() {
     const before = await getBalance(TEST_ID);
     const pool = await readPool();
     const res = await fight(TEST_ID); // queues a strike, then resolves
+    rememberTile(mWin);
     const gained = (await getBalance(TEST_ID)) - before;
     ok(res.ok && (await getCombat(TEST_ID)) === null, "queued strike killed the monster (combat cleared)");
     ok((await getPlayer(TEST_ID))?.state === "idle", "idle after win");
@@ -238,6 +265,7 @@ async function main() {
     await updatePlayer(TEST_ID, { x_coord: chest.x - 1, y_coord: chest.y, hunger: 100, state: "idle" });
     const before = await getBalance(TEST_ID);
     await move(TEST_ID, "right");
+    rememberTile(chest);
     const gained = (await getBalance(TEST_ID)) - before;
     ok(gained >= 0 && gained <= pool, `chest payout (${gained}) capped to pool (${pool})`);
     ok(await isTileCleared(chest.x, chest.y), "chest tile cleared");
@@ -286,7 +314,7 @@ async function main() {
 
   // 9. Quests & reputation
   console.log("\n9. Quests & reputation");
-  await updatePlayer(TEST_ID, { x_coord: 0, y_coord: 0, state: "idle", hunger: 100 });
+  await updatePlayer(TEST_ID, { x_coord: REST.cx, y_coord: REST.cy, state: "idle", hunger: 100 });
   // bounty: 3 kills
   ok((await acceptQuest(TEST_ID, "rest_cull")).ok, "accepted bounty quest");
   for (let i = 0; i < 3; i++) {
@@ -296,6 +324,7 @@ async function main() {
     await move(TEST_ID, "right");
     Math.random = () => 0;
     await fight(TEST_ID);
+    rememberTile(m);
     Math.random = realRandom;
   }
   const board = await questBoard(TEST_ID, "rest");
@@ -311,7 +340,7 @@ async function main() {
   ok(effectivePrice(restItem, restKeeper, 5) < effectivePrice(restItem, restKeeper, 0), "reputation lowers shop prices");
 
   // tribute → Greta
-  await updatePlayer(TEST_ID, { x_coord: 0, y_coord: 0, state: "idle" });
+  await updatePlayer(TEST_ID, { x_coord: REST.cx, y_coord: REST.cy, state: "idle" });
   const balPreT = await getBalance(TEST_ID);
   ok((await payTribute(TEST_ID, "frosthold_tribute")).ok, "paid tribute to Greta");
   ok((await getBalance(TEST_ID)) === balPreT - 300, "tribute debited 300 sats");
@@ -333,7 +362,7 @@ async function main() {
 
   // 10. Boots & multi-step movement
   console.log("\n10. Boots & multi-step movement");
-  await updatePlayer(TEST_ID, { x_coord: 0, y_coord: 0, state: "idle", hunger: 100, equipped_boots: null, steps_per_move: 1 });
+  await updatePlayer(TEST_ID, { x_coord: REST.cx, y_coord: REST.cy, state: "idle", hunger: 100, equipped_boots: null, steps_per_move: 1 });
   let bp = (await getPlayer(TEST_ID))!;
   ok(maxStepsFor(bp) === SAT.MAX_STEPS_BASE, `base max steps is ${SAT.MAX_STEPS_BASE}`);
   ok((await buyItem(TEST_ID, "rest_boots")).ok, "bought Worn Boots in town");
@@ -345,16 +374,7 @@ async function main() {
   await setStepsPerMove(TEST_ID, 4);
 
   // walk 4 tiles in one press through empty wilds
-  let start: { x: number; y: number } | null = null;
-  outer: for (let y = 350; y < 360; y++) {
-    for (let x = REGION_X; x < REGION_X + 200; x++) {
-      let allEmpty = true;
-      for (let k = 0; k < 5; k++) {
-        if (biomeAt(x + k, y) === "town" || entityAt(x + k, y) !== null || await isTileCleared(x + k, y)) { allEmpty = false; break; }
-      }
-      if (allEmpty) { start = { x, y }; break outer; }
-    }
-  }
+  const start = await findEmptyStretch(5);
   if (!start) { ok(false, "no empty 5-tile stretch for multi-step"); }
   else {
     await updatePlayer(TEST_ID, { x_coord: start.x, y_coord: start.y, hunger: 100, state: "idle", steps_per_move: 4 });
@@ -369,7 +389,10 @@ async function main() {
   // Cleanup
   console.log("\nCleanup");
   Math.random = realRandom;
-  await supabase.from("sat_world_entities").delete().gte("x", REGION_X).lt("x", REGION_X + 800);
+  for (const key of TOUCHED_ENTITY_TILES) {
+    const [x, y] = key.split(",").map(Number);
+    await supabase.from("sat_world_entities").delete().eq("x", x).eq("y", y);
+  }
   await supabase.from("sat_prize_pool").update({ balance_sats: poolBefore }).eq("id", 1);
   await supabase.from("users").delete().eq("discord_id", TEST_ID);
   console.log("  restored prize pool and removed test data");

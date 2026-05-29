@@ -1,6 +1,7 @@
 import { supabase } from "../db.js";
 import { getBalance, getOrCreateUser } from "../balance.js";
 import { SAT, entityAt, viewportBounds } from "./engine.js";
+import { TOWN_BY_ID } from "./towns.js";
 import type {
   CombatSessionRow,
   OtherPlayer,
@@ -37,13 +38,14 @@ export async function getPlayer(discordId: string): Promise<SatPlayerRow | null>
 export async function startRun(discordId: string): Promise<SatPlayerRow> {
   await getOrCreateUser(discordId); // ensure FK target in `users` exists
   const balance = await getBalance(discordId);
+  const spawn = TOWN_BY_ID.get("rest") ?? { cx: 0, cy: 0 };
   const { data, error } = await supabase
     .from("sat_players")
     .upsert(
       {
         discord_id: discordId,
-        x_coord: 0,
-        y_coord: 0,
+        x_coord: spawn.cx,
+        y_coord: spawn.cy,
         hunger: 100,
         state: "idle",
         active: true,
@@ -56,7 +58,7 @@ export async function startRun(discordId: string): Promise<SatPlayerRow> {
     .select("*")
     .single();
   if (error) throw new Error(error.message);
-  await revealAround(discordId, 0, 0); // light up the spawn town
+  await revealAround(discordId, spawn.cx, spawn.cy); // light up the spawn town
   return data as SatPlayerRow;
 }
 

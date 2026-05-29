@@ -83,7 +83,7 @@ export const TOWNS: Town[] = [
   {
     id: "rest",
     name: "Satoshi's Rest",
-    cx: 0, cy: 0, safeRadius: 12,
+    cx: 127, cy: 111, safeRadius: 12,
     identity: "The temperate starter town — rolling plains, woods and hills.",
     palette: ["plains", "forest", "hills"],
     monsterColor: "#6b7280",
@@ -99,7 +99,7 @@ export const TOWNS: Town[] = [
   {
     id: "jaipur",
     name: "Jaipur",
-    cx: 260, cy: 40, safeRadius: 14,
+    cx: 185, cy: 66, safeRadius: 14,
     identity: "A vast eastern realm of jungle, monsoon wetlands and golden savanna.",
     palette: ["jungle", "monsoon", "savanna"],
     monsterColor: "#b45309",
@@ -117,7 +117,7 @@ export const TOWNS: Town[] = [
   {
     id: "dustfall",
     name: "Dustfall",
-    cx: -280, cy: 120, safeRadius: 14,
+    cx: 27, cy: 97, safeRadius: 14,
     identity: "A sun-blasted expanse of desert, slot canyons and rare oases.",
     palette: ["desert", "canyon", "oasis"],
     monsterColor: "#a16207",
@@ -133,7 +133,7 @@ export const TOWNS: Town[] = [
   {
     id: "frosthold",
     name: "Frosthold",
-    cx: -40, cy: -300, safeRadius: 14,
+    cx: 31, cy: 59, safeRadius: 14,
     identity: "A frozen north of snowfields, frostbitten tundra and blue ice.",
     palette: ["snow", "tundra", "ice"],
     monsterColor: "#7c3aed",

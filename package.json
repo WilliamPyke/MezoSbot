@@ -4,9 +4,10 @@
   "description": "Discord bot for depositing sats from EVM, tipping, distributing, and dropping",
   "main": "dist/index.js",
   "scripts": {
-    "build": "npm run build:web && tsc",
+    "build": "npm run build:web && tsc && npm run copy:satscape-assets",
     "build:server": "tsc",
     "build:web": "vite build --config web/vite.config.ts",
+    "copy:satscape-assets": "node -e \"const fs=require('fs'); if (fs.existsSync('src/satscape/world_gen/chunks')) fs.cpSync('src/satscape/world_gen/chunks','dist/satscape/world_gen/chunks',{recursive:true});\"",
     "dev:web": "vite dev --config web/vite.config.ts",
     "test:contracts": "hardhat test --config contracts/hardhat.config.ts",
     "deploy:contracts": "hardhat run --config contracts/hardhat.config.ts contracts/scripts/deployMallardEscrow.ts",

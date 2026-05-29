@@ -1,4 +1,5 @@
-import { createCanvas, type SKRSContext2D } from "@napi-rs/canvas";
+import { createCanvas, loadImage, type SKRSContext2D } from "@napi-rs/canvas";
+import { join } from "node:path";
 import {
   ActionRowBuilder,
   AttachmentBuilder,
@@ -8,7 +9,7 @@ import {
   StringSelectMenuBuilder,
 } from "discord.js";
 import { formatSats } from "../format.js";
-import { biomeAt, SAT, viewportBounds } from "./engine.js";
+import { biomeAt, biomeColorAt, biomeNameAt, SAT, viewportBounds } from "./engine.js";
 import { estimateTravel, travelCost } from "./game.js";
 import { type ItemSlot } from "./items.js";
 import { keeperLine } from "./lines.js";
@@ -39,6 +40,7 @@ import {
   type Town,
 } from "./towns.js";
 import type { SatPlayerRow, ViewModel } from "./types.js";
+import chunkManifest from "./world_gen/chunks/manifest.json";
 
 /* ─────────── custom-id helpers (mirrors arcade/ui.ts) ─────────── */
 export const SQ_PREFIX = "satscape";
@@ -54,6 +56,78 @@ export const MAP_FILE = "satscape-map.webp";
 
 const TILE = 22;
 const FOG = "#060a14";
+const OCEAN_BASE = "#04121f";
+const CHUNK_CACHE_MAX = 9;
+const CHUNK_DIR = join(__dirname, "world_gen", "chunks");
+const WORLD_ART = chunkManifest as {
+  tile: number;
+  chunkTiles: number;
+  cols: number;
+  rows: number;
+  worldTilesX: number;
+  worldTilesY: number;
+};
+type LoadedImage = Awaited<ReturnType<typeof loadImage>>;
+const chunkCache = new Map<string, Promise<LoadedImage>>();
+
+function getChunk(col: number, row: number): Promise<LoadedImage> {
+  const key = `${col},${row}`;
+  const hit = chunkCache.get(key);
+  if (hit) {
+    chunkCache.delete(key);
+    chunkCache.set(key, hit);
+    return hit;
+  }
+  const pending = loadImage(join(CHUNK_DIR, `chunk_${col}_${row}.png`));
+  chunkCache.set(key, pending);
+  pending.catch(() => chunkCache.delete(key));
+  while (chunkCache.size > CHUNK_CACHE_MAX) {
+    const oldest = chunkCache.keys().next().value;
+    if (oldest === undefined) break;
+    chunkCache.delete(oldest);
+  }
+  return pending;
+}
+
+async function drawWorldArt(
+  ctx: SKRSContext2D,
+  b: ReturnType<typeof viewportBounds>,
+  width: number,
+  height: number,
+): Promise<void> {
+  ctx.fillStyle = OCEAN_BASE;
+  ctx.fillRect(0, 0, width, height);
+  ctx.imageSmoothingEnabled = false;
+
+  const chunkTiles = WORLD_ART.chunkTiles;
+  const artTile = WORLD_ART.tile;
+  const minCol = Math.floor(b.minX / chunkTiles);
+  const maxCol = Math.floor(b.maxX / chunkTiles);
+  const minRow = Math.floor(b.minY / chunkTiles);
+  const maxRow = Math.floor(b.maxY / chunkTiles);
+
+  for (let row = minRow; row <= maxRow; row++) {
+    for (let col = minCol; col <= maxCol; col++) {
+      if (col < 0 || row < 0 || col >= WORLD_ART.cols || row >= WORLD_ART.rows) continue;
+      const wx0 = Math.max(b.minX, col * chunkTiles);
+      const wx1 = Math.min(b.maxX + 1, (col + 1) * chunkTiles, WORLD_ART.worldTilesX);
+      const wy0 = Math.max(b.minY, row * chunkTiles);
+      const wy1 = Math.min(b.maxY + 1, (row + 1) * chunkTiles, WORLD_ART.worldTilesY);
+      if (wx1 <= wx0 || wy1 <= wy0) continue;
+
+      const img = await getChunk(col, row);
+      const sx = (wx0 - col * chunkTiles) * artTile;
+      const sy = (wy0 - row * chunkTiles) * artTile;
+      const sw = (wx1 - wx0) * artTile;
+      const sh = (wy1 - wy0) * artTile;
+      const dx = (wx0 - b.minX) * TILE;
+      const dy = (wy0 - b.minY) * TILE;
+      const dw = (wx1 - wx0) * TILE;
+      const dh = (wy1 - wy0) * TILE;
+      ctx.drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh);
+    }
+  }
+}
 
 /**
  * FIFO cache of encoded WebP buffers keyed by a visual signature supplied by
@@ -93,7 +167,7 @@ function terrainLabel(t: Terrain): string {
 function locationLabel(x: number, y: number): string {
   const here = townAt(x, y);
   if (here) return `🏙️ ${here.name}`;
-  return `${terrainLabel(biomeAt(x, y))} · near ${nearestTown(x, y).town.name}`;
+  return `${biomeNameAt(x, y)} · near ${nearestTown(x, y).town.name}`;
 }
 
 /**
@@ -133,6 +207,7 @@ export async function buildMapImage(view: ViewModel, cacheKey = ""): Promise<Att
   // solid-color regions trivially; the previous jitter overlay and tile
   // borders sabotaged that, bloating the file with high-frequency detail.
   // The wavy biome borders supplied by biomeAt are still the visual identity.
+  await drawWorldArt(ctx, b, w, h);
   for (let row = 0; row < SAT.VIEW_H; row++) {
     for (let col = 0; col < SAT.VIEW_W; col++) {
       const tx = b.minX + col;
@@ -146,8 +221,6 @@ export async function buildMapImage(view: ViewModel, cacheKey = ""): Promise<Att
         ctx.fillRect(px, py, TILE, TILE);
         continue;
       }
-      ctx.fillStyle = TERRAIN_COLOR[biomeAt(tx, ty)];
-      ctx.fillRect(px, py, TILE, TILE);
       if (!seen) {
         // explored but out of current sight → dim "memory"
         ctx.fillStyle = "rgba(2,6,23,0.5)";
@@ -264,7 +337,7 @@ async function buildBattleImage(view: ViewModel): Promise<Buffer> {
     for (let x = 0; x < ARENA_SIZE; x++) {
       const px = x * tile;
       const py = y * tile;
-      ctx.fillStyle = TERRAIN_COLOR[biomeAt(combat.enemy_x + x - 4, combat.enemy_y + y - 4)];
+      ctx.fillStyle = biomeColorAt(combat.enemy_x + x - 4, combat.enemy_y + y - 4);
       ctx.fillRect(px, py, tile, tile);
       ctx.strokeStyle = "rgba(15,23,42,0.45)";
       ctx.lineWidth = 1;

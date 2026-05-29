@@ -40,6 +40,7 @@ import { bootBonus, effectivePrice, ITEM_BY_ID, nearestTown, townAt } from "./to
 import { getRep, onArriveTown, onCombatWin } from "./quests.js";
 import { keeperLine } from "./lines.js";
 import type { Direction, SatPlayerRow } from "./types.js";
+import { BIOME, blockReasonAt, tileAt } from "./world.js";
 
 const BREAD_COST = 1; // sats → pool
 const FLEE_COST = 1; // sats → pool
@@ -96,6 +97,15 @@ const DELTA: Record<Direction, [number, number]> = {
   right: [1, 0],
 };
 
+function blockedMoveNote(x: number, y: number, ownsBoat: boolean): string | null {
+  const reason = blockReasonAt(x, y, { ownsBoat });
+  if (!reason) return null;
+  if (reason === "sea") return "🌊 The sea blocks your path.";
+  const tile = tileAt(x, y);
+  if (tile === BIOME.HOUSE || tile === BIOME.CASTLE) return "🧱 A wall blocks your path.";
+  return "⛰️ The way is blocked.";
+}
+
 /** The most tiles a single directional press can cover, given equipped boots. */
 export function maxStepsFor(player: SatPlayerRow): number {
   return Math.min(SAT.MAX_STEPS_CAP, SAT.MAX_STEPS_BASE + bootBonus(player));
@@ -137,6 +147,7 @@ export async function moveMany(discordId: string, dir: Direction): Promise<Actio
     if (res.note.includes("fainted")) break;
   }
   const header = `🏃 ×${actual}`;
+  if (actual === 0 && events.length) return { ok: false, note: events.join("\n"), enteredCombat: entered };
   const note = events.length ? `${header}\n${events.join("\n")}` : header;
   return { ok: true, note, enteredCombat: entered };
 }
@@ -150,6 +161,9 @@ export async function move(discordId: string, dir: Direction): Promise<ActionRes
   const [dx, dy] = DELTA[dir];
   const nx = player.x_coord + dx;
   const ny = player.y_coord + dy;
+  const ownsBoatNow = await ownsItem(discordId, "boat");
+  const blocked = blockedMoveNote(nx, ny, ownsBoatNow);
+  if (blocked) return { ok: false, note: blocked };
 
   // Stamina first; once it's gone each step burns 1 sat of HP into the pool.
   let note = "";
@@ -500,6 +514,9 @@ export async function travelTo(
 
   const est = estimateTravel(player, tx, ty);
   if (est.steps === 0) return { ok: false, note: "You're already there." };
+  const ownsBoatNow = await ownsItem(discordId, "boat");
+  const blocked = blockedMoveNote(tx, ty, ownsBoatNow);
+  if (blocked) return { ok: false, note: `Can't travel there. ${blocked}` };
 
   const cost = travelCost(est, opts.discountMul ?? 1);
   const viaPortal = (opts.discountMul ?? 1) < 1;
