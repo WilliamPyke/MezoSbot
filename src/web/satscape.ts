@@ -1,5 +1,9 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { URL } from "node:url";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
+
+const CHUNKS_DIR = join(__dirname, "..", "satscape", "world_gen", "chunks");
 import { supabase } from "../db.js";
 import { biomeAt, SAT } from "../satscape/engine.js";
 import {
@@ -73,6 +77,26 @@ export async function handleSatscapeWebRequest(
 
   if (method === "GET" && path === "/satscape") {
     sendHtml(res, 200, PAGE_HTML);
+    return true;
+  }
+
+  if (method === "GET" && path.startsWith("/satscape/chunks/")) {
+    const filename = path.slice("/satscape/chunks/".length);
+    if (filename.includes("..") || !/^[a-zA-Z0-9_.-]+$/.test(filename)) {
+      sendJson(res, 400, { error: "Invalid chunk filename" });
+      return true;
+    }
+    const filePath = join(CHUNKS_DIR, filename);
+    try {
+      const content = await readFile(filePath);
+      const isPng = filename.endsWith(".png");
+      res.statusCode = 200;
+      res.setHeader("Content-Type", isPng ? "image/png" : "application/json; charset=utf-8");
+      res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+      res.end(content);
+    } catch (err) {
+      sendJson(res, 404, { error: "Not found" });
+    }
     return true;
   }
 
@@ -584,6 +608,27 @@ const PLAY_HTML = /* html */ `<!doctype html>
   var play = document.getElementById("play"), ctx = play.getContext("2d");
   var minimap = document.getElementById("minimap"), mini = minimap.getContext("2d");
   var note = document.getElementById("note");
+  var chunkCache = {};
+  var WORLD_ART = { tile: 18, chunkTiles: 32, cols: 12, rows: 11, worldTilesX: 380, worldTilesY: 335 };
+  function getChunkImage(col, row) {
+    var key = col + "," + row;
+    if (chunkCache[key]) {
+      return chunkCache[key].loaded ? chunkCache[key].img : null;
+    }
+    var img = new Image();
+    chunkCache[key] = { img: img, loaded: false };
+    img.onload = function() {
+      chunkCache[key].loaded = true;
+      render();
+    };
+    img.src = "/satscape/chunks/chunk_" + col + "_" + row + ".png";
+    return null;
+  }
+  function inSight(x, y) {
+    var dx = x - state.player.x;
+    var dy = y - state.player.y;
+    return dx * dx + dy * dy <= 30;
+  }
   function api(path, body) {
     return fetch(path, { method: body ? "POST" : "GET", headers: { "Content-Type":"application/json", "X-Satscape-Token": token }, body: body ? JSON.stringify(body) : undefined })
       .then(function(r){ return r.json().then(function(j){ if(!r.ok) throw new Error(j.error || "Request failed"); return j; }); });
@@ -614,14 +659,72 @@ const PLAY_HTML = /* html */ `<!doctype html>
     if(!state) return;
     var p = state.player, b = state.viewport.bounds, ex = exploredSet();
     var tw = play.width / 16, th = play.height / 16;
-    ctx.fillStyle = "#070b11"; ctx.fillRect(0,0,play.width,play.height);
+    
+    // Draw background (chunks or fallback solid color)
+    ctx.fillStyle = "#04121f"; // OCEAN_BASE
+    ctx.fillRect(0, 0, play.width, play.height);
+
+    var chunkTiles = WORLD_ART.chunkTiles;
+    var artTile = WORLD_ART.tile;
+    var minCol = Math.floor(b.minX / chunkTiles);
+    var maxCol = Math.floor(b.maxX / chunkTiles);
+    var minRow = Math.floor(b.minY / chunkTiles);
+    var maxRow = Math.floor(b.maxY / chunkTiles);
+
+    for (var r = minRow; r <= maxRow; r++) {
+      for (var c = minCol; c <= maxCol; c++) {
+        if (c < 0 || r < 0 || c >= WORLD_ART.cols || r >= WORLD_ART.rows) continue;
+        var wx0 = Math.max(b.minX, c * chunkTiles);
+        var wx1 = Math.min(b.maxX + 1, (c + 1) * chunkTiles, WORLD_ART.worldTilesX);
+        var wy0 = Math.max(b.minY, r * chunkTiles);
+        var wy1 = Math.min(b.maxY + 1, (r + 1) * chunkTiles, WORLD_ART.worldTilesY);
+        if (wx1 <= wx0 || wy1 <= wy0) continue;
+
+        var img = getChunkImage(c, r);
+        if (img) {
+          var sx = (wx0 - c * chunkTiles) * artTile;
+          var sy = (wy0 - r * chunkTiles) * artTile;
+          var sw = (wx1 - wx0) * artTile;
+          var sh = (wy1 - wy0) * artTile;
+          var dx = (wx0 - b.minX) * tw;
+          var dy = (wy0 - b.minY) * th;
+          var dw = (wx1 - wx0) * tw;
+          var dh = (wy1 - wy0) * th;
+          ctx.drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh);
+        } else {
+          // Fallback to solid tiles for this chunk's viewport intersection
+          for (var ty = wy0; ty < wy1; ty++) {
+            for (var tx = wx0; tx < wx1; tx++) {
+              var sx = (tx - b.minX) * tw, sy = (ty - b.minY) * th;
+              if (!ex[key(tx, ty)]) {
+                ctx.fillStyle = "#05070b";
+              } else {
+                ctx.fillStyle = state.viewport.terrainColors[biomeAt(tx, ty)] || "#334155";
+              }
+              ctx.fillRect(sx, sy, Math.ceil(tw), Math.ceil(th));
+            }
+          }
+        }
+      }
+    }
+
+    // Fog overlay
     for(var y=b.minY;y<=b.maxY;y++) for(var x=b.minX;x<=b.maxX;x++){
       var sx = (x - b.minX) * tw, sy = (y - b.minY) * th;
-      if(!ex[key(x,y)]) { ctx.fillStyle = "#05070b"; }
-      else { ctx.fillStyle = state.viewport.terrainColors[biomeAt(x,y)] || "#334155"; }
-      ctx.fillRect(sx, sy, Math.ceil(tw), Math.ceil(th));
-      ctx.strokeStyle = "rgba(15,23,42,.35)"; ctx.strokeRect(sx, sy, tw, th);
+      var seen = inSight(x, y);
+      var known = seen || ex[key(x, y)];
+      if (!known) {
+        ctx.fillStyle = "#060a14"; // FOG
+        ctx.fillRect(sx, sy, Math.ceil(tw), Math.ceil(th));
+      } else if (!seen) {
+        // explored but out of sight -> dim memory overlay
+        ctx.fillStyle = "rgba(2,6,23,0.5)";
+        ctx.fillRect(sx, sy, Math.ceil(tw), Math.ceil(th));
+      }
+      ctx.strokeStyle = "rgba(15,23,42,.35)"; 
+      ctx.strokeRect(sx, sy, tw, th);
     }
+
     (state.viewport.entities||[]).forEach(function(e){
       if(!ex[key(e.x,e.y)]) return;
       var sx=(e.x-b.minX+.5)*tw, sy=(e.y-b.minY+.5)*th;
