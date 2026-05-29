@@ -53,6 +53,16 @@ async function loadExploredTiles(): Promise<Array<{ x: number; y: number }>> {
   }
 }
 
+let exploredTilesCache: { loadedAt: number; tiles: Array<{ x: number; y: number }> } | null = null;
+
+async function loadExploredTilesCached(ttlMs = 5000): Promise<Array<{ x: number; y: number }>> {
+  const now = Date.now();
+  if (exploredTilesCache && now - exploredTilesCache.loadedAt < ttlMs) return exploredTilesCache.tiles;
+  const tiles = await loadExploredTiles();
+  exploredTilesCache = { loadedAt: now, tiles };
+  return tiles;
+}
+
 export async function handleSatscapeWebRequest(
   req: IncomingMessage,
   res: ServerResponse,
@@ -172,7 +182,7 @@ async function respondSpectatorPlayers(res: ServerResponse): Promise<void> {
       .neq("state", "fainted");
     if (error) throw error;
 
-    const explored = await loadExploredTiles();
+      const explored = await loadExploredTilesCached();
     const ids = (players ?? []).map((p) => p.discord_id);
     const nameById = new Map<string, string>();
     const balanceById = new Map<string, number>();
@@ -215,6 +225,7 @@ async function respondSpectatorPlayers(res: ServerResponse): Promise<void> {
 async function buildStateResponse(userId: string, note?: string): Promise<Record<string, unknown>> {
   const view = await loadView(userId);
   if (!view || !view.player.active) return { error: "Use /satscape join first." };
+  const worldExplored = await loadExploredTilesCached();
   return {
     ok: true,
     note,
@@ -234,6 +245,10 @@ async function buildStateResponse(userId: string, note?: string): Promise<Record
       }),
       entities: view.entities,
       others: view.others,
+    },
+    minimap: {
+      explored: worldExplored,
+      towns: TOWNS.map(publicTown),
     },
     combat: combatState(view),
     inventory: inventoryState(view),
@@ -460,44 +475,43 @@ const PLAY_HTML = /* html */ `<!doctype html>
 <style>
   :root { color-scheme: dark; --bg:#10151c; --panel:#18212b; --line:#2a3644; --text:#edf2f7; --muted:#9aa8b7; --accent:#4ade80; --danger:#fb7185; --gold:#facc15; }
   * { box-sizing: border-box; }
+  html, body { min-height:100%; }
   body { margin:0; background:var(--bg); color:var(--text); font-family:Inter,Segoe UI,Arial,sans-serif; }
   button, input, select { font: inherit; }
-  button { border:1px solid var(--line); background:#223040; color:var(--text); border-radius:6px; padding:9px 11px; cursor:pointer; }
+  button { border:1px solid var(--line); background:#223040; color:var(--text); border-radius:6px; padding:7px 9px; cursor:pointer; }
   button:hover { border-color:#52657a; }
   button.primary { background:#166534; border-color:#22c55e; }
   button.danger { background:#5f1f2b; border-color:#fb7185; }
-  input, select { width:100%; border:1px solid var(--line); background:#111820; color:var(--text); border-radius:6px; padding:8px; }
-  .app { display:grid; grid-template-columns:minmax(360px, 1fr) 360px; gap:14px; min-height:100vh; padding:14px; }
+  input, select { width:100%; border:1px solid var(--line); background:#111820; color:var(--text); border-radius:6px; padding:7px; }
+  .app { display:grid; grid-template-columns:minmax(380px, 560px) 340px; justify-content:center; gap:10px; min-height:100dvh; padding:10px; }
   .stage, .side { min-width:0; }
-  .top { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:10px; }
-  h1 { margin:0; font-size:20px; letter-spacing:0; }
-  .coords { color:var(--muted); font-size:13px; }
-  .bars { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:10px; }
-  .bar { border:1px solid var(--line); border-radius:6px; padding:8px; background:#141c25; }
-  .bar label { display:flex; justify-content:space-between; color:var(--muted); font-size:12px; margin-bottom:6px; }
-  .fill { height:9px; border-radius:999px; background:#303b48; overflow:hidden; }
+  .top { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:8px; }
+  h1 { margin:0; font-size:18px; letter-spacing:0; }
+  .coords { color:var(--muted); font-size:12px; }
+  .bars { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:8px; }
+  .bar { border:1px solid var(--line); border-radius:6px; padding:7px; background:#141c25; }
+  .bar label { display:flex; justify-content:space-between; color:var(--muted); font-size:12px; margin-bottom:5px; }
+  .fill { height:8px; border-radius:999px; background:#303b48; overflow:hidden; }
   .fill span { display:block; height:100%; background:var(--accent); }
   .fill.hp span { background:#fb7185; }
-  canvas { width:100%; display:block; background:#080c12; border:1px solid var(--line); border-radius:8px; image-rendering:pixelated; touch-action:none; }
-  #map { aspect-ratio:1/1; }
-  .side { display:flex; flex-direction:column; gap:10px; }
-  .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:10px; }
-  .panel h2 { margin:0 0 8px; font-size:14px; }
-  .grid4 { display:grid; grid-template-columns:repeat(3,1fr); gap:6px; }
+  canvas { width:100%; max-height:calc(100dvh - 104px); display:block; background:#080c12; border:1px solid var(--line); border-radius:8px; image-rendering:pixelated; touch-action:none; aspect-ratio:1/1; }
+  #minimap { height:118px; max-height:118px; aspect-ratio:auto; }
+  .side { display:flex; flex-direction:column; gap:8px; max-height:calc(100dvh - 20px); overflow:auto; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:8px; }
+  .panel h2 { margin:0 0 6px; font-size:13px; }
+  .grid4 { display:grid; grid-template-columns:repeat(3,1fr); gap:5px; }
   .grid4 .up { grid-column:2; }.grid4 .left { grid-column:1; }.grid4 .down { grid-column:2; }.grid4 .right { grid-column:3; }
-  .row { display:flex; gap:6px; align-items:center; }
+  .row { display:flex; gap:5px; align-items:center; }
   .row > * { flex:1; }
-  .tabs { display:flex; gap:6px; }
-  .tabs button { flex:1; padding:8px; }
+  .tabs { display:flex; gap:5px; }
+  .tabs button { flex:1; padding:7px; }
   .tabs button.active { border-color:var(--accent); color:#bbf7d0; }
-  .list { display:flex; flex-direction:column; gap:6px; max-height:260px; overflow:auto; }
-  .item { display:grid; grid-template-columns:1fr auto; gap:8px; align-items:center; border-top:1px solid var(--line); padding-top:7px; }
+  .list { display:flex; flex-direction:column; gap:5px; max-height:150px; overflow:auto; }
+  .item { display:grid; grid-template-columns:1fr auto; gap:7px; align-items:center; border-top:1px solid var(--line); padding-top:6px; font-size:13px; }
   .item:first-child { border-top:0; padding-top:0; }
   .muted { color:var(--muted); font-size:12px; }
-  .note { min-height:36px; color:#dbeafe; white-space:pre-wrap; font-size:13px; }
-  .combat { display:none; margin-top:10px; }
-  .combat.on { display:block; }
-  @media (max-width: 860px) { .app { grid-template-columns:1fr; } }
+  .note { min-height:34px; max-height:86px; overflow:auto; color:#dbeafe; white-space:pre-wrap; font-size:13px; }
+  @media (max-width: 860px) { .app { grid-template-columns:1fr; } .side { max-height:none; overflow:visible; } canvas { max-height:none; } }
 </style>
 </head>
 <body>
@@ -508,18 +522,18 @@ const PLAY_HTML = /* html */ `<!doctype html>
       <div class="bar"><label><span>HP</span><span id="hpText">0/0</span></label><div class="fill hp"><span id="hpFill"></span></div></div>
       <div class="bar"><label><span>Stamina</span><span id="stText">0%</span></label><div class="fill"><span id="stFill"></span></div></div>
     </div>
-    <canvas id="map" width="640" height="640"></canvas>
-    <div class="combat" id="combatPanel"><canvas id="battle" width="480" height="480"></canvas></div>
+    <canvas id="play" width="512" height="512"></canvas>
   </section>
   <aside class="side">
     <div class="panel note" id="note">Opening SatScape...</div>
+    <div class="panel"><canvas id="minimap" width="320" height="118"></canvas></div>
     <div class="panel">
       <h2>Move</h2>
       <div class="grid4">
-        <button class="up" data-move="up">Up</button>
-        <button class="left" data-move="left">Left</button>
-        <button class="down" data-move="down">Down</button>
-        <button class="right" data-move="right">Right</button>
+        <button class="up" data-move="up" title="Move north">Up</button>
+        <button class="left" data-move="left" title="Move west">Left</button>
+        <button class="down" data-move="down" title="Move south">Down</button>
+        <button class="right" data-move="right" title="Move east">Right</button>
       </div>
       <div class="row" style="margin-top:8px"><button id="eat">Eat</button><button id="refresh">Refresh</button></div>
     </div>
@@ -530,7 +544,7 @@ const PLAY_HTML = /* html */ `<!doctype html>
     </div>
     <div class="panel" id="battleControls">
       <h2>Battle</h2>
-      <div class="row"><button data-bmove="up">Up</button><button data-bmove="down">Down</button><button data-bmove="left">Left</button><button data-bmove="right">Right</button></div>
+      <div class="row"><button data-bmove="up" title="Queue north">Up</button><button data-bmove="down" title="Queue south">Down</button><button data-bmove="left" title="Queue west">Left</button><button data-bmove="right" title="Queue east">Right</button></div>
       <div class="row" style="margin-top:6px"><select id="strikeMode"></select><button id="strike" class="primary">Strike</button></div>
       <div class="row" style="margin-top:6px"><select id="weapon"></select><button id="weaponBtn">Ready</button></div>
       <div class="row" style="margin-top:6px"><button id="wait">Wait</button><button id="undo">Undo</button><button id="resolve" class="primary">Resolve</button><button id="flee" class="danger">Flee</button></div>
@@ -552,8 +566,8 @@ const PLAY_HTML = /* html */ `<!doctype html>
   var token = new URLSearchParams(location.search).get("t") || localStorage.getItem("satscapeToken") || "";
   if (token) localStorage.setItem("satscapeToken", token);
   var state = null, activeTab = location.hash === "#quests" ? "quests" : location.hash === "#shop" ? "shop" : "gear";
-  var map = document.getElementById("map"), mctx = map.getContext("2d");
-  var battle = document.getElementById("battle"), bctx = battle.getContext("2d");
+  var play = document.getElementById("play"), ctx = play.getContext("2d");
+  var minimap = document.getElementById("minimap"), mini = minimap.getContext("2d");
   var note = document.getElementById("note");
   function api(path, body) {
     return fetch(path, { method: body ? "POST" : "GET", headers: { "Content-Type":"application/json", "X-Satscape-Token": token }, body: body ? JSON.stringify(body) : undefined })
@@ -582,44 +596,80 @@ const PLAY_HTML = /* html */ `<!doctype html>
   function drawMap(){
     if(!state) return;
     var p = state.player, b = state.viewport.bounds, ex = exploredSet();
-    var tw = map.width / 16, th = map.height / 16;
-    mctx.fillStyle = "#070b11"; mctx.fillRect(0,0,map.width,map.height);
+    var tw = play.width / 16, th = play.height / 16;
+    ctx.fillStyle = "#070b11"; ctx.fillRect(0,0,play.width,play.height);
     for(var y=b.minY;y<=b.maxY;y++) for(var x=b.minX;x<=b.maxX;x++){
       var sx = (x - b.minX) * tw, sy = (y - b.minY) * th;
-      if(!ex[key(x,y)]) { mctx.fillStyle = "#05070b"; }
-      else { mctx.fillStyle = state.viewport.terrainColors[biomeAt(x,y)] || "#334155"; }
-      mctx.fillRect(sx, sy, Math.ceil(tw), Math.ceil(th));
-      mctx.strokeStyle = "rgba(15,23,42,.35)"; mctx.strokeRect(sx, sy, tw, th);
+      if(!ex[key(x,y)]) { ctx.fillStyle = "#05070b"; }
+      else { ctx.fillStyle = state.viewport.terrainColors[biomeAt(x,y)] || "#334155"; }
+      ctx.fillRect(sx, sy, Math.ceil(tw), Math.ceil(th));
+      ctx.strokeStyle = "rgba(15,23,42,.35)"; ctx.strokeRect(sx, sy, tw, th);
     }
     (state.viewport.entities||[]).forEach(function(e){
       if(!ex[key(e.x,e.y)]) return;
       var sx=(e.x-b.minX+.5)*tw, sy=(e.y-b.minY+.5)*th;
-      mctx.fillStyle = e.type === "chest" ? "#facc15" : "#fb923c";
-      mctx.beginPath(); mctx.arc(sx, sy, Math.max(5, tw*.18), 0, Math.PI*2); mctx.fill();
+      ctx.fillStyle = e.type === "chest" ? "#facc15" : "#fb923c";
+      ctx.beginPath(); ctx.arc(sx, sy, Math.max(5, tw*.18), 0, Math.PI*2); ctx.fill();
     });
     (state.viewport.others||[]).forEach(function(o){
       var sx=(o.x-b.minX+.5)*tw, sy=(o.y-b.minY+.5)*th;
-      mctx.fillStyle = o.state === "combat" ? "#f97316" : "#60a5fa";
-      mctx.beginPath(); mctx.arc(sx, sy, Math.max(5, tw*.16), 0, Math.PI*2); mctx.fill();
+      ctx.fillStyle = o.state === "combat" ? "#f97316" : "#60a5fa";
+      ctx.beginPath(); ctx.arc(sx, sy, Math.max(5, tw*.16), 0, Math.PI*2); ctx.fill();
     });
     var px=(p.x-b.minX+.5)*tw, py=(p.y-b.minY+.5)*th;
-    mctx.fillStyle = "#f43f5e"; mctx.beginPath(); mctx.arc(px, py, Math.max(7, tw*.22), 0, Math.PI*2); mctx.fill();
-    mctx.strokeStyle = "#fff"; mctx.lineWidth = 2; mctx.stroke();
+    ctx.fillStyle = "#f43f5e"; ctx.beginPath(); ctx.arc(px, py, Math.max(7, tw*.22), 0, Math.PI*2); ctx.fill();
+    ctx.strokeStyle = "#fff"; ctx.lineWidth = 2; ctx.stroke();
   }
   function drawBattle(){
     var c = state && state.combat;
-    document.getElementById("combatPanel").className = "combat" + (c ? " on" : "");
     if(!c) return;
-    var s = battle.width / 8;
-    bctx.fillStyle="#10151c"; bctx.fillRect(0,0,battle.width,battle.height);
-    for(var y=0;y<8;y++) for(var x=0;x<8;x++){ bctx.fillStyle=(x+y)%2?"#17212c":"#1f2a36"; bctx.fillRect(x*s,y*s,s,s); bctx.strokeStyle="#304052"; bctx.strokeRect(x*s,y*s,s,s); }
+    var s = play.width / 8;
+    ctx.fillStyle="#10151c"; ctx.fillRect(0,0,play.width,play.height);
+    for(var y=0;y<8;y++) for(var x=0;x<8;x++){ ctx.fillStyle=(x+y)%2?"#17212c":"#1f2a36"; ctx.fillRect(x*s,y*s,s,s); ctx.strokeStyle="#304052"; ctx.strokeRect(x*s,y*s,s,s); }
     (c.intents||[]).forEach(function(intent){
-      (intent.attackTiles||[]).forEach(function(t){ bctx.fillStyle="rgba(248,113,113,.55)"; bctx.fillRect(t.x*s,t.y*s,s,s); });
-      bctx.fillStyle="#facc15"; bctx.fillText(String(intent.order), intent.to.x*s+6, intent.to.y*s+16);
+      (intent.attackTiles||[]).forEach(function(t){ ctx.fillStyle="rgba(248,113,113,.55)"; ctx.fillRect(t.x*s,t.y*s,s,s); });
+      ctx.fillStyle="#facc15"; ctx.font="14px sans-serif"; ctx.fillText(String(intent.order), intent.to.x*s+6, intent.to.y*s+16);
     });
-    bctx.fillStyle="#60a5fa"; bctx.beginPath(); bctx.arc(c.player.x*s+s/2,c.player.y*s+s/2,s*.28,0,Math.PI*2); bctx.fill();
-    bctx.fillStyle="#fb923c"; bctx.beginPath(); bctx.arc(c.monster.x*s+s/2,c.monster.y*s+s/2,s*.3,0,Math.PI*2); bctx.fill();
-    bctx.fillStyle="#e5e7eb"; bctx.font="14px sans-serif"; bctx.fillText(c.monster.name + " " + c.monster.hp + "/" + c.monster.maxHp, 10, battle.height - 12);
+    if(c.projected){
+      ctx.strokeStyle="#fde047"; ctx.lineWidth=3; ctx.setLineDash([6,4]);
+      ctx.beginPath(); ctx.moveTo(c.player.x*s+s/2,c.player.y*s+s/2); ctx.lineTo(c.projected.x*s+s/2,c.projected.y*s+s/2); ctx.stroke(); ctx.setLineDash([]);
+    }
+    ctx.fillStyle="#60a5fa"; ctx.beginPath(); ctx.arc(c.player.x*s+s/2,c.player.y*s+s/2,s*.28,0,Math.PI*2); ctx.fill();
+    if(c.projected && (c.projected.x !== c.player.x || c.projected.y !== c.player.y)){ ctx.fillStyle="#93c5fd"; ctx.beginPath(); ctx.arc(c.projected.x*s+s/2,c.projected.y*s+s/2,s*.2,0,Math.PI*2); ctx.fill(); }
+    ctx.fillStyle="#fb923c"; ctx.beginPath(); ctx.arc(c.monster.x*s+s/2,c.monster.y*s+s/2,s*.3,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle="#e5e7eb"; ctx.font="14px sans-serif"; ctx.fillText(c.monster.name + " " + c.monster.hp + "/" + c.monster.maxHp, 10, play.height - 12);
+  }
+  function drawMinimap(){
+    if(!state) return;
+    var tiles = state.minimap && state.minimap.explored || [];
+    var p = state.player, b = state.viewport.bounds, pad = 8;
+    mini.fillStyle = "#070b11"; mini.fillRect(0,0,minimap.width,minimap.height);
+    if(!tiles.length) return;
+    var minX=p.x, maxX=p.x, minY=p.y, maxY=p.y;
+    tiles.forEach(function(t){ if(t.x<minX)minX=t.x; if(t.x>maxX)maxX=t.x; if(t.y<minY)minY=t.y; if(t.y>maxY)maxY=t.y; });
+    (state.minimap.towns||[]).forEach(function(t){ if(t.cx<minX)minX=t.cx; if(t.cx>maxX)maxX=t.cx; if(t.cy<minY)minY=t.cy; if(t.cy>maxY)maxY=t.cy; });
+    var sx = (minimap.width - pad*2) / Math.max(1, maxX - minX + 1);
+    var sy = (minimap.height - pad*2) / Math.max(1, maxY - minY + 1);
+    var scale = Math.max(1, Math.min(sx, sy));
+    var ox = (minimap.width - (maxX - minX + 1) * scale) / 2;
+    var oy = (minimap.height - (maxY - minY + 1) * scale) / 2;
+    function mx(x){ return ox + (x - minX) * scale; }
+    function my(y){ return oy + (y - minY) * scale; }
+    tiles.forEach(function(t){
+      var inView = t.x >= b.minX && t.x <= b.maxX && t.y >= b.minY && t.y <= b.maxY;
+      mini.globalAlpha = inView ? 1 : 0.28;
+      mini.fillStyle = state.viewport.terrainColors[biomeAt(t.x,t.y)] || "#334155";
+      mini.fillRect(mx(t.x), my(t.y), Math.ceil(scale), Math.ceil(scale));
+    });
+    mini.globalAlpha = 1;
+    mini.strokeStyle = "#f8fafc"; mini.lineWidth = 1.5;
+    mini.strokeRect(mx(b.minX), my(b.minY), (b.maxX - b.minX + 1) * scale, (b.maxY - b.minY + 1) * scale);
+    (state.minimap.towns||[]).forEach(function(t){
+      mini.fillStyle = "#bfdbfe";
+      mini.fillRect(mx(t.cx)-2, my(t.cy)-2, 4, 4);
+    });
+    mini.fillStyle = "#fb7185";
+    mini.beginPath(); mini.arc(mx(p.x)+scale/2, my(p.y)+scale/2, 4, 0, Math.PI*2); mini.fill();
   }
   function renderPanels(){
     var p = state.player, needed = Math.max(0, Math.min(p.maxHp - p.hp, p.balance - p.hp));
@@ -654,7 +704,7 @@ const PLAY_HTML = /* html */ `<!doctype html>
     }
   }
   function addItem(label, button, cb){ var el=document.createElement("div"); el.className="item"; var s=document.createElement("span"); s.textContent=label; var b=document.createElement("button"); b.textContent=button; b.onclick=cb; el.appendChild(s); el.appendChild(b); document.getElementById("list").appendChild(el); }
-  function render(){ if(!state || state.error) return; drawMap(); drawBattle(); renderPanels(); }
+  function render(){ if(!state || state.error) return; if(state.combat) drawBattle(); else drawMap(); drawMinimap(); renderPanels(); }
   document.querySelectorAll("[data-move]").forEach(function(b){ b.onclick=function(){ act("/satscape/api/move", { dir:b.dataset.move }); }; });
   document.querySelectorAll("[data-bmove]").forEach(function(b){ b.onclick=function(){ act("/satscape/api/battle", { action:"move", dir:b.dataset.bmove }); }; });
   document.getElementById("eat").onclick=function(){ act("/satscape/api/eat", {}); };
@@ -668,9 +718,9 @@ const PLAY_HTML = /* html */ `<!doctype html>
   document.getElementById("flee").onclick=function(){ act("/satscape/api/battle", { action:"flee" }); };
   document.getElementById("estimate").onclick=function(){ act("/satscape/api/travel", { estimate:true, tx:Number(document.getElementById("tx").value), ty:Number(document.getElementById("ty").value) }); };
   document.getElementById("travel").onclick=function(){ act("/satscape/api/travel", { tx:Number(document.getElementById("tx").value), ty:Number(document.getElementById("ty").value) }); };
-  map.addEventListener("click", function(e){
-    if(!state) return;
-    var r = map.getBoundingClientRect(), b = state.viewport.bounds;
+  play.addEventListener("click", function(e){
+    if(!state || state.combat) return;
+    var r = play.getBoundingClientRect(), b = state.viewport.bounds;
     var x = Math.floor((e.clientX - r.left) / r.width * 16) + b.minX;
     var y = Math.floor((e.clientY - r.top) / r.height * 16) + b.minY;
     document.getElementById("tx").value = String(x);
@@ -678,7 +728,34 @@ const PLAY_HTML = /* html */ `<!doctype html>
     document.getElementById("travelText").textContent = "Target set to (" + x + ", " + y + ").";
   });
   ["Shop","Quests","Gear"].forEach(function(n){ document.getElementById("tab"+n).onclick=function(){ activeTab=n.toLowerCase(); renderList(); }; });
-  window.addEventListener("keydown", function(e){ var d={ArrowUp:"up",ArrowDown:"down",ArrowLeft:"left",ArrowRight:"right"}[e.key]; if(d){ e.preventDefault(); act("/satscape/api/move", { dir:d }); } });
+  function typingTarget(el){ return el && (el.tagName === "INPUT" || el.tagName === "SELECT" || el.tagName === "TEXTAREA" || el.isContentEditable); }
+  function directionKey(e){ return { ArrowUp:"up", ArrowDown:"down", ArrowLeft:"left", ArrowRight:"right", w:"up", W:"up", s:"down", S:"down", a:"left", A:"left", d:"right", D:"right" }[e.key]; }
+  window.addEventListener("keydown", function(e){
+    if(typingTarget(document.activeElement)) return;
+    var d = directionKey(e);
+    if(d){
+      e.preventDefault();
+      if(state && state.combat) act("/satscape/api/battle", { action:"move", dir:d });
+      else act("/satscape/api/move", { dir:d });
+      return;
+    }
+    if(!state) return;
+    if(e.key === "r" || e.key === "R"){ e.preventDefault(); api("/satscape/api/state").then(setState).catch(function(err){ note.textContent=err.message; }); return; }
+    if(e.key === "e" || e.key === "E"){ e.preventDefault(); act("/satscape/api/eat", {}); return; }
+    if(!state.combat) return;
+    if(e.key === " " || e.key === "Enter"){ e.preventDefault(); act("/satscape/api/battle", { action:"resolve" }); return; }
+    if(e.key === "q" || e.key === "Q"){ e.preventDefault(); act("/satscape/api/battle", { action:"wait" }); return; }
+    if(e.key === "z" || e.key === "Z" || e.key === "u" || e.key === "U"){ e.preventDefault(); act("/satscape/api/battle", { action:"undo" }); return; }
+    if(e.key === "f" || e.key === "F"){ e.preventDefault(); act("/satscape/api/battle", { action:"flee" }); return; }
+    var modeIndex = { "1":0, "2":1, "3":2 }[e.key];
+    if(modeIndex !== undefined){
+      e.preventDefault();
+      var modes = state.combat.attackModes || [];
+      var mode = modes[modeIndex] && modes[modeIndex].mode || "line";
+      document.getElementById("strikeMode").value = mode;
+      act("/satscape/api/battle", { action:"strike", mode:mode });
+    }
+  });
   api("/satscape/api/state").then(setState).catch(function(e){ note.textContent=e.message; });
   setInterval(function(){ api("/satscape/api/state").then(setState).catch(function(){}); }, 2000);
 })();
