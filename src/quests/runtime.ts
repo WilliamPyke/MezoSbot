@@ -941,7 +941,12 @@ async function completeRepeatableLinkWindowAndNotify(
 
     if ((result.rewardDeltaSats ?? 0) > 0) {
       await notifyQuestReward(client, task, userId, result.rewardDeltaSats ?? 0);
-    } else if (result.insertedCompletion === false) {
+    } else if (!result.insertedCompletion) {
+      // The tier-delta path paid nothing and did not insert a fresh completion,
+      // meaning this user already completed the task in a previous window. They
+      // legitimately won this window's claim, so pay the repeatable reward.
+      // Note: a truthy check (not `=== false`) so a missing `insertedCompletion`
+      // field from an older deployed RPC still routes repeat winners to payment.
       const repeatResult = await payRepeatableQuestTaskReward({
         questId: task.quest_id,
         taskId: task.id,
@@ -1023,6 +1028,18 @@ async function maybeDeleteDuplicateLinkPost(
   }
 }
 
+/**
+ * Reopens the current rotating-link window so a fresh winner can claim it
+ * (admin/creator "reset" command).
+ *
+ * INVARIANT: this only deletes the window-claim row for the current window and
+ * clears render-cache metadata. It must NOT delete quest_task_completions,
+ * quest_user_rewards, or quest_reward_events. Those rows are what let prior
+ * winners be recognised as repeat claimers — completeRepeatableLinkWindowAndNotify
+ * relies on `insertedCompletion === false` / `rewardDelta === 0` to route them to
+ * the repeatable payout. Wiping completion/reward state here would make a reopened
+ * window pay every past winner a fresh tier delta and silently break repeat claims.
+ */
 export async function resetFirstLinkWindow(
   client: Client,
   questId: number,
