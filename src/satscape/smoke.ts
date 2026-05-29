@@ -4,8 +4,8 @@
  *
  *   • sats are conserved: player balance + prize pool stays constant
  *   • balance never goes negative
- *   • combat is a win-chance roll (gear vs level), not HP attrition
- *   • shop purchases & equipping shift the win chance; cost flows to the pool
+ *   • tactical combat: queue a plan, resolve it, monster HP attrition / loot payout
+ *   • shop purchases & equipping flow cost to the pool (and feed the legacy gear math)
  *   • chest/fast-travel/faint behave and stay within the closed loop
  *
  * Uses a throwaway player + a far-off world region, then restores the global
@@ -38,7 +38,8 @@ import {
   travelCost,
   travelTo,
 } from "./game.js";
-import { getCombat, getPlayer, isTileCleared, startRun, updatePlayer } from "./db.js";
+import { queueWait, resolvePlan } from "./game.js";
+import { getCombat, getPlayer, isTileCleared, startRun, updateCombat, updatePlayer } from "./db.js";
 import { lossFor, winChance } from "./items.js";
 import { effectivePrice, gearScore, nearestTown, TOWN_BY_ID } from "./towns.js";
 import { acceptQuest, claimQuest, getRep, payTribute, questBoard } from "./quests.js";
@@ -144,7 +145,8 @@ async function main() {
   ok(!(await buyItem(TEST_ID, "rest_weapon")).ok, "shop refused outside town");
   await conserved(TOTAL, "after shop");
 
-  // 5. Combat — forced WIN then forced LOSS via deterministic RNG
+  // 5. Combat — tactical plan-3. Deterministic: we position the arena directly,
+  //    then drive the real queue→resolve path (no RNG forcing needed).
   console.log("\n5. Combat");
   const mWin = await findTile("monster", 0);
   if (!mWin) {
@@ -154,13 +156,18 @@ async function main() {
     await move(TEST_ID, "right");
     const c = await getCombat(TEST_ID);
     ok(!!c && c.monster_level >= 1, `combat started (lv ${c?.monster_level}) vs ${c?.monster_name}`);
-    Math.random = () => 0; // always below win chance → win
+    // Stand the player directly below the monster (in weapon range) and chip the
+    // monster down to a sliver, so a single queued strike is a guaranteed kill.
+    await updateCombat(TEST_ID, {
+      player_battle_x: 3, player_battle_y: 3,
+      monster_battle_x: 3, monster_battle_y: 2,
+      monster_current_hp: 1, battle_plan: null,
+    });
     const before = await getBalance(TEST_ID);
     const pool = await readPool();
-    const res = await fight(TEST_ID);
-    Math.random = realRandom;
+    const res = await fight(TEST_ID); // queues a strike, then resolves
     const gained = (await getBalance(TEST_ID)) - before;
-    ok(res.ok && (await getCombat(TEST_ID)) === null, "forced win cleared combat");
+    ok(res.ok && (await getCombat(TEST_ID)) === null, "queued strike killed the monster (combat cleared)");
     ok((await getPlayer(TEST_ID))?.state === "idle", "idle after win");
     ok(await isTileCleared(mWin.x, mWin.y), "won monster tile cleared");
     ok(gained >= 0 && gained <= pool, `loot (${gained}) capped to pool (${pool})`);
@@ -174,12 +181,19 @@ async function main() {
     await updatePlayer(TEST_ID, { x_coord: mLose.x - 1, y_coord: mLose.y, hunger: 100, state: "idle" });
     await move(TEST_ID, "right");
     const c = await getCombat(TEST_ID);
-    Math.random = () => 0.999999; // above win chance → loss
+    // Monster sits right on top of the player with plenty of HP: resolving an
+    // all-wait plan lets it close in and strike, so the player takes damage and
+    // the fight continues.
+    await updateCombat(TEST_ID, {
+      player_battle_x: 3, player_battle_y: 3,
+      monster_battle_x: 3, monster_battle_y: 2,
+      monster_current_hp: c!.monster_max_hp, battle_plan: null,
+    });
     const before = await getBalance(TEST_ID);
-    await fight(TEST_ID);
-    Math.random = realRandom;
-    ok((await getBalance(TEST_ID)) === before - lossFor(c!.monster_level), `loss cost ${lossFor(c!.monster_level)} sats`);
-    ok((await getCombat(TEST_ID)) !== null, "monster stays after a loss");
+    await queueWait(TEST_ID);
+    await resolvePlan(TEST_ID);
+    ok((await getBalance(TEST_ID)) < before, "waiting into the monster cost sats");
+    ok((await getCombat(TEST_ID)) !== null, "monster stays after a non-lethal round");
     await conserved(TOTAL, "after loss");
     await flee(TEST_ID); // tidy up
   }

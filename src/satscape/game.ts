@@ -18,7 +18,21 @@ import {
   updateCombat,
   updatePlayer,
 } from "./db.js";
-import { battleMovePoints, battleMoveRange, legalBattleMoves, monsterIntent, moveByButton, playerAttackTiles, samePoint, selectedWeaponId, startingBattlePositions, weaponFor, type BattleMove } from "./battle.js";
+import {
+  battleMoveRange,
+  MAX_PLAN,
+  parsePlan,
+  planGlyph,
+  projectedPlayerPos,
+  samePoint,
+  selectedWeaponId,
+  serializePlan,
+  simulateBattle,
+  startingBattlePositions,
+  weaponFor,
+  type BattleMove,
+  type PlanAction,
+} from "./battle.js";
 import { bootBonus, effectivePrice, ITEM_BY_ID, nearestTown, townAt } from "./towns.js";
 import { getRep, onArriveTown, onCombatWin } from "./quests.js";
 import { keeperLine } from "./lines.js";
@@ -40,10 +54,6 @@ const DELTA: Record<Direction, [number, number]> = {
   left: [-1, 0],
   right: [1, 0],
 };
-
-function arenaLabel(x: number, y: number): string {
-  return `${String.fromCharCode(65 + x)}${y + 1}`;
-}
 
 /** The most tiles a single directional press can cover, given equipped boots. */
 export function maxStepsFor(player: SatPlayerRow): number {
@@ -172,7 +182,8 @@ export async function resolveTile(discordId: string, x: number, y: number): Prom
     player_battle_y: positions.player.y,
     monster_battle_x: positions.monster.x,
     monster_battle_y: positions.monster.y,
-    battle_move_points: fighter ? battleMoveRange(fighter) : 1,
+    battle_move_points: fighter ? battleMoveRange(fighter) : 5,
+    battle_plan: null,
     selected_battle_weapon: null,
     turn_number: 1,
     created_at: new Date().toISOString(),
@@ -180,61 +191,79 @@ export async function resolveTile(discordId: string, x: number, y: number): Prom
   return { ok: true, note: `👹 A level ${m.level} **${m.name}** blocks your path!`, enteredCombat: true };
 }
 
-/** Preview movement inside combat. Arrows spend movement; Attack resolves the turn. */
-export async function battleMove(discordId: string, move: BattleMove): Promise<ActionResult> {
-  const [combat, player] = await Promise.all([getCombat(discordId), getPlayer(discordId)]);
-  if (!combat || !player) return { ok: false, note: "No active fight." };
-  const points = battleMovePoints(combat, player);
-  if (points <= 0) return { ok: false, note: "No movement left this turn. Attack or flee." };
+/** Append one action to the combat plan, capped at MAX_PLAN slots. */
+async function queueAction(discordId: string, action: PlanAction): Promise<ActionResult> {
+  const combat = await getCombat(discordId);
+  if (!combat) return { ok: false, note: "No active fight." };
+  const plan = parsePlan(combat.battle_plan);
+  if (plan.length >= MAX_PLAN) return { ok: false, note: `Plan is full (${MAX_PLAN}/${MAX_PLAN}). Resolve or Undo.` };
 
-  const destination = moveByButton(combat, move, player);
-  const monster = { x: combat.monster_battle_x, y: combat.monster_battle_y };
-  if (samePoint(destination, monster)) return { ok: false, note: "The monster blocks that tile." };
-  if (samePoint(destination, { x: combat.player_battle_x, y: combat.player_battle_y })) {
-    return { ok: false, note: "You are already at the edge of the arena." };
+  if (action.kind === "move") {
+    const before = projectedPlayerPos(combat, plan);
+    const after = projectedPlayerPos(combat, [...plan, action]);
+    if (samePoint(before, after)) {
+      const d = action.dir;
+      const blocked = d === "up" || d === "down" || d === "left" || d === "right";
+      return { ok: false, note: blocked ? "That step is blocked (arena edge or the monster's tile)." : "Can't move there." };
+    }
   }
 
-  await updateCombat(discordId, {
-    player_battle_x: destination.x,
-    player_battle_y: destination.y,
-    battle_move_points: points - 1,
-  });
-  return { ok: true, note: `Moved to **${arenaLabel(destination.x, destination.y)}**. ${points - 1} move left.` };
+  const next = [...plan, action];
+  await updateCombat(discordId, { battle_plan: serializePlan(next) });
+  return { ok: true, note: `Queued ${planGlyph(action)} (${next.length}/${MAX_PLAN}).` };
 }
 
-/** Resolve the monster telegraph and the currently selected weapon. */
-export async function battleAttack(discordId: string): Promise<ActionResult> {
+/** Queue a directional step into the plan (arrows). */
+export async function battleMove(discordId: string, move: BattleMove): Promise<ActionResult> {
+  if (move === "stay") return queueAction(discordId, { kind: "wait" });
+  return queueAction(discordId, { kind: "move", dir: move });
+}
+
+/** Queue a weapon strike into the plan. */
+export async function queueStrike(discordId: string): Promise<ActionResult> {
+  return queueAction(discordId, { kind: "strike" });
+}
+
+/** Queue a wait (hold position one tick) into the plan. */
+export async function queueWait(discordId: string): Promise<ActionResult> {
+  return queueAction(discordId, { kind: "wait" });
+}
+
+/** Remove the last queued action. */
+export async function undoPlanAction(discordId: string): Promise<ActionResult> {
+  const combat = await getCombat(discordId);
+  if (!combat) return { ok: false, note: "No active fight." };
+  const plan = parsePlan(combat.battle_plan);
+  if (plan.length === 0) return { ok: false, note: "Nothing queued to undo." };
+  const popped = plan.pop()!;
+  await updateCombat(discordId, { battle_plan: serializePlan(plan) });
+  return { ok: true, note: `Removed ${planGlyph(popped)} (${plan.length}/${MAX_PLAN}).` };
+}
+
+/**
+ * Resolve the queued plan against the monster's 3 telegraphed strikes,
+ * interleaved tick-by-tick (see simulateBattle). Persists the outcome, clears
+ * the plan, and advances the turn — or ends the fight on a kill / faint.
+ */
+export async function resolvePlan(discordId: string): Promise<ActionResult> {
   const [combat, player] = await Promise.all([getCombat(discordId), getPlayer(discordId)]);
   if (!combat || !player) return { ok: false, note: "No active fight." };
 
-  const destination = { x: combat.player_battle_x, y: combat.player_battle_y };
-  const intent = monsterIntent(combat, player);
   const weapon = weaponFor(player, selectedWeaponId(combat, player));
-  const monsterPos = intent.to;
-  const bodyChecked = samePoint(destination, monsterPos);
-  const wasHit = bodyChecked || intent.attackTiles.some((p) => samePoint(p, destination));
-  const hitTiles = playerAttackTiles(destination, monsterPos, weapon);
-  const hitMonster = hitTiles.some((p) => samePoint(p, monsterPos)) || bodyChecked;
+  const plan = parsePlan(combat.battle_plan);
+  const res = simulateBattle(combat, weapon, plan);
 
-  let note = `Moved to **${arenaLabel(destination.x, destination.y)}**.`;
-  if (wasHit) {
-    const lost = await takeDamage(discordId, intent.damage);
-    note += ` 🩸 ${combat.monster_name}'s ${intent.name} hit you for ${lost} sats.`;
+  let note = res.steps.map((s) => s.line).join("\n");
+
+  // Apply damage the player took (closed-loop economy: sats → pool).
+  if (res.totalTaken > 0) {
+    await takeDamage(discordId, res.totalTaken);
     if ((await getBalance(discordId)) <= 0) {
-      return { ok: true, note: `${note} ` + (await faint(discordId)).note };
+      return { ok: true, note: `${note}\n` + (await faint(discordId)).note };
     }
-  } else {
-    note += ` ✨ Dodged ${combat.monster_name}'s ${intent.name}.`;
   }
 
-  const nextHp = hitMonster ? Math.max(0, combat.monster_current_hp - weapon.damage) : combat.monster_current_hp;
-  if (hitMonster) {
-    note += ` ${weapon.emoji} ${weapon.name} landed for **${weapon.damage}**.`;
-  } else {
-    note += ` ${weapon.emoji} ${weapon.name} missed.`;
-  }
-
-  if (nextHp <= 0) {
+  if (res.monsterDead) {
     const granted = await payoutFromPool(discordId, combat.reward_sats);
     await clearTile(combat.enemy_x, combat.enemy_y);
     await deleteCombat(discordId);
@@ -248,15 +277,20 @@ export async function battleAttack(discordId: string): Promise<ActionResult> {
   }
 
   await updateCombat(discordId, {
-    player_battle_x: destination.x,
-    player_battle_y: destination.y,
-    monster_battle_x: monsterPos.x,
-    monster_battle_y: monsterPos.y,
-    monster_current_hp: nextHp,
-    battle_move_points: battleMoveRange(player),
+    player_battle_x: res.playerEnd.x,
+    player_battle_y: res.playerEnd.y,
+    monster_battle_x: res.monsterEnd.x,
+    monster_battle_y: res.monsterEnd.y,
+    monster_current_hp: res.monsterHp,
+    battle_plan: null,
     turn_number: combat.turn_number + 1,
   });
-  return { ok: true, note };
+  return { ok: true, note: `${note}\n🗡️ Dealt ${res.totalDealt}, took ${res.totalTaken}. Plan the next 3.` };
+}
+
+/** Back-compat alias — older callers used "battleAttack". */
+export async function battleAttack(discordId: string): Promise<ActionResult> {
+  return resolvePlan(discordId);
 }
 
 export async function selectBattleWeapon(discordId: string, itemId: string): Promise<ActionResult> {
@@ -269,17 +303,17 @@ export async function selectBattleWeapon(discordId: string, itemId: string): Pro
   return { ok: true, note: `Readied ${item.emoji} **${item.name}**.` };
 }
 
-/** Back-compat for older callers: attack from the current preview position. */
-export async function battleTurn(discordId: string, _destX: number, _destY: number): Promise<ActionResult> {
-  return battleAttack(discordId);
+/** Back-compat for older callers: resolve the current plan. */
+export async function battleTurn(discordId: string, _destX?: number, _destY?: number): Promise<ActionResult> {
+  return resolvePlan(discordId);
 }
 
-/** Back-compat for older smoke helpers: take the first legal tactical move. */
+/** Back-compat helper (smoke): queue a strike, then resolve the round. */
 export async function fight(discordId: string): Promise<ActionResult> {
-  const [combat, player] = await Promise.all([getCombat(discordId), getPlayer(discordId)]);
-  if (!combat || !player) return { ok: false, note: "No active fight." };
-  const choice = legalBattleMoves(combat, player)[0] ?? { x: combat.player_battle_x, y: combat.player_battle_y };
-  return battleTurn(discordId, choice.x, choice.y);
+  const combat = await getCombat(discordId);
+  if (!combat) return { ok: false, note: "No active fight." };
+  await queueStrike(discordId);
+  return resolvePlan(discordId);
 }
 
 export async function flee(discordId: string): Promise<ActionResult> {

@@ -34,6 +34,8 @@ export interface CombatSessionRow {
   monster_battle_x: number;
   monster_battle_y: number;
   battle_move_points: number;
+  /** Comma-joined queued plan tokens: up|down|left|right|strike|wait. Null/"" = empty. */
+  battle_plan: string | null;
   selected_battle_weapon: string | null;
   turn_number: number;
   created_at: string;

@@ -14,7 +14,6 @@ import { SAT } from "./engine.js";
 import { getOwnedItemIds, getPlayer } from "./db.js";
 import {
   buyItem,
-  battleAttack,
   battleMove,
   eat,
   equipItem,
@@ -22,10 +21,14 @@ import {
   flee,
   maxStepsFor,
   moveMany,
+  queueStrike,
+  queueWait,
+  resolvePlan,
   setStepsPerMove,
   travelCost,
   travelTo,
   selectBattleWeapon,
+  undoPlanAction,
   type ActionResult,
 } from "./game.js";
 import {
@@ -175,7 +178,10 @@ export async function handleSatscapeInteraction(interaction: Interaction): Promi
       ? await battleMove(discordId, action as Direction)
       : await moveMany(discordId, action as Direction);
   }
-  else if (action === "battleattack") result = await battleAttack(discordId);
+  else if (action === "battlestrike") result = await queueStrike(discordId);
+  else if (action === "battlewait") result = await queueWait(discordId);
+  else if (action === "battleundo") result = await undoPlanAction(discordId);
+  else if (action === "battleresolve" || action === "battleattack") result = await resolvePlan(discordId);
   else if (action === "flee") result = await flee(discordId);
   else if (action === "eat") result = await eat(discordId);
   if (!result) return;

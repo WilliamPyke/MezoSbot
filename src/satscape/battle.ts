@@ -22,6 +22,8 @@ export interface WeaponProfile {
 }
 
 export interface MonsterIntent {
+  /** 1-based position in the telegraphed sequence (①②③). */
+  order: number;
   pattern: MonsterPattern;
   name: string;
   description: string;
@@ -29,6 +31,36 @@ export interface MonsterIntent {
   to: Point;
   attackTiles: Point[];
   damage: number;
+}
+
+export type PlanAction =
+  | { kind: "move"; dir: Direction }
+  | { kind: "strike" }
+  | { kind: "wait" };
+
+/** Max queued actions per round (the player's "next 3 attacks"). */
+export const MAX_PLAN = 3;
+
+/** One step of the interleaved resolution, for the embed log + image. */
+export interface ResolutionStep {
+  /** What the player did this tick. */
+  player: PlanAction | null;
+  /** Damage the player dealt to the monster this tick (0 if none). */
+  dealt: number;
+  /** Damage the player took from the monster's strike this tick (0 if dodged). */
+  taken: number;
+  /** Human-readable line for the combat note. */
+  line: string;
+}
+
+export interface BattleResolution {
+  steps: ResolutionStep[];
+  playerEnd: Point;
+  monsterEnd: Point;
+  monsterHp: number;
+  totalDealt: number;
+  totalTaken: number;
+  monsterDead: boolean;
 }
 
 export interface BattlePreview {
@@ -72,11 +104,62 @@ export function pointKey(p: Point): string {
 }
 
 export function battleMoveRange(player: SatPlayerRow): number {
-  return Math.min(3, 1 + Math.floor(bootBonus(player) / 3));
+  return Math.min(10, 5 + bootBonus(player));
 }
 
 export function battleMovePoints(combat: CombatSessionRow, player: SatPlayerRow): number {
   return Math.max(0, Math.min(battleMoveRange(player), combat.battle_move_points ?? battleMoveRange(player)));
+}
+
+const MOVE_TOKENS = new Set<Direction>(["up", "down", "left", "right"]);
+
+/** Decode the persisted plan string into an action list (capped at MAX_PLAN). */
+export function parsePlan(plan: string | null | undefined): PlanAction[] {
+  if (!plan) return [];
+  const out: PlanAction[] = [];
+  for (const raw of plan.split(",")) {
+    const tok = raw.trim();
+    if (!tok) continue;
+    if (tok === "strike") out.push({ kind: "strike" });
+    else if (tok === "wait") out.push({ kind: "wait" });
+    else if (MOVE_TOKENS.has(tok as Direction)) out.push({ kind: "move", dir: tok as Direction });
+    if (out.length >= MAX_PLAN) break;
+  }
+  return out;
+}
+
+/** Encode an action list back to the persisted comma-joined token form. */
+export function serializePlan(actions: PlanAction[]): string {
+  return actions
+    .slice(0, MAX_PLAN)
+    .map((a) => (a.kind === "move" ? a.dir : a.kind))
+    .join(",");
+}
+
+/** Compact glyph for a plan action — used in the embed plan strip. */
+export function planGlyph(action: PlanAction): string {
+  if (action.kind === "strike") return "⚔️";
+  if (action.kind === "wait") return "⏳";
+  return action.dir === "up" ? "⬆️" : action.dir === "down" ? "⬇️" : action.dir === "left" ? "⬅️" : "➡️";
+}
+
+/**
+ * Where the player would stand after applying the already-queued moves. Used to
+ * validate the next queued move against the *end* of the plan rather than the
+ * round-start position. Moves clamp to the arena and can't land on the monster's
+ * round-start tile (it hasn't moved yet during planning).
+ */
+export function projectedPlayerPos(combat: CombatSessionRow, plan: PlanAction[]): Point {
+  let pos = { x: combat.player_battle_x, y: combat.player_battle_y };
+  const monster = { x: combat.monster_battle_x, y: combat.monster_battle_y };
+  for (const a of plan) {
+    if (a.kind !== "move") continue;
+    const d = DIR_DELTA[a.dir];
+    const next = { x: clampArena(pos.x + d.x), y: clampArena(pos.y + d.y) };
+    if (samePoint(next, monster)) continue; // blocked — stay put
+    pos = next;
+  }
+  return pos;
 }
 
 export function startingBattlePositions(worldX: number, worldY: number): {
@@ -200,29 +283,124 @@ export function playerAttackTiles(from: Point, target: Point, weapon: WeaponProf
   return uniquePoints(raw.filter(inArena));
 }
 
-export function monsterIntent(combat: CombatSessionRow, player: SatPlayerRow): MonsterIntent {
-  const monster = { x: combat.monster_battle_x, y: combat.monster_battle_y };
+/**
+ * The monster's next MAX_PLAN telegraphed strikes, forward-simulated from its
+ * current tile. Each strike aims at the player's round-start tile — fixed at
+ * telegraph time so the preview is honest: the marked tiles WILL be struck
+ * regardless of where the player moves, and the player dodges by vacating them.
+ */
+export function monsterPlan(combat: CombatSessionRow, _player?: SatPlayerRow): MonsterIntent[] {
   const target = { x: combat.player_battle_x, y: combat.player_battle_y };
-  const seed = hash(`${combat.monster_name}:${combat.monster_level}:${combat.turn_number}:${combat.enemy_x}:${combat.enemy_y}`);
-  const pattern = monsterPatternFor(combat.monster_name, seed);
-  const move = monsterStep(monster, target, pattern, seed);
-  const to = {
-    x: clampArena(monster.x + move.x),
-    y: clampArena(monster.y + move.y),
-  };
-  const dir = attackDirection(to, target);
-  const tiles = monsterAttackTiles(to, dir, pattern, seed);
   const damage = Math.max(3, 3 + combat.monster_level * 2);
-  const name = monsterIntentName(pattern);
+  const out: MonsterIntent[] = [];
+  let from = { x: combat.monster_battle_x, y: combat.monster_battle_y };
+  for (let k = 0; k < MAX_PLAN; k++) {
+    const seed = hash(`${combat.monster_name}:${combat.monster_level}:${combat.turn_number}:${combat.enemy_x}:${combat.enemy_y}:${k}`);
+    const pattern = monsterPatternFor(combat.monster_name, seed);
+    const move = monsterStep(from, target, pattern, seed);
+    const to = { x: clampArena(from.x + move.x), y: clampArena(from.y + move.y) };
+    const dir = attackDirection(to, target);
+    out.push({
+      order: k + 1,
+      pattern,
+      name: monsterIntentName(pattern),
+      description: monsterIntentDescription(pattern, move, dir),
+      from,
+      to,
+      attackTiles: monsterAttackTiles(to, dir, pattern, seed),
+      damage,
+    });
+    from = to; // chain the next strike off where this one ended
+  }
+  return out;
+}
+
+/** Back-compat single-intent accessor (the next strike only). */
+export function monsterIntent(combat: CombatSessionRow, player: SatPlayerRow): MonsterIntent {
+  return monsterPlan(combat, player)[0];
+}
+
+/**
+ * Deterministically resolve a player plan against the monster's telegraph,
+ * interleaved tick-by-tick: each tick the player acts first (so a move can
+ * dodge that tick's strike), then the monster executes strike k on its
+ * pre-marked tiles. Pure — used both to apply the round and to preview it.
+ */
+export function simulateBattle(
+  combat: CombatSessionRow,
+  weapon: WeaponProfile,
+  plan: PlanAction[],
+): BattleResolution {
+  const intents = monsterPlan(combat);
+  let playerPos = { x: combat.player_battle_x, y: combat.player_battle_y };
+  let monsterPos = { x: combat.monster_battle_x, y: combat.monster_battle_y };
+  let monsterHp = combat.monster_current_hp;
+  const steps: ResolutionStep[] = [];
+  let totalDealt = 0;
+  let totalTaken = 0;
+
+  for (let k = 0; k < MAX_PLAN; k++) {
+    const action = plan[k] ?? null;
+    let dealt = 0;
+    let taken = 0;
+    const parts: string[] = [];
+
+    // 1) Player acts first.
+    if (action?.kind === "move") {
+      const d = DIR_DELTA[action.dir];
+      const next = { x: clampArena(playerPos.x + d.x), y: clampArena(playerPos.y + d.y) };
+      if (!samePoint(next, monsterPos)) playerPos = next;
+      parts.push(`${planGlyph(action)} to ${arenaTag(playerPos)}`);
+    } else if (action?.kind === "strike") {
+      const tiles = playerAttackTiles(playerPos, monsterPos, weapon);
+      const onTarget = tiles.some((p) => samePoint(p, monsterPos));
+      if (onTarget && monsterHp > 0) {
+        dealt = weapon.damage;
+        monsterHp = Math.max(0, monsterHp - dealt);
+        parts.push(`⚔️ ${weapon.name} hit for ${dealt}`);
+      } else {
+        parts.push(`⚔️ ${weapon.name} whiffed`);
+      }
+    } else if (action?.kind === "wait") {
+      parts.push("⏳ hold");
+    } else {
+      parts.push("— idle");
+    }
+
+    // 2) Monster executes its k-th telegraphed strike (move, then hit marked tiles).
+    const intent = intents[k];
+    if (intent) {
+      monsterPos = intent.to;
+      const struck = samePoint(playerPos, monsterPos) || intent.attackTiles.some((p) => samePoint(p, playerPos));
+      if (struck && monsterHp > 0) {
+        taken = intent.damage;
+        parts.push(`🩸 ${intent.name} hit you for ${taken}`);
+      } else if (monsterHp > 0) {
+        parts.push(`✨ dodged ${intent.name}`);
+      }
+    }
+
+    totalDealt += dealt;
+    totalTaken += taken;
+    steps.push({ player: action, dealt, taken, line: `${k + 1}. ${parts.join(" · ")}` });
+
+    if (monsterHp <= 0) break; // monster dead — remaining ticks moot
+  }
+
   return {
-    pattern,
-    name,
-    description: monsterIntentDescription(pattern, move, dir),
-    from: monster,
-    to,
-    attackTiles: tiles,
-    damage,
+    steps,
+    playerEnd: playerPos,
+    monsterEnd: monsterPos,
+    monsterHp,
+    totalDealt,
+    totalTaken,
+    monsterDead: monsterHp <= 0,
   };
+}
+
+/** Arena tag like "C4" for log lines (mirrors game.ts arenaLabel). */
+function arenaTag(p: Point): string {
+  return `${String.fromCharCode(65 + p.x)}${p.y + 1}`;
 }
 
 function monsterPatternFor(monsterName: string, seed: number): MonsterPattern {
