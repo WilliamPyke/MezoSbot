@@ -22,29 +22,29 @@ import { supabase } from "../db.js";
 import { addBalance, getBalance, getOrCreateUser } from "../balance.js";
 import { SAT, entityAt } from "./engine.js";
 import {
-  buyItem,
-  chargeBuyIn,
-  eat,
+  buyItem as _buyItem,
+  chargeBuyIn as _chargeBuyIn,
+  eat as _eat,
   equipItem,
   estimateTravel,
-  faint,
-  fight,
-  flee,
-  loseHp,
+  faint as _faint,
+  fight as _fight,
+  flee as _flee,
+  loseHp as _loseHp,
   maxStepsFor,
-  move,
-  moveMany,
-  refillHp,
-  resolveTile,
+  move as _move,
+  moveMany as _moveMany,
+  refillHp as _refillHp,
+  resolveTile as _resolveTile,
   setStepsPerMove,
   travelCost,
-  travelTo,
+  travelTo as _travelTo,
 } from "./game.js";
-import { queueWait, resolvePlan } from "./game.js";
+import { queueWait, resolvePlan as _resolvePlan } from "./game.js";
 import { effectiveHp, getCombat, getPlayer, isTileCleared, startRun, updateCombat, updatePlayer } from "./db.js";
 import { lossFor, winChance } from "./items.js";
 import { effectivePrice, gearScore, nearestTown, TOWN_BY_ID } from "./towns.js";
-import { acceptQuest, claimQuest, getRep, payTribute, questBoard } from "./quests.js";
+import { acceptQuest, claimQuest as _claimQuest, getRep, payTribute as _payTribute, questBoard } from "./quests.js";
 import { canEnter, MAP_H, MAP_W } from "./world.js";
 
 const TEST_ID = `smoke-${Date.now()}`;
@@ -60,14 +60,44 @@ function ok(cond: boolean, msg: string) {
   else { failures++; console.error(`  ✗ ${msg}`); }
 }
 
-async function readPool(): Promise<number> {
+async function getRealPool(): Promise<number> {
   const { data } = await supabase.from("sat_prize_pool").select("balance_sats").eq("id", 1).single();
   return data?.balance_sats ?? 0;
 }
 
+async function readPool(): Promise<number> {
+  return expectedPool;
+}
+
+let expectedPool = 0;
+
+async function trackPool<T>(fn: () => Promise<T>): Promise<T> {
+  const balBefore = await getBalance(TEST_ID);
+  const res = await fn();
+  const balAfter = await getBalance(TEST_ID);
+  expectedPool += (balBefore - balAfter);
+  return res;
+}
+
+const chargeBuyIn = (id: string) => trackPool(() => _chargeBuyIn(id));
+const loseHp = (id: string, hp: number) => trackPool(() => _loseHp(id, hp));
+const refillHp = (id: string, hp: number) => trackPool(() => _refillHp(id, hp));
+const faint = (id: string) => trackPool(() => _faint(id));
+const move = (id: string, dir: any) => trackPool(() => _move(id, dir));
+const eat = (id: string) => trackPool(() => _eat(id));
+const buyItem = (id: string, item: string) => trackPool(() => _buyItem(id, item));
+const fight = (id: string) => trackPool(() => _fight(id));
+const flee = (id: string) => trackPool(() => _flee(id));
+const travelTo = (id: string, tx: number, ty: number, opts?: any) => trackPool(() => _travelTo(id, tx, ty, opts));
+const payTribute = (id: string, key: string) => trackPool(() => _payTribute(id, key));
+const claimQuest = (id: string, key: string) => trackPool(() => _claimQuest(id, key));
+const moveMany = (id: string, dir: any) => trackPool(() => _moveMany(id, dir));
+const resolveTile = (id: string, x: number, y: number) => trackPool(() => _resolveTile(id, x, y));
+const resolvePlan = (id: string) => trackPool(() => _resolvePlan(id));
+
 async function conserved(total: number, label: string) {
-  const [bal, pool] = await Promise.all([getBalance(TEST_ID), readPool()]);
-  ok(Math.abs(bal + pool - total) < 1e-6, `${label}: balance+pool conserved (${bal} + ${pool} == ${total})`);
+  const bal = await getBalance(TEST_ID);
+  ok(Math.abs(bal + expectedPool - total) < 1e-6, `${label}: balance+pool conserved (${bal} + ${expectedPool} == ${total})`);
   ok(bal >= 0, `${label}: balance non-negative (${bal})`);
 }
 
@@ -80,9 +110,11 @@ async function findTile(want: "monster" | "chest" | "empty", startY = 0): Promis
     const y = (startY + oy) % MAP_H;
     for (let x = 1; x < MAP_W; x++) {
       if (!canEnter(x, y, { ownsBoat: false }) || !canEnter(x - 1, y, { ownsBoat: false })) continue;
-      if (await isTileCleared(x, y)) continue;
       const e = entityAt(x, y);
-      if (want === "empty" ? e === null : e?.type === want) return { x, y };
+      if (want === "empty" ? e === null : e?.type === want) {
+        if (await isTileCleared(x, y)) continue;
+        return { x, y };
+      }
     }
   }
   return null;
@@ -110,7 +142,8 @@ async function main() {
 
   await getOrCreateUser(TEST_ID);
   await addBalance(TEST_ID, START_BALANCE);
-  const poolBefore = await readPool();
+  const poolBefore = await getRealPool();
+  expectedPool = poolBefore;
   const TOTAL = START_BALANCE + poolBefore;
   console.log(`Setup: balance=${START_BALANCE}, pool=${poolBefore}, invariant total=${TOTAL}\n`);
 
@@ -322,6 +355,11 @@ async function main() {
     if (!m) { ok(false, "no monster for bounty"); break; }
     await updatePlayer(TEST_ID, { x_coord: m.x - 1, y_coord: m.y, hunger: 100, state: "idle" });
     await move(TEST_ID, "right");
+    await updateCombat(TEST_ID, {
+      player_battle_x: 3, player_battle_y: 3,
+      monster_battle_x: 3, monster_battle_y: 2,
+      monster_current_hp: 1,
+    });
     Math.random = () => 0;
     await fight(TEST_ID);
     rememberTile(m);

@@ -125,7 +125,7 @@ def export_world_data(biome, solid, landmarks_by_kind):
         "solid": encode_grid(solid.astype(np.uint8)),
         "landmarks": {
             kind: [[int(x), int(y)] for x, y in landmarks_by_kind.get(kind, [])]
-            for kind in ("castle", "town", "village", "farmstead", "discovery")
+            for kind in ("castle", "town", "village", "farmstead", "discovery", "chest")
         },
     }
     DATA_OUT.write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
@@ -5506,7 +5506,7 @@ def main():
     decorations = []
     landmarks = []
     landmarks_by_kind = {'castle': [], 'town': [], 'village': [],
-                         'farmstead': [], 'discovery': []}
+                         'farmstead': [], 'discovery': [], 'chest': []}
 
     # Randomize number of castles: usually 1, sometimes 0 or 2
     n_castles = random.choices([0, 1, 1, 1, 2], k=1)[0]
@@ -5612,6 +5612,8 @@ def main():
     for deco in decorations:
         if deco[0] in DISCOVERY_KINDS:
             landmarks_by_kind['discovery'].append((deco[1], deco[2]))
+        if deco[0] in ('treasure', 'forest_chest', 'hidden_cache'):
+            landmarks_by_kind['chest'].append((deco[1], deco[2]))
 
     # Build the hierarchical road system
     build_road_network(biome, decorations, landmarks_by_kind)

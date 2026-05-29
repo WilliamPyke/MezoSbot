@@ -80,6 +80,20 @@ export async function handleSatscapeWebRequest(
     return true;
   }
 
+  if (method === "GET" && path === "/satscape/chunks/world.json") {
+    const filePath = join(__dirname, "..", "satscape", "world.json");
+    try {
+      const content = await readFile(filePath);
+      res.statusCode = 200;
+      res.setHeader("Content-Type", "application/json; charset=utf-8");
+      res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+      res.end(content);
+    } catch (err) {
+      sendJson(res, 404, { error: "Not found" });
+    }
+    return true;
+  }
+
   if (method === "GET" && path.startsWith("/satscape/chunks/")) {
     const filename = path.slice("/satscape/chunks/".length);
     if (filename.includes("..") || !/^[a-zA-Z0-9_.-]+$/.test(filename)) {
@@ -609,6 +623,17 @@ const PLAY_HTML = /* html */ `<!doctype html>
   var minimap = document.getElementById("minimap"), mini = minimap.getContext("2d");
   var note = document.getElementById("note");
   var chunkCache = {};
+  var biomeGrid = null;
+  fetch("/satscape/chunks/world.json")
+    .then(function(r){ return r.json(); })
+    .then(function(data){
+      var binary = atob(data.biome);
+      var bytes = new Uint8Array(binary.length);
+      for(var i=0; i<binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      biomeGrid = bytes;
+      if (typeof render === "function") render();
+      else if (typeof draw === "function") draw();
+    }).catch(function(e){ console.error("Failed to load biomeGrid:", e); });
   var WORLD_ART = { tile: 18, chunkTiles: 32, cols: 12, rows: 11, worldTilesX: 380, worldTilesY: 335 };
   function getChunkImage(col, row) {
     var key = col + "," + row;
@@ -646,10 +671,18 @@ const PLAY_HTML = /* html */ `<!doctype html>
   function act(path, body) { api(path, body).then(setState).catch(function(e){ note.textContent = e.message; }); }
   function key(x,y){ return x + "," + y; }
   function exploredSet(){ var out={}; (state.viewport.explored||[]).forEach(function(t){ out[key(t.x,t.y)] = true; }); return out; }
-  function biomeAt(x,y){
-    var towns = state.viewport.towns, best = towns[0], bd = Infinity;
+  function biomeAt(x, y){
+    var towns = (state && state.viewport && state.viewport.towns) || [];
+    var best = null, bd = Infinity;
     towns.forEach(function(t){ var d = Math.hypot(x - t.cx, y - t.cy); if(d < bd){ bd = d; best = t; } });
-    if (bd <= best.safeRadius) return "town";
+    if (best && bd <= best.safeRadius) return "town";
+    if (biomeGrid && x >= 0 && x < 380 && y >= 0 && y < 335) {
+      var idx = y * 380 + x;
+      var biomeId = biomeGrid[idx];
+      var BIOME_TERRAINS = ["oasis","oasis","desert","desert","plains","plains","forest","forest","forest","monsoon","hills","snow","oasis","oasis","plains","plains","plains","forest","town","town","town","plains","forest","forest","plains","jungle","desert","plains","plains"];
+      return BIOME_TERRAINS[biomeId] || "oasis";
+    }
+    if (!best) return "town";
     var wx = x + Math.sin(y * 0.12) * 4, wy = y + Math.cos(x * 0.12) * 4;
     var cx = Math.floor(wx / 22), cy = Math.floor(wy / 22);
     var h = Math.abs(Math.sin(cx * 1.7 * 12.9898 + cy * 2.3 * 78.233 + 99) * 43758.5453) % 1;
@@ -1015,13 +1048,36 @@ const PAGE_HTML = /* html */ `<!doctype html>
   var meta = document.getElementById("meta");
   var state = { towns: [], terrainColors: {}, explored: [], exploredKeys: {}, players: [] };
   var scale = 3, ox = 0, oy = 0, dragging = false, lastX = 0, lastY = 0;
+  var biomeGrid = null;
+  fetch("/satscape/chunks/world.json")
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      var binary = atob(data.biome);
+      var bytes = new Uint8Array(binary.length);
+      for (var i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      biomeGrid = bytes;
+      if (typeof render === "function") render();
+      else if (typeof draw === "function") draw();
+    }).catch(function(e) { console.error("Failed to load biomeGrid:", e); });
+
   function worldToScreen(wx, wy) { return [canvas.width / 2 + (wx * scale) + ox, canvas.height / 2 + (wy * scale) + oy]; }
   function hash01(a, b, s) { return Math.abs(Math.sin(a * 12.9898 + b * 78.233 + s) * 43758.5453) % 1; }
   function biomeAt(x, y) {
     var best = null, bd = Infinity;
-    for (var i = 0; i < state.towns.length; i++) { var t = state.towns[i]; var d = Math.hypot(x - t.cx, y - t.cy); if (d < bd) { bd = d; best = t; } }
+    var towns = state.towns || [];
+    for (var i = 0; i < towns.length; i++) { var t = towns[i]; var d = Math.hypot(x - t.cx, y - t.cy); if (d < bd) { bd = d; best = t; } }
+    if (best && bd <= best.safeRadius) return "town";
+
+    if (biomeGrid && x >= 0 && x < 380 && y >= 0 && y < 335) {
+      var idx = y * 380 + x;
+      var biomeId = biomeGrid[idx];
+      var BIOME_TERRAINS = ["oasis","oasis","desert","desert","plains","plains","forest","forest","forest","monsoon","hills","snow","oasis","oasis","plains","plains","plains","forest","town","town","town","plains","forest","forest","plains","jungle","desert","plains","plains"];
+      return BIOME_TERRAINS[biomeId] || "oasis";
+    }
+
     if (!best) return "town";
-    if (bd <= best.safeRadius) return "town";
     var wx = x + Math.sin(y * 0.12) * 4, wy = y + Math.cos(x * 0.12) * 4;
     var cx = Math.floor(wx / 22), cy = Math.floor(wy / 22);
     var h = hash01(cx * 1.7, cy * 2.3, 99);

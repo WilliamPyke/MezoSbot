@@ -16,6 +16,11 @@ export const MAP_W = data.width;
 export const MAP_H = data.height;
 export const WORLD_SEED = data.seed;
 export const WORLD_LANDMARKS = data.landmarks;
+export const WORLD_CHEST_COORDS = new Set((data.landmarks.chest ?? []).map(([x, y]) => `${x},${y}`));
+
+export function isChestAt(x: number, y: number): boolean {
+  return WORLD_CHEST_COORDS.has(`${x},${y}`);
+}
 
 export const BIOME = {
   OCEAN: 0,
@@ -81,6 +86,7 @@ export function isSea(x: number, y: number): boolean {
 
 export function isSolid(x: number, y: number): boolean {
   if (!inWorldBounds(x, y)) return true;
+  if (isChestAt(x, y)) return false;
   return SOLID_GRID[indexAt(x, y)] === 1;
 }
 

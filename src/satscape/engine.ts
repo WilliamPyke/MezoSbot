@@ -1,7 +1,7 @@
 import { nearestTown, townAt } from "./towns.js";
 import type { Terrain } from "./towns.js";
 import type { TileEntity } from "./types.js";
-import { BIOME, canEnter, tileAt, type BiomeId } from "./world.js";
+import { BIOME, canEnter, tileAt, isChestAt, type BiomeId } from "./world.js";
 
 /** Tunables for the game loop. */
 export const SAT = {
@@ -108,13 +108,13 @@ function monsterFor(x: number, y: number): MonsterSpec {
  * Town, sea, solid, and out-of-bounds tiles never spawn anything.
  */
 export function entityAt(x: number, y: number): TileEntity | null {
+  if (isChestAt(x, y)) {
+    const reward = 15 + hash01(x, y, 5) * 10;
+    return { x, y, type: "chest", data: { reward } };
+  }
   if (biomeAt(x, y) === "town") return null;
   if (!canEnter(x, y, { ownsBoat: false })) return null;
   const r = hash01(x, y, 3);
-  if (r < SAT.CHEST_SPAWN) {
-    const reward = 20 + Math.floor(hash01(x, y, 5) * 80); // 20..99
-    return { x, y, type: "chest", data: { reward } };
-  }
   if (r < SAT.MONSTER_SPAWN) {
     return { x, y, type: "monster", data: { ...monsterFor(x, y) } };
   }
