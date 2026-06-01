@@ -8,7 +8,6 @@ import { supabase } from "../db.js";
 import { biomeAt, SAT } from "../satscape/engine.js";
 import {
   MAX_PLAN,
-  monsterPlan,
   monstersTelegraph,
   parsePlan,
   planAP,
@@ -139,7 +138,8 @@ export async function handleSatscapeWebRequest(
   }
 
   if (method === "GET" && path === "/satscape/api/state") {
-    await respond(req, res, async (claim) => buildStateResponse(claim.userId));
+    const full = url.searchParams.get("full") === "1";
+    await respond(req, res, async (claim) => buildStateResponse(claim.userId, undefined, { lite: !full }));
     return true;
   }
 
@@ -269,10 +269,14 @@ async function respondSpectatorPlayers(res: ServerResponse): Promise<void> {
   }
 }
 
-async function buildStateResponse(userId: string, note?: string): Promise<Record<string, unknown>> {
+async function buildStateResponse(userId: string, note?: string, opts?: { lite?: boolean }): Promise<Record<string, unknown>> {
   const view = await loadView(userId);
   if (!view || !view.player.active) return { error: "Use /satscape join first." };
-  const worldExplored = await loadExploredTilesCached();
+  // The global explored-tiles list can be tens of thousands of tiles. Only ship it on
+  // a "full" request (initial load / map open). Lite responses (the poll + every action)
+  // omit it — the client grows its minimap incrementally from each viewport instead.
+  const lite = !!opts?.lite;
+  const worldExplored = lite ? null : await loadExploredTilesCached();
   return {
     ok: true,
     note,
@@ -294,7 +298,7 @@ async function buildStateResponse(userId: string, note?: string): Promise<Record
       others: view.others,
     },
     minimap: {
-      explored: worldExplored,
+      explored: worldExplored, // null on lite — client keeps its accumulated set
       towns: TOWNS.map(publicTown),
     },
     combat: combatState(view),
@@ -381,7 +385,7 @@ function combatState(view: ViewModel): Record<string, unknown> | null {
     turn: combat.turn_number,
     plan,
     projected: projectedPlayerPos(combat, plan),
-    intents: monsterPlan(combat, view.player),
+    intents: telegraph.length ? telegraph[0].intents : [],
     kit,
     ap: { max: maxAp, available: availableAp, spent: spentAp, ticks: plan.length, maxTicks: MAX_PLAN },
     playerStatus: statusBadges(playerStatus),
@@ -477,7 +481,8 @@ async function respondAction(
 ): Promise<void> {
   await respondWithBody(req, res, async (claim, body) => {
     const result = await handler(claim, body);
-    return { status: 200, body: { ...result, state: await buildStateResponse(claim.userId, result.note) } };
+    // Action responses are always lite — the client grows its minimap from the viewport.
+    return { status: 200, body: { ...result, state: await buildStateResponse(claim.userId, result.note, { lite: true }) } };
   });
 }
 
@@ -656,6 +661,8 @@ const PLAY_HTML = /* html */ `<!doctype html>
       <div class="muted" id="battleTurnText" style="margin-top:7px"></div>
       <div id="battlePlan" style="margin-top:6px"></div>
       <div class="turn-track" id="monsterPlan"></div>
+      <div style="margin-top:8px;font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:1px">Battle log</div>
+      <div id="battleLog" style="margin-top:4px;max-height:128px;overflow:auto;font-size:11px;line-height:1.55;border:1px solid #1e293b;border-radius:8px;padding:6px 8px;background:#0b1220"></div>
     </div>
     <div class="panel">
       <h2>Travel</h2>
@@ -719,8 +726,29 @@ const PLAY_HTML = /* html */ `<!doctype html>
     return fetch(path, { method: body ? "POST" : "GET", headers: { "Content-Type":"application/json", "X-Satscape-Token": token }, body: body ? JSON.stringify(body) : undefined })
       .then(function(r){ return r.json().then(function(j){ if(!r.ok) throw new Error(j.error || "Request failed"); return j; }); });
   }
+  // Minimap tiles accumulate client-side: a "full" payload seeds them; every (lite)
+  // payload merges in the current viewport, so the minimap stays fresh without the
+  // server shipping the whole world's explored set each time.
+  var minimapTiles = [], minimapSeen = {};
+  function ingestMinimap(st){
+    if(!st) return;
+    var mm = st.minimap;
+    if(mm && Array.isArray(mm.explored)){
+      minimapTiles = mm.explored.slice(); minimapSeen = {};
+      for(var i=0;i<minimapTiles.length;i++) minimapSeen[minimapTiles[i].x+","+minimapTiles[i].y]=1;
+    }
+    var vp = (st.viewport && st.viewport.explored) || [];
+    for(var j=0;j<vp.length;j++){ var t=vp[j], k=t.x+","+t.y; if(!minimapSeen[k]){ minimapSeen[k]=1; minimapTiles.push({x:t.x,y:t.y}); } }
+    if(!st.minimap) st.minimap = {};
+    st.minimap.explored = minimapTiles;
+  }
+  var hadCombat = false;
   function setState(s) {
     state = s.state || s;
+    ingestMinimap(state);
+    var nowCombat = !!(state && state.combat);
+    if(nowCombat && !hadCombat) clearBattleLog(); // fresh fight — start a clean log
+    hadCombat = nowCombat;
     var combatKey = state && state.combat ? state.combat.turn + ":" + state.combat.monster.hp + ":" + (state.combat.plan || []).length : "";
     if (combatKey !== lastCombatKey) { battleAnimStart = performance.now(); lastCombatKey = combatKey; }
     if (s.estimate) {
@@ -841,11 +869,25 @@ const PLAY_HTML = /* html */ `<!doctype html>
       } else { setState(s); }
     }).catch(function(e){ inflight--; note.textContent = e.message; });
   }
+  // Persistent battle log ("the stack") — accumulates across the fight, capped.
+  function logEvent(text, cls){
+    var el = document.getElementById("battleLog"); if(!el || !text) return;
+    var d = document.createElement("div"); if(cls) d.className = cls;
+    if(cls === "log-turn"){ d.style.color = "#94a3b8"; d.style.margin = "4px 0 2px"; d.style.fontWeight = "700"; }
+    else if(/hit you|took|🩸/.test(text)) d.style.color = "#fca5a5";
+    else if(/hit|dealt|defeat|🗡️|🏆/.test(text)) d.style.color = "#86efac";
+    d.textContent = text;
+    el.appendChild(d);
+    while(el.childNodes.length > 60) el.removeChild(el.firstChild);
+    el.scrollTop = el.scrollHeight;
+  }
+  function clearBattleLog(){ var el = document.getElementById("battleLog"); if(el) el.innerHTML = ""; }
   function startPlayback(data, done){
     var c = state.combat; if(!c){ done(); return; }
     var prevMons = {}; (c.monsters || [c.monster]).forEach(function(m){ if(m) prevMons[m.id || "m0"] = { x:m.x, y:m.y, hp:m.hp, maxHp:m.maxHp, name:m.name }; });
+    logEvent("— Turn " + c.turn + " —", "log-turn");
     pb = {
-      steps: data.steps, idx: 0, start: performance.now(), stepMs: 560, shownIdx: -1,
+      steps: data.steps, idx: 0, start: performance.now(), stepMs: 620, shownIdx: -1,
       prevPlayer: { x:c.player.x, y:c.player.y }, prevMons: prevMons, done: done,
     };
     playing = true;
@@ -1056,25 +1098,49 @@ const PLAY_HTML = /* html */ `<!doctype html>
     var local = Math.min(1, (now - pb.start) / pb.stepMs);
     var ease = 1 - Math.pow(1 - local, 3);
     var flash = 0.25 + Math.sin(local * Math.PI) * 0.4;
+    // Screen shake when the player takes a hit this step (decays over the step).
+    var shake = step.taken > 0 ? Math.sin(local * Math.PI * 7) * (1 - local) * 4 : 0;
+    var slashA = Math.max(0, 1 - Math.abs(local - 0.35) / 0.35); // slash visible mid-step
+    ctx.save();
+    ctx.translate(shake, 0);
     drawArenaGrid(s);
     (step.monsters || []).forEach(function(m){ (m.attackTiles || []).forEach(function(t){ ctx.fillStyle="rgba(248,113,113," + (0.25 + flash) + ")"; ctx.fillRect(t.x*s,t.y*s,s,s); }); });
-    (step.attackTiles || []).forEach(function(t){ ctx.fillStyle="rgba(34,211,238," + (0.22 + flash) + ")"; ctx.fillRect(t.x*s,t.y*s,s,s); ctx.strokeStyle="rgba(34,211,238,.75)"; ctx.lineWidth=1.5; ctx.strokeRect(t.x*s+1,t.y*s+1,s-2,s-2); });
+    (step.attackTiles || []).forEach(function(t){ ctx.fillStyle="rgba(34,211,238," + (0.22 + flash) + ")"; ctx.fillRect(t.x*s,t.y*s,s,s); ctx.strokeStyle="rgba(34,211,238,.8)"; ctx.lineWidth=1.5; ctx.strokeRect(t.x*s+1,t.y*s+1,s-2,s-2); });
     var pp = { x: pb.prevPlayer.x + (step.playerPos.x - pb.prevPlayer.x) * ease, y: pb.prevPlayer.y + (step.playerPos.y - pb.prevPlayer.y) * ease };
+    var ppx = pp.x*s+s/2, ppy = pp.y*s+s/2;
     (step.monsters || []).forEach(function(m, mi){
       var prev = pb.prevMons[m.id] || { x:m.x, y:m.y, hp:m.hp, maxHp:m.maxHp, name:m.name };
       var mx = prev.x + (m.x - prev.x) * ease, my = prev.y + (m.y - prev.y) * ease;
+      var attacking = m.attackTiles && m.attackTiles.length;
+      // lunge: a quick thrust toward the player that peaks mid-step then recoils
+      if(attacking){
+        var cx0 = mx*s+s/2, cy0 = my*s+s/2;
+        var ldx = ppx - cx0, ldy = ppy - cy0, ld = Math.hypot(ldx, ldy) || 1;
+        var lunge = Math.sin(local * Math.PI) * s * 0.3;
+        mx += (ldx/ld) * lunge / s; my += (ldy/ld) * lunge / s;
+      }
       var dyingNow = (m.act === "dead" || m.hp <= 0);
-      var alpha = dyingNow ? Math.max(0.15, 1 - local) : 1;
-      var glow = (m.attackTiles && m.attackTiles.length) ? flash : 0;
-      drawMonsterToken(s, mx, my, monColor(mi), alpha, glow);
+      var alpha = dyingNow ? Math.max(0.12, 1 - local) : 1;
+      drawMonsterToken(s, mx, my, monColor(mi), alpha, attacking ? flash : 0);
+      if(attacking && slashA > 0){
+        var scx = mx*s+s/2, scy = my*s+s/2;
+        ctx.strokeStyle = "rgba(255,255,255," + (0.65 * slashA) + ")"; ctx.lineWidth = 3;
+        ctx.beginPath(); ctx.arc(scx, scy, s*0.46, local*4, local*4 + Math.PI*0.8); ctx.stroke();
+      }
       if(!dyingNow) drawHpBar(s, mx*s+s/2, my*s+s/2 - s*.42, m.hp, m.maxHp || prev.maxHp || m.hp, monColor(mi));
+      var dealtM = Math.max(0, (prev.hp != null ? prev.hp : m.hp) - m.hp);
+      if(dealtM > 0){ ctx.fillStyle = "rgba(134,239,172," + Math.max(0,1-local) + ")"; ctx.font = "bold 16px sans-serif"; ctx.fillText("-" + dealtM, mx*s+s/2-6, my*s+s/2 - s*0.5 - local*14); }
     });
-    ctx.fillStyle="#60a5fa"; ctx.beginPath(); ctx.arc(pp.x*s+s/2,pp.y*s+s/2,s*.28,0,Math.PI*2); ctx.fill();
-    if(step.taken > 0){ ctx.fillStyle="rgba(248,113,113," + Math.max(0,1-local) + ")"; ctx.font="bold 18px sans-serif"; ctx.fillText("-" + step.taken, pp.x*s+s/2-8, pp.y*s+s/2 - s*0.5 - local*16); }
+    // player token — briefly flares toward red when struck this step
+    var hitT = step.taken > 0 ? Math.max(0, 1 - local) : 0;
+    ctx.fillStyle = hitT > 0 ? ("rgb(" + Math.round(96+159*hitT) + "," + Math.round(165-120*hitT) + "," + Math.round(250-180*hitT) + ")") : "#60a5fa";
+    ctx.beginPath(); ctx.arc(ppx, ppy, s*.28 + hitT*2, 0, Math.PI*2); ctx.fill();
+    if(step.taken > 0){ ctx.fillStyle="rgba(248,113,113," + Math.max(0,1-local) + ")"; ctx.font="bold 18px sans-serif"; ctx.fillText("-" + step.taken, ppx-8, ppy - s*0.5 - local*16); }
+    ctx.restore();
     if(pb.shownIdx !== pb.idx){
       var line = step.line || "";
       var dot = line.indexOf(". "); if(dot >= 0 && dot <= 2) line = line.slice(dot+2); else if(line.indexOf("• ") === 0) line = line.slice(2);
-      if(line) note.textContent = line;
+      if(line){ note.textContent = line; logEvent(line); }
       pb.shownIdx = pb.idx;
     }
     ctx.fillStyle="#e5e7eb"; ctx.font="13px sans-serif"; ctx.fillText("Resolving… " + (pb.idx+1) + "/" + pb.steps.length, 10, play.height - 12);
@@ -1242,7 +1308,7 @@ const PLAY_HTML = /* html */ `<!doctype html>
   document.querySelectorAll("[data-move]").forEach(function(b){ b.onclick=function(){ act("/satscape/api/move", { dir:b.dataset.move }); }; });
   document.querySelectorAll("[data-bmove]").forEach(function(b){ b.onclick=function(){ battleQueue({ kind:"move", dir:b.dataset.bmove }, { action:"move", dir:b.dataset.bmove }); }; });
   document.getElementById("eat").onclick=function(){ act("/satscape/api/eat", {}); };
-  document.getElementById("refresh").onclick=function(){ api("/satscape/api/state").then(setState).catch(function(e){ note.textContent=e.message; }); };
+  document.getElementById("refresh").onclick=function(){ api("/satscape/api/state?full=1").then(setState).catch(function(e){ note.textContent=e.message; }); };
   document.getElementById("refill").onclick=function(){ act("/satscape/api/refill-hp", { sats:Number(document.getElementById("hpInput").value || 0) }); };
   document.getElementById("weaponBtn").onclick=function(){ act("/satscape/api/battle", { action:"weapon", itemId:document.getElementById("weapon").value }); };
   document.getElementById("wait").onclick=function(){ battleQueue({ kind:"wait" }, { action:"wait" }); };
@@ -1276,7 +1342,7 @@ const PLAY_HTML = /* html */ `<!doctype html>
     if(typingTarget(document.activeElement)) return;
     if(e.key === "m" || e.key === "M"){
       e.preventDefault();
-      if(!showWorldMap){ showWorldMap = true; render(); }
+      if(!showWorldMap){ showWorldMap = true; render(); if(!(state && state.combat)) api("/satscape/api/state?full=1").then(setState).catch(function(){}); }
       return;
     }
     var d = directionKey(e);
@@ -1312,10 +1378,11 @@ const PLAY_HTML = /* html */ `<!doctype html>
     requestAnimationFrame(animate);
   }
   requestAnimationFrame(animate);
-  api("/satscape/api/state").then(setState).catch(function(e){ note.textContent=e.message; });
-  // Live state poll — paused while a battle action is in flight or a playback is running,
-  // so it can't clobber the optimistic board or interrupt the resolution animation.
-  setInterval(function(){ if(playing || inflight > 0) return; api("/satscape/api/state").then(setState).catch(function(){}); }, 2000);
+  api("/satscape/api/state?full=1").then(setState).catch(function(e){ note.textContent=e.message; });
+  // Live state poll — lite (no heavy minimap payload) and PAUSED during combat (turn-based,
+  // so action responses already carry fresh state) or while an action/playback is running.
+  // This removes the per-2s full-world fetch that caused most of the in-fight lag.
+  setInterval(function(){ if(playing || inflight > 0 || (state && state.combat)) return; api("/satscape/api/state").then(setState).catch(function(){}); }, 2500);
 })();
 </script>
 </body>

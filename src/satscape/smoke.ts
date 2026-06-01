@@ -249,6 +249,7 @@ async function main() {
       player_battle_x: 3, player_battle_y: 3,
       monster_battle_x: 3, monster_battle_y: 2,
       monster_current_hp: 1, battle_plan: null,
+      monsters: null, // force a single monster (clear any pack) for a deterministic kill
     });
     const before = await getBalance(TEST_ID);
     const pool = await readPool();
@@ -276,6 +277,7 @@ async function main() {
       player_battle_x: 3, player_battle_y: 3,
       monster_battle_x: 3, monster_battle_y: 2,
       monster_current_hp: c!.monster_max_hp, battle_plan: null,
+      monsters: null, // force a single monster for a deterministic non-lethal round
     });
     const before = await getBalance(TEST_ID);
     await queueWait(TEST_ID);
@@ -359,6 +361,7 @@ async function main() {
       player_battle_x: 3, player_battle_y: 3,
       monster_battle_x: 3, monster_battle_y: 2,
       monster_current_hp: 1,
+      monsters: null, // force a single monster so one strike is a guaranteed kill
     });
     Math.random = () => 0;
     await fight(TEST_ID);

@@ -247,16 +247,19 @@ export async function resolveTile(discordId: string, x: number, y: number): Prom
   const fighter = await getPlayer(discordId);
   const positions = startingBattlePositions(x, y);
 
-  // Spawn a small pack (1–3) for a chess-like board. More/tougher monsters appear
-  // for higher-level encounters; per-monster HP and loot scale down so a pack is
-  // tougher but not punishing, and total loot stays roughly the encounter reward.
+  // Spawn a small pack (1–3) for a chess-like board, with VARIED species drawn from
+  // the local town's roster — different species attack differently (cone/dash+bleed,
+  // slam/line+stun, line/cone+poison…), so a pack mixes attack styles. Per-monster HP
+  // and loot scale down so a pack is tougher but not punishing.
   const count = monsterCountFor(m.level, x, y);
+  const pool = nearestTown(x, y).town.monsters;
+  const names = packSpecies(m.name, pool, count, x, y);
   const perHp = count > 1 ? Math.max(8, Math.round((18 + m.level * 8) * 0.65)) : 18 + m.level * 8;
   const perReward = Math.max(1, Math.round(m.reward / count));
   const starts = startingMonsterPositions(x, y, count);
   const monsters: BattleMonster[] = starts.map((pos, i) => ({
     id: `m${i}`,
-    name: m.name,
+    name: names[i],
     level: m.level,
     maxHp: perHp,
     hp: perHp,
@@ -295,18 +298,37 @@ export async function resolveTile(discordId: string, x: number, y: number): Prom
     created_at: new Date().toISOString(),
   } as CombatSessionRow);
   const note = count > 1
-    ? `👹 An ambush! **${count}× level ${m.level} ${m.name}** block your path!`
+    ? `👹 An ambush! **${count} foes** block your path — ${names.join(", ")}!`
     : `👹 A level ${m.level} **${m.name}** blocks your path!`;
   return { ok: true, note, enteredCombat: true };
 }
 
-/** Deterministic pack size (1–3) for an encounter, scaling with monster level. */
+/** Deterministic pack size (1–3): ~half of encounters are packs, scaling up with level. */
 function monsterCountFor(level: number, x: number, y: number): number {
   const h = Math.abs(((x * 73856093) ^ (y * 19349663)) >>> 0);
   let count = 1;
-  if (level >= 3 && h % 2 === 0) count++;
-  if (level >= 5 && h % 3 === 0) count++;
+  if (h % 2 === 0) count++; // ~50% spawn at least a pair, even near spawn
+  if ((level >= 2 && h % 3 === 0) || h % 7 === 0) count++; // a subset gets a third
   return Math.min(3, count);
+}
+
+/**
+ * Distinct species for a pack: the encountered monster first, then other species
+ * from the same town's roster (so a pack mixes attack styles). Deterministic.
+ */
+function packSpecies(primaryName: string, pool: readonly string[], count: number, x: number, y: number): string[] {
+  const names = [primaryName];
+  const h = Math.abs(((x * 2654435761) ^ (y * 40503)) >>> 0);
+  for (let i = 1; i < count; i++) {
+    const start = (h >> (i * 3)) % Math.max(1, pool.length);
+    let pick = pool[start] ?? primaryName;
+    // prefer a species not already in the pack, for visible variety
+    for (let t = 0; t < pool.length && names.indexOf(pick) !== -1; t++) {
+      pick = pool[(start + t + 1) % pool.length];
+    }
+    names.push(pick);
+  }
+  return names;
 }
 
 /**
