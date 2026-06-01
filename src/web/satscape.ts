@@ -1024,16 +1024,74 @@ const PLAY_HTML = /* html */ `<!doctype html>
     if(glow){ ctx.strokeStyle="rgba(248,113,113,"+(0.55+glow*0.4)+")"; ctx.lineWidth=4; ctx.beginPath(); ctx.arc(cx,cy,s*(.38+glow*.16),0,Math.PI*2); ctx.stroke(); }
     ctx.globalAlpha = 1;
   }
-  // Preview the tiles each queued attack card will strike, from the projected end position.
-  function drawCardPreview(s, c, proj){
+  // Faithful per-tick preview mirroring the server: walk the queued plan tick-by-tick,
+  // moving the player AND advancing each monster along its telegraph, so a card's tiles
+  // are oriented toward where the target ACTUALLY is when that card fires. With two
+  // cleaves and a monster that steps between them, the two arcs point different ways —
+  // exactly what resolution will do.
+  function previewPlan(c){
     var plan = c.plan || [];
-    var target = nearestMonster(c, proj); if(!target) return;
-    for(var i=0;i<plan.length;i++){
-      var a = plan[i]; if(a.kind !== "card") continue;
-      var card = kitCard(c, a.cardId); if(!card || card.kind === "buff" || !card.shape) continue;
-      var tiles = attackTilesJS(proj, { x:target.x, y:target.y }, card.shape);
-      tiles.forEach(function(t){ ctx.fillStyle="rgba(34,211,238,.30)"; ctx.fillRect(t.x*s,t.y*s,s,s); ctx.strokeStyle="rgba(34,211,238,.75)"; ctx.lineWidth=1.5; ctx.strokeRect(t.x*s+1,t.y*s+1,s-2,s-2); });
+    var DELTA = { up:{x:0,y:-1}, down:{x:0,y:1}, left:{x:-1,y:0}, right:{x:1,y:0} };
+    var mons = battleMonsters(c).filter(function(m){ return !m.dead && m.hp > 0; });
+    // monster position at the START of tick k (when the player acts) = intents[k].from
+    function monAt(m, k){
+      var its = m.intents || [], it = its[k];
+      if(it && it.from) return { x:it.from.x, y:it.from.y };
+      var last = its.length ? its[its.length-1] : null;
+      return last && last.to ? { x:last.to.x, y:last.to.y } : { x:m.x, y:m.y };
     }
+    var ppos = { x:c.player.x, y:c.player.y };
+    var attacks = [];
+    for(var k=0;k<plan.length;k++){
+      var a = plan[k];
+      var monPos = mons.map(function(m){ return monAt(m, k); });
+      if(a.kind === "move"){
+        var d = DELTA[a.dir];
+        if(d){
+          var nx = clampA(ppos.x+d.x), ny = clampA(ppos.y+d.y), blocked = false;
+          for(var b=0;b<monPos.length;b++){ if(monPos[b].x===nx && monPos[b].y===ny){ blocked = true; break; } }
+          if(!blocked) ppos = { x:nx, y:ny };
+        }
+      } else if(a.kind === "card"){
+        var card = kitCard(c, a.cardId);
+        if(card && card.kind !== "buff" && card.shape && monPos.length){
+          var tgt = null, bd = Infinity;
+          for(var i=0;i<monPos.length;i++){ var dd = Math.abs(monPos[i].x-ppos.x)+Math.abs(monPos[i].y-ppos.y); if(dd<bd){ bd = dd; tgt = monPos[i]; } }
+          attacks.push({ order: attacks.length+1, tiles: attackTilesJS({x:ppos.x,y:ppos.y}, {x:tgt.x,y:tgt.y}, card.shape), from: {x:ppos.x,y:ppos.y}, target: tgt, emoji: card.emoji });
+        }
+      }
+    }
+    return attacks;
+  }
+  function drawArrow(x1,y1,x2,y2,color){
+    var len = Math.hypot(x2-x1, y2-y1); if(len < 6) return;
+    var ang = Math.atan2(y2-y1, x2-x1), ex = x1 + Math.cos(ang)*(len-9), ey = y1 + Math.sin(ang)*(len-9), ah = 7;
+    ctx.strokeStyle = color; ctx.lineWidth = 2.5; ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(ex,ey); ctx.stroke();
+    ctx.fillStyle = color; ctx.beginPath();
+    ctx.moveTo(ex + Math.cos(ang)*ah, ey + Math.sin(ang)*ah);
+    ctx.lineTo(ex + Math.cos(ang+2.5)*ah, ey + Math.sin(ang+2.5)*ah);
+    ctx.lineTo(ex + Math.cos(ang-2.5)*ah, ey + Math.sin(ang-2.5)*ah);
+    ctx.closePath(); ctx.fill();
+  }
+  function drawCardPreview(s, c){
+    var attacks = previewPlan(c);
+    attacks.forEach(function(atk){
+      atk.tiles.forEach(function(t){
+        ctx.fillStyle = "rgba(34,211,238,.26)"; ctx.fillRect(t.x*s,t.y*s,s,s);
+        ctx.strokeStyle = "rgba(34,211,238,.85)"; ctx.lineWidth = 1.5; ctx.strokeRect(t.x*s+1.5,t.y*s+1.5,s-3,s-3);
+        // order badge, corner offset by order so stacked attacks stay legible
+        var bx = t.x*s + (atk.order % 2 === 1 ? 2 : s - 15), by = t.y*s + (atk.order <= 2 ? 2 : s - 15);
+        ctx.fillStyle = "#0e7490"; ctx.fillRect(bx, by, 13, 13);
+        ctx.fillStyle = "#e0f2fe"; ctx.font = "bold 10px sans-serif"; ctx.fillText(String(atk.order), bx + 3, by + 10);
+      });
+      // direction arrow from the firing position toward the target at that tick
+      drawArrow(atk.from.x*s+s/2, atk.from.y*s+s/2, atk.target.x*s+s/2, atk.target.y*s+s/2, "rgba(34,211,238,.95)");
+      // ghost ring where the player will be standing when this attack fires (if moved)
+      if(atk.from.x !== c.player.x || atk.from.y !== c.player.y){
+        ctx.strokeStyle = "rgba(96,165,250,.8)"; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.arc(atk.from.x*s+s/2, atk.from.y*s+s/2, s*.22, 0, Math.PI*2); ctx.stroke();
+      }
+    });
   }
   function drawBattle(){
     var c = state && state.combat;
@@ -1063,8 +1121,7 @@ const PLAY_HTML = /* html */ `<!doctype html>
       });
     });
     // 2) player move + card previews
-    var proj = c.projected || c.player;
-    drawCardPreview(s, c, proj);
+    drawCardPreview(s, c);
     if(c.projected && (c.projected.x !== c.player.x || c.projected.y !== c.player.y)){
       ctx.strokeStyle="#fde047"; ctx.lineWidth=3; ctx.setLineDash([6,4]);
       ctx.beginPath(); ctx.moveTo(c.player.x*s+s/2,c.player.y*s+s/2); ctx.lineTo(c.projected.x*s+s/2,c.projected.y*s+s/2); ctx.stroke(); ctx.setLineDash([]);
