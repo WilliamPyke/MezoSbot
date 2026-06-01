@@ -1,5 +1,5 @@
 import type { ShopItem } from "./items.js";
-import type { CombatSessionRow, Direction, SatPlayerRow } from "./types.js";
+import type { BattleMonster, CombatSessionRow, Direction, SatPlayerRow } from "./types.js";
 import { bootBonus, ITEM_BY_ID } from "./towns.js";
 import {
   addStatus,
@@ -61,12 +61,28 @@ export type PlanAction =
 /** Max queued actions (ticks) per round — the monster telegraphs the same count. */
 export const MAX_PLAN = 3;
 
+/** Per-monster snapshot at the end of one resolution tick (drives playback). */
+export interface StepMonster {
+  id: string;
+  x: number;
+  y: number;
+  hp: number;
+  maxHp: number;
+  /** Tiles this monster struck on this tick (empty unless it attacked this tick). */
+  attackTiles: Point[];
+  act: MonsterAct | "dead";
+}
+
 /** One step of the interleaved resolution, for the log + board preview. */
 export interface ResolutionStep {
   player: PlanAction | null;
   playerPos: Point;
+  /** The player's attack-card tiles this tick (back-compat: player's, not monster's). */
   attackTiles: Point[];
+  /** Primary monster position (back-compat single-monster field). */
   monsterPos: Point;
+  /** All monsters after this tick — positions, hp, per-tick strikes. */
+  monsters: StepMonster[];
   dealt: number;
   taken: number;
   line: string;
@@ -75,13 +91,19 @@ export interface ResolutionStep {
 export interface BattleResolution {
   steps: ResolutionStep[];
   playerEnd: Point;
+  /** Primary monster end (back-compat single-monster field). */
   monsterEnd: Point;
+  /** Primary monster end HP (back-compat single-monster field). */
   monsterHp: number;
+  /** All monsters' end state — persist this back onto the combat row. */
+  monsters: BattleMonster[];
   totalDealt: number;
   totalTaken: number;
+  /** True only when EVERY monster is dead. */
   monsterDead: boolean;
   /** Persist these back onto the combat row for the next round. */
   playerStatusEnd: StatusEffect[];
+  /** Primary monster end statuses (back-compat single-monster field). */
   monsterStatusEnd: StatusEffect[];
 }
 
@@ -182,12 +204,12 @@ export function planGlyph(action: PlanAction): string {
  */
 export function projectedPlayerPos(combat: CombatSessionRow, plan: PlanAction[]): Point {
   let pos = { x: combat.player_battle_x, y: combat.player_battle_y };
-  const monster = { x: combat.monster_battle_x, y: combat.monster_battle_y };
+  const blockers = readMonsters(combat).filter((m) => m.hp > 0).map((m) => ({ x: m.x, y: m.y }));
   for (const a of plan) {
     if (a.kind !== "move") continue;
     const d = DIR_DELTA[a.dir];
     const next = { x: clampArena(pos.x + d.x), y: clampArena(pos.y + d.y) };
-    if (samePoint(next, monster)) continue; // blocked — stay put
+    if (blockers.some((b) => samePoint(next, b))) continue; // blocked — stay put
     pos = next;
   }
   return pos;
@@ -204,16 +226,96 @@ export function startingBattlePositions(worldX: number, worldY: number): {
   };
 }
 
+/**
+ * Distinct starting tiles for `count` monsters along the top rows of the arena,
+ * deterministically spread so they don't overlap (chess-like opening setup).
+ */
+export function startingMonsterPositions(worldX: number, worldY: number, count: number): Point[] {
+  const h = Math.abs((worldX * 31 + worldY * 17) | 0);
+  const n = Math.max(1, Math.min(ARENA_SIZE, count));
+  const used = new Set<string>();
+  const out: Point[] = [];
+  for (let i = 0; i < n; i++) {
+    const seed = hash(`${worldX}:${worldY}:${i}`);
+    let x = (1 + ((h >> (i * 2)) % (ARENA_SIZE - 2))) % ARENA_SIZE;
+    let y = i % 2 === 0 ? 1 : 0;
+    // nudge off any tile already taken
+    let guard = 0;
+    while (used.has(pointKey({ x, y })) && guard < ARENA_SIZE * 2) {
+      x = (x + 1) % ARENA_SIZE;
+      if (x === 0) y = (y + 1) % 2;
+      guard++;
+    }
+    used.add(pointKey({ x, y }));
+    out.push({ x: clampArena(x), y: clampArena(y) });
+    void seed;
+  }
+  return out;
+}
+
+/**
+ * Read the full monster roster. Falls back to synthesising a single monster from
+ * the legacy singular `monster_*` columns when `monsters` is null/empty, so
+ * in-flight fights (and rows written before the multi-monster migration) resolve.
+ */
+export function readMonsters(combat: CombatSessionRow): BattleMonster[] {
+  if (combat.monsters) {
+    try {
+      const arr = JSON.parse(combat.monsters);
+      if (Array.isArray(arr) && arr.length) return arr.map((m, i) => normalizeMonster(m, i));
+    } catch {
+      /* fall through to legacy columns */
+    }
+  }
+  return [{
+    id: "m0",
+    name: combat.monster_name,
+    level: combat.monster_level,
+    maxHp: combat.monster_max_hp,
+    hp: combat.monster_current_hp,
+    x: combat.monster_battle_x,
+    y: combat.monster_battle_y,
+    attack: combat.monster_attack,
+    reward: combat.reward_sats,
+    status: parseStatuses(combat.monster_status),
+  }];
+}
+
+function normalizeMonster(m: Record<string, unknown>, i: number): BattleMonster {
+  const num = (v: unknown, d: number) => (Number.isFinite(Number(v)) ? Number(v) : d);
+  const rawStatus = (m as { status?: unknown }).status;
+  return {
+    id: typeof m.id === "string" ? m.id : `m${i}`,
+    name: String(m.name ?? "Monster"),
+    level: num(m.level, 1),
+    maxHp: num(m.maxHp, num(m.hp, 1)),
+    hp: Math.max(0, num(m.hp, 0)),
+    x: clampArena(num(m.x, 0)),
+    y: clampArena(num(m.y, 0)),
+    attack: num(m.attack, 0),
+    reward: num(m.reward, 0),
+    status: parseStatuses(typeof rawStatus === "string" ? rawStatus : JSON.stringify(rawStatus ?? [])),
+  };
+}
+
+export function serializeMonsters(monsters: BattleMonster[]): string {
+  return JSON.stringify(monsters);
+}
+
+export function allMonstersDead(combat: CombatSessionRow): boolean {
+  return readMonsters(combat).every((m) => m.hp <= 0);
+}
+
 export function legalBattleMoves(combat: CombatSessionRow, player: SatPlayerRow): Point[] {
   const origin = { x: combat.player_battle_x, y: combat.player_battle_y };
-  const occupied = { x: combat.monster_battle_x, y: combat.monster_battle_y };
+  const occupied = readMonsters(combat).filter((m) => m.hp > 0).map((m) => ({ x: m.x, y: m.y }));
   const range = battleMovePoints(combat, player);
   const out: Point[] = [];
   for (let y = 0; y < ARENA_SIZE; y++) {
     for (let x = 0; x < ARENA_SIZE; x++) {
       const p = { x, y };
       const dist = Math.abs(x - origin.x) + Math.abs(y - origin.y);
-      if (dist <= range && !samePoint(p, occupied)) out.push(p);
+      if (dist <= range && !occupied.some((o) => samePoint(p, o))) out.push(p);
     }
   }
   return out;
@@ -351,21 +453,32 @@ export function attackTilesForShape(from: Point, target: Point, shape: string): 
  * the monster advances toward the player before it, then rests after. The attack
  * tick carries the monster's signature ability (name + inflicted statuses).
  */
-export function monsterPlan(combat: CombatSessionRow, _player?: SatPlayerRow): MonsterIntent[] {
-  const target = { x: combat.player_battle_x, y: combat.player_battle_y };
-  const damage = Math.max(3, 3 + combat.monster_level * 2);
-  const ability = monsterAbility(combat.monster_name);
-  const base = `${combat.monster_name}:${combat.monster_level}:${combat.turn_number}:${combat.enemy_x}:${combat.enemy_y}`;
+export interface MonsterTelegraph {
+  monster: BattleMonster;
+  intents: MonsterIntent[];
+}
+
+/** Telegraph for one monster, with `blocked(p)` reserving tiles other monsters claimed. */
+function monsterIntentsFor(
+  m: BattleMonster,
+  target: Point,
+  turnNumber: number,
+  blocked: (p: Point) => boolean,
+): MonsterIntent[] {
+  const damage = Math.max(3, 3 + m.level * 2);
+  const ability = monsterAbility(m.name);
+  const base = `${m.name}:${m.id}:${m.level}:${turnNumber}:${m.x}:${m.y}`;
   const attackIndex = hash(base) % MAX_PLAN;
   const out: MonsterIntent[] = [];
-  let from = { x: combat.monster_battle_x, y: combat.monster_battle_y };
+  let from = { x: m.x, y: m.y };
 
   for (let k = 0; k < MAX_PLAN; k++) {
     const seed = hash(`${base}:${k}`);
     if (k === attackIndex) {
-      const pattern = monsterPatternFor(combat.monster_name, seed);
+      const pattern = monsterPatternFor(m.name, seed);
       const move = monsterStep(from, target, pattern, seed);
-      const to = { x: clampArena(from.x + move.x), y: clampArena(from.y + move.y) };
+      let to = { x: clampArena(from.x + move.x), y: clampArena(from.y + move.y) };
+      if (!samePoint(to, from) && blocked(to)) to = from; // don't stack onto a claimed tile
       const dir = attackDirection(to, target);
       out.push({
         order: k + 1, act: "attack", pattern,
@@ -380,7 +493,8 @@ export function monsterPlan(combat: CombatSessionRow, _player?: SatPlayerRow): M
     } else {
       const advancing = k < attackIndex;
       const move = advancing ? stepToward(from, target) : { x: 0, y: 0 };
-      const to = { x: clampArena(from.x + move.x), y: clampArena(from.y + move.y) };
+      let to = { x: clampArena(from.x + move.x), y: clampArena(from.y + move.y) };
+      if (!samePoint(to, from) && blocked(to)) to = from;
       out.push({
         order: k + 1, act: advancing ? "advance" : "rest", pattern: "line",
         name: advancing ? "Advance" : "Rest",
@@ -391,6 +505,35 @@ export function monsterPlan(combat: CombatSessionRow, _player?: SatPlayerRow): M
     }
   }
   return out;
+}
+
+/**
+ * Telegraph every living monster's next MAX_PLAN acts. Monsters are processed in
+ * roster order; each one reserves the tiles on its path so later monsters route
+ * around it (so two monsters don't telegraph onto the same square). Deterministic,
+ * so the preview shown to the player matches what {@link simulateBattle} resolves.
+ */
+export function monstersTelegraph(combat: CombatSessionRow): MonsterTelegraph[] {
+  const monsters = readMonsters(combat).filter((m) => m.hp > 0);
+  const target = { x: combat.player_battle_x, y: combat.player_battle_y };
+  const claimed = new Set<string>();
+  for (const m of monsters) claimed.add(pointKey({ x: m.x, y: m.y }));
+  const out: MonsterTelegraph[] = [];
+  for (const m of monsters) {
+    const self = pointKey({ x: m.x, y: m.y });
+    const blocked = (p: Point) => claimed.has(pointKey(p)) && pointKey(p) !== self;
+    const intents = monsterIntentsFor(m, target, combat.turn_number, blocked);
+    claimed.delete(self);
+    for (const it of intents) claimed.add(pointKey(it.to));
+    out.push({ monster: m, intents });
+  }
+  return out;
+}
+
+/** Back-compat: the primary (first living) monster's telegraph. */
+export function monsterPlan(combat: CombatSessionRow, _player?: SatPlayerRow): MonsterIntent[] {
+  const tele = monstersTelegraph(combat);
+  return tele.length ? tele[0].intents : [];
 }
 
 function stepToward(from: Point, target: Point): Point {
@@ -428,39 +571,68 @@ export function simulateBattle(
   weapon: { power: number },
   plan: PlanAction[],
 ): BattleResolution {
-  const intents = monsterPlan(combat);
+  const telegraph = monstersTelegraph(combat);
   let playerPos = { x: combat.player_battle_x, y: combat.player_battle_y };
-  let monsterPos = { x: combat.monster_battle_x, y: combat.monster_battle_y };
-  let monsterHp = combat.monster_current_hp;
 
-  // Statuses active at the start of this round (the "old" set that decays at end).
+  // Working state per living monster: position/hp clone + this-round status bookkeeping.
+  const mons = telegraph.map((t) => ({
+    m: { ...t.monster, status: [...t.monster.status] },
+    intents: t.intents,
+    old: t.monster.status, // statuses at round start (decay at end)
+    adds: [] as StatusEffect[], // inflicted this round → carry into next round
+    stunned: hasStatus(t.monster.status, "stun"),
+    chill: totalOf(t.monster.status, "chill"),
+  }));
+
   const playerOld = parseStatuses(combat.player_status);
-  const monsterOld = parseStatuses(combat.monster_status);
-  // Debuffs inflicted during this round — carried at full duration into next round.
   const playerAdds: StatusEffect[] = [];
-  const monsterAdds: StatusEffect[] = [];
 
   const steps: ResolutionStep[] = [];
   let totalDealt = 0;
   let totalTaken = 0;
 
-  // Round-start damage-over-time.
-  const monsterDot = monsterHp > 0 ? dotDamage(monsterOld) : 0;
-  if (monsterDot > 0) monsterHp = Math.max(0, monsterHp - monsterDot);
+  const livingPositions = () => mons.filter((mm) => mm.m.hp > 0).map((mm) => ({ x: mm.m.x, y: mm.m.y }));
+  const nearestLiving = (from: Point) => {
+    let best: typeof mons[number] | null = null;
+    let bd = Infinity;
+    for (const mm of mons) {
+      if (mm.m.hp <= 0) continue;
+      const d = Math.abs(mm.m.x - from.x) + Math.abs(mm.m.y - from.y);
+      if (d < bd) { bd = d; best = mm; }
+    }
+    return best;
+  };
+  const snapshot = (tickStrikes: Record<string, Point[]>, k: number): StepMonster[] =>
+    mons.map((mm) => ({
+      id: mm.m.id,
+      x: mm.m.x,
+      y: mm.m.y,
+      hp: mm.m.hp,
+      maxHp: mm.m.maxHp,
+      attackTiles: tickStrikes[mm.m.id] ?? [],
+      act: mm.m.hp <= 0 ? "dead" : (mm.intents[k]?.act ?? "rest"),
+    }));
+  const primaryPos = (): Point => (mons[0] ? { x: mons[0].m.x, y: mons[0].m.y } : { x: combat.monster_battle_x, y: combat.monster_battle_y });
+
+  // Round-start damage-over-time (each monster bleeds/poisons independently).
+  let dotDealt = 0;
+  for (const mm of mons) {
+    if (mm.m.hp <= 0) continue;
+    const d = dotDamage(mm.old);
+    if (d > 0) { mm.m.hp = Math.max(0, mm.m.hp - d); dotDealt += d; }
+  }
   const playerDot = dotDamage(playerOld);
-  totalDealt += monsterDot;
+  totalDealt += dotDealt;
   totalTaken += playerDot;
-  if (monsterDot > 0 || playerDot > 0) {
+  if (dotDealt > 0 || playerDot > 0) {
     const bits: string[] = [];
-    if (monsterDot > 0) bits.push(`🩸 lingering effects deal ${monsterDot} to ${combat.monster_name}`);
+    if (dotDealt > 0) bits.push(`🩸 lingering effects deal ${dotDealt}`);
     if (playerDot > 0) bits.push(`🩸 you take ${playerDot} from lingering effects`);
-    steps.push({ player: null, playerPos, attackTiles: [], monsterPos, dealt: monsterDot, taken: playerDot, line: `• ${bits.join(" · ")}` });
+    steps.push({ player: null, playerPos, attackTiles: [], monsterPos: primaryPos(), monsters: snapshot({}, -1), dealt: dotDealt, taken: playerDot, line: `• ${bits.join(" · ")}` });
   }
 
-  let playerShield = 0; // built from self-buff cards played this round (one-round)
+  let playerShield = 0; // self-buff cards this round (one-round)
   let empower = 0;
-  const monsterStunned = hasStatus(monsterOld, "stun");
-  const monsterChill = totalOf(monsterOld, "chill"); // flat damage reduction while chilled
 
   for (let k = 0; k < MAX_PLAN; k++) {
     const action = plan[k] ?? null;
@@ -468,12 +640,13 @@ export function simulateBattle(
     let taken = 0;
     let attackTiles: Point[] = [];
     const parts: string[] = [];
+    const tickStrikes: Record<string, Point[]> = {};
 
-    // 1) Player acts first (so a move can dodge this tick's strike).
+    // 1) Player acts first (so a move can dodge this tick's strikes).
     if (action?.kind === "move") {
       const d = DIR_DELTA[action.dir];
       const next = { x: clampArena(playerPos.x + d.x), y: clampArena(playerPos.y + d.y) };
-      if (!samePoint(next, monsterPos)) playerPos = next;
+      if (!livingPositions().some((p) => samePoint(p, next))) playerPos = next;
       parts.push(`${planGlyph(action)} to ${arenaTag(playerPos)}`);
     } else if (action?.kind === "card") {
       const card = cardById(action.cardId);
@@ -486,15 +659,19 @@ export function simulateBattle(
         }
         parts.push(`${card.emoji} ${card.name}`);
       } else {
-        attackTiles = attackTilesForShape(playerPos, monsterPos, card.shape ?? "line");
-        const onTarget = attackTiles.some((p) => samePoint(p, monsterPos));
-        if (onTarget && monsterHp > 0) {
-          dealt = Math.max(1, (card.damage ?? 0) + Math.round(weapon.power) + empower);
-          if (empower > 0) empower = 0; // consumed
-          monsterHp = Math.max(0, monsterHp - dealt);
-          for (const eff of card.apply ?? []) monsterAdds.push({ ...eff });
+        const focus = nearestLiving(playerPos);
+        attackTiles = focus ? attackTilesForShape(playerPos, { x: focus.m.x, y: focus.m.y }, card.shape ?? "line") : [];
+        const hits = mons.filter((mm) => mm.m.hp > 0 && attackTiles.some((p) => samePoint(p, { x: mm.m.x, y: mm.m.y })));
+        if (hits.length) {
+          const dmgEach = Math.max(1, (card.damage ?? 0) + Math.round(weapon.power) + empower);
+          if (empower > 0) empower = 0; // consumed by the first swing
+          for (const h of hits) {
+            h.m.hp = Math.max(0, h.m.hp - dmgEach);
+            for (const eff of card.apply ?? []) h.adds.push({ ...eff });
+            dealt += dmgEach;
+          }
           const tag = (card.apply ?? []).length ? ` (+${(card.apply ?? []).map((e) => e.kind).join(",")})` : "";
-          parts.push(`${card.emoji} ${card.name} hit for ${dealt}${tag}`);
+          parts.push(`${card.emoji} ${card.name} hit ${hits.length > 1 ? `${hits.length} foes ` : ""}for ${dmgEach}${tag}`);
         } else {
           parts.push(`${card.emoji} ${card.name} whiffed`);
         }
@@ -505,54 +682,60 @@ export function simulateBattle(
       parts.push("— idle");
     }
 
-    // 2) Monster executes its k-th telegraphed act.
-    const intent = intents[k];
-    if (intent) {
-      monsterPos = intent.to;
-      if (intent.act === "attack" && monsterHp > 0) {
-        if (monsterStunned) {
-          parts.push("💫 stunned — its strike fizzles");
+    // 2) Each living monster executes its k-th telegraphed act, in roster order.
+    for (const mm of mons) {
+      if (mm.m.hp <= 0) continue;
+      const intent = mm.intents[k];
+      if (!intent) continue;
+      mm.m.x = intent.to.x;
+      mm.m.y = intent.to.y;
+      if (intent.act === "attack") {
+        if (mm.stunned) {
+          parts.push(`💫 ${mm.m.name} fizzles`);
         } else {
-          const struck = samePoint(playerPos, monsterPos) || intent.attackTiles.some((p) => samePoint(p, playerPos));
+          tickStrikes[mm.m.id] = intent.attackTiles;
+          const struck = samePoint(playerPos, { x: mm.m.x, y: mm.m.y }) || intent.attackTiles.some((p) => samePoint(p, playerPos));
           if (struck) {
-            const raw = Math.max(1, intent.damage - monsterChill);
+            const raw = Math.max(1, intent.damage - mm.chill);
             const absorbed = Math.min(playerShield, raw);
             playerShield -= absorbed;
-            taken = raw - absorbed;
-            if (taken > 0) for (const eff of intent.apply ?? []) playerAdds.push({ ...eff });
+            const t = raw - absorbed;
+            taken += t;
+            if (t > 0) for (const eff of intent.apply ?? []) playerAdds.push({ ...eff });
             parts.push(absorbed > 0
-              ? `🛡️ shield soaks ${absorbed}${taken > 0 ? `, ${intent.name} took ${taken}` : ""}`
-              : `🩸 ${intent.name} hit you for ${taken}`);
+              ? `🛡️ soaks ${absorbed}${t > 0 ? `, ${intent.name} took ${t}` : ""}`
+              : `🩸 ${intent.name} hit you for ${t}`);
           } else {
-            parts.push(`✨ dodged ${intent.name}`);
+            parts.push(`✨ dodged ${mm.m.name}`);
           }
         }
-      } else if (monsterHp > 0) {
-        parts.push(intent.act === "rest" ? "💤 it rests" : "👣 it advances");
       }
     }
 
     totalDealt += dealt;
     totalTaken += taken;
-    steps.push({ player: action, playerPos, attackTiles, monsterPos, dealt, taken, line: `${k + 1}. ${parts.join(" · ")}` });
+    steps.push({ player: action, playerPos, attackTiles, monsterPos: primaryPos(), monsters: snapshot(tickStrikes, k), dealt, taken, line: `${k + 1}. ${parts.join(" · ")}` });
 
-    if (monsterHp <= 0) break;
+    if (mons.every((mm) => mm.m.hp <= 0)) break;
   }
 
   // Old statuses age one round; freshly-inflicted debuffs carry over at full duration.
+  for (const mm of mons) mm.m.status = decayStatuses(mm.old).concat(mm.adds);
   const playerStatusEnd = decayStatuses(playerOld).concat(playerAdds);
-  const monsterStatusEnd = decayStatuses(monsterOld).concat(monsterAdds);
 
+  const endMonsters = mons.map((mm) => mm.m);
+  const primary = endMonsters[0];
   return {
     steps,
     playerEnd: playerPos,
-    monsterEnd: monsterPos,
-    monsterHp,
+    monsterEnd: primary ? { x: primary.x, y: primary.y } : { x: combat.monster_battle_x, y: combat.monster_battle_y },
+    monsterHp: primary ? primary.hp : 0,
+    monsters: endMonsters,
     totalDealt,
     totalTaken,
-    monsterDead: monsterHp <= 0,
+    monsterDead: endMonsters.length > 0 && endMonsters.every((m) => m.hp <= 0),
     playerStatusEnd,
-    monsterStatusEnd,
+    monsterStatusEnd: primary ? primary.status : [],
   };
 }
 

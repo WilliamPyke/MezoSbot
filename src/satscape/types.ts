@@ -1,5 +1,26 @@
+import type { StatusEffect } from "./cards.js";
+
 export type PlayerState = "idle" | "combat" | "fainted";
 export type Direction = "up" | "down" | "left" | "right";
+
+/**
+ * One combatant in a (possibly multi-monster) fight. Persisted as a JSON array in
+ * `CombatSessionRow.monsters`. Position is in arena tile coordinates (0..ARENA_SIZE-1).
+ */
+export interface BattleMonster {
+  /** Stable per-fight id (e.g. "m0") — keys telegraph seeding and client tokens. */
+  id: string;
+  name: string;
+  level: number;
+  maxHp: number;
+  hp: number;
+  x: number;
+  y: number;
+  attack: number;
+  reward: number;
+  /** Active statuses on this monster (bleed/poison/stun/chill…). */
+  status: StatusEffect[];
+}
 
 export interface SatPlayerRow {
   discord_id: string;
@@ -38,6 +59,11 @@ export interface CombatSessionRow {
   battle_move_points: number;
   /** Comma-joined queued plan tokens: up|down|left|right|card-<id>|wait. Null/"" = empty. */
   battle_plan: string | null;
+  /**
+   * JSON array of {@link BattleMonster} — the full (multi-)monster roster. Null/empty
+   * falls back to the singular monster_* columns (which mirror the primary monster).
+   */
+  monsters: string | null;
   selected_battle_weapon: string | null;
   /** JSON array of StatusEffect on the player (bleed/poison/stun etc). Null = none. */
   player_status: string | null;

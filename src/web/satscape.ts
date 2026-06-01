@@ -9,9 +9,11 @@ import { biomeAt, SAT } from "../satscape/engine.js";
 import {
   MAX_PLAN,
   monsterPlan,
+  monstersTelegraph,
   parsePlan,
   planAP,
   projectedPlayerPos,
+  readMonsters,
   selectedWeaponId,
   weaponFor,
   type BattleMove,
@@ -336,20 +338,45 @@ function combatState(view: ViewModel): Record<string, unknown> | null {
     emoji: c.emoji,
     apCost: c.apCost,
     kind: c.kind,
+    shape: c.shape ?? null,
     desc: c.desc,
     affordable: c.apCost <= availableAp - spentAp,
   }));
+  const telegraph = monstersTelegraph(combat);
+  const roster = readMonsters(combat);
+  // Full monster roster, each with its own telegraph + status badges (drives the
+  // chess-like board). Dead monsters drop out of the telegraph but stay listed so
+  // the client can fade them out.
+  const monsters = roster.map((mm) => {
+    const tele = telegraph.find((t) => t.monster.id === mm.id);
+    return {
+      id: mm.id,
+      name: mm.name,
+      level: mm.level,
+      hp: mm.hp,
+      maxHp: mm.maxHp,
+      attack: mm.attack,
+      reward: mm.reward,
+      x: mm.x,
+      y: mm.y,
+      dead: mm.hp <= 0,
+      intents: tele ? tele.intents : [],
+      status: statusBadges(mm.status),
+    };
+  });
+  const primaryMon = roster[0];
   return {
     monster: {
-      name: combat.monster_name,
-      level: combat.monster_level,
-      hp: combat.monster_current_hp,
-      maxHp: combat.monster_max_hp,
-      attack: combat.monster_attack,
+      name: primaryMon ? primaryMon.name : combat.monster_name,
+      level: primaryMon ? primaryMon.level : combat.monster_level,
+      hp: primaryMon ? primaryMon.hp : combat.monster_current_hp,
+      maxHp: primaryMon ? primaryMon.maxHp : combat.monster_max_hp,
+      attack: primaryMon ? primaryMon.attack : combat.monster_attack,
       reward: combat.reward_sats,
-      x: combat.monster_battle_x,
-      y: combat.monster_battle_y,
+      x: primaryMon ? primaryMon.x : combat.monster_battle_x,
+      y: primaryMon ? primaryMon.y : combat.monster_battle_y,
     },
+    monsters,
     player: { x: combat.player_battle_x, y: combat.player_battle_y },
     turn: combat.turn_number,
     plan,
@@ -650,6 +677,9 @@ const PLAY_HTML = /* html */ `<!doctype html>
   var state = null, activeTab = location.hash === "#quests" ? "quests" : location.hash === "#shop" ? "shop" : "gear";
   var clickTravel = false, showWorldMap = false, battleAnimStart = performance.now(), lastCombatKey = "";
   var reduceMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  var inflight = 0;   // battle POSTs in flight — pause the poll so it can't clobber optimistic state
+  var playing = false; // a resolution playback animation is running
+  var pb = null;       // playback driver state
   var play = document.getElementById("play"), ctx = play.getContext("2d");
   var minimap = document.getElementById("minimap"), mini = minimap.getContext("2d");
   var note = document.getElementById("note");
@@ -700,6 +730,126 @@ const PLAY_HTML = /* html */ `<!doctype html>
     render();
   }
   function act(path, body) { api(path, body).then(setState).catch(function(e){ note.textContent = e.message; }); }
+
+  /* ─── combat: client mirrors of the server rules (for instant, optimistic input) ─── */
+  function clampA(n){ return Math.max(0, Math.min(7, Math.round(n))); }
+  function livingMonsters(c){ return (c.monsters || (c.monster ? [c.monster] : [])).filter(function(m){ return !m.dead && m.hp > 0; }); }
+  function nearestMonster(c, from){
+    var ms = livingMonsters(c), best = null, bd = Infinity;
+    for(var i=0;i<ms.length;i++){ var d = Math.abs(ms[i].x-from.x)+Math.abs(ms[i].y-from.y); if(d<bd){ bd=d; best=ms[i]; } }
+    return best;
+  }
+  // Mirror of battle.ts projectedPlayerPos: walk the move plan, blocked by any living monster.
+  function projectClient(c, plan){
+    var pos = { x:c.player.x, y:c.player.y };
+    var DELTA = { up:{x:0,y:-1}, down:{x:0,y:1}, left:{x:-1,y:0}, right:{x:1,y:0} };
+    var blockers = livingMonsters(c);
+    for(var i=0;i<plan.length;i++){
+      var a = plan[i]; if(a.kind !== "move") continue;
+      var d = DELTA[a.dir]; if(!d) continue;
+      var next = { x:clampA(pos.x+d.x), y:clampA(pos.y+d.y) };
+      var blocked = false; for(var j=0;j<blockers.length;j++){ if(blockers[j].x===next.x && blockers[j].y===next.y){ blocked=true; break; } }
+      if(!blocked) pos = next;
+    }
+    return pos;
+  }
+  function attackDirJS(from, to){
+    var dx = to.x-from.x, dy = to.y-from.y;
+    if(Math.abs(dx) > Math.abs(dy)) return dx > 0 ? "right" : "left";
+    return dy > 0 ? "down" : "up";
+  }
+  // Mirror of battle.ts attackTilesForShape (geometry only) — for the on-board preview.
+  function attackTilesJS(from, target, shape){
+    var dir = attackDirJS(from, target);
+    var DELTA = { up:{x:0,y:-1}, down:{x:0,y:1}, left:{x:-1,y:0}, right:{x:1,y:0} };
+    var d = DELTA[dir];
+    var lateral = (dir === "up" || dir === "down") ? {x:1,y:0} : {x:0,y:1};
+    function f(n){ return { x:from.x+d.x*n, y:from.y+d.y*n }; }
+    var raw = [];
+    if(shape === "longsword"){ raw.push(f(1), f(2)); }
+    else if(shape === "spear"){ raw.push(f(1), f(2), f(3)); }
+    else if(shape === "hammer"){ var a=f(1); raw.push(a, {x:a.x+lateral.x,y:a.y+lateral.y}, f(2), {x:a.x+lateral.x+d.x,y:a.y+lateral.y+d.y}); }
+    else if(shape === "cleave" || shape === "arc"){ var cc=f(1); raw.push(cc, {x:cc.x+lateral.x,y:cc.y+lateral.y}, {x:cc.x-lateral.x,y:cc.y-lateral.y}); }
+    else if(shape === "star"){ raw.push({x:from.x-1,y:from.y-1},{x:from.x+1,y:from.y-1},{x:from.x-1,y:from.y+1},{x:from.x+1,y:from.y+1}, f(2)); }
+    else if(shape === "slam"){ for(var yy=from.y-1;yy<=from.y+1;yy++) for(var xx=from.x-1;xx<=from.x+1;xx++) if(xx!==from.x||yy!==from.y) raw.push({x:xx,y:yy}); }
+    else if(shape === "bolt"){ for(var i=1;i<8;i++) raw.push(f(i)); }
+    else if(shape === "nova"){ for(var y2=from.y-2;y2<=from.y+2;y2++) for(var x2=from.x-2;x2<=from.x+2;x2++) if(x2!==from.x||y2!==from.y) raw.push({x:x2,y:y2}); }
+    else { raw.push(f(1), f(2), f(3)); } // line / default
+    var out = [], seen = {};
+    for(var k=0;k<raw.length;k++){ var p=raw[k]; if(p.x<0||p.x>7||p.y<0||p.y>7) continue; var key=p.x+","+p.y; if(seen[key]) continue; seen[key]=1; out.push(p); }
+    return out;
+  }
+  function kitCard(c, id){ var k = c.kit || []; for(var i=0;i<k.length;i++) if(k[i].id===id) return k[i]; return null; }
+  function actionCost(c, a){ if(!a) return 0; if(a.kind==="move") return 1; if(a.kind==="wait") return 0; var card=kitCard(c,a.cardId); return card ? card.apCost : 0; }
+  function recomputeAffordable(c){
+    var ap = c.ap || {available:3, spent:0}; var remain = ap.available - ap.spent;
+    (c.kit||[]).forEach(function(card){ card.affordable = card.apCost <= remain; });
+  }
+  // Apply a queued action locally so the board + plan update instantly, before the POST returns.
+  function queueOptimistic(c, action){
+    var ap = c.ap || {available:3, spent:0, ticks:0, maxTicks:3};
+    if(ap.ticks >= ap.maxTicks) return false;
+    var cost = actionCost(c, action);
+    if(ap.spent + cost > ap.available) return false;
+    if(action.kind === "move"){
+      var before = projectClient(c, c.plan);
+      var after = projectClient(c, c.plan.concat([action]));
+      if(before.x===after.x && before.y===after.y) return false; // blocked step
+    }
+    c.plan = (c.plan||[]).concat([action]);
+    c.ap = { max:ap.max, available:ap.available, spent:ap.spent+cost, ticks:ap.ticks+1, maxTicks:ap.maxTicks };
+    c.projected = projectClient(c, c.plan);
+    recomputeAffordable(c);
+    return true;
+  }
+  function undoOptimistic(c){
+    if(!c.plan || !c.plan.length) return false;
+    var popped = c.plan.pop();
+    var cost = actionCost(c, popped), ap = c.ap;
+    c.ap = { max:ap.max, available:ap.available, spent:Math.max(0,ap.spent-cost), ticks:Math.max(0,ap.ticks-1), maxTicks:ap.maxTicks };
+    c.projected = projectClient(c, c.plan);
+    recomputeAffordable(c);
+    return true;
+  }
+  // Queue a battle action: reflect it instantly, then POST and reconcile with the authoritative state.
+  function battleQueue(action, body){
+    if(playing) return;
+    var c = state && state.combat;
+    if(c){ if(!queueOptimistic(c, action)){ /* server will explain */ } render(); }
+    inflight++;
+    api("/satscape/api/battle", body).then(function(s){ inflight--; setState(s); }).catch(function(e){
+      inflight--; note.textContent = e.message; api("/satscape/api/state").then(setState).catch(function(){});
+    });
+  }
+  function battleUndo(){
+    if(playing) return;
+    var c = state && state.combat;
+    if(c && c.plan && c.plan.length){ undoOptimistic(c); render(); }
+    inflight++;
+    api("/satscape/api/battle", { action:"undo" }).then(function(s){ inflight--; setState(s); }).catch(function(e){
+      inflight--; note.textContent = e.message; api("/satscape/api/state").then(setState).catch(function(){});
+    });
+  }
+  // Resolve, then animate the round step-by-step before applying the final state.
+  function resolveBattle(){
+    if(playing) return;
+    inflight++;
+    api("/satscape/api/battle", { action:"resolve" }).then(function(s){
+      inflight--;
+      if(s.playback && s.playback.steps && s.playback.steps.length && !reduceMotion && !showWorldMap){
+        startPlayback(s.playback, function(){ setState(s); });
+      } else { setState(s); }
+    }).catch(function(e){ inflight--; note.textContent = e.message; });
+  }
+  function startPlayback(data, done){
+    var c = state.combat; if(!c){ done(); return; }
+    var prevMons = {}; (c.monsters || [c.monster]).forEach(function(m){ if(m) prevMons[m.id || "m0"] = { x:m.x, y:m.y, hp:m.hp, maxHp:m.maxHp, name:m.name }; });
+    pb = {
+      steps: data.steps, idx: 0, start: performance.now(), stepMs: 560, shownIdx: -1,
+      prevPlayer: { x:c.player.x, y:c.player.y }, prevMons: prevMons, done: done,
+    };
+    playing = true;
+  }
   function key(x,y){ return x + "," + y; }
   function exploredSet(){ var out={}; (state.viewport.explored||[]).forEach(function(t){ out[key(t.x,t.y)] = true; }); return out; }
   function biomeAt(x, y){
@@ -812,44 +962,128 @@ const PLAY_HTML = /* html */ `<!doctype html>
       ctx.strokeRect(rx, ry, side * tw, side * th); ctx.setLineDash([]);
     }
   }
+  var MON_COLORS = ["#fb923c","#f472b6","#c084fc","#f87171","#fbbf24"];
+  function monColor(i){ return MON_COLORS[i % MON_COLORS.length]; }
+  function battleMonsters(c){ return c.monsters || (c.monster ? [{ id:"m0", name:c.monster.name, hp:c.monster.hp, maxHp:c.monster.maxHp, x:c.monster.x, y:c.monster.y, dead:false, intents:c.intents||[], status:c.monsterStatus||[] }] : []); }
+  function drawArenaGrid(s){
+    ctx.fillStyle="#10151c"; ctx.fillRect(0,0,play.width,play.height);
+    for(var y=0;y<8;y++) for(var x=0;x<8;x++){ ctx.fillStyle=(x+y)%2?"#17212c":"#1f2a36"; ctx.fillRect(x*s,y*s,s,s); ctx.strokeStyle="#304052"; ctx.strokeRect(x*s,y*s,s,s); }
+  }
+  function drawHpBar(s, cx, topY, hp, maxHp, color){
+    var w = s*0.72, h = 5, x = cx - w/2;
+    ctx.fillStyle="rgba(2,6,23,.85)"; ctx.fillRect(x-1,topY-1,w+2,h+2);
+    ctx.fillStyle="#0f172a"; ctx.fillRect(x,topY,w,h);
+    ctx.fillStyle=color; ctx.fillRect(x,topY,w*Math.max(0,Math.min(1,hp/Math.max(1,maxHp))),h);
+  }
+  function drawMonsterToken(s, mx, my, color, alpha, glow){
+    var cx = mx*s+s/2, cy = my*s+s/2;
+    ctx.globalAlpha = alpha==null?1:alpha;
+    ctx.fillStyle=color; ctx.beginPath(); ctx.arc(cx,cy,s*.3,0,Math.PI*2); ctx.fill();
+    if(glow){ ctx.strokeStyle="rgba(248,113,113,"+(0.55+glow*0.4)+")"; ctx.lineWidth=4; ctx.beginPath(); ctx.arc(cx,cy,s*(.38+glow*.16),0,Math.PI*2); ctx.stroke(); }
+    ctx.globalAlpha = 1;
+  }
+  // Preview the tiles each queued attack card will strike, from the projected end position.
+  function drawCardPreview(s, c, proj){
+    var plan = c.plan || [];
+    var target = nearestMonster(c, proj); if(!target) return;
+    for(var i=0;i<plan.length;i++){
+      var a = plan[i]; if(a.kind !== "card") continue;
+      var card = kitCard(c, a.cardId); if(!card || card.kind === "buff" || !card.shape) continue;
+      var tiles = attackTilesJS(proj, { x:target.x, y:target.y }, card.shape);
+      tiles.forEach(function(t){ ctx.fillStyle="rgba(34,211,238,.30)"; ctx.fillRect(t.x*s,t.y*s,s,s); ctx.strokeStyle="rgba(34,211,238,.75)"; ctx.lineWidth=1.5; ctx.strokeRect(t.x*s+1,t.y*s+1,s-2,s-2); });
+    }
+  }
   function drawBattle(){
     var c = state && state.combat;
     if(!c) return;
+    if(playing && pb){ drawPlaybackFrame(); return; }
     var s = play.width / 8;
-    var intents = c.intents || [];
     var frameMs = 1200;
-    var anim = reduceMotion || !intents.length ? 0 : (performance.now() - battleAnimStart) % (frameMs * intents.length);
-    var active = intents.length ? Math.floor(anim / frameMs) : 0;
-    var local = reduceMotion || !intents.length ? 0 : (anim % frameMs) / frameMs;
-    var pulse = reduceMotion ? 0.35 : 0.25 + Math.sin(local * Math.PI) * 0.35;
-    ctx.fillStyle="#10151c"; ctx.fillRect(0,0,play.width,play.height);
-    for(var y=0;y<8;y++) for(var x=0;x<8;x++){ ctx.fillStyle=(x+y)%2?"#17212c":"#1f2a36"; ctx.fillRect(x*s,y*s,s,s); ctx.strokeStyle="#304052"; ctx.strokeRect(x*s,y*s,s,s); }
-    intents.forEach(function(intent, idx){
-      var isActive = idx === active;
-      if(intent.attackTiles && intent.attackTiles.length){
-        intent.attackTiles.forEach(function(t){ ctx.fillStyle=isActive ? "rgba(248,113,113," + (0.38 + pulse) + ")" : "rgba(248,113,113,.24)"; ctx.fillRect(t.x*s,t.y*s,s,s); });
-      }
-      ctx.strokeStyle = intent.act === "attack" ? "#fb7185" : intent.act === "advance" ? "#facc15" : "#64748b";
-      ctx.lineWidth = isActive ? 4 : 2;
-      ctx.beginPath(); ctx.moveTo(intent.from.x*s+s/2,intent.from.y*s+s/2); ctx.lineTo(intent.to.x*s+s/2,intent.to.y*s+s/2); ctx.stroke();
-      ctx.fillStyle = isActive ? "#f8fafc" : "#facc15"; ctx.font="bold 14px sans-serif"; ctx.fillText(String(intent.order), intent.to.x*s+6, intent.to.y*s+16);
+    drawArenaGrid(s);
+    var monsters = battleMonsters(c);
+    // 1) telegraph tiles + intent arrows for every living monster
+    monsters.forEach(function(m){
+      if(m.dead || m.hp<=0) return;
+      var intents = m.intents || [];
+      var anim = reduceMotion || !intents.length ? 0 : (performance.now() - battleAnimStart) % (frameMs * intents.length);
+      var active = intents.length ? Math.floor(anim / frameMs) : 0;
+      var local = reduceMotion || !intents.length ? 0 : (anim % frameMs) / frameMs;
+      var pulse = reduceMotion ? 0.35 : 0.25 + Math.sin(local * Math.PI) * 0.35;
+      intents.forEach(function(intent, idx){
+        var isActive = idx === active;
+        if(intent.attackTiles && intent.attackTiles.length){
+          intent.attackTiles.forEach(function(t){ ctx.fillStyle=isActive ? "rgba(248,113,113," + (0.30 + pulse) + ")" : "rgba(248,113,113,.16)"; ctx.fillRect(t.x*s,t.y*s,s,s); });
+        }
+        ctx.strokeStyle = intent.act === "attack" ? "#fb7185" : intent.act === "advance" ? "#facc15" : "#64748b";
+        ctx.lineWidth = isActive ? 3 : 1.5;
+        ctx.beginPath(); ctx.moveTo(intent.from.x*s+s/2,intent.from.y*s+s/2); ctx.lineTo(intent.to.x*s+s/2,intent.to.y*s+s/2); ctx.stroke();
+        ctx.fillStyle = isActive ? "#f8fafc" : "#facc15"; ctx.font="bold 12px sans-serif"; ctx.fillText(String(intent.order), intent.to.x*s+5, intent.to.y*s+15);
+      });
     });
-    if(c.projected){
+    // 2) player move + card previews
+    var proj = c.projected || c.player;
+    drawCardPreview(s, c, proj);
+    if(c.projected && (c.projected.x !== c.player.x || c.projected.y !== c.player.y)){
       ctx.strokeStyle="#fde047"; ctx.lineWidth=3; ctx.setLineDash([6,4]);
       ctx.beginPath(); ctx.moveTo(c.player.x*s+s/2,c.player.y*s+s/2); ctx.lineTo(c.projected.x*s+s/2,c.projected.y*s+s/2); ctx.stroke(); ctx.setLineDash([]);
     }
     ctx.fillStyle="#60a5fa"; ctx.beginPath(); ctx.arc(c.player.x*s+s/2,c.player.y*s+s/2,s*.28,0,Math.PI*2); ctx.fill();
-    if(c.projected && (c.projected.x !== c.player.x || c.projected.y !== c.player.y)){ ctx.fillStyle="#93c5fd"; ctx.beginPath(); ctx.arc(c.projected.x*s+s/2,c.projected.y*s+s/2,s*.2,0,Math.PI*2); ctx.fill(); }
-    var monsterDraw = { x:c.monster.x, y:c.monster.y };
-    var activeIntent = intents[active];
-    if(activeIntent && !reduceMotion){
-      var ease = 1 - Math.pow(1 - Math.min(1, local * 1.35), 3);
-      monsterDraw.x = activeIntent.from.x + (activeIntent.to.x - activeIntent.from.x) * ease;
-      monsterDraw.y = activeIntent.from.y + (activeIntent.to.y - activeIntent.from.y) * ease;
+    if(c.projected && (c.projected.x !== c.player.x || c.projected.y !== c.player.y)){ ctx.fillStyle="rgba(147,197,253,.7)"; ctx.beginPath(); ctx.arc(c.projected.x*s+s/2,c.projected.y*s+s/2,s*.2,0,Math.PI*2); ctx.fill(); }
+    // 3) monster tokens (animate toward the active telegraphed tile) + HP bars
+    monsters.forEach(function(m, mi){
+      if(m.dead || m.hp<=0) return;
+      var intents = m.intents || [];
+      var anim = reduceMotion || !intents.length ? 0 : (performance.now() - battleAnimStart) % (frameMs * Math.max(1, intents.length));
+      var active = intents.length ? Math.floor(anim / frameMs) : 0;
+      var local = reduceMotion || !intents.length ? 0 : (anim % frameMs) / frameMs;
+      var pulse = reduceMotion ? 0.35 : 0.25 + Math.sin(local * Math.PI) * 0.35;
+      var dx = m.x, dy = m.y, ai = intents[active];
+      if(ai && !reduceMotion){ var ease = 1 - Math.pow(1 - Math.min(1, local * 1.35), 3); dx = ai.from.x + (ai.to.x - ai.from.x) * ease; dy = ai.from.y + (ai.to.y - ai.from.y) * ease; }
+      drawMonsterToken(s, dx, dy, monColor(mi), 1, ai && ai.act === "attack" && !reduceMotion ? pulse : 0);
+      drawHpBar(s, dx*s+s/2, dy*s+s/2 - s*.42, m.hp, m.maxHp, monColor(mi));
+    });
+    ctx.fillStyle="#e5e7eb"; ctx.font="13px sans-serif";
+    var label = monsters.filter(function(m){ return !m.dead && m.hp>0; }).map(function(m){ return m.name + " " + m.hp + "/" + m.maxHp; }).join("   ");
+    ctx.fillText(label || "Victory!", 10, play.height - 12);
+  }
+  // One frame of the post-resolve playback: interpolate everyone toward this step's
+  // positions, flash the tiles struck, then advance to the next step when done.
+  function drawPlaybackFrame(){
+    var s = play.width / 8;
+    var now = performance.now();
+    var step = pb.steps[pb.idx];
+    if(!step){ playing = false; var d0 = pb.done; pb = null; if(d0) d0(); return; }
+    var local = Math.min(1, (now - pb.start) / pb.stepMs);
+    var ease = 1 - Math.pow(1 - local, 3);
+    var flash = 0.25 + Math.sin(local * Math.PI) * 0.4;
+    drawArenaGrid(s);
+    (step.monsters || []).forEach(function(m){ (m.attackTiles || []).forEach(function(t){ ctx.fillStyle="rgba(248,113,113," + (0.25 + flash) + ")"; ctx.fillRect(t.x*s,t.y*s,s,s); }); });
+    (step.attackTiles || []).forEach(function(t){ ctx.fillStyle="rgba(34,211,238," + (0.22 + flash) + ")"; ctx.fillRect(t.x*s,t.y*s,s,s); ctx.strokeStyle="rgba(34,211,238,.75)"; ctx.lineWidth=1.5; ctx.strokeRect(t.x*s+1,t.y*s+1,s-2,s-2); });
+    var pp = { x: pb.prevPlayer.x + (step.playerPos.x - pb.prevPlayer.x) * ease, y: pb.prevPlayer.y + (step.playerPos.y - pb.prevPlayer.y) * ease };
+    (step.monsters || []).forEach(function(m, mi){
+      var prev = pb.prevMons[m.id] || { x:m.x, y:m.y, hp:m.hp, maxHp:m.maxHp, name:m.name };
+      var mx = prev.x + (m.x - prev.x) * ease, my = prev.y + (m.y - prev.y) * ease;
+      var dyingNow = (m.act === "dead" || m.hp <= 0);
+      var alpha = dyingNow ? Math.max(0.15, 1 - local) : 1;
+      var glow = (m.attackTiles && m.attackTiles.length) ? flash : 0;
+      drawMonsterToken(s, mx, my, monColor(mi), alpha, glow);
+      if(!dyingNow) drawHpBar(s, mx*s+s/2, my*s+s/2 - s*.42, m.hp, m.maxHp || prev.maxHp || m.hp, monColor(mi));
+    });
+    ctx.fillStyle="#60a5fa"; ctx.beginPath(); ctx.arc(pp.x*s+s/2,pp.y*s+s/2,s*.28,0,Math.PI*2); ctx.fill();
+    if(step.taken > 0){ ctx.fillStyle="rgba(248,113,113," + Math.max(0,1-local) + ")"; ctx.font="bold 18px sans-serif"; ctx.fillText("-" + step.taken, pp.x*s+s/2-8, pp.y*s+s/2 - s*0.5 - local*16); }
+    if(pb.shownIdx !== pb.idx){
+      var line = step.line || "";
+      var dot = line.indexOf(". "); if(dot >= 0 && dot <= 2) line = line.slice(dot+2); else if(line.indexOf("• ") === 0) line = line.slice(2);
+      if(line) note.textContent = line;
+      pb.shownIdx = pb.idx;
     }
-    ctx.fillStyle="#fb923c"; ctx.beginPath(); ctx.arc(monsterDraw.x*s+s/2,monsterDraw.y*s+s/2,s*.3,0,Math.PI*2); ctx.fill();
-    if(activeIntent && activeIntent.act === "attack" && !reduceMotion){ ctx.strokeStyle="rgba(248,113,113," + (0.55 + pulse * 0.4) + ")"; ctx.lineWidth=4; ctx.beginPath(); ctx.arc(monsterDraw.x*s+s/2,monsterDraw.y*s+s/2,s*(.38 + pulse*.16),0,Math.PI*2); ctx.stroke(); }
-    ctx.fillStyle="#e5e7eb"; ctx.font="14px sans-serif"; ctx.fillText(c.monster.name + " " + c.monster.hp + "/" + c.monster.maxHp, 10, play.height - 12);
+    ctx.fillStyle="#e5e7eb"; ctx.font="13px sans-serif"; ctx.fillText("Resolving… " + (pb.idx+1) + "/" + pb.steps.length, 10, play.height - 12);
+    if(local >= 1){
+      pb.prevPlayer = { x:step.playerPos.x, y:step.playerPos.y };
+      pb.prevMons = {}; (step.monsters || []).forEach(function(m){ pb.prevMons[m.id] = { x:m.x, y:m.y, hp:m.hp, maxHp:m.maxHp, name:m.name }; });
+      pb.idx++; pb.start = now;
+      if(pb.idx >= pb.steps.length){ playing = false; var d = pb.done; pb = null; if(d) d(); }
+    }
   }
   function drawKnownMap(target, width, height, pad, labels){
     var tiles = state.minimap && state.minimap.explored || [];
@@ -937,21 +1171,29 @@ const PLAY_HTML = /* html */ `<!doctype html>
       statusEl.appendChild(d);
     }
     badgeRow("You", c.playerStatus);
-    badgeRow(c.monster.name, c.monsterStatus);
-    (c.intents || []).forEach(function(intent){
-      var el = document.createElement("div");
-      el.className = "turn-step " + intent.act;
-      var target = tileLabel(intent.to);
-      var fx = intent.apply && intent.apply.length ? " +" + intent.apply.map(function(e){ return e.kind; }).join("/") : "";
-      var detail = intent.act === "attack" ? "hits " + (intent.attackTiles || []).length + " tiles for " + intent.damage + fx : intent.description;
-      el.textContent = intent.order + ". " + intent.name + " -> " + target + " - " + detail;
-      monsterEl.appendChild(el);
+    var monsters = battleMonsters(c);
+    monsters.forEach(function(m){
+      var head = document.createElement("div");
+      head.className = "turn-step";
+      head.textContent = (m.dead || m.hp <= 0) ? (m.name + " — 💀 defeated") : (m.name + " — " + m.hp + "/" + m.maxHp + " HP");
+      monsterEl.appendChild(head);
+      if(m.status && m.status.length) badgeRow(m.name, m.status);
+      if(m.dead || m.hp <= 0) return;
+      (m.intents || []).forEach(function(intent){
+        var el = document.createElement("div");
+        el.className = "turn-step " + intent.act;
+        var target = tileLabel(intent.to);
+        var fx = intent.apply && intent.apply.length ? " +" + intent.apply.map(function(e){ return e.kind; }).join("/") : "";
+        var detail = intent.act === "attack" ? "hits " + (intent.attackTiles || []).length + " tiles for " + intent.damage + fx : intent.description;
+        el.textContent = "  " + intent.order + ". " + intent.name + " -> " + target + " - " + detail;
+        monsterEl.appendChild(el);
+      });
     });
-    document.getElementById("resolve").disabled = false;
-    var noTicks = ticksLeft <= 0;
+    document.getElementById("resolve").disabled = playing;
+    var noTicks = ticksLeft <= 0 || playing;
     document.querySelectorAll("[data-bmove]").forEach(function(b){ b.disabled = noTicks || remainingAp < 1; });
     document.getElementById("wait").disabled = noTicks;
-    document.getElementById("undo").disabled = plan.length === 0;
+    document.getElementById("undo").disabled = plan.length === 0 || playing;
   }
   function renderPanels(){
     var p = state.player, needed = Math.max(0, Math.min(p.maxHp - p.hp, p.balance - p.hp));
@@ -971,7 +1213,7 @@ const PLAY_HTML = /* html */ `<!doctype html>
       b.title = card.desc;
       b.className = card.kind === "buff" ? "" : "primary";
       b.disabled = !card.affordable;
-      b.onclick = function(){ act("/satscape/api/battle", { action:"card", cardId:card.id }); };
+      b.onclick = function(){ battleQueue({ kind:"card", cardId:card.id }, { action:"card", cardId:card.id }); };
       tray.appendChild(b);
     });
     var weap = document.getElementById("weapon"); weap.innerHTML = "";
@@ -998,14 +1240,14 @@ const PLAY_HTML = /* html */ `<!doctype html>
   function addItem(label, button, cb){ var el=document.createElement("div"); el.className="item"; var s=document.createElement("span"); s.textContent=label; var b=document.createElement("button"); b.textContent=button; b.onclick=cb; el.appendChild(s); el.appendChild(b); document.getElementById("list").appendChild(el); }
   function render(){ if(!state || state.error) return; if(showWorldMap) drawExpandedMap(); else if(state.combat) drawBattle(); else drawMap(); drawMinimap(); renderPanels(); }
   document.querySelectorAll("[data-move]").forEach(function(b){ b.onclick=function(){ act("/satscape/api/move", { dir:b.dataset.move }); }; });
-  document.querySelectorAll("[data-bmove]").forEach(function(b){ b.onclick=function(){ act("/satscape/api/battle", { action:"move", dir:b.dataset.bmove }); }; });
+  document.querySelectorAll("[data-bmove]").forEach(function(b){ b.onclick=function(){ battleQueue({ kind:"move", dir:b.dataset.bmove }, { action:"move", dir:b.dataset.bmove }); }; });
   document.getElementById("eat").onclick=function(){ act("/satscape/api/eat", {}); };
   document.getElementById("refresh").onclick=function(){ api("/satscape/api/state").then(setState).catch(function(e){ note.textContent=e.message; }); };
   document.getElementById("refill").onclick=function(){ act("/satscape/api/refill-hp", { sats:Number(document.getElementById("hpInput").value || 0) }); };
   document.getElementById("weaponBtn").onclick=function(){ act("/satscape/api/battle", { action:"weapon", itemId:document.getElementById("weapon").value }); };
-  document.getElementById("wait").onclick=function(){ act("/satscape/api/battle", { action:"wait" }); };
-  document.getElementById("undo").onclick=function(){ act("/satscape/api/battle", { action:"undo" }); };
-  document.getElementById("resolve").onclick=function(){ act("/satscape/api/battle", { action:"resolve" }); };
+  document.getElementById("wait").onclick=function(){ battleQueue({ kind:"wait" }, { action:"wait" }); };
+  document.getElementById("undo").onclick=function(){ battleUndo(); };
+  document.getElementById("resolve").onclick=function(){ resolveBattle(); };
   document.getElementById("flee").onclick=function(){ act("/satscape/api/battle", { action:"flee" }); };
   document.getElementById("estimate").onclick=function(){ act("/satscape/api/travel", { estimate:true, tx:Number(document.getElementById("tx").value), ty:Number(document.getElementById("ty").value) }); };
   document.getElementById("travel").onclick=function(){ act("/satscape/api/travel", { tx:Number(document.getElementById("tx").value), ty:Number(document.getElementById("ty").value) }); };
@@ -1040,7 +1282,7 @@ const PLAY_HTML = /* html */ `<!doctype html>
     var d = directionKey(e);
     if(d){
       e.preventDefault();
-      if(state && state.combat) act("/satscape/api/battle", { action:"move", dir:d });
+      if(state && state.combat) battleQueue({ kind:"move", dir:d }, { action:"move", dir:d });
       else act("/satscape/api/move", { dir:d });
       return;
     }
@@ -1048,15 +1290,15 @@ const PLAY_HTML = /* html */ `<!doctype html>
     if(e.key === "r" || e.key === "R"){ e.preventDefault(); api("/satscape/api/state").then(setState).catch(function(err){ note.textContent=err.message; }); return; }
     if(e.key === "e" || e.key === "E"){ e.preventDefault(); act("/satscape/api/eat", {}); return; }
     if(!state.combat) return;
-    if(e.key === " " || e.key === "Enter"){ e.preventDefault(); act("/satscape/api/battle", { action:"resolve" }); return; }
-    if(e.key === "q" || e.key === "Q"){ e.preventDefault(); act("/satscape/api/battle", { action:"wait" }); return; }
-    if(e.key === "z" || e.key === "Z" || e.key === "u" || e.key === "U"){ e.preventDefault(); act("/satscape/api/battle", { action:"undo" }); return; }
+    if(e.key === " " || e.key === "Enter"){ e.preventDefault(); resolveBattle(); return; }
+    if(e.key === "q" || e.key === "Q"){ e.preventDefault(); battleQueue({ kind:"wait" }, { action:"wait" }); return; }
+    if(e.key === "z" || e.key === "Z" || e.key === "u" || e.key === "U"){ e.preventDefault(); battleUndo(); return; }
     if(e.key === "f" || e.key === "F"){ e.preventDefault(); act("/satscape/api/battle", { action:"flee" }); return; }
     var cardIdx = "123456789".indexOf(e.key);
     if(cardIdx >= 0){
       e.preventDefault();
       var kit = state.combat.kit || [];
-      if(kit[cardIdx] && kit[cardIdx].affordable) act("/satscape/api/battle", { action:"card", cardId:kit[cardIdx].id });
+      if(kit[cardIdx] && kit[cardIdx].affordable) battleQueue({ kind:"card", cardId:kit[cardIdx].id }, { action:"card", cardId:kit[cardIdx].id });
     }
   });
   window.addEventListener("keyup", function(e){
@@ -1066,12 +1308,14 @@ const PLAY_HTML = /* html */ `<!doctype html>
     if(showWorldMap){ showWorldMap = false; render(); }
   });
   function animate(){
-    if(!document.hidden && state && state.combat && !showWorldMap && !reduceMotion) drawBattle();
+    if(!document.hidden && state && state.combat && !showWorldMap && (!reduceMotion || playing)) drawBattle();
     requestAnimationFrame(animate);
   }
   requestAnimationFrame(animate);
   api("/satscape/api/state").then(setState).catch(function(e){ note.textContent=e.message; });
-  setInterval(function(){ api("/satscape/api/state").then(setState).catch(function(){}); }, 2000);
+  // Live state poll — paused while a battle action is in flight or a playback is running,
+  // so it can't clobber the optimistic board or interrupt the resolution animation.
+  setInterval(function(){ if(playing || inflight > 0) return; api("/satscape/api/state").then(setState).catch(function(){}); }, 2000);
 })();
 </script>
 </body>

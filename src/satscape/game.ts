@@ -28,12 +28,15 @@ import {
   projectedPlayerPos,
   samePoint,
   selectedWeaponId,
+  serializeMonsters,
   serializePlan,
   simulateBattle,
   startingBattlePositions,
+  startingMonsterPositions,
   weaponPower,
   type BattleMove,
   type PlanAction,
+  type ResolutionStep,
 } from "./battle.js";
 import {
   cardById,
@@ -45,17 +48,30 @@ import {
 import { bootBonus, effectivePrice, fastTravelRadius, ITEM_BY_ID, nearestTown, townAt } from "./towns.js";
 import { getRep, onArriveTown, onCombatWin } from "./quests.js";
 import { keeperLine } from "./lines.js";
-import type { Direction, SatPlayerRow } from "./types.js";
+import type { BattleMonster, CombatSessionRow, Direction, SatPlayerRow } from "./types.js";
 import { BIOME, blockReasonAt, tileAt } from "./world.js";
 
 const BREAD_COST = 1; // sats → pool
 const FLEE_COST = 1; // sats → pool
+
+/** Step-by-step resolution data so the web client can animate the round playing out. */
+export interface BattlePlayback {
+  steps: ResolutionStep[];
+  dealt: number;
+  taken: number;
+  /** True when every monster died this round (fight ends). */
+  monsterDead: boolean;
+  /** True when the player fainted resolving this round. */
+  fainted: boolean;
+}
 
 export interface ActionResult {
   ok: boolean;
   note: string;
   /** True when this action put the player into combat (used to stop auto-explore). */
   enteredCombat?: boolean;
+  /** Present on a resolved battle round — drives the sequential board playback. */
+  playback?: BattlePlayback;
 }
 
 /**
@@ -230,30 +246,67 @@ export async function resolveTile(discordId: string, x: number, y: number): Prom
   const m = entity.data as { name: string; level: number; reward: number };
   const fighter = await getPlayer(discordId);
   const positions = startingBattlePositions(x, y);
-  const monsterHp = 18 + m.level * 8;
+
+  // Spawn a small pack (1–3) for a chess-like board. More/tougher monsters appear
+  // for higher-level encounters; per-monster HP and loot scale down so a pack is
+  // tougher but not punishing, and total loot stays roughly the encounter reward.
+  const count = monsterCountFor(m.level, x, y);
+  const perHp = count > 1 ? Math.max(8, Math.round((18 + m.level * 8) * 0.65)) : 18 + m.level * 8;
+  const perReward = Math.max(1, Math.round(m.reward / count));
+  const starts = startingMonsterPositions(x, y, count);
+  const monsters: BattleMonster[] = starts.map((pos, i) => ({
+    id: `m${i}`,
+    name: m.name,
+    level: m.level,
+    maxHp: perHp,
+    hp: perHp,
+    x: pos.x,
+    y: pos.y,
+    attack: 3 + m.level * 2,
+    reward: perReward,
+    status: [],
+  }));
+  const primary = monsters[0];
+
+  // Only persist the `monsters` JSON for actual packs. Single-monster fights stay on
+  // the legacy singular columns, so combat keeps working even before the multi-monster
+  // migration is applied (readMonsters falls back to those columns).
   await createCombat({
     discord_id: discordId,
-    monster_name: m.name,
-    monster_level: m.level,
-    monster_max_hp: monsterHp,
-    monster_current_hp: monsterHp,
-    monster_attack: 3 + m.level * 2,
+    monster_name: primary.name,
+    monster_level: primary.level,
+    monster_max_hp: primary.maxHp,
+    monster_current_hp: primary.hp,
+    monster_attack: primary.attack,
     reward_sats: m.reward,
     enemy_x: x,
     enemy_y: y,
     player_battle_x: positions.player.x,
     player_battle_y: positions.player.y,
-    monster_battle_x: positions.monster.x,
-    monster_battle_y: positions.monster.y,
+    monster_battle_x: primary.x,
+    monster_battle_y: primary.y,
     battle_move_points: fighter ? battleMoveRange(fighter) : 5,
     battle_plan: null,
+    ...(count > 1 ? { monsters: serializeMonsters(monsters) } : {}),
     selected_battle_weapon: null,
     player_status: "[]",
     monster_status: "[]",
     turn_number: 1,
     created_at: new Date().toISOString(),
-  });
-  return { ok: true, note: `👹 A level ${m.level} **${m.name}** blocks your path!`, enteredCombat: true };
+  } as CombatSessionRow);
+  const note = count > 1
+    ? `👹 An ambush! **${count}× level ${m.level} ${m.name}** block your path!`
+    : `👹 A level ${m.level} **${m.name}** blocks your path!`;
+  return { ok: true, note, enteredCombat: true };
+}
+
+/** Deterministic pack size (1–3) for an encounter, scaling with monster level. */
+function monsterCountFor(level: number, x: number, y: number): number {
+  const h = Math.abs(((x * 73856093) ^ (y * 19349663)) >>> 0);
+  let count = 1;
+  if (level >= 3 && h % 2 === 0) count++;
+  if (level >= 5 && h % 3 === 0) count++;
+  return Math.min(3, count);
 }
 
 /**
@@ -332,40 +385,54 @@ export async function resolvePlan(discordId: string): Promise<ActionResult> {
   const res = simulateBattle(combat, { power }, plan);
 
   const note = res.steps.map((s) => s.line).join("\n");
+  const playback: BattlePlayback = {
+    steps: res.steps,
+    dealt: res.totalDealt,
+    taken: res.totalTaken,
+    monsterDead: res.monsterDead,
+    fainted: false,
+  };
 
   // Apply damage the player took: burn sats → pool AND lower HP. Faint at 0 HP.
   if (res.totalTaken > 0) {
     const { hp } = await loseHp(discordId, res.totalTaken);
     if (hp <= 0) {
-      return { ok: true, note: `${note}\n` + (await faint(discordId)).note };
+      return { ok: true, note: `${note}\n` + (await faint(discordId)).note, playback: { ...playback, fainted: true } };
     }
   }
 
   if (res.monsterDead) {
-    const granted = await payoutFromPool(discordId, combat.reward_sats);
+    const totalReward = res.monsters.reduce((sum, mm) => sum + (mm.reward || 0), 0) || combat.reward_sats;
+    const granted = await payoutFromPool(discordId, totalReward);
     await clearTile(combat.enemy_x, combat.enemy_y);
     await deleteCombat(discordId);
     await updatePlayer(discordId, { state: "idle" });
-    await onCombatWin(discordId, combat.monster_level); // advance bounty quests
+    for (const mm of res.monsters) await onCombatWin(discordId, mm.level); // advance bounty quests per kill
+    const slain = res.monsters.length > 1 ? `all ${res.monsters.length} foes` : `the **${combat.monster_name}**`;
     return {
       ok: true,
-      note: `${note}\n🏆 You defeated the **${combat.monster_name}**! ` +
+      note: `${note}\n🏆 You defeated ${slain}! ` +
         (granted > 0 ? `Looted **${formatSats(granted)}**.` : "(Prize pool was empty — no loot.)"),
+      playback,
     };
   }
 
-  await updateCombat(discordId, {
+  const primary = res.monsters[0];
+  const patch: Partial<CombatSessionRow> = {
     player_battle_x: res.playerEnd.x,
     player_battle_y: res.playerEnd.y,
-    monster_battle_x: res.monsterEnd.x,
-    monster_battle_y: res.monsterEnd.y,
-    monster_current_hp: res.monsterHp,
+    monster_battle_x: primary ? primary.x : res.monsterEnd.x,
+    monster_battle_y: primary ? primary.y : res.monsterEnd.y,
+    monster_current_hp: primary ? primary.hp : res.monsterHp,
     battle_plan: null,
     player_status: serializeStatuses(res.playerStatusEnd),
     monster_status: serializeStatuses(res.monsterStatusEnd),
     turn_number: combat.turn_number + 1,
-  });
-  return { ok: true, note: `${note}\n🗡️ Dealt ${res.totalDealt}, took ${res.totalTaken}. Plan your next move.` };
+  };
+  // Persist the full roster only for packs (keeps single-monster fights migration-free).
+  if (res.monsters.length > 1) patch.monsters = serializeMonsters(res.monsters);
+  await updateCombat(discordId, patch);
+  return { ok: true, note: `${note}\n🗡️ Dealt ${res.totalDealt}, took ${res.totalTaken}. Plan your next move.`, playback };
 }
 
 /** Back-compat alias — older callers used "battleAttack". */
