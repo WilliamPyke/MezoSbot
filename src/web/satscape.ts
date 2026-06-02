@@ -84,7 +84,7 @@ export async function handleSatscapeWebRequest(
   const method = (req.method ?? "GET").toUpperCase();
   const path = url.pathname;
 
-  if (method === "GET" && path === "/satscape") {
+  if (method === "GET" && (path === "/satscape" || path === "/satscape/")) {
     sendHtml(res, 200, PAGE_HTML);
     return true;
   }
@@ -634,40 +634,47 @@ const PLAY_HTML = /* html */ `<!doctype html>
     border:1px solid #9a6a2c; border-bottom-width:2px; border-radius:5px; padding:1px 5px; min-width:16px; display:inline-block; text-align:center;
     box-shadow:0 1px 0 rgba(0,0,0,.25); line-height:1.5; }
 
-  .app { position:relative; z-index:1; display:grid; grid-template-columns:minmax(360px,1fr) 348px; justify-content:center; max-width:1140px; margin:0 auto; gap:16px; min-height:100dvh; padding:16px; }
-  .stage, .side { min-width:0; }
+  .app { position:relative; z-index:1; display:grid; grid-template-columns:1fr 360px; gap:14px; height:100dvh; padding:14px; }
+  .stage { position:relative; min-width:0; min-height:0; display:flex; flex-direction:column; }
+  .side { min-width:0; }
 
-  /* header */
-  .top { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:12px; }
-  .brand { display:flex; align-items:center; gap:11px; }
-  .sigil { width:38px; height:38px; flex:none; display:grid; place-items:center; border-radius:50%; font-family:var(--display); font-weight:700; font-size:19px; color:#3a2a08;
+  /* slim HUD bar above the map */
+  .hudbar { flex:0 0 auto; display:flex; align-items:center; gap:14px; margin-bottom:10px; }
+  .brand { display:flex; align-items:center; gap:10px; flex:0 0 auto; }
+  .sigil { width:36px; height:36px; flex:none; display:grid; place-items:center; border-radius:50%; font-family:var(--display); font-weight:700; font-size:18px; color:#3a2a08;
     background:radial-gradient(circle at 34% 28%, #fbe8a8, #d6a32a 46%, #6b4a12); box-shadow:0 0 0 1px rgba(232,193,90,.55), 0 0 18px rgba(232,193,90,.38), inset 0 -3px 6px rgba(0,0,0,.35); }
-  h1 { margin:0; font-family:var(--display); font-weight:800; font-size:23px; letter-spacing:4px; color:var(--parch); text-shadow:0 1px 0 #000, 0 0 22px rgba(232,193,90,.28); }
-  .tagline { font-family:var(--body); font-style:italic; font-size:11.5px; letter-spacing:.5px; color:var(--muted); margin-top:1px; }
-  .toolbelt { display:flex; gap:7px; align-items:center; }
-  .toolbelt button { min-height:38px; padding:8px 11px; font-size:10px; }
+  h1 { margin:0; font-family:var(--display); font-weight:800; font-size:19px; letter-spacing:3px; color:var(--parch); text-shadow:0 1px 0 #000, 0 0 22px rgba(232,193,90,.28); }
+  .tagline { font-family:var(--body); font-style:italic; font-size:11px; letter-spacing:.5px; color:var(--muted); margin-top:1px; }
+  .vitals { flex:1 1 auto; display:flex; gap:12px; min-width:0; max-width:540px; }
+  .vitals .bar { flex:1 1 0; min-width:0; }
+  .toolbelt { flex:0 0 auto; display:flex; gap:7px; align-items:center; margin-left:auto; }
+  .toolbelt button { min-height:40px; padding:8px 11px; font-size:10px; }
   .coords { font-family:var(--display); font-size:12px; letter-spacing:1px; color:#fff3da; padding:8px 14px;
-    border-style:solid; border-width:12px 24px; border-color:transparent; border-image:var(--btn) 16 18 fill / 12px 24px / 0 stretch; white-space:nowrap; }
+    border-style:solid; border-width:12px 22px; border-color:transparent; border-image:var(--btn) 16 18 fill / 12px 22px / 0 stretch; white-space:nowrap; }
 
-  /* vitals */
-  .vitals { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:12px; }
-  .bar { position:relative; padding:9px 13px; color:var(--ink);
-    border-style:solid; border-width:16px; border-color:transparent; border-image:var(--wood) 30 fill / 14px / 0 stretch; }
-  .bar label { display:flex; justify-content:space-between; font-family:var(--display); letter-spacing:1.5px; text-transform:uppercase; font-size:10px; color:#6b4a18; margin-bottom:6px; }
+  .bar { position:relative; padding:6px 12px; color:var(--ink);
+    border-style:solid; border-width:13px; border-color:transparent; border-image:var(--wood) 30 fill / 12px / 0 stretch; }
+  .bar label { display:flex; justify-content:space-between; font-family:var(--display); letter-spacing:1.2px; text-transform:uppercase; font-size:9.5px; color:#6b4a18; margin-bottom:5px; }
   .bar label span:last-child { color:#3a2a12; font-weight:700; }
-  .fill { height:13px; border-radius:999px; background:#3a2c18; overflow:hidden; box-shadow:inset 0 1px 3px rgba(0,0,0,.6); }
+  .fill { height:11px; border-radius:999px; background:#3a2c18; overflow:hidden; box-shadow:inset 0 1px 3px rgba(0,0,0,.6); }
   .fill span { position:relative; display:block; height:100%; border-radius:999px; background:linear-gradient(90deg,#3f8f54,#7ad08a); box-shadow:0 0 10px rgba(122,208,138,.5); transition:width .4s cubic-bezier(.4,0,.2,1); }
   .fill.hp span { background:linear-gradient(90deg,#9a2230,#e0566a); box-shadow:0 0 10px rgba(224,86,106,.5); }
 
-  /* map */
-  .map-frame { position:relative; padding:8px; border-style:solid; border-width:22px; border-color:transparent; border-image:var(--frame) 22 fill / 22px / 0 stretch; }
-  canvas#play { width:100%; max-height:calc(100dvh - 188px); display:block; background:#0e0a04; border-radius:4px; image-rendering:pixelated; touch-action:none; aspect-ratio:1/1; cursor:crosshair; }
+  /* map = the hero: a square that fills all remaining stage height */
+  .map-wrap { position:relative; flex:1 1 auto; min-height:0; display:grid; place-items:center; overflow:hidden; }
+  .map-frame { position:relative; width:min(100%, calc(100dvh - 96px)); aspect-ratio:1/1; padding:8px;
+    border-style:solid; border-width:22px; border-color:transparent; border-image:var(--frame) 22 fill / 22px / 0 stretch; }
+  canvas#play { width:100%; height:100%; display:block; background:#0e0a04; border-radius:4px; image-rendering:pixelated; touch-action:none; cursor:crosshair; }
   body.in-combat canvas#play { cursor:default; }
   .map-badge { position:absolute; left:18px; top:18px; z-index:3; font-family:var(--display); font-weight:700; font-size:10px; letter-spacing:2px; text-transform:uppercase;
     color:#fff3da; padding:5px 11px; border-radius:7px; background:rgba(40,24,8,.74); box-shadow:0 0 0 1px rgba(202,164,90,.4); pointer-events:none; }
   .map-badge::after { content:"Exploring"; }
   body.in-combat .map-badge { color:#ffd9c0; box-shadow:0 0 0 1px rgba(224,86,106,.55), 0 0 16px rgba(224,86,106,.3); }
   body.in-combat .map-badge::after { content:"⚔ Battle"; }
+  /* note ribbon overlaid on the map's lower-left (stays clear of the D-pad) */
+  .note-ribbon { position:absolute; left:18px; bottom:18px; max-width:min(58%, 460px); z-index:3; pointer-events:none;
+    background:linear-gradient(180deg,rgba(243,228,194,.95),rgba(228,208,160,.95)); border-radius:9px; padding:8px 13px;
+    box-shadow:0 6px 16px rgba(0,0,0,.45), inset 0 0 0 1px rgba(90,58,22,.4); max-height:34%; overflow:hidden; }
 
   /* on-map D-pad (single, context-aware: walks the world or queues a battle step) */
   .dpad { position:absolute; right:16px; bottom:16px; z-index:3; display:grid; grid-template-columns:repeat(3,40px); grid-template-rows:repeat(3,40px); gap:4px; pointer-events:none; }
@@ -675,7 +682,7 @@ const PLAY_HTML = /* html */ `<!doctype html>
   .dpad .up { grid-area:1/2; } .dpad .left { grid-area:2/1; } .dpad .right { grid-area:2/3; } .dpad .down { grid-area:3/2; }
 
   /* side ledger */
-  .side { display:flex; flex-direction:column; gap:13px; max-height:calc(100dvh - 20px); overflow:auto; padding-right:2px; }
+  .side { display:flex; flex-direction:column; gap:13px; min-height:0; max-height:100%; overflow:auto; padding-right:2px; }
   .panel { position:relative; color:var(--ink); padding:6px;
     border-style:solid; border-width:18px; border-color:transparent; border-image:var(--wood) 30 fill / 18px / 0 stretch;
     filter:drop-shadow(0 10px 20px rgba(0,0,0,.4)); }
@@ -746,9 +753,12 @@ const PLAY_HTML = /* html */ `<!doctype html>
   .keys .klist div { display:flex; align-items:center; gap:6px; }
 
   @media (max-width: 880px) {
-    .app { grid-template-columns:1fr; }
+    .app { grid-template-columns:1fr; height:auto; min-height:100dvh; }
+    .stage { min-height:70dvh; }
+    .hudbar { flex-wrap:wrap; }
+    .vitals { order:3; flex-basis:100%; max-width:none; }
+    .map-frame { width:min(100%, 70dvh); }
     .side { max-height:none; overflow:visible; }
-    canvas#play { max-height:none; }
   }
   @media (prefers-reduced-motion: reduce) { .fill span { transition:none; } }
 </style>
@@ -756,29 +766,31 @@ const PLAY_HTML = /* html */ `<!doctype html>
 <body>
 <main class="app">
   <section class="stage">
-    <div class="top">
+    <div class="hudbar">
       <div class="brand"><span class="sigil">₿</span><div><h1>SATSCAPE</h1><div class="tagline">Adventurer's Ledger</div></div></div>
+      <div class="vitals">
+        <div class="bar"><label><span>Health</span><span id="hpText">0/0</span></label><div class="fill hp"><span id="hpFill"></span></div></div>
+        <div class="bar"><label><span>Stamina</span><span id="stText">0%</span></label><div class="fill"><span id="stFill"></span></div></div>
+      </div>
       <div class="toolbelt">
         <button id="eat" title="Eat bread to restore stamina (E)">Eat <kbd>E</kbd></button>
         <button id="refresh" title="Refresh the realm (R)">↻ <kbd>R</kbd></button>
         <div class="coords" id="coords">loading</div>
       </div>
     </div>
-    <div class="vitals">
-      <div class="bar"><label><span>Health</span><span id="hpText">0/0</span></label><div class="fill hp"><span id="hpFill"></span></div></div>
-      <div class="bar"><label><span>Stamina</span><span id="stText">0%</span></label><div class="fill"><span id="stFill"></span></div></div>
-    </div>
-    <div class="map-frame">
-      <div class="map-badge"></div>
-      <canvas id="play" width="512" height="512"></canvas>
-      <div class="dpad">
-        <button class="sq up" data-move="up" title="North (W / ↑)">▲</button>
-        <button class="sq left" data-move="left" title="West (A / ←)">◀</button>
-        <button class="sq right" data-move="right" title="East (D / →)">▶</button>
-        <button class="sq down" data-move="down" title="South (S / ↓)">▼</button>
+    <div class="map-wrap">
+      <div class="map-frame">
+        <div class="map-badge"></div>
+        <canvas id="play" width="512" height="512"></canvas>
+        <div class="dpad">
+          <button class="sq up" data-move="up" title="North (W / ↑)">▲</button>
+          <button class="sq left" data-move="left" title="West (A / ←)">◀</button>
+          <button class="sq right" data-move="right" title="East (D / →)">▶</button>
+          <button class="sq down" data-move="down" title="South (S / ↓)">▼</button>
+        </div>
       </div>
+      <div class="note-ribbon"><div id="note">Opening SatScape…</div></div>
     </div>
-    <div style="margin-top:11px"><div class="panel"><div class="sheet" id="note">Opening SatScape…</div></div></div>
   </section>
   <aside class="side">
     <!-- COMBAT: shown only while fighting -->
@@ -1641,46 +1653,41 @@ const PAGE_HTML = /* html */ `<!doctype html>
       radial-gradient(900px 600px at 50% 120%, rgba(40,60,80,.18), transparent 60%),
       #14100b;
   }
-  /* parchment-fiber grain over a deep tabletop */
-  body::before { content:""; position:fixed; inset:0; pointer-events:none; opacity:.05; mix-blend-mode:overlay; z-index:0;
-    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='2'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E"); }
-  body::after { content:""; position:fixed; inset:0; pointer-events:none; z-index:0; box-shadow:inset 0 0 260px 60px rgba(0,0,0,.6); }
-
-  .page { position:relative; z-index:1; max-width:1240px; margin:0 auto; padding:18px 18px 28px; }
-
-  header { display:flex; flex-direction:column; align-items:center; gap:6px; margin-bottom:14px; }
-  .banner {
-    position:relative; min-width:340px; padding:14px 30px 16px; text-align:center;
-    border-style:solid; border-width:22px 56px; border-color:transparent;
-    border-image: var(--banner) 22 56 fill / 22px 56px / 0 stretch;
-    filter: drop-shadow(0 10px 18px rgba(0,0,0,.5));
-  }
-  h1 { margin:0; font-family:var(--display); font-weight:800; font-size:clamp(20px,3.4vw,30px); letter-spacing:5px;
-    color:#fff5df; text-shadow:0 2px 0 #6e2b25, 0 0 18px rgba(0,0,0,.35); }
-  .meta { font-family:var(--display); font-size:12px; letter-spacing:2.5px; text-transform:uppercase; color:var(--gold);
-    text-shadow:0 1px 2px rgba(0,0,0,.6); }
-
-  .layout { display:grid; grid-template-columns:1fr 268px; gap:16px; align-items:start; }
-
-  /* the framed map */
-  .map-frame { position:relative; padding:10px; border-style:solid; border-width:22px; border-color:transparent; border-image: var(--frame) 22 fill / 22px / 0 stretch; }
-  .map-stage { position:relative; border-radius:6px; overflow:hidden; box-shadow:inset 0 0 90px rgba(0,0,0,.7); }
-  canvas#map { display:block; width:100%; height:auto; background:#0e1622; touch-action:none; cursor:grab; }
+  /* full-bleed map: the canvas IS the page */
+  canvas#map { position:fixed; inset:0; width:100vw; height:100vh; display:block; background:#0e1622; touch-action:none; cursor:grab; z-index:0; }
   canvas#map.dragging { cursor:grabbing; }
+  /* parchment-fiber grain + torch vignette float just above the map, below the HUD */
+  body::before { content:""; position:fixed; inset:0; pointer-events:none; opacity:.05; mix-blend-mode:overlay; z-index:1;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='2'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E"); }
+  body::after { content:""; position:fixed; inset:0; pointer-events:none; z-index:1; box-shadow:inset 0 0 280px 90px rgba(0,0,0,.66); }
 
-  /* compass overlay, built from the pack's minimap compass tiles */
-  .compass { position:absolute; right:18px; top:18px; width:104px; height:104px; pointer-events:none;
-    filter: drop-shadow(0 4px 8px rgba(0,0,0,.6)); opacity:.95; }
-  .compass span { position:absolute; width:30px; height:30px; background-size:100% 100%; background-repeat:no-repeat; }
-  .compass .c-hub { left:37px; top:37px; width:30px; height:30px; border-radius:50%;
+  /* HUD overlay — covers the viewport, only its children catch clicks */
+  .hud { position:fixed; inset:0; z-index:5; pointer-events:none; }
+  .hud > * { pointer-events:auto; }
+
+  .title { position:absolute; left:18px; top:16px; display:flex; flex-direction:column; align-items:flex-start; gap:4px; }
+  .banner {
+    position:relative; padding:10px 26px 12px; text-align:center;
+    border-style:solid; border-width:20px 52px; border-color:transparent;
+    border-image: var(--banner) 22 56 fill / 20px 52px / 0 stretch;
+    filter: drop-shadow(0 8px 16px rgba(0,0,0,.55));
+  }
+  h1 { margin:0; font-family:var(--display); font-weight:800; font-size:clamp(18px,2.6vw,26px); letter-spacing:5px;
+    color:#fff5df; text-shadow:0 2px 0 #6e2b25, 0 0 18px rgba(0,0,0,.35); }
+  .meta { font-family:var(--display); font-size:11px; letter-spacing:2.5px; text-transform:uppercase; color:var(--gold);
+    text-shadow:0 1px 3px rgba(0,0,0,.8); padding-left:6px; }
+
+  /* compass + zoom controls dock, bottom-left */
+  .dock { position:absolute; left:18px; bottom:18px; display:flex; align-items:flex-end; gap:14px; }
+  .compass { position:relative; width:96px; height:96px; pointer-events:none; filter: drop-shadow(0 4px 8px rgba(0,0,0,.6)); opacity:.95; }
+  .compass span { position:absolute; width:28px; height:28px; background-size:100% 100%; background-repeat:no-repeat; }
+  .compass .c-hub { left:34px; top:34px; width:28px; height:28px; border-radius:50%;
     background:radial-gradient(circle at 38% 32%, #fbe8a8, #b8861f 60%, #5a3c10); box-shadow:0 0 0 2px rgba(0,0,0,.4), 0 0 12px rgba(246,227,166,.5); }
-  .compass .c-n { left:37px; top:0;  background-image:url("${UI.compassN}"); }
-  .compass .c-s { left:37px; bottom:0; background-image:url("${UI.compassS}"); }
-  .compass .c-w { left:0;  top:37px; background-image:url("${UI.compassW}"); }
-  .compass .c-e { right:0; top:37px; background-image:url("${UI.compassE}"); }
-
-  /* zoom + recenter controls */
-  .controls { position:absolute; left:18px; bottom:18px; display:flex; flex-direction:column; gap:8px; }
+  .compass .c-n { left:34px; top:0;  background-image:url("${UI.compassN}"); }
+  .compass .c-s { left:34px; bottom:0; background-image:url("${UI.compassS}"); }
+  .compass .c-w { left:0;  top:34px; background-image:url("${UI.compassW}"); }
+  .compass .c-e { right:0; top:34px; background-image:url("${UI.compassE}"); }
+  .controls { display:flex; flex-direction:column; gap:8px; }
   .ctl { width:44px; height:44px; border:0; cursor:pointer; background:transparent; background-image:var(--btn);
     background-size:100% 100%; background-repeat:no-repeat; color:#fff3da; font-family:var(--display); font-weight:700; font-size:20px;
     text-shadow:0 1px 2px rgba(0,0,0,.6); display:grid; place-items:center; transition:filter .12s; }
@@ -1688,10 +1695,15 @@ const PAGE_HTML = /* html */ `<!doctype html>
   .ctl:active { background-image:var(--btnDown); transform:translateY(1px); }
   .ctl.wide { width:auto; padding:0 12px; font-size:11px; letter-spacing:1.5px; text-transform:uppercase; }
 
-  /* side ledger */
-  aside { display:flex; flex-direction:column; gap:14px; }
+  /* right ledger rail, floating over the map */
+  .rail { position:absolute; right:14px; top:16px; bottom:16px; width:262px; display:flex; flex-direction:column; gap:12px; overflow:auto; padding-right:2px; }
+  .rail.collapsed { transform:translateX(calc(100% + 18px)); }
+  .rail-toggle { position:absolute; top:24px; right:286px; width:34px; height:46px; border:0; cursor:pointer; z-index:6;
+    background:var(--btn) center/100% 100% no-repeat; color:#fff3da; font-family:var(--display); font-weight:700; font-size:16px;
+    text-shadow:0 1px 2px rgba(0,0,0,.6); transition:right .25s; }
+  .rail.collapsed ~ .rail-toggle, .hud .rail-toggle.shifted { right:14px; }
   .panel { position:relative; padding:10px; color:#3a2a14; border-style:solid; border-width:18px; border-color:transparent;
-    border-image: var(--wood) 30 fill / 18px / 0 stretch; filter: drop-shadow(0 10px 20px rgba(0,0,0,.45)); }
+    border-image: var(--wood) 30 fill / 18px / 0 stretch; filter: drop-shadow(0 10px 20px rgba(0,0,0,.5)); }
   .panel .sheet { border-style:solid; border-width:16px; border-color:transparent; border-image: var(--inset) 28 fill / 16px / 0 stretch; padding:6px 8px 4px; }
   .panel h2 { margin:0 0 10px; font-family:var(--display); font-weight:700; font-size:13px; letter-spacing:2px; text-transform:uppercase;
     color:#5a3a16; border-bottom:1px solid rgba(90,58,22,.3); padding-bottom:7px; }
@@ -1705,7 +1717,7 @@ const PAGE_HTML = /* html */ `<!doctype html>
   .legend .ring { width:18px; height:18px; border:2px solid #9a6a2c; border-radius:50%; background:rgba(154,106,44,.12); }
   .legend .swatch { width:16px; height:16px; flex:none; border-radius:3px; box-shadow:inset 0 0 0 1px rgba(0,0,0,.25); }
 
-  .roster { display:flex; flex-direction:column; gap:7px; max-height:280px; overflow:auto; }
+  .roster { display:flex; flex-direction:column; gap:7px; max-height:38vh; overflow:auto; }
   .who { display:grid; grid-template-columns:auto 1fr auto; gap:9px; align-items:center; font-size:13px; color:#3f2c12; }
   .who .dot { width:11px; height:11px; border-radius:50%; box-shadow:0 0 0 2px rgba(0,0,0,.25); }
   .who .nm { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -1713,56 +1725,56 @@ const PAGE_HTML = /* html */ `<!doctype html>
   .who.combat .nm::after { content:" ⚔"; color:#b4341f; }
   .empty { font-style:italic; color:#6b542f; font-size:13px; }
 
-  .hint { text-align:center; color:#9a8155; font-style:italic; font-size:12px; margin-top:16px; font-family:var(--body); }
+  .hint { position:absolute; left:50%; bottom:14px; transform:translateX(-50%); white-space:nowrap; text-align:center; color:#d9c89a; font-style:italic; font-size:12px; font-family:var(--body);
+    background:rgba(20,12,6,.5); padding:5px 14px; border-radius:999px; text-shadow:0 1px 2px rgba(0,0,0,.7); }
 
-  @media (max-width: 880px) {
-    .layout { grid-template-columns:1fr; }
-    aside { order:2; }
+  @media (max-width: 720px) {
+    .rail { width:200px; top:auto; bottom:90px; max-height:46vh; }
+    .rail-toggle { right:224px; }
+    .title .banner { border-width:18px 40px; }
+    .dock { gap:8px; }
   }
 </style>
 </head>
 <body>
-  <div class="page">
-    <header>
+  <canvas id="map" width="900" height="640"></canvas>
+  <div class="hud">
+    <div class="title">
       <div class="banner"><h1>SATSCAPE</h1></div>
       <div class="meta" id="meta">charting the realm…</div>
-    </header>
-    <div class="layout">
-      <div class="map-frame">
-        <div class="map-stage">
-          <canvas id="map" width="900" height="640"></canvas>
-          <div class="compass"><span class="c-n"></span><span class="c-e"></span><span class="c-s"></span><span class="c-w"></span><span class="c-hub"></span></div>
-          <div class="controls">
-            <button class="ctl" id="zin" title="Zoom in">+</button>
-            <button class="ctl" id="zout" title="Zoom out">−</button>
-            <button class="ctl wide" id="recenter" title="Recenter">Home</button>
-          </div>
-        </div>
-      </div>
-      <aside>
-        <div class="panel"><div class="sheet">
-          <h2>The Realm</h2>
-          <div class="stat"><span>Adventurers afield</span><span class="v" id="sPlayers">—</span></div>
-          <div class="stat"><span>In battle</span><span class="v" id="sCombat">—</span></div>
-          <div class="stat"><span>Tiles charted</span><span class="v" id="sTiles">—</span></div>
-          <div class="stat"><span>Townships</span><span class="v" id="sTowns">—</span></div>
-        </div></div>
-        <div class="panel"><div class="sheet">
-          <h2>Legend</h2>
-          <div class="legend">
-            <div class="row"><span class="ico" style="background-image:url('${UI.iconStar}')"></span> Township</div>
-            <div class="row"><span class="ring"></span> Safe territory</div>
-            <div class="row"><span class="ico" style="background-image:url('${UI.iconJewelRed}')"></span> Adventurer</div>
-            <div class="row"><span class="ico" style="background-image:url('${UI.iconExcl}')"></span> In battle</div>
-          </div>
-        </div></div>
-        <div class="panel"><div class="sheet">
-          <h2>Adventurers</h2>
-          <div class="roster" id="roster"><div class="empty">Listening for travellers…</div></div>
-        </div></div>
-      </aside>
     </div>
-    <p class="hint">Drag to pan · scroll to zoom · the map breathes every 2 seconds</p>
+    <aside class="rail" id="rail">
+      <div class="panel"><div class="sheet">
+        <h2>The Realm</h2>
+        <div class="stat"><span>Adventurers afield</span><span class="v" id="sPlayers">—</span></div>
+        <div class="stat"><span>In battle</span><span class="v" id="sCombat">—</span></div>
+        <div class="stat"><span>Tiles charted</span><span class="v" id="sTiles">—</span></div>
+        <div class="stat"><span>Townships</span><span class="v" id="sTowns">—</span></div>
+      </div></div>
+      <div class="panel"><div class="sheet">
+        <h2>Legend</h2>
+        <div class="legend">
+          <div class="row"><span class="ico" style="background-image:url('${UI.iconStar}')"></span> Township</div>
+          <div class="row"><span class="ring"></span> Safe territory</div>
+          <div class="row"><span class="ico" style="background-image:url('${UI.iconJewelRed}')"></span> Adventurer</div>
+          <div class="row"><span class="ico" style="background-image:url('${UI.iconExcl}')"></span> In battle</div>
+        </div>
+      </div></div>
+      <div class="panel"><div class="sheet">
+        <h2>Adventurers</h2>
+        <div class="roster" id="roster"><div class="empty">Listening for travellers…</div></div>
+      </div></div>
+    </aside>
+    <button class="rail-toggle" id="railToggle" title="Hide panel">⟩</button>
+    <div class="dock">
+      <div class="compass"><span class="c-n"></span><span class="c-e"></span><span class="c-s"></span><span class="c-w"></span><span class="c-hub"></span></div>
+      <div class="controls">
+        <button class="ctl" id="zin" title="Zoom in">+</button>
+        <button class="ctl" id="zout" title="Zoom out">−</button>
+        <button class="ctl wide" id="recenter" title="Recenter">Home</button>
+      </div>
+    </div>
+    <p class="hint">Drag to pan · scroll to zoom · live every 2s</p>
   </div>
 <script>
 (function () {
@@ -1793,14 +1805,11 @@ const PAGE_HTML = /* html */ `<!doctype html>
       draw();
     }).catch(function(e) { console.error("Failed to load biomeGrid:", e); });
 
-  // Match the canvas backing store to its displayed size (crisp on HiDPI).
+  // Full-viewport backing store, crisp on HiDPI.
   function fit() {
     var dpr = Math.min(window.devicePixelRatio || 1, 2);
-    var w = canvas.clientWidth || 900;
-    var h = Math.round(w * 0.71);
-    canvas.width = Math.round(w * dpr);
-    canvas.height = Math.round(h * dpr);
-    canvas.style.height = h + "px";
+    canvas.width = Math.round(window.innerWidth * dpr);
+    canvas.height = Math.round(window.innerHeight * dpr);
     draw();
   }
 
@@ -1924,6 +1933,8 @@ const PAGE_HTML = /* html */ `<!doctype html>
   document.getElementById("zin").addEventListener("click", function () { zoom(1.25); });
   document.getElementById("zout").addEventListener("click", function () { zoom(0.8); });
   document.getElementById("recenter").addEventListener("click", function () { ox = 0; oy = 0; scale = 3; draw(); });
+  (function(){ var rail = document.getElementById("rail"), tg = document.getElementById("railToggle");
+    tg.addEventListener("click", function(){ var c = rail.classList.toggle("collapsed"); tg.textContent = c ? "⟨" : "⟩"; tg.title = c ? "Show panel" : "Hide panel"; }); })();
 
   canvas.addEventListener("mousedown", function (e) { dragging = true; canvas.classList.add("dragging"); lastX = e.clientX; lastY = e.clientY; });
   window.addEventListener("mouseup", function () { dragging = false; canvas.classList.remove("dragging"); });
