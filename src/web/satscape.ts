@@ -1208,30 +1208,37 @@ const PLAY_HTML = /* html */ `<!doctype html>
     var plan = c.plan || [];
     var DELTA = { up:{x:0,y:-1}, down:{x:0,y:1}, left:{x:-1,y:0}, right:{x:1,y:0} };
     var mons = battleMonsters(c).filter(function(m){ return !m.dead && m.hp > 0; });
-    // monster position at the START of tick k (when the player acts) = intents[k].from
-    function monAt(m, k){
+    // Match battle.ts simulateBattle: attack cards auto-orient toward the monster's
+    // destination for this tick, so a tick-3 card uses intent 3 rather than the
+    // start of tick 3 (which is where intent 2 ended).
+    function monTargetAt(m, k){
+      var its = m.intents || [], it = its[k];
+      if(it && it.to) return { x:it.to.x, y:it.to.y };
+      return { x:m.x, y:m.y };
+    }
+    function monBlockerAt(m, k){
       var its = m.intents || [], it = its[k];
       if(it && it.from) return { x:it.from.x, y:it.from.y };
-      var last = its.length ? its[its.length-1] : null;
-      return last && last.to ? { x:last.to.x, y:last.to.y } : { x:m.x, y:m.y };
+      return { x:m.x, y:m.y };
     }
     var ppos = { x:c.player.x, y:c.player.y };
     var attacks = [];
     for(var k=0;k<plan.length;k++){
       var a = plan[k];
-      var monPos = mons.map(function(m){ return monAt(m, k); });
+      var monTargets = mons.map(function(m){ return monTargetAt(m, k); });
       if(a.kind === "move"){
         var d = DELTA[a.dir];
         if(d){
           var nx = clampA(ppos.x+d.x), ny = clampA(ppos.y+d.y), blocked = false;
-          for(var b=0;b<monPos.length;b++){ if(monPos[b].x===nx && monPos[b].y===ny){ blocked = true; break; } }
+          var blockers = mons.map(function(m){ return monBlockerAt(m, k); });
+          for(var b=0;b<blockers.length;b++){ if(blockers[b].x===nx && blockers[b].y===ny){ blocked = true; break; } }
           if(!blocked) ppos = { x:nx, y:ny };
         }
       } else if(a.kind === "card"){
         var card = kitCard(c, a.cardId);
-        if(card && card.kind !== "buff" && card.shape && monPos.length){
+        if(card && card.kind !== "buff" && card.shape && monTargets.length){
           var tgt = null, bd = Infinity;
-          for(var i=0;i<monPos.length;i++){ var dd = Math.abs(monPos[i].x-ppos.x)+Math.abs(monPos[i].y-ppos.y); if(dd<bd){ bd = dd; tgt = monPos[i]; } }
+          for(var i=0;i<monTargets.length;i++){ var dd = Math.abs(monTargets[i].x-ppos.x)+Math.abs(monTargets[i].y-ppos.y); if(dd<bd){ bd = dd; tgt = monTargets[i]; } }
           attacks.push({ order: attacks.length+1, tiles: attackTilesJS({x:ppos.x,y:ppos.y}, {x:tgt.x,y:tgt.y}, card.shape), from: {x:ppos.x,y:ppos.y}, target: tgt, emoji: card.emoji });
         }
       }
