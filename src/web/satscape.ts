@@ -45,6 +45,7 @@ import { acceptQuest, claimQuest, getRep, payTribute, questBoard } from "../sats
 import { ALL_ITEMS, effectivePrice, fastTravelRadius, TERRAIN_COLOR, townAt, TOWNS } from "../satscape/towns.js";
 import { verifyPlayToken } from "../satscape/web_tokens.js";
 import type { Direction, ViewModel } from "../satscape/types.js";
+import { UI } from "./satscape_ui_assets.js";
 
 type Claim = ReturnType<typeof verifyPlayToken>;
 
@@ -577,15 +578,17 @@ const PLAY_HTML = /* html */ `<!doctype html>
 <style>
   :root {
     color-scheme: dark;
-    --ink:#0a0e13; --ink-2:#0d131b;
-    --panel-a:#151e28; --panel-b:#0e151d;
-    --line:#2c3a47; --line-soft:#1b2630;
-    --gold:#e8c15a; --gold-deep:#b8861f; --gold-soft:#f6e3a6;
-    --parchment:#ece0c4;
-    --text:#e7e0cf; --muted:#9a917c;
-    --emerald:#5ee08a; --crimson:#fb7185; --cyan:#38d6ee;
-    --shadow:0 12px 34px rgba(0,0,0,.55);
-    --r:12px;
+    --frame: url("${UI.frameMap}");
+    --wood: url("${UI.panelWoodPlain}");
+    --woodDetail: url("${UI.panelWood}");
+    --inset: url("${UI.panelInset}");
+    --banner: url("${UI.banner}");
+    --btn: url("${UI.btn}"); --btnDown: url("${UI.btnPressed}");
+    --btnLong: url("${UI.btnLong}"); --btnLongDown: url("${UI.btnLongPressed}");
+    --btnBlue: url("${UI.btnBlue}"); --btnBlueDown: url("${UI.btnBluePressed}");
+    --gold:#f6e3a6; --gold-deep:#b8861f;
+    --ink:#3a2a14; --ink-soft:#5a3f1c; --parch:#f3e4c2;
+    --text:#f2ead6; --muted:#9a8155;
     --display:'Cinzel','Trajan Pro',Georgia,serif;
     --body:'Spectral','Iowan Old Style',Georgia,serif;
   }
@@ -594,114 +597,160 @@ const PLAY_HTML = /* html */ `<!doctype html>
   body {
     margin:0; color:var(--text); font-family:var(--body); -webkit-font-smoothing:antialiased;
     background:
-      radial-gradient(1100px 560px at 50% -12%, rgba(232,193,90,.12), transparent 60%),
-      radial-gradient(900px 520px at 50% 118%, rgba(56,214,238,.06), transparent 60%),
-      linear-gradient(180deg,#0a0e13,#080b10 55%,#06080c);
+      radial-gradient(1200px 640px at 50% -10%, rgba(120,84,40,.30), transparent 60%),
+      radial-gradient(900px 560px at 50% 120%, rgba(40,60,80,.16), transparent 60%),
+      #14100b;
     background-attachment:fixed;
   }
-  /* film grain + torch vignette */
-  body::before { content:""; position:fixed; inset:0; z-index:0; pointer-events:none; opacity:.045; mix-blend-mode:overlay;
-    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E"); }
-  body::after { content:""; position:fixed; inset:0; z-index:0; pointer-events:none; box-shadow:inset 0 0 220px 50px rgba(0,0,0,.72); }
+  body::before { content:""; position:fixed; inset:0; z-index:0; pointer-events:none; opacity:.05; mix-blend-mode:overlay;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='2'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E"); }
+  body::after { content:""; position:fixed; inset:0; z-index:0; pointer-events:none; box-shadow:inset 0 0 260px 60px rgba(0,0,0,.62); }
   button, input, select { font:inherit; }
-  button {
-    font-family:var(--display); letter-spacing:1px; text-transform:uppercase; font-size:11px; font-weight:600;
-    color:var(--gold-soft); border:1px solid var(--line); border-radius:8px; padding:9px 10px; cursor:pointer;
-    background:linear-gradient(180deg,#1e2a35,#141c25);
-    box-shadow:inset 0 1px 0 rgba(255,255,255,.05), 0 2px 7px rgba(0,0,0,.45);
-    transition:transform .08s ease, border-color .15s, box-shadow .18s, color .15s, background .15s;
-  }
-  button:hover { border-color:var(--gold-deep); color:#fff8e6; box-shadow:0 0 16px rgba(232,193,90,.28), 0 3px 9px rgba(0,0,0,.5); }
-  button:active { transform:translateY(1px); }
-  button:disabled { opacity:.38; cursor:not-allowed; filter:grayscale(.5); box-shadow:none; }
-  button.primary { background:linear-gradient(180deg,#1f7a45,#0e5631); border-color:#2fbf6b; color:#eafff1; text-shadow:0 1px 0 rgba(0,0,0,.4); }
-  button.primary:hover { box-shadow:0 0 18px rgba(94,224,138,.5); border-color:#5ee08a; }
-  button.danger { background:linear-gradient(180deg,#7a2230,#4d1521); border-color:#fb7185; color:#ffe4e9; }
-  button.danger:hover { box-shadow:0 0 16px rgba(251,113,133,.45); }
-  input, select {
-    width:100%; font-family:var(--body); border:1px solid var(--line); background:#0b1219; color:var(--text);
-    border-radius:8px; padding:8px 9px; transition:border-color .15s, box-shadow .15s;
-  }
-  input:focus, select:focus { outline:none; border-color:var(--gold-deep); box-shadow:0 0 0 3px rgba(232,193,90,.13); }
-  ::-webkit-scrollbar { width:9px; height:9px; }
-  ::-webkit-scrollbar-thumb { background:#2a3744; border-radius:9px; border:2px solid transparent; background-clip:padding-box; }
-  ::-webkit-scrollbar-thumb:hover { background:#3c4d5e; }
 
-  .app { position:relative; z-index:1; display:grid; grid-template-columns:minmax(380px,1fr) 360px; justify-content:center; max-width:1120px; margin:0 auto; gap:14px; min-height:100dvh; padding:16px; }
+  /* wood sprite buttons */
+  button {
+    position:relative; font-family:var(--display); letter-spacing:1px; text-transform:uppercase; font-size:11px; font-weight:700;
+    color:#fff3da; text-shadow:0 1px 2px rgba(0,0,0,.55); border:0; cursor:pointer; padding:11px 12px; min-height:42px;
+    background:var(--btnLong) center/100% 100% no-repeat; transition:filter .12s, transform .06s; }
+  button:hover { filter:brightness(1.1); }
+  button:active { background-image:var(--btnLongDown); transform:translateY(1px); }
+  button:disabled { filter:grayscale(.7) brightness(.8); opacity:.55; cursor:not-allowed; }
+  button.primary { background-image:var(--btnBlue); color:#eaf4ff; }
+  button.primary:active { background-image:var(--btnBlueDown); }
+  button.danger { color:#ffd9d4; }
+  button.danger::after { content:""; position:absolute; inset:0; border-radius:9px; box-shadow:inset 0 0 0 2px rgba(180,52,31,.55); pointer-events:none; }
+  button.sq { background-image:var(--btn); min-width:44px; min-height:46px; padding:0; }
+  button.sq:active { background-image:var(--btnDown); }
+
+  input, select {
+    width:100%; font-family:var(--body); color:var(--ink); border:0; padding:9px 11px; min-height:42px;
+    background:var(--inset) center/100% 100% no-repeat; }
+  input:focus, select:focus { outline:none; filter:brightness(1.05) drop-shadow(0 0 4px rgba(184,134,31,.5)); }
+  select { color:var(--ink); }
+  ::-webkit-scrollbar { width:9px; height:9px; }
+  ::-webkit-scrollbar-thumb { background:rgba(90,58,22,.55); border-radius:9px; border:2px solid transparent; background-clip:padding-box; }
+
+  kbd { font-family:var(--display); font-size:10px; font-weight:700; color:#3a2a12; background:linear-gradient(180deg,#f3e4c2,#d8c08c);
+    border:1px solid #9a6a2c; border-bottom-width:2px; border-radius:5px; padding:1px 5px; min-width:16px; display:inline-block; text-align:center;
+    box-shadow:0 1px 0 rgba(0,0,0,.25); line-height:1.5; }
+
+  .app { position:relative; z-index:1; display:grid; grid-template-columns:minmax(360px,1fr) 348px; justify-content:center; max-width:1140px; margin:0 auto; gap:16px; min-height:100dvh; padding:16px; }
   .stage, .side { min-width:0; }
 
+  /* header */
   .top { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:12px; }
   .brand { display:flex; align-items:center; gap:11px; }
   .sigil { width:38px; height:38px; flex:none; display:grid; place-items:center; border-radius:50%; font-family:var(--display); font-weight:700; font-size:19px; color:#3a2a08;
     background:radial-gradient(circle at 34% 28%, #fbe8a8, #d6a32a 46%, #6b4a12); box-shadow:0 0 0 1px rgba(232,193,90,.55), 0 0 18px rgba(232,193,90,.38), inset 0 -3px 6px rgba(0,0,0,.35); }
-  h1 { margin:0; font-family:var(--display); font-weight:700; font-size:23px; letter-spacing:4px; color:var(--parchment); text-shadow:0 1px 0 #000, 0 0 22px rgba(232,193,90,.28); }
+  h1 { margin:0; font-family:var(--display); font-weight:800; font-size:23px; letter-spacing:4px; color:var(--parch); text-shadow:0 1px 0 #000, 0 0 22px rgba(232,193,90,.28); }
   .tagline { font-family:var(--body); font-style:italic; font-size:11.5px; letter-spacing:.5px; color:var(--muted); margin-top:1px; }
-  .coords { font-family:var(--body); font-size:12.5px; color:var(--parchment); background:linear-gradient(180deg,#1a2330,#10171f); border:1px solid var(--gold-deep); border-radius:999px; padding:7px 13px; white-space:nowrap; box-shadow:0 0 16px rgba(232,193,90,.12), inset 0 1px 0 rgba(255,255,255,.05); }
+  .toolbelt { display:flex; gap:7px; align-items:center; }
+  .toolbelt button { min-height:38px; padding:8px 11px; font-size:10px; }
+  .coords { font-family:var(--display); font-size:12px; letter-spacing:1px; color:#fff3da; padding:8px 14px;
+    border-style:solid; border-width:12px 24px; border-color:transparent; border-image:var(--btn) 16 18 fill / 12px 24px / 0 stretch; white-space:nowrap; }
 
-  .bars { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:12px; }
-  .bar { position:relative; border:1px solid var(--line); border-radius:10px; padding:9px 12px; background:linear-gradient(180deg,#141d27,#0d141c); box-shadow:var(--shadow), inset 0 1px 0 rgba(255,255,255,.04); }
-  .bar label { display:flex; justify-content:space-between; font-family:var(--display); letter-spacing:1.5px; text-transform:uppercase; font-size:10px; color:var(--muted); margin-bottom:7px; }
-  .bar label span:last-child { color:var(--parchment); letter-spacing:.5px; }
-  .fill { height:12px; border-radius:999px; background:#0a1118; overflow:hidden; box-shadow:inset 0 1px 3px rgba(0,0,0,.7), inset 0 0 0 1px rgba(255,255,255,.03); }
-  .fill span { position:relative; display:block; height:100%; border-radius:999px; background:linear-gradient(90deg,#2f9d5b,#5ee08a); box-shadow:0 0 12px rgba(94,224,138,.5); transition:width .4s cubic-bezier(.4,0,.2,1); }
-  .fill.hp span { background:linear-gradient(90deg,#7a1f2e,#fb7185); box-shadow:0 0 12px rgba(251,113,133,.5); }
-  .fill span::after { content:""; position:absolute; inset:0; background:linear-gradient(90deg,transparent,rgba(255,255,255,.28),transparent); transform:translateX(-110%); animation:shimmer 2.8s linear infinite; }
-  @keyframes shimmer { to { transform:translateX(110%); } }
+  /* vitals */
+  .vitals { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:12px; }
+  .bar { position:relative; padding:9px 13px; color:var(--ink);
+    border-style:solid; border-width:16px; border-color:transparent; border-image:var(--wood) 30 fill / 14px / 0 stretch; }
+  .bar label { display:flex; justify-content:space-between; font-family:var(--display); letter-spacing:1.5px; text-transform:uppercase; font-size:10px; color:#6b4a18; margin-bottom:6px; }
+  .bar label span:last-child { color:#3a2a12; font-weight:700; }
+  .fill { height:13px; border-radius:999px; background:#3a2c18; overflow:hidden; box-shadow:inset 0 1px 3px rgba(0,0,0,.6); }
+  .fill span { position:relative; display:block; height:100%; border-radius:999px; background:linear-gradient(90deg,#3f8f54,#7ad08a); box-shadow:0 0 10px rgba(122,208,138,.5); transition:width .4s cubic-bezier(.4,0,.2,1); }
+  .fill.hp span { background:linear-gradient(90deg,#9a2230,#e0566a); box-shadow:0 0 10px rgba(224,86,106,.5); }
 
-  .map-frame { position:relative; padding:10px; border-radius:14px; border:1px solid var(--gold-deep);
-    background:linear-gradient(180deg,#1a232d,#0b121a); box-shadow:var(--shadow), inset 0 0 0 1px rgba(232,193,90,.16), inset 0 0 70px rgba(0,0,0,.6); }
-  canvas#play { width:100%; max-height:calc(100dvh - 168px); display:block; background:#070b10; border:1px solid var(--line-soft); border-radius:8px; image-rendering:pixelated; touch-action:none; aspect-ratio:1/1; }
-  #minimap { width:100%; height:120px; display:block; background:#070b10; border:1px solid var(--line-soft); border-radius:8px; image-rendering:pixelated; }
+  /* map */
+  .map-frame { position:relative; padding:8px; border-style:solid; border-width:22px; border-color:transparent; border-image:var(--frame) 22 fill / 22px / 0 stretch; }
+  canvas#play { width:100%; max-height:calc(100dvh - 188px); display:block; background:#0e0a04; border-radius:4px; image-rendering:pixelated; touch-action:none; aspect-ratio:1/1; cursor:crosshair; }
+  body.in-combat canvas#play { cursor:default; }
+  .map-badge { position:absolute; left:18px; top:18px; z-index:3; font-family:var(--display); font-weight:700; font-size:10px; letter-spacing:2px; text-transform:uppercase;
+    color:#fff3da; padding:5px 11px; border-radius:7px; background:rgba(40,24,8,.74); box-shadow:0 0 0 1px rgba(202,164,90,.4); pointer-events:none; }
+  .map-badge::after { content:"Exploring"; }
+  body.in-combat .map-badge { color:#ffd9c0; box-shadow:0 0 0 1px rgba(224,86,106,.55), 0 0 16px rgba(224,86,106,.3); }
+  body.in-combat .map-badge::after { content:"⚔ Battle"; }
 
-  .side { display:flex; flex-direction:column; gap:12px; max-height:calc(100dvh - 20px); overflow:auto; padding-right:2px; }
-  .panel { position:relative; background:linear-gradient(180deg,var(--panel-a),var(--panel-b)); border:1px solid var(--line); border-radius:var(--r); padding:12px; box-shadow:var(--shadow); animation:rise .5s both; }
-  .panel::before { content:""; position:absolute; left:12px; right:12px; top:0; height:1px; background:linear-gradient(90deg,transparent,var(--gold-deep),transparent); opacity:.55; }
-  .panel:nth-child(1){animation-delay:.04s} .panel:nth-child(2){animation-delay:.09s} .panel:nth-child(3){animation-delay:.14s}
-  .panel:nth-child(4){animation-delay:.19s} .panel:nth-child(5){animation-delay:.24s} .panel:nth-child(6){animation-delay:.29s} .panel:nth-child(7){animation-delay:.34s}
-  @keyframes rise { from { opacity:0; transform:translateY(12px); } to { opacity:1; transform:none; } }
-  .panel h2 { margin:0 0 9px; font-family:var(--display); font-weight:600; font-size:12px; letter-spacing:2px; text-transform:uppercase; color:var(--gold-soft); display:flex; align-items:center; gap:8px; }
-  .panel h2::before { content:""; width:6px; height:6px; transform:rotate(45deg); background:var(--gold); box-shadow:0 0 9px var(--gold); }
+  /* on-map D-pad (single, context-aware: walks the world or queues a battle step) */
+  .dpad { position:absolute; right:16px; bottom:16px; z-index:3; display:grid; grid-template-columns:repeat(3,40px); grid-template-rows:repeat(3,40px); gap:4px; pointer-events:none; }
+  .dpad button { pointer-events:auto; min-height:40px; min-width:40px; padding:0; font-size:15px; opacity:.92; }
+  .dpad .up { grid-area:1/2; } .dpad .left { grid-area:2/1; } .dpad .right { grid-area:2/3; } .dpad .down { grid-area:3/2; }
 
-  .grid4 { display:grid; grid-template-columns:repeat(3,1fr); gap:6px; }
-  .grid4 button { padding:12px 0; }
-  .grid4 .up { grid-column:2; } .grid4 .left { grid-column:1; } .grid4 .down { grid-column:2; } .grid4 .right { grid-column:3; }
-  .row { display:flex; gap:6px; align-items:center; }
+  /* side ledger */
+  .side { display:flex; flex-direction:column; gap:13px; max-height:calc(100dvh - 20px); overflow:auto; padding-right:2px; }
+  .panel { position:relative; color:var(--ink); padding:6px;
+    border-style:solid; border-width:18px; border-color:transparent; border-image:var(--wood) 30 fill / 18px / 0 stretch;
+    filter:drop-shadow(0 10px 20px rgba(0,0,0,.4)); }
+  .sheet { border-style:solid; border-width:16px; border-color:transparent; border-image:var(--inset) 28 fill / 14px / 0 stretch; padding:10px 12px 11px; }
+  .panel h2 { margin:0 0 9px; font-family:var(--display); font-weight:700; font-size:12px; letter-spacing:2px; text-transform:uppercase; color:#5a3a16;
+    display:flex; align-items:center; justify-content:space-between; gap:8px; border-bottom:1px solid rgba(90,58,22,.28); padding-bottom:7px; }
+  .panel h2 .hint { font-family:var(--body); font-weight:400; font-size:10.5px; letter-spacing:0; text-transform:none; color:#7a5a2a; }
+
+  .row { display:flex; gap:7px; align-items:center; }
   .row > * { flex:1; }
+  .muted { color:#6b542f; font-size:12px; font-family:var(--body); }
 
-  #battleControls { border-color:var(--gold-deep); box-shadow:var(--shadow), 0 0 0 1px rgba(232,193,90,.12), 0 0 46px rgba(232,193,90,.06); }
-  #battleControls h2 { color:#ffe9b0; }
-  #apText { font-family:var(--display); letter-spacing:1px; font-size:12px; color:var(--gold-soft); text-shadow:0 0 10px rgba(232,193,90,.3); }
-  #cardTray { display:flex; flex-wrap:wrap; gap:7px; }
-  #cardTray button { flex:1 1 calc(50% - 4px); min-width:118px; text-align:left; text-transform:none; letter-spacing:.2px; font-family:var(--body); font-size:13px; font-weight:500; padding:10px 11px; border-radius:10px; border-color:#3b6f95; color:#d6ecff; background:linear-gradient(160deg,#15212e,#0e1822); }
-  #cardTray button:hover { transform:translateY(-2px); box-shadow:0 0 16px rgba(59,125,168,.3), 0 4px 10px rgba(0,0,0,.5); }
-  #cardTray button.primary { border-color:var(--gold-deep); color:var(--gold-soft); background:linear-gradient(160deg,#241c10,#15110a); text-shadow:none; }
-  #cardTray button.primary:hover { box-shadow:0 0 16px rgba(232,193,90,.32), 0 4px 10px rgba(0,0,0,.5); }
-  #statusRow { font-family:var(--body); font-size:12px; color:var(--muted); display:grid; gap:3px; }
+  /* context visibility */
+  .only-combat { display:none; }
+  body.in-combat .only-combat { display:block; }
+  body.in-combat .only-explore { display:none; }
 
-  .tabs { display:flex; gap:6px; }
-  .tabs button { flex:1; }
-  .tabs button.active { border-color:var(--gold); color:var(--gold-soft); background:linear-gradient(180deg,#241c10,#15110a); box-shadow:0 0 13px rgba(232,193,90,.2); }
-  .list { display:flex; flex-direction:column; max-height:172px; overflow:auto; }
-  .item { display:grid; grid-template-columns:1fr auto; gap:10px; align-items:center; border-top:1px solid var(--line-soft); padding:8px 2px; font-size:13px; font-family:var(--body); }
+  /* note ribbon under the map */
+  #note { font-family:var(--body); font-style:italic; color:#3a2a12; white-space:pre-wrap; font-size:13.5px; line-height:1.5; min-height:24px; }
+
+  #minimap { width:100%; height:120px; display:block; border-radius:4px; image-rendering:pixelated; background:#0e0a04; }
+
+  /* travel */
+  #travelText { margin-top:8px; min-height:18px; }
+
+  /* combat */
+  #battleControls { border-image:var(--woodDetail) 22 fill / 18px / 0 stretch; }
+  .ap-line { display:flex; align-items:center; justify-content:space-between; margin-bottom:8px; }
+  #apText { font-family:var(--display); letter-spacing:.5px; font-size:12px; font-weight:700; color:#6b3f10; }
+  #cardTray { display:grid; grid-template-columns:1fr 1fr; gap:7px; margin-bottom:9px; }
+  #cardTray button { text-transform:none; letter-spacing:.2px; font-family:var(--body); font-size:12.5px; font-weight:600; text-align:left;
+    padding:9px 10px 9px 28px; min-height:46px; color:#fff3da; }
+  #cardTray button .hot { position:absolute; left:6px; top:6px; }
+  #cardTray button b { color:var(--gold); font-weight:700; }
+  .actbar { display:grid; grid-template-columns:1fr 1fr; gap:7px; margin-top:9px; }
+  .actbar .wide { grid-column:1 / -1; }
+  .actbar button .hot, .toolbelt button .hot, #travel .hot { margin-left:6px; }
+  #weapon { font-size:12px; min-height:38px; }
+  #weaponBtn { flex:0 0 auto; min-width:72px; min-height:38px; padding:8px 12px; font-size:10px; }
+  #statusRow { font-family:var(--body); font-size:12px; color:#5a3f1c; display:grid; gap:3px; margin-top:8px; }
+  #battleTurnText { margin-top:8px; font-size:12px; color:#6b542f; }
+  .turn-track { display:grid; gap:5px; margin-top:7px; max-height:118px; overflow:auto; }
+  .turn-step { border-left:3px solid rgba(90,58,22,.4); border-radius:5px; padding:5px 8px; background:rgba(255,250,235,.45); font-size:11.5px; color:#4a3318; }
+  .turn-step.attack { border-left-color:#c2433f; color:#7a241f; background:rgba(224,86,106,.12); }
+  .turn-step.advance { border-left-color:#c08a1a; color:#6b4a10; }
+  .turn-step.rest { border-left-color:#7a6a4a; }
+  .turn-slot { display:inline-flex; align-items:center; justify-content:center; min-width:48px; height:30px; margin:0 5px 5px 0; border:1px solid rgba(90,58,22,.4); border-radius:6px; background:rgba(255,250,235,.4); font-size:11.5px; color:#6b542f; }
+  .turn-slot.filled { border-color:#c08a1a; color:#6b3f10; font-weight:700; box-shadow:0 0 8px rgba(192,138,26,.25); }
+  .log-label { font-family:var(--display); font-size:10px; letter-spacing:2px; text-transform:uppercase; color:#7a5a2a; margin-top:11px; }
+  #battleLog { margin-top:5px; max-height:118px; overflow:auto; font-family:var(--body); font-size:12px; line-height:1.55; border-radius:6px; padding:7px 9px; background:rgba(30,18,6,.5); color:#e8dcc0; box-shadow:inset 0 0 18px rgba(0,0,0,.45); }
+  #battleLog .log-turn { color:#caa45a !important; }
+
+  /* tabs / lists */
+  .tabs { display:flex; gap:6px; margin-bottom:9px; }
+  .tabs button { flex:1; min-height:38px; padding:8px 6px; font-size:10px; }
+  .tabs button.active { background-image:var(--btnBlue); color:#eaf4ff; }
+  .list { display:flex; flex-direction:column; max-height:188px; overflow:auto; }
+  .item { display:grid; grid-template-columns:1fr auto; gap:10px; align-items:center; border-top:1px solid rgba(90,58,22,.22); padding:8px 2px; font-size:13px; font-family:var(--body); color:#4a3318; }
   .item:first-child { border-top:0; }
-  .item button { padding:6px 11px; }
+  .item button { min-height:34px; padding:6px 12px; }
 
-  .muted { color:var(--muted); font-size:12px; font-family:var(--body); }
-  .note { font-family:var(--body); font-style:italic; color:var(--parchment); white-space:pre-wrap; font-size:13.5px; line-height:1.5; min-height:42px; max-height:98px; overflow:auto; border-left:3px solid var(--gold-deep); padding-left:11px; background:linear-gradient(90deg,rgba(232,193,90,.05),transparent); }
-  .turn-track { display:grid; gap:6px; margin-top:8px; }
-  .turn-step { border:1px solid var(--line-soft); border-left:3px solid var(--line); border-radius:8px; padding:7px 9px; background:#0d141c; font-size:12px; font-family:var(--body); }
-  .turn-step.attack { border-left-color:var(--crimson); color:#fecdd3; background:linear-gradient(90deg,rgba(251,113,133,.09),transparent); }
-  .turn-step.advance { border-left-color:var(--gold); color:#fde68a; }
-  .turn-step.rest { border-left-color:#475569; color:#cbd5e1; }
-  .turn-slot { display:inline-flex; align-items:center; justify-content:center; min-width:46px; height:32px; margin:0 5px 5px 0; border:1px solid var(--line); border-radius:8px; background:#0d141c; font-size:12px; font-family:var(--body); color:var(--muted); }
-  .turn-slot.filled { border-color:var(--gold); color:var(--gold-soft); box-shadow:0 0 11px rgba(232,193,90,.22); }
-  .log-label { font-family:var(--display); font-size:10px; letter-spacing:2px; text-transform:uppercase; color:var(--muted); margin-top:11px; }
-  #battleLog { margin-top:5px; max-height:132px; overflow:auto; font-family:var(--body); font-size:12px; line-height:1.6; border:1px solid var(--line-soft); border-radius:8px; padding:8px 10px; background:linear-gradient(180deg,#0a0f15,#0c1219); box-shadow:inset 0 0 22px rgba(0,0,0,.55); }
-  .toggle { display:flex; align-items:center; gap:8px; margin-top:8px; color:var(--muted); font-size:12px; font-family:var(--body); }
-  .toggle input { width:auto; }
+  /* keyboard legend */
+  details.keys { padding:6px; border-style:solid; border-width:18px; border-color:transparent; border-image:var(--wood) 30 fill / 18px / 0 stretch; }
+  details.keys > summary { cursor:pointer; list-style:none; font-family:var(--display); font-weight:700; font-size:11px; letter-spacing:2px; text-transform:uppercase; color:#5a3a16; }
+  details.keys > summary::-webkit-details-marker { display:none; }
+  details.keys[open] > summary { margin-bottom:8px; border-bottom:1px solid rgba(90,58,22,.28); padding-bottom:7px; }
+  .keys .klist { display:grid; grid-template-columns:1fr 1fr; gap:5px 12px; font-size:12px; color:#4a3318; }
+  .keys .klist div { display:flex; align-items:center; gap:6px; }
 
-  @media (max-width: 860px) { .app { grid-template-columns:1fr; } .side { max-height:none; overflow:visible; } canvas#play { max-height:none; } }
-  @media (prefers-reduced-motion: reduce) { .panel { animation:none; } .fill span::after { animation:none; } }
+  @media (max-width: 880px) {
+    .app { grid-template-columns:1fr; }
+    .side { max-height:none; overflow:visible; }
+    canvas#play { max-height:none; }
+  }
+  @media (prefers-reduced-motion: reduce) { .fill span { transition:none; } }
 </style>
 </head>
 <body>
@@ -709,57 +758,86 @@ const PLAY_HTML = /* html */ `<!doctype html>
   <section class="stage">
     <div class="top">
       <div class="brand"><span class="sigil">₿</span><div><h1>SATSCAPE</h1><div class="tagline">Adventurer's Ledger</div></div></div>
-      <div class="coords" id="coords">loading</div>
+      <div class="toolbelt">
+        <button id="eat" title="Eat bread to restore stamina (E)">Eat <kbd>E</kbd></button>
+        <button id="refresh" title="Refresh the realm (R)">↻ <kbd>R</kbd></button>
+        <div class="coords" id="coords">loading</div>
+      </div>
     </div>
-    <div class="bars">
-      <div class="bar"><label><span>HP</span><span id="hpText">0/0</span></label><div class="fill hp"><span id="hpFill"></span></div></div>
+    <div class="vitals">
+      <div class="bar"><label><span>Health</span><span id="hpText">0/0</span></label><div class="fill hp"><span id="hpFill"></span></div></div>
       <div class="bar"><label><span>Stamina</span><span id="stText">0%</span></label><div class="fill"><span id="stFill"></span></div></div>
     </div>
-    <div class="map-frame"><canvas id="play" width="512" height="512"></canvas></div>
+    <div class="map-frame">
+      <div class="map-badge"></div>
+      <canvas id="play" width="512" height="512"></canvas>
+      <div class="dpad">
+        <button class="sq up" data-move="up" title="North (W / ↑)">▲</button>
+        <button class="sq left" data-move="left" title="West (A / ←)">◀</button>
+        <button class="sq right" data-move="right" title="East (D / →)">▶</button>
+        <button class="sq down" data-move="down" title="South (S / ↓)">▼</button>
+      </div>
+    </div>
+    <div style="margin-top:11px"><div class="panel"><div class="sheet" id="note">Opening SatScape…</div></div></div>
   </section>
   <aside class="side">
-    <div class="panel note" id="note">Opening SatScape...</div>
-    <div class="panel"><canvas id="minimap" width="320" height="118"></canvas></div>
-    <div class="panel">
-      <h2>Move</h2>
-      <div class="grid4">
-        <button class="up" data-move="up" title="Move north">Up</button>
-        <button class="left" data-move="left" title="Move west">Left</button>
-        <button class="down" data-move="down" title="Move south">Down</button>
-        <button class="right" data-move="right" title="Move east">Right</button>
+    <!-- COMBAT: shown only while fighting -->
+    <div class="panel only-combat" id="battleControls">
+      <div class="sheet">
+        <h2>Battle <span class="hint" id="battleTurnText"></span></h2>
+        <div class="ap-line"><span id="apText"></span></div>
+        <div id="battlePlan"></div>
+        <div id="cardTray"></div>
+        <div class="row"><select id="weapon"></select><button id="weaponBtn">Ready</button></div>
+        <div class="actbar">
+          <button id="resolve" class="primary wide">Resolve <kbd>↵</kbd></button>
+          <button id="undo">Undo <kbd>Z</kbd></button>
+          <button id="wait">Wait <kbd>Q</kbd></button>
+          <button id="flee" class="danger wide">Flee <kbd>F</kbd></button>
+        </div>
+        <div id="statusRow"></div>
+        <div class="turn-track" id="monsterPlan"></div>
+        <div class="log-label">Battle Log</div>
+        <div id="battleLog"></div>
       </div>
-      <div class="row" style="margin-top:8px"><button id="eat">Eat</button><button id="refresh">Refresh</button></div>
     </div>
-    <div class="panel">
-      <h2>HP Refill</h2>
-      <div class="row"><input id="hpInput" type="number" min="0" step="1"><button id="refill" class="primary">Refill</button></div>
-      <div class="muted" id="bankText"></div>
-    </div>
-    <div class="panel" id="battleControls">
-      <h2>Battle</h2>
-      <div class="muted" id="apText" style="margin-bottom:6px"></div>
-      <div id="cardTray" style="display:flex;flex-wrap:wrap;gap:6px"></div>
-      <div class="row" style="margin-top:6px"><button data-bmove="up" title="Queue north (1 AP)">Up</button><button data-bmove="down" title="Queue south (1 AP)">Down</button><button data-bmove="left" title="Queue west (1 AP)">Left</button><button data-bmove="right" title="Queue east (1 AP)">Right</button></div>
-      <div class="row" style="margin-top:6px"><select id="weapon"></select><button id="weaponBtn">Ready</button></div>
-      <div class="row" style="margin-top:6px"><button id="wait">Wait</button><button id="undo">Undo</button><button id="resolve" class="primary">Resolve</button><button id="flee" class="danger">Flee</button></div>
-      <div id="statusRow" style="margin-top:7px;font-size:12px"></div>
-      <div class="muted" id="battleTurnText" style="margin-top:7px"></div>
-      <div id="battlePlan" style="margin-top:6px"></div>
-      <div class="turn-track" id="monsterPlan"></div>
-      <div class="log-label">Battle Log</div>
-      <div id="battleLog"></div>
-    </div>
-    <div class="panel">
-      <h2>Travel</h2>
-      <div class="row"><input id="tx" type="number" placeholder="x"><input id="ty" type="number" placeholder="y"></div>
-      <label class="toggle"><input id="clickTravel" type="checkbox"> Click map to fast travel</label>
-      <div class="row" style="margin-top:6px"><button id="estimate">Estimate</button><button id="travel" class="primary">Travel</button></div>
-      <div class="muted" id="travelText"></div>
-    </div>
-    <div class="panel">
-      <div class="tabs"><button id="tabShop">Shop</button><button id="tabQuests">Quests</button><button id="tabGear">Gear</button></div>
-      <div class="list" id="list" style="margin-top:10px"></div>
-    </div>
+
+    <!-- EXPLORING: hidden during combat -->
+    <div class="panel only-explore"><div class="sheet">
+      <h2>The Known World <span class="hint">hold <kbd>M</kbd> for atlas</span></h2>
+      <canvas id="minimap" width="320" height="118"></canvas>
+    </div></div>
+    <div class="panel only-explore"><div class="sheet">
+      <h2>Fast Travel <span class="hint">click a tile in range</span></h2>
+      <div id="travelText" class="muted">Click anywhere on the map to set a destination.</div>
+      <input id="tx" type="hidden"><input id="ty" type="hidden">
+      <button id="travel" class="primary" style="width:100%;margin-top:8px" disabled>Travel</button>
+    </div></div>
+    <div class="panel only-explore"><div class="sheet">
+      <h2>Provisions</h2>
+      <div class="row"><input id="hpInput" type="number" min="0" step="1" placeholder="sats"><button id="refill" class="primary">Refill HP</button></div>
+      <div class="muted" id="bankText" style="margin-top:7px"></div>
+    </div></div>
+    <div class="panel only-explore"><div class="sheet">
+      <div class="tabs"><button id="tabGear">Gear</button><button id="tabShop">Shop</button><button id="tabQuests">Quests</button></div>
+      <div class="list" id="list"></div>
+    </div></div>
+
+    <details class="keys">
+      <summary>Keyboard</summary>
+      <div class="klist">
+        <div><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> Move</div>
+        <div><kbd>M</kbd> Atlas (hold)</div>
+        <div><kbd>E</kbd> Eat</div>
+        <div><kbd>R</kbd> Refresh</div>
+        <div><kbd>1</kbd>–<kbd>9</kbd> Cards</div>
+        <div><kbd>↵</kbd> Resolve</div>
+        <div><kbd>Q</kbd> Wait</div>
+        <div><kbd>Z</kbd> Undo</div>
+        <div><kbd>F</kbd> Flee</div>
+        <div><span class="muted">click map</span> Travel</div>
+      </div>
+    </details>
   </aside>
 </main>
 <script>
@@ -767,7 +845,7 @@ const PLAY_HTML = /* html */ `<!doctype html>
   var token = new URLSearchParams(location.search).get("t") || localStorage.getItem("satscapeToken") || "";
   if (token) localStorage.setItem("satscapeToken", token);
   var state = null, activeTab = location.hash === "#quests" ? "quests" : location.hash === "#shop" ? "shop" : "gear";
-  var clickTravel = false, showWorldMap = false, battleAnimStart = performance.now(), lastCombatKey = "";
+  var showWorldMap = false, battleAnimStart = performance.now(), lastCombatKey = "";
   var reduceMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   var inflight = 0;   // battle POSTs in flight — pause the poll so it can't clobber optimistic state
   var playing = false; // a resolution playback animation is running
@@ -1357,7 +1435,7 @@ const PLAY_HTML = /* html */ `<!doctype html>
     if(!c){
       turnEl.textContent = "Not in combat."; apEl.textContent = "";
       document.getElementById("resolve").disabled = true;
-      document.querySelectorAll("[data-bmove]").forEach(function(b){ b.disabled = true; });
+      document.querySelectorAll("[data-move]").forEach(function(b){ b.disabled = false; });
       document.getElementById("wait").disabled = true;
       document.getElementById("undo").disabled = true;
       return;
@@ -1399,7 +1477,7 @@ const PLAY_HTML = /* html */ `<!doctype html>
     });
     document.getElementById("resolve").disabled = playing;
     var noTicks = ticksLeft <= 0 || playing;
-    document.querySelectorAll("[data-bmove]").forEach(function(b){ b.disabled = noTicks || remainingAp < 1; });
+    document.querySelectorAll("[data-move]").forEach(function(b){ b.disabled = noTicks || remainingAp < 1; });
     document.getElementById("wait").disabled = noTicks;
     document.getElementById("undo").disabled = plan.length === 0 || playing;
   }
@@ -1415,9 +1493,10 @@ const PLAY_HTML = /* html */ `<!doctype html>
     document.getElementById("bankText").textContent = needed > 0 ? needed + " banked sats can be committed to HP." : "No HP refill available.";
     document.getElementById("battleControls").style.opacity = state.combat ? "1" : ".45";
     var tray = document.getElementById("cardTray"); tray.innerHTML = "";
-    ((state.combat && state.combat.kit) || []).forEach(function(card){
+    ((state.combat && state.combat.kit) || []).forEach(function(card, idx){
       var b = document.createElement("button");
-      b.textContent = card.emoji + " " + card.name + " " + card.apCost + "⚡";
+      var hot = idx < 9 ? '<span class="hot"><kbd>' + (idx + 1) + '</kbd></span>' : '';
+      b.innerHTML = hot + card.emoji + " " + card.name + " <b>" + card.apCost + "⚡</b>";
       b.title = card.desc;
       b.className = card.kind === "buff" ? "" : "primary";
       b.disabled = !card.affordable;
@@ -1446,9 +1525,9 @@ const PLAY_HTML = /* html */ `<!doctype html>
     }
   }
   function addItem(label, button, cb){ var el=document.createElement("div"); el.className="item"; var s=document.createElement("span"); s.textContent=label; var b=document.createElement("button"); b.textContent=button; b.onclick=cb; el.appendChild(s); el.appendChild(b); document.getElementById("list").appendChild(el); }
-  function render(){ if(!state || state.error) return; if(showWorldMap) drawExpandedMap(); else if(state.combat) drawBattle(); else drawMap(); drawMinimap(); renderPanels(); }
-  document.querySelectorAll("[data-move]").forEach(function(b){ b.onclick=function(){ act("/satscape/api/move", { dir:b.dataset.move }); }; });
-  document.querySelectorAll("[data-bmove]").forEach(function(b){ b.onclick=function(){ battleQueue({ kind:"move", dir:b.dataset.bmove }, { action:"move", dir:b.dataset.bmove }); }; });
+  function render(){ if(!state || state.error) return; document.body.classList.toggle("in-combat", !!state.combat); if(showWorldMap) drawExpandedMap(); else if(state.combat) drawBattle(); else drawMap(); drawMinimap(); renderPanels(); }
+  // One context-aware D-pad: walks the overworld, or queues a battle step when fighting.
+  document.querySelectorAll("[data-move]").forEach(function(b){ b.onclick=function(){ var d=b.dataset.move; if(state && state.combat) battleQueue({ kind:"move", dir:d }, { action:"move", dir:d }); else act("/satscape/api/move", { dir:d }); }; });
   document.getElementById("eat").onclick=function(){ act("/satscape/api/eat", {}); };
   document.getElementById("refresh").onclick=function(){ api("/satscape/api/state?full=1").then(setState).catch(function(e){ note.textContent=e.message; }); };
   document.getElementById("refill").onclick=function(){ act("/satscape/api/refill-hp", { sats:Number(document.getElementById("hpInput").value || 0) }); };
@@ -1457,9 +1536,9 @@ const PLAY_HTML = /* html */ `<!doctype html>
   document.getElementById("undo").onclick=function(){ battleUndo(); };
   document.getElementById("resolve").onclick=function(){ resolveBattle(); };
   document.getElementById("flee").onclick=function(){ act("/satscape/api/battle", { action:"flee" }); };
-  document.getElementById("estimate").onclick=function(){ act("/satscape/api/travel", { estimate:true, tx:Number(document.getElementById("tx").value), ty:Number(document.getElementById("ty").value) }); };
-  document.getElementById("travel").onclick=function(){ act("/satscape/api/travel", { tx:Number(document.getElementById("tx").value), ty:Number(document.getElementById("ty").value) }); };
-  document.getElementById("clickTravel").onchange=function(e){ clickTravel = !!e.target.checked; document.getElementById("travelText").textContent = clickTravel ? "Click any visible map tile to travel immediately." : ""; };
+  var travelBtn = document.getElementById("travel");
+  travelBtn.onclick=function(){ if(travelBtn.disabled) return; act("/satscape/api/travel", { tx:Number(document.getElementById("tx").value), ty:Number(document.getElementById("ty").value) }); };
+  // Click-to-travel: clicking a reachable tile arms the Travel button and fetches an estimate.
   play.addEventListener("click", function(e){
     if(!state || state.combat || showWorldMap) return;
     var r = play.getBoundingClientRect(), b = state.viewport.bounds;
@@ -1469,13 +1548,14 @@ const PLAY_HTML = /* html */ `<!doctype html>
     document.getElementById("ty").value = String(y);
     var rad = state.player.travelRadius || 0;
     var reach = Math.max(Math.abs(x - state.player.x), Math.abs(y - state.player.y));
-    if(clickTravel){
-      if(reach > rad){ document.getElementById("travelText").textContent = "Out of fast-travel range (" + (rad*2+1) + "×" + (rad*2+1) + ")."; return; }
-      document.getElementById("travelText").textContent = "Travelling to (" + x + ", " + y + ")...";
-      act("/satscape/api/travel", { tx:x, ty:y });
-    } else {
-      document.getElementById("travelText").textContent = "Target (" + x + ", " + y + ")" + (reach > rad ? " — out of range" : "") + ".";
+    if(reach > rad){
+      travelBtn.disabled = true; travelBtn.textContent = "Travel";
+      document.getElementById("travelText").textContent = "(" + x + ", " + y + ") is beyond your reach (" + (rad*2+1) + "×" + (rad*2+1) + " around you).";
+      return;
     }
+    travelBtn.disabled = false; travelBtn.textContent = "Travel → (" + x + ", " + y + ")";
+    document.getElementById("travelText").textContent = "Charting a route…";
+    act("/satscape/api/travel", { estimate:true, tx:x, ty:y });
   });
   ["Shop","Quests","Gear"].forEach(function(n){ document.getElementById("tab"+n).onclick=function(){ activeTab=n.toLowerCase(); renderList(); }; });
   function typingTarget(el){ return el && (el.tagName === "INPUT" || el.tagName === "SELECT" || el.tagName === "TEXTAREA" || el.isContentEditable); }
@@ -1534,44 +1614,195 @@ const PAGE_HTML = /* html */ `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>SatScape - Global Map</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>SatScape · World Map</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@600;700;800&family=Spectral:ital,wght@0,400;0,500;0,600;1,400&display=swap" rel="stylesheet">
 <style>
-  :root { color-scheme: dark; }
+  :root {
+    color-scheme: dark;
+    --frame: url("${UI.frameMap}");
+    --wood: url("${UI.panelWoodPlain}");
+    --woodDetail: url("${UI.panelWood}");
+    --inset: url("${UI.panelInset}");
+    --banner: url("${UI.banner}");
+    --btn: url("${UI.btn}");
+    --btnDown: url("${UI.btnPressed}");
+    --ink:#2a1c10; --parch:#f3e4c2; --parch-deep:#e6d2a4; --gold:#f6e3a6;
+    --display:'Cinzel',Georgia,serif; --body:'Spectral',Georgia,serif;
+  }
   * { box-sizing: border-box; }
-  body { margin: 0; background: #020617; color: #f8fafc; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-  header { display: flex; align-items: baseline; gap: 12px; padding: 16px 20px; }
-  h1 { font-size: 18px; letter-spacing: 2px; margin: 0; font-weight: 800; }
-  .meta { color: #64748b; font-size: 12px; }
-  .wrap { display: flex; justify-content: center; padding: 0 16px 24px; }
-  canvas { background: #020617; border: 1px solid #1e293b; border-radius: 12px; box-shadow: 0 20px 60px rgba(0,0,0,.5); max-width: 100%; touch-action: none; }
-  .hint { text-align: center; color: #475569; font-size: 11px; padding-bottom: 24px; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; color: #f2ead6; font-family: var(--body); -webkit-font-smoothing: antialiased;
+    background:
+      radial-gradient(1200px 700px at 50% -10%, rgba(120,84,40,.30), transparent 60%),
+      radial-gradient(900px 600px at 50% 120%, rgba(40,60,80,.18), transparent 60%),
+      #14100b;
+  }
+  /* parchment-fiber grain over a deep tabletop */
+  body::before { content:""; position:fixed; inset:0; pointer-events:none; opacity:.05; mix-blend-mode:overlay; z-index:0;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='2'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E"); }
+  body::after { content:""; position:fixed; inset:0; pointer-events:none; z-index:0; box-shadow:inset 0 0 260px 60px rgba(0,0,0,.6); }
+
+  .page { position:relative; z-index:1; max-width:1240px; margin:0 auto; padding:18px 18px 28px; }
+
+  header { display:flex; flex-direction:column; align-items:center; gap:6px; margin-bottom:14px; }
+  .banner {
+    position:relative; min-width:340px; padding:14px 30px 16px; text-align:center;
+    border-style:solid; border-width:22px 56px; border-color:transparent;
+    border-image: var(--banner) 22 56 fill / 22px 56px / 0 stretch;
+    filter: drop-shadow(0 10px 18px rgba(0,0,0,.5));
+  }
+  h1 { margin:0; font-family:var(--display); font-weight:800; font-size:clamp(20px,3.4vw,30px); letter-spacing:5px;
+    color:#fff5df; text-shadow:0 2px 0 #6e2b25, 0 0 18px rgba(0,0,0,.35); }
+  .meta { font-family:var(--display); font-size:12px; letter-spacing:2.5px; text-transform:uppercase; color:var(--gold);
+    text-shadow:0 1px 2px rgba(0,0,0,.6); }
+
+  .layout { display:grid; grid-template-columns:1fr 268px; gap:16px; align-items:start; }
+
+  /* the framed map */
+  .map-frame { position:relative; padding:10px; border-style:solid; border-width:22px; border-color:transparent; border-image: var(--frame) 22 fill / 22px / 0 stretch; }
+  .map-stage { position:relative; border-radius:6px; overflow:hidden; box-shadow:inset 0 0 90px rgba(0,0,0,.7); }
+  canvas#map { display:block; width:100%; height:auto; background:#0e1622; touch-action:none; cursor:grab; }
+  canvas#map.dragging { cursor:grabbing; }
+
+  /* compass overlay, built from the pack's minimap compass tiles */
+  .compass { position:absolute; right:18px; top:18px; width:104px; height:104px; pointer-events:none;
+    filter: drop-shadow(0 4px 8px rgba(0,0,0,.6)); opacity:.95; }
+  .compass span { position:absolute; width:30px; height:30px; background-size:100% 100%; background-repeat:no-repeat; }
+  .compass .c-hub { left:37px; top:37px; width:30px; height:30px; border-radius:50%;
+    background:radial-gradient(circle at 38% 32%, #fbe8a8, #b8861f 60%, #5a3c10); box-shadow:0 0 0 2px rgba(0,0,0,.4), 0 0 12px rgba(246,227,166,.5); }
+  .compass .c-n { left:37px; top:0;  background-image:url("${UI.compassN}"); }
+  .compass .c-s { left:37px; bottom:0; background-image:url("${UI.compassS}"); }
+  .compass .c-w { left:0;  top:37px; background-image:url("${UI.compassW}"); }
+  .compass .c-e { right:0; top:37px; background-image:url("${UI.compassE}"); }
+
+  /* zoom + recenter controls */
+  .controls { position:absolute; left:18px; bottom:18px; display:flex; flex-direction:column; gap:8px; }
+  .ctl { width:44px; height:44px; border:0; cursor:pointer; background:transparent; background-image:var(--btn);
+    background-size:100% 100%; background-repeat:no-repeat; color:#fff3da; font-family:var(--display); font-weight:700; font-size:20px;
+    text-shadow:0 1px 2px rgba(0,0,0,.6); display:grid; place-items:center; transition:filter .12s; }
+  .ctl:hover { filter:brightness(1.12); }
+  .ctl:active { background-image:var(--btnDown); transform:translateY(1px); }
+  .ctl.wide { width:auto; padding:0 12px; font-size:11px; letter-spacing:1.5px; text-transform:uppercase; }
+
+  /* side ledger */
+  aside { display:flex; flex-direction:column; gap:14px; }
+  .panel { position:relative; padding:10px; color:#3a2a14; border-style:solid; border-width:18px; border-color:transparent;
+    border-image: var(--wood) 30 fill / 18px / 0 stretch; filter: drop-shadow(0 10px 20px rgba(0,0,0,.45)); }
+  .panel .sheet { border-style:solid; border-width:16px; border-color:transparent; border-image: var(--inset) 28 fill / 16px / 0 stretch; padding:6px 8px 4px; }
+  .panel h2 { margin:0 0 10px; font-family:var(--display); font-weight:700; font-size:13px; letter-spacing:2px; text-transform:uppercase;
+    color:#5a3a16; border-bottom:1px solid rgba(90,58,22,.3); padding-bottom:7px; }
+
+  .stat { display:flex; align-items:baseline; justify-content:space-between; padding:5px 0; font-family:var(--body); font-size:14px; color:#4a3318; }
+  .stat .v { font-family:var(--display); font-weight:700; font-size:18px; color:#7a4a14; }
+
+  .legend { display:grid; gap:9px; }
+  .legend .row { display:flex; align-items:center; gap:10px; font-size:13.5px; color:#4a3318; }
+  .legend .ico { width:18px; height:18px; flex:none; background-size:contain; background-repeat:no-repeat; background-position:center; }
+  .legend .ring { width:18px; height:18px; border:2px solid #9a6a2c; border-radius:50%; background:rgba(154,106,44,.12); }
+  .legend .swatch { width:16px; height:16px; flex:none; border-radius:3px; box-shadow:inset 0 0 0 1px rgba(0,0,0,.25); }
+
+  .roster { display:flex; flex-direction:column; gap:7px; max-height:280px; overflow:auto; }
+  .who { display:grid; grid-template-columns:auto 1fr auto; gap:9px; align-items:center; font-size:13px; color:#3f2c12; }
+  .who .dot { width:11px; height:11px; border-radius:50%; box-shadow:0 0 0 2px rgba(0,0,0,.25); }
+  .who .nm { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .who .hp { font-family:var(--display); font-size:11px; color:#7a4a14; }
+  .who.combat .nm::after { content:" ⚔"; color:#b4341f; }
+  .empty { font-style:italic; color:#6b542f; font-size:13px; }
+
+  .hint { text-align:center; color:#9a8155; font-style:italic; font-size:12px; margin-top:16px; font-family:var(--body); }
+
+  @media (max-width: 880px) {
+    .layout { grid-template-columns:1fr; }
+    aside { order:2; }
+  }
 </style>
 </head>
 <body>
-  <header><h1>SATSCAPE - GLOBAL MAP</h1><span class="meta" id="meta">connecting...</span></header>
-  <div class="wrap"><canvas id="map" width="900" height="640"></canvas></div>
-  <p class="hint">Towns and their territories - drag to pan - scroll to zoom - live every 2s</p>
+  <div class="page">
+    <header>
+      <div class="banner"><h1>SATSCAPE</h1></div>
+      <div class="meta" id="meta">charting the realm…</div>
+    </header>
+    <div class="layout">
+      <div class="map-frame">
+        <div class="map-stage">
+          <canvas id="map" width="900" height="640"></canvas>
+          <div class="compass"><span class="c-n"></span><span class="c-e"></span><span class="c-s"></span><span class="c-w"></span><span class="c-hub"></span></div>
+          <div class="controls">
+            <button class="ctl" id="zin" title="Zoom in">+</button>
+            <button class="ctl" id="zout" title="Zoom out">−</button>
+            <button class="ctl wide" id="recenter" title="Recenter">Home</button>
+          </div>
+        </div>
+      </div>
+      <aside>
+        <div class="panel"><div class="sheet">
+          <h2>The Realm</h2>
+          <div class="stat"><span>Adventurers afield</span><span class="v" id="sPlayers">—</span></div>
+          <div class="stat"><span>In battle</span><span class="v" id="sCombat">—</span></div>
+          <div class="stat"><span>Tiles charted</span><span class="v" id="sTiles">—</span></div>
+          <div class="stat"><span>Townships</span><span class="v" id="sTowns">—</span></div>
+        </div></div>
+        <div class="panel"><div class="sheet">
+          <h2>Legend</h2>
+          <div class="legend">
+            <div class="row"><span class="ico" style="background-image:url('${UI.iconStar}')"></span> Township</div>
+            <div class="row"><span class="ring"></span> Safe territory</div>
+            <div class="row"><span class="ico" style="background-image:url('${UI.iconJewelRed}')"></span> Adventurer</div>
+            <div class="row"><span class="ico" style="background-image:url('${UI.iconExcl}')"></span> In battle</div>
+          </div>
+        </div></div>
+        <div class="panel"><div class="sheet">
+          <h2>Adventurers</h2>
+          <div class="roster" id="roster"><div class="empty">Listening for travellers…</div></div>
+        </div></div>
+      </aside>
+    </div>
+    <p class="hint">Drag to pan · scroll to zoom · the map breathes every 2 seconds</p>
+  </div>
 <script>
 (function () {
   var canvas = document.getElementById("map");
   var ctx = canvas.getContext("2d");
   var meta = document.getElementById("meta");
+  var roster = document.getElementById("roster");
   var state = { towns: [], terrainColors: {}, explored: [], exploredKeys: {}, players: [] };
   var scale = 3, ox = 0, oy = 0, dragging = false, lastX = 0, lastY = 0;
   var biomeGrid = null;
+
+  // Sprite markers from the Kenney pack, drawn onto the canvas once loaded.
+  var sprites = {};
+  function loadSprite(name, src) { var im = new Image(); im.onload = function(){ draw(); }; im.src = src; sprites[name] = im; }
+  loadSprite("ring", "${UI.ringTown}");
+  loadSprite("star", "${UI.iconStar}");
+  loadSprite("player", "${UI.iconJewelRed}");
+  loadSprite("combat", "${UI.iconExcl}");
+  function ready(im) { return im && im.complete && im.naturalWidth; }
+
   fetch("/satscape/chunks/world.json")
     .then(function(r) { return r.json(); })
     .then(function(data) {
       var binary = atob(data.biome);
       var bytes = new Uint8Array(binary.length);
-      for (var i = 0; i < binary.length; i++) {
-        bytes[i] = binary.charCodeAt(i);
-      }
+      for (var i = 0; i < binary.length; i++) { bytes[i] = binary.charCodeAt(i); }
       biomeGrid = bytes;
-      if (typeof render === "function") render();
-      else if (typeof draw === "function") draw();
+      draw();
     }).catch(function(e) { console.error("Failed to load biomeGrid:", e); });
+
+  // Match the canvas backing store to its displayed size (crisp on HiDPI).
+  function fit() {
+    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+    var w = canvas.clientWidth || 900;
+    var h = Math.round(w * 0.71);
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+    canvas.style.height = h + "px";
+    draw();
+  }
 
   function worldToScreen(wx, wy) { return [canvas.width / 2 + (wx * scale) + ox, canvas.height / 2 + (wy * scale) + oy]; }
   function hash01(a, b, s) { return Math.abs(Math.sin(a * 12.9898 + b * 78.233 + s) * 43758.5453) % 1; }
@@ -1580,66 +1811,140 @@ const PAGE_HTML = /* html */ `<!doctype html>
     var towns = state.towns || [];
     for (var i = 0; i < towns.length; i++) { var t = towns[i]; var d = Math.hypot(x - t.cx, y - t.cy); if (d < bd) { bd = d; best = t; } }
     if (best && bd <= best.safeRadius) return "town";
-
     if (biomeGrid && x >= 0 && x < 380 && y >= 0 && y < 335) {
       var idx = y * 380 + x;
       var biomeId = biomeGrid[idx];
       var BIOME_TERRAINS = ["oasis","oasis","desert","desert","plains","plains","forest","forest","forest","monsoon","hills","snow","oasis","oasis","plains","plains","plains","forest","town","town","town","plains","forest","forest","plains","jungle","desert","plains","plains"];
       return BIOME_TERRAINS[biomeId] || "oasis";
     }
-
     if (!best) return "town";
     var wx = x + Math.sin(y * 0.12) * 4, wy = y + Math.cos(x * 0.12) * 4;
     var cx = Math.floor(wx / 22), cy = Math.floor(wy / 22);
     var h = hash01(cx * 1.7, cy * 2.3, 99);
     return best.palette[h < 0.34 ? 0 : h < 0.67 ? 1 : 2];
   }
-  function color(t) { return state.terrainColors[t] || "#1f2937"; }
+  function color(t) { return state.terrainColors[t] || "#3a2c1a"; }
   function key(x, y) { return x + "," + y; }
   function isExplored(x, y) { return !!state.exploredKeys[key(x, y)]; }
+
   function draw() {
-    ctx.fillStyle = "#020617"; ctx.fillRect(0, 0, canvas.width, canvas.height);
+    var W = canvas.width, H = canvas.height;
+    // unexplored = aged-parchment void
+    var g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, "#191207"); g.addColorStop(1, "#0e0a04");
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
     if (!state.towns.length) return;
-    var cxp = canvas.width / 2 + ox, cyp = canvas.height / 2 + oy;
-    var minTX = Math.floor((0 - cxp) / scale - 0.5), maxTX = Math.ceil((canvas.width - cxp) / scale + 0.5);
-    var minTY = Math.floor((0 - cyp) / scale - 0.5), maxTY = Math.ceil((canvas.height - cyp) / scale + 0.5);
+    var cxp = W / 2 + ox, cyp = H / 2 + oy;
+    var minTX = Math.floor((0 - cxp) / scale - 0.5), maxTX = Math.ceil((W - cxp) / scale + 0.5);
+    var minTY = Math.floor((0 - cyp) / scale - 0.5), maxTY = Math.ceil((H - cyp) / scale + 0.5);
     for (var ty = minTY; ty <= maxTY; ty++) for (var tx = minTX; tx <= maxTX; tx++) {
-      ctx.fillStyle = isExplored(tx, ty) ? color(biomeAt(tx, ty)) : "#060a14";
+      if (!isExplored(tx, ty)) continue;
+      ctx.fillStyle = color(biomeAt(tx, ty));
       ctx.fillRect(cxp + (tx - 0.5) * scale, cyp + (ty - 0.5) * scale, scale + 1, scale + 1);
     }
-    ctx.textAlign = "center";
+
+    // town territories: pack ring sprite scaled to the safe radius, with a star at the heart
     state.towns.forEach(function (t) {
       if (!isExplored(t.cx, t.cy)) return;
       var c = worldToScreen(t.cx, t.cy);
-      ctx.strokeStyle = "#bfdbfe"; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(c[0], c[1], t.safeRadius * scale, 0, Math.PI * 2); ctx.stroke();
-      ctx.fillStyle = "#e2e8f0"; ctx.font = "bold 12px monospace"; ctx.fillText(t.name, c[0], c[1] - t.safeRadius * scale - 6);
+      var d = Math.max(28, t.safeRadius * scale * 2 + 8);
+      if (ready(sprites.ring)) ctx.drawImage(sprites.ring, c[0] - d / 2, c[1] - d / 2, d, d);
+      else { ctx.strokeStyle = "#caa45a"; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(c[0], c[1], t.safeRadius * scale, 0, Math.PI * 2); ctx.stroke(); }
+      var ss = 22;
+      if (ready(sprites.star)) ctx.drawImage(sprites.star, c[0] - ss / 2, c[1] - ss / 2, ss, ss);
+      label(t.name, c[0], c[1] - d / 2 - 4, "#fff0c8", "rgba(40,24,8,.72)", true);
     });
-    ctx.textAlign = "left";
+
+    // adventurers
     state.players.forEach(function (p) {
       if (!isExplored(p.x, p.y)) return;
       var s = worldToScreen(p.x, p.y);
-      ctx.fillStyle = p.state === "combat" ? "#f97316" : "#f43f5e"; ctx.beginPath(); ctx.arc(s[0], s[1], 5, 0, Math.PI * 2); ctx.fill();
-      ctx.strokeStyle = "#0f172a"; ctx.lineWidth = 1.5; ctx.stroke();
-      var label = p.name + "  " + p.hpPct + "%";
-      ctx.font = "11px monospace"; var tw = ctx.measureText(label).width + 6;
-      ctx.fillStyle = "rgba(2,6,23,0.7)"; ctx.fillRect(s[0] + 8, s[1] - 9, tw, 14);
-      ctx.fillStyle = "#f8fafc"; ctx.fillText(label, s[0] + 11, s[1] + 2);
+      var combat = p.state === "combat";
+      var im = combat ? sprites.combat : sprites.player;
+      var iw = combat ? 14 : 18, ih = combat ? 26 : 18;
+      if (ready(im)) ctx.drawImage(im, s[0] - iw / 2, s[1] - ih / 2, iw, ih);
+      else { ctx.fillStyle = combat ? "#f97316" : "#f43f5e"; ctx.beginPath(); ctx.arc(s[0], s[1], 5, 0, Math.PI * 2); ctx.fill(); }
+      label(p.name + "  " + p.hpPct + "%", s[0] + 12, s[1] - 8, "#fdf3df", "rgba(40,24,8,.7)", false);
     });
   }
+
+  function label(text, x, y, fg, bg, center) {
+    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+    ctx.font = "600 " + Math.round(12 * dpr) + "px 'Spectral', Georgia, serif";
+    ctx.textAlign = center ? "center" : "left";
+    ctx.textBaseline = "middle";
+    var tw = ctx.measureText(text).width;
+    var padX = 6 * dpr, h = 18 * dpr;
+    var bx = center ? x - tw / 2 - padX : x - padX;
+    ctx.fillStyle = bg;
+    roundRect(bx, y - h / 2, tw + padX * 2, h, 5 * dpr); ctx.fill();
+    ctx.strokeStyle = "rgba(202,164,90,.5)"; ctx.lineWidth = dpr; ctx.stroke();
+    ctx.fillStyle = fg; ctx.fillText(text, x, y);
+  }
+  function roundRect(x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+  }
+
+  function renderRoster() {
+    var ps = state.players || [];
+    if (!ps.length) { roster.innerHTML = '<div class="empty">No adventurers afield right now.</div>'; return; }
+    var sorted = ps.slice().sort(function (a, b) { return b.hpPct - a.hpPct; });
+    roster.innerHTML = sorted.map(function (p) {
+      var combat = p.state === "combat";
+      var dot = combat ? "#e0662b" : "#c2433f";
+      return '<div class="who ' + (combat ? "combat" : "") + '">' +
+        '<span class="dot" style="background:' + dot + '"></span>' +
+        '<span class="nm">' + esc(p.name) + '</span>' +
+        '<span class="hp">' + p.hpPct + '%</span></div>';
+    }).join("");
+  }
+  function esc(s) { return String(s).replace(/[&<>"]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); }
+
   function fetchPlayers() {
     fetch("/api/satscape/players").then(function (r) { return r.json(); }).then(function (d) {
       if (d && d.players) {
         state = d; state.exploredKeys = {};
         (state.explored || []).forEach(function (tile) { state.exploredKeys[key(tile.x, tile.y)] = true; });
-        meta.textContent = state.players.length + " adventurer" + (state.players.length === 1 ? "" : "s") + " - " + (state.explored || []).length + " tiles charted";
+        var combat = state.players.filter(function (p) { return p.state === "combat"; }).length;
+        var n = state.players.length;
+        meta.textContent = n + " adventurer" + (n === 1 ? "" : "s") + " · " + (state.explored || []).length + " tiles charted";
+        document.getElementById("sPlayers").textContent = n;
+        document.getElementById("sCombat").textContent = combat;
+        document.getElementById("sTiles").textContent = (state.explored || []).length.toLocaleString();
+        document.getElementById("sTowns").textContent = (state.towns || []).length;
+        renderRoster();
       }
       draw();
-    }).catch(function () { meta.textContent = "offline"; });
+    }).catch(function () { meta.textContent = "the realm is offline"; });
   }
-  canvas.addEventListener("mousedown", function (e) { dragging = true; lastX = e.clientX; lastY = e.clientY; });
-  window.addEventListener("mouseup", function () { dragging = false; });
-  window.addEventListener("mousemove", function (e) { if (!dragging) return; ox += e.clientX - lastX; oy += e.clientY - lastY; lastX = e.clientX; lastY = e.clientY; draw(); });
-  canvas.addEventListener("wheel", function (e) { e.preventDefault(); scale = Math.max(2, Math.min(40, scale * (e.deltaY < 0 ? 1.1 : 0.9))); draw(); }, { passive: false });
+
+  function zoom(factor) { scale = Math.max(2, Math.min(40, scale * factor)); draw(); }
+  document.getElementById("zin").addEventListener("click", function () { zoom(1.25); });
+  document.getElementById("zout").addEventListener("click", function () { zoom(0.8); });
+  document.getElementById("recenter").addEventListener("click", function () { ox = 0; oy = 0; scale = 3; draw(); });
+
+  canvas.addEventListener("mousedown", function (e) { dragging = true; canvas.classList.add("dragging"); lastX = e.clientX; lastY = e.clientY; });
+  window.addEventListener("mouseup", function () { dragging = false; canvas.classList.remove("dragging"); });
+  window.addEventListener("mousemove", function (e) {
+    if (!dragging) return;
+    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+    ox += (e.clientX - lastX) * dpr; oy += (e.clientY - lastY) * dpr; lastX = e.clientX; lastY = e.clientY; draw();
+  });
+  canvas.addEventListener("wheel", function (e) { e.preventDefault(); zoom(e.deltaY < 0 ? 1.1 : 0.9); }, { passive: false });
+  // touch pan
+  canvas.addEventListener("touchstart", function (e) { if (e.touches.length === 1) { dragging = true; lastX = e.touches[0].clientX; lastY = e.touches[0].clientY; } }, { passive: true });
+  canvas.addEventListener("touchmove", function (e) {
+    if (!dragging || e.touches.length !== 1) return;
+    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+    ox += (e.touches[0].clientX - lastX) * dpr; oy += (e.touches[0].clientY - lastY) * dpr;
+    lastX = e.touches[0].clientX; lastY = e.touches[0].clientY; draw();
+  }, { passive: true });
+  canvas.addEventListener("touchend", function () { dragging = false; });
+
+  window.addEventListener("resize", fit);
+  fit();
   fetchPlayers(); setInterval(fetchPlayers, 2000);
 })();
 </script>
