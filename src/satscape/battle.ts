@@ -592,12 +592,13 @@ export function simulateBattle(
   let totalTaken = 0;
 
   const livingPositions = () => mons.filter((mm) => mm.m.hp > 0).map((mm) => ({ x: mm.m.x, y: mm.m.y }));
-  const nearestLiving = (from: Point) => {
+  const nearestLiving = (from: Point, posOf: (mm: typeof mons[number]) => Point) => {
     let best: typeof mons[number] | null = null;
     let bd = Infinity;
     for (const mm of mons) {
       if (mm.m.hp <= 0) continue;
-      const d = Math.abs(mm.m.x - from.x) + Math.abs(mm.m.y - from.y);
+      const p = posOf(mm);
+      const d = Math.abs(p.x - from.x) + Math.abs(p.y - from.y);
       if (d < bd) { bd = d; best = mm; }
     }
     return best;
@@ -659,9 +660,15 @@ export function simulateBattle(
         }
         parts.push(`${card.emoji} ${card.name}`);
       } else {
-        const focus = nearestLiving(playerPos);
-        attackTiles = focus ? attackTilesForShape(playerPos, { x: focus.m.x, y: focus.m.y }, card.shape ?? "line") : [];
-        const hits = mons.filter((mm) => mm.m.hp > 0 && attackTiles.some((p) => samePoint(p, { x: mm.m.x, y: mm.m.y })));
+        // Orient toward — and resolve hits against — where each monster will be
+        // AFTER it moves on THIS tick (its telegraphed `intents[k].to`), not its
+        // start-of-tick position. The player acts before monsters each tick, so
+        // using the start-of-tick position aimed a strike one move "behind" the
+        // monster whenever it advanced on the same tick the strike landed.
+        const destOf = (mm: typeof mons[number]): Point => mm.intents[k]?.to ?? { x: mm.m.x, y: mm.m.y };
+        const focus = nearestLiving(playerPos, destOf);
+        attackTiles = focus ? attackTilesForShape(playerPos, destOf(focus), card.shape ?? "line") : [];
+        const hits = mons.filter((mm) => mm.m.hp > 0 && attackTiles.some((p) => samePoint(p, destOf(mm))));
         if (hits.length) {
           const dmgEach = Math.max(1, (card.damage ?? 0) + Math.round(weapon.power) + empower);
           if (empower > 0) empower = 0; // consumed by the first swing
