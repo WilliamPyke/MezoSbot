@@ -823,6 +823,9 @@ const PLAY_HTML = /* html */ `<!doctype html>
       <h2>Fast Travel <span class="hint">click a tile in range</span></h2>
       <div id="travelText" class="muted">Click anywhere on the map to set a destination.</div>
       <input id="tx" type="hidden"><input id="ty" type="hidden">
+      <label style="display:flex;align-items:center;gap:7px;margin-top:8px;font-size:12.5px;cursor:pointer;color:#5a3f1c">
+        <input id="instantTravel" type="checkbox" style="cursor:pointer"> One-click travel <span class="hint">skip confirm</span>
+      </label>
       <button id="travel" class="primary" style="width:100%;margin-top:8px" disabled>Travel</button>
     </div></div>
     <div class="panel only-explore"><div class="sheet">
@@ -858,6 +861,7 @@ const PLAY_HTML = /* html */ `<!doctype html>
   if (token) localStorage.setItem("satscapeToken", token);
   var state = null, activeTab = location.hash === "#quests" ? "quests" : location.hash === "#shop" ? "shop" : "gear";
   var showWorldMap = false, battleAnimStart = performance.now(), lastCombatKey = "";
+  var BREAD_STAMINA = ${SAT.BREAD_STAMINA}; // mirrors server SAT.BREAD_STAMINA — lets us cost a trip locally, no round-trip
   var reduceMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   var inflight = 0;   // battle POSTs in flight — pause the poll so it can't clobber optimistic state
   var playing = false; // a resolution playback animation is running
@@ -1557,7 +1561,20 @@ const PLAY_HTML = /* html */ `<!doctype html>
   document.getElementById("flee").onclick=function(){ act("/satscape/api/battle", { action:"flee" }); };
   var travelBtn = document.getElementById("travel");
   travelBtn.onclick=function(){ if(travelBtn.disabled) return; act("/satscape/api/travel", { tx:Number(document.getElementById("tx").value), ty:Number(document.getElementById("ty").value) }); };
-  // Click-to-travel: clicking a reachable tile arms the Travel button and fetches an estimate.
+  // One-click-travel toggle: persisted so it survives reloads.
+  var instantChk = document.getElementById("instantTravel");
+  try { instantChk.checked = localStorage.getItem("satscape:instantTravel") === "1"; } catch(e){}
+  instantChk.onchange = function(){ try { localStorage.setItem("satscape:instantTravel", instantChk.checked ? "1" : "0"); } catch(e){} };
+  // Cost a trip locally — same Manhattan/bread math the server uses — so the estimate
+  // is instant on click instead of waiting on a round-trip.
+  function costTrip(x, y){
+    var p = state.player;
+    var steps = Math.abs(x - p.x) + Math.abs(y - p.y);
+    var bread = Math.ceil(Math.max(0, steps - p.stamina) / BREAD_STAMINA);
+    return steps + " steps, " + bread + " bread, " + bread + " sats.";
+  }
+  // Click-to-travel: clicking a reachable tile shows the local cost and arms Travel —
+  // or, with one-click-travel on, departs immediately.
   play.addEventListener("click", function(e){
     if(!state || state.combat || showWorldMap) return;
     var r = play.getBoundingClientRect(), b = state.viewport.bounds;
@@ -1572,9 +1589,13 @@ const PLAY_HTML = /* html */ `<!doctype html>
       document.getElementById("travelText").textContent = "(" + x + ", " + y + ") is beyond your reach (" + (rad*2+1) + "×" + (rad*2+1) + " around you).";
       return;
     }
+    if(instantChk.checked){
+      document.getElementById("travelText").textContent = costTrip(x, y);
+      act("/satscape/api/travel", { tx:x, ty:y });
+      return;
+    }
     travelBtn.disabled = false; travelBtn.textContent = "Travel → (" + x + ", " + y + ")";
-    document.getElementById("travelText").textContent = "Charting a route…";
-    act("/satscape/api/travel", { estimate:true, tx:x, ty:y });
+    document.getElementById("travelText").textContent = costTrip(x, y);
   });
   ["Shop","Quests","Gear"].forEach(function(n){ document.getElementById("tab"+n).onclick=function(){ activeTab=n.toLowerCase(); renderList(); }; });
   function typingTarget(el){ return el && (el.tagName === "INPUT" || el.tagName === "SELECT" || el.tagName === "TEXTAREA" || el.isContentEditable); }

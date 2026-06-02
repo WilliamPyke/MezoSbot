@@ -247,14 +247,18 @@ export async function resolveTile(discordId: string, x: number, y: number): Prom
   const fighter = await getPlayer(discordId);
   const positions = startingBattlePositions(x, y);
 
-  // Spawn a small pack (1–3) for a chess-like board, with VARIED species drawn from
+  // Spawn a random pack (1–5) for a chess-like board, with VARIED species drawn from
   // the local town's roster — different species attack differently (cone/dash+bleed,
   // slam/line+stun, line/cone+poison…), so a pack mixes attack styles. Per-monster HP
   // and loot scale down so a pack is tougher but not punishing.
-  const count = monsterCountFor(m.level, x, y);
+  const count = monsterCountFor();
   const pool = nearestTown(x, y).town.monsters;
   const names = packSpecies(m.name, pool, count, x, y);
-  const perHp = count > 1 ? Math.max(8, Math.round((18 + m.level * 8) * 0.65)) : 18 + m.level * 8;
+  // Per-monster HP scales DOWN as the pack grows, so a 5-foe ambush is a flurry of
+  // quick kills rather than five ~40-HP slogs. Total pack HP still rises with count,
+  // but sub-linearly (÷count^0.7): 1→×1.0, 2→×0.62, 3→×0.46, 4→×0.38, 5→×0.32.
+  const baseHp = 18 + m.level * 8;
+  const perHp = Math.max(8, Math.round(baseHp / Math.pow(count, 0.7)));
   const perReward = Math.max(1, Math.round(m.reward / count));
   const starts = startingMonsterPositions(x, y, count);
   const monsters: BattleMonster[] = starts.map((pos, i) => ({
@@ -303,13 +307,10 @@ export async function resolveTile(discordId: string, x: number, y: number): Prom
   return { ok: true, note, enteredCombat: true };
 }
 
-/** Deterministic pack size (1–3): ~half of encounters are packs, scaling up with level. */
-function monsterCountFor(level: number, x: number, y: number): number {
-  const h = Math.abs(((x * 73856093) ^ (y * 19349663)) >>> 0);
-  let count = 1;
-  if (h % 2 === 0) count++; // ~50% spawn at least a pair, even near spawn
-  if ((level >= 2 && h % 3 === 0) || h % 7 === 0) count++; // a subset gets a third
-  return Math.min(3, count);
+/** Random pack size (1–5), rolled fresh per encounter. Per-monster HP scales down
+ * with the count (see resolveTile) so bigger packs stay brisk. */
+function monsterCountFor(): number {
+  return 1 + Math.floor(Math.random() * 5);
 }
 
 /**
