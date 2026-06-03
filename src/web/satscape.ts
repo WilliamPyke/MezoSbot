@@ -659,9 +659,10 @@ const PLAY_HTML = /* html */ `<!doctype html>
   button.sq { background-image:var(--btn); min-width:44px; min-height:46px; padding:0; }
   button.sq:active { background-image:var(--btnDown); }
 
-  input, select {
+  input:not([type="checkbox"]):not([type="radio"]), select {
     width:100%; font-family:var(--body); color:var(--ink); border:0; padding:9px 11px; min-height:42px;
     background:var(--inset) center/100% 100% no-repeat; }
+  input[type="checkbox"] { flex:0 0 auto; width:15px; height:15px; min-height:0; margin:0; padding:0; accent-color:#b8861f; cursor:pointer; }
   input:focus, select:focus { outline:none; filter:brightness(1.05) drop-shadow(0 0 4px rgba(184,134,31,.5)); }
   select { color:var(--ink); }
   ::-webkit-scrollbar { width:9px; height:9px; }
@@ -905,6 +906,8 @@ const PLAY_HTML = /* html */ `<!doctype html>
   var BREAD_STAMINA = ${SAT.BREAD_STAMINA}; // mirrors server SAT.BREAD_STAMINA — lets us cost a trip locally, no round-trip
   var reduceMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   var inflight = 0;   // battle POSTs in flight — pause the poll so it can't clobber optimistic state
+  var moveInflight = 0; // overworld action POSTs in flight — pause the poll so it can't snap us back
+  var reqCounter = 0, latestApplied = 0; // monotonic request order so a stale response never overrides a newer one
   var playing = false; // a resolution playback animation is running
   var pb = null;       // playback driver state
   var play = document.getElementById("play"), ctx = play.getContext("2d");
@@ -993,7 +996,15 @@ const PLAY_HTML = /* html */ `<!doctype html>
     document.body.classList.toggle("godmode", godMode);
     render();
   }
-  function act(path, body) { api(path, body).then(setState).catch(function(e){ note.textContent = e.message; }); }
+  // Apply a state response only if no newer request has already landed — kills the
+  // rubber-banding where a slower/older response snaps the player back a position.
+  function applyFresh(seq, s){ if(seq < latestApplied) return; latestApplied = seq; setState(s); }
+  function act(path, body) {
+    var seq = ++reqCounter;
+    moveInflight++;
+    api(path, body).then(function(s){ moveInflight--; applyFresh(seq, s); })
+      .catch(function(e){ moveInflight--; note.textContent = e.message; });
+  }
 
   /* ─── combat: client mirrors of the server rules (for instant, optimistic input) ─── */
   function clampA(n){ return Math.max(0, Math.min(7, Math.round(n))); }
@@ -1819,7 +1830,7 @@ const PLAY_HTML = /* html */ `<!doctype html>
   // Live state poll — lite (no heavy minimap payload) and PAUSED during combat (turn-based,
   // so action responses already carry fresh state) or while an action/playback is running.
   // This removes the per-2s full-world fetch that caused most of the in-fight lag.
-  setInterval(function(){ if(playing || inflight > 0 || (state && state.combat)) return; api("/satscape/api/state").then(setState).catch(function(){}); }, 2500);
+  setInterval(function(){ if(playing || inflight > 0 || moveInflight > 0 || (state && state.combat)) return; var seq = ++reqCounter; api("/satscape/api/state").then(function(s){ applyFresh(seq, s); }).catch(function(){}); }, 2500);
 })();
 </script>
 </body>
