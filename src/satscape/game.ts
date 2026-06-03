@@ -1,5 +1,6 @@
-import { getBalance, subtractBalance } from "../balance.js";
+import { subtractBalance } from "../balance.js";
 import { formatSats } from "../format.js";
+import { isGodProfile } from "./admin.js";
 import { addToPool, payoutFromPool, takeDamage } from "./economy.js";
 import { SAT, entityAt } from "./engine.js";
 import {
@@ -11,11 +12,14 @@ import {
   getCombat,
   getOwnedItemIds,
   getPlayer,
+  getSatBalance,
+  grantAllItems,
   isTileCleared,
   ownsItem,
   revealAround,
   setEquipped,
   setStateIf,
+  startRun,
   updateCombat,
   updatePlayer,
 } from "./db.js";
@@ -31,8 +35,9 @@ import {
   serializeMonsters,
   serializePlan,
   simulateBattle,
-  startingBattlePositions,
-  startingMonsterPositions,
+  rollBattleLayout,
+  rollTerrain,
+  serializeTerrain,
   weaponPower,
   type BattleMove,
   type PlanAction,
@@ -45,7 +50,7 @@ import {
   playerCardIds,
   serializeStatuses,
 } from "./cards.js";
-import { bootBonus, effectivePrice, fastTravelRadius, ITEM_BY_ID, nearestTown, townAt } from "./towns.js";
+import { ALL_ITEMS, bootBonus, effectivePrice, fastTravelRadius, ITEM_BY_ID, nearestTown, townAt } from "./towns.js";
 import { getRep, onArriveTown, onCombatWin } from "./quests.js";
 import { keeperLine } from "./lines.js";
 import type { BattleMonster, CombatSessionRow, Direction, SatPlayerRow } from "./types.js";
@@ -81,7 +86,7 @@ export interface ActionResult {
  */
 export async function loseHp(discordId: string, dmg: number): Promise<{ burned: number; hp: number }> {
   const burned = await takeDamage(discordId, dmg);
-  const [player, balance] = await Promise.all([getPlayer(discordId), getBalance(discordId)]);
+  const [player, balance] = await Promise.all([getPlayer(discordId), getSatBalance(discordId)]);
   if (!player) return { burned, hp: 0 };
   if (burned <= 0) return { burned: 0, hp: effectiveHp(player, balance) };
   // `balance` is already post-damage; reconstruct the pre-damage HP, then subtract.
@@ -97,7 +102,7 @@ export async function loseHp(discordId: string, dmg: number): Promise<{ burned: 
  * transfer). Caller picks `n`; it's clamped to `min(max_hp − hp, balance − hp)`.
  */
 export async function refillHp(discordId: string, n: number): Promise<{ ok: boolean; added: number; hp: number; maxHp: number; note: string }> {
-  const [player, balance] = await Promise.all([getPlayer(discordId), getBalance(discordId)]);
+  const [player, balance] = await Promise.all([getPlayer(discordId), getSatBalance(discordId)]);
   if (!player || !player.active) return { ok: false, added: 0, hp: 0, maxHp: SAT.HP_MAX_DEFAULT, note: "Use `/satscape join` first." };
   const maxHp = player.max_hp ?? SAT.HP_MAX_DEFAULT;
   const cur = effectiveHp(player, balance);
@@ -245,7 +250,6 @@ export async function resolveTile(discordId: string, x: number, y: number): Prom
   }
   const m = entity.data as { name: string; level: number; reward: number };
   const fighter = await getPlayer(discordId);
-  const positions = startingBattlePositions(x, y);
 
   // Spawn a random pack (1–5) for a chess-like board, with VARIED species drawn from
   // the local town's roster — different species attack differently (cone/dash+bleed,
@@ -260,8 +264,8 @@ export async function resolveTile(discordId: string, x: number, y: number): Prom
   const baseHp = 18 + m.level * 8;
   const perHp = Math.max(8, Math.round(baseHp / Math.pow(count, 0.7)));
   const perReward = Math.max(1, Math.round(m.reward / count));
-  const starts = startingMonsterPositions(x, y, count);
-  const monsters: BattleMonster[] = starts.map((pos, i) => ({
+  const layout = rollBattleLayout(count);
+  const monsters: BattleMonster[] = layout.monsters.map((pos, i) => ({
     id: `m${i}`,
     name: names[i],
     level: m.level,
@@ -274,6 +278,8 @@ export async function resolveTile(discordId: string, x: number, y: number): Prom
     status: [],
   }));
   const primary = monsters[0];
+  // Scatter cover/impassable terrain across the arena, avoiding everyone's start tile.
+  const terrain = rollTerrain(layout.player, layout.monsters);
 
   // Only persist the `monsters` JSON for actual packs. Single-monster fights stay on
   // the legacy singular columns, so combat keeps working even before the multi-monster
@@ -288,13 +294,14 @@ export async function resolveTile(discordId: string, x: number, y: number): Prom
     reward_sats: m.reward,
     enemy_x: x,
     enemy_y: y,
-    player_battle_x: positions.player.x,
-    player_battle_y: positions.player.y,
+    player_battle_x: layout.player.x,
+    player_battle_y: layout.player.y,
     monster_battle_x: primary.x,
     monster_battle_y: primary.y,
     battle_move_points: fighter ? battleMoveRange(fighter) : 5,
     battle_plan: null,
     ...(count > 1 ? { monsters: serializeMonsters(monsters) } : {}),
+    terrain: serializeTerrain(terrain),
     selected_battle_weapon: null,
     player_status: "[]",
     monster_status: "[]",
@@ -513,7 +520,7 @@ export async function eat(discordId: string): Promise<ActionResult> {
  */
 export async function faint(discordId: string): Promise<ActionResult> {
   await deleteCombat(discordId);
-  const [player, balance] = await Promise.all([getPlayer(discordId), getBalance(discordId)]);
+  const [player, balance] = await Promise.all([getPlayer(discordId), getSatBalance(discordId)]);
   const { town } = nearestTown(player?.x_coord ?? 0, player?.y_coord ?? 0);
   const maxHp = player?.max_hp ?? SAT.HP_MAX_DEFAULT;
   const rearmed = Math.min(balance, maxHp);
@@ -550,11 +557,36 @@ export async function buyItem(discordId: string, itemId: string): Promise<Action
     return { ok: false, note: `🔒 ${item.name} is locked — reach ${item.repReq} rep with ${town.keeper.name} first.` };
   }
   const price = effectivePrice(item, town.keeper, rep);
+  // God/admin profiles buy for free (no ledger touch, nothing flows to the pool).
+  if (isGodProfile(discordId)) {
+    await addInventoryItem(discordId, itemId);
+    return { ok: true, note: `👑 Conjured ${item.emoji} **${item.name}** (god mode — free).` };
+  }
   const paid = await subtractBalance(discordId, price);
   if (!paid) return { ok: false, note: `Not enough sats for ${item.name} (${formatSats(price)}). *"${keeperLine(town.keeper.persona, "poor")}"*` };
   await addToPool(price);
   await addInventoryItem(discordId, itemId);
   return { ok: true, note: `🛒 Bought ${item.emoji} **${item.name}** for ${formatSats(price)}. *"${keeperLine(town.keeper.persona, "buy")}"*` };
+}
+
+/**
+ * Enter (provision) the god/admin sandbox profile for a real Discord id: start a run
+ * on the namespaced `god:` id, grant the whole catalogue, and auto-equip the strongest
+ * item in each slot so god mode is immediately kitted out. Idempotent. The caller is
+ * responsible for verifying the real id is a SatScape admin.
+ */
+export async function enterGodMode(godId: string): Promise<void> {
+  await startRun(godId); // active=true, spawn at town, HP armed from the sandbox balance
+  await grantAllItems(godId);
+  // Equip the highest-power item per slot (rep gates don't apply once owned).
+  const best = new Map<string, { id: string; power: number }>();
+  for (const it of ALL_ITEMS) {
+    const cur = best.get(it.slot);
+    if (!cur || (it.power ?? 0) > cur.power) best.set(it.slot, { id: it.id, power: it.power ?? 0 });
+  }
+  for (const [slot, pick] of best) {
+    await setEquipped(godId, slot as "weapon" | "armor" | "accessory" | "boots", pick.id);
+  }
 }
 
 /** Equip an owned item into its slot (allowed anywhere — gear up before heading out). */
@@ -649,7 +681,7 @@ export async function travelTo(
   await updatePlayer(discordId, { x_coord: tx, y_coord: ty, hunger: endStamina, last_move_at: new Date().toISOString() });
   await revealAround(discordId, tx, ty);
 
-  const [balAfter, plAfter] = await Promise.all([getBalance(discordId), getPlayer(discordId)]);
+  const [balAfter, plAfter] = await Promise.all([getSatBalance(discordId), getPlayer(discordId)]);
   if (plAfter && effectiveHp(plAfter, balAfter) <= 0) {
     return { ok: true, note: paidNote + (await faint(discordId)).note };
   }

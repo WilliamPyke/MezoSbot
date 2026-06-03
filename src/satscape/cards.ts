@@ -10,7 +10,7 @@ import { ITEM_BY_ID } from "./towns.js";
 
 /* ─────────── status effects ─────────── */
 
-export type StatusKind = "bleed" | "poison" | "stun" | "chill" | "shield" | "empower";
+export type StatusKind = "bleed" | "poison" | "burn" | "stun" | "chill" | "shield" | "empower";
 
 export interface StatusEffect {
   kind: StatusKind;
@@ -31,6 +31,7 @@ export interface StatusMeta {
 export const STATUS_META: Record<StatusKind, StatusMeta> = {
   bleed: { kind: "bleed", emoji: "🩸", label: "Bleed", dot: true },
   poison: { kind: "poison", emoji: "🟢", label: "Poison", dot: true },
+  burn: { kind: "burn", emoji: "🔥", label: "Burn", dot: true },
   stun: { kind: "stun", emoji: "💫", label: "Stun", dot: false },
   chill: { kind: "chill", emoji: "❄️", label: "Chill", dot: false },
   shield: { kind: "shield", emoji: "🛡️", label: "Shield", dot: false },
@@ -194,7 +195,10 @@ export function monsterAbility(monsterName: string): MonsterAbility {
   if (name.includes("golem") || name.includes("wraith") || name.includes("revenant")) {
     return { name: "Crushing Blow", apply: [st("stun", 1, 1)] };
   }
-  if (name.includes("naga") || name.includes("wyrm") || name.includes("scorpion")) {
+  if (name.includes("wyrm") || name.includes("dragon") || name.includes("drake") || name.includes("djinn")) {
+    return { name: "Searing Breath", apply: [st("burn", 4, 3)] };
+  }
+  if (name.includes("naga") || name.includes("scorpion")) {
     return { name: "Venom Strike", apply: [st("poison", 4, 3)] };
   }
   return { name: "Savage Hit", apply: [] };

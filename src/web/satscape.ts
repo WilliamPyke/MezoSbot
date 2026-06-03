@@ -13,6 +13,7 @@ import {
   planAP,
   projectedPlayerPos,
   readMonsters,
+  readTerrain,
   selectedWeaponId,
   weaponFor,
   type BattleMove,
@@ -29,6 +30,7 @@ import {
   battleMove,
   buyItem,
   eat,
+  enterGodMode,
   equipItem,
   estimateTravel,
   flee,
@@ -41,6 +43,7 @@ import {
   travelTo,
   undoPlanAction,
 } from "../satscape/game.js";
+import { godProfileId, isGodProfile, isSatscapeAdmin, realIdFromProfile } from "../satscape/admin.js";
 import { acceptQuest, claimQuest, getRep, payTribute, questBoard } from "../satscape/quests.js";
 import { ALL_ITEMS, effectivePrice, fastTravelRadius, TERRAIN_COLOR, townAt, TOWNS } from "../satscape/towns.js";
 import { verifyPlayToken } from "../satscape/web_tokens.js";
@@ -218,6 +221,19 @@ export async function handleSatscapeWebRequest(
     return true;
   }
 
+  if (method === "POST" && path === "/satscape/api/god") {
+    await respondWithBody(req, res, async (claim, body) => {
+      const realId = realIdFromProfile(claim.userId);
+      if (!isSatscapeAdmin(realId)) return { status: 403, body: { error: "Not authorized." } };
+      const on = body.on === true;
+      const profileId = on ? godProfileId(realId) : realId;
+      if (on) await enterGodMode(profileId); // provision the sandbox profile (idempotent)
+      const note = on ? "👑 God mode ON — full gear, no sat cost." : "Back to your real run.";
+      return { status: 200, body: { ok: true, god: on, note, state: await buildStateResponse(profileId, note, { lite: true }) } };
+    });
+    return true;
+  }
+
   return false;
 }
 
@@ -227,7 +243,8 @@ async function respondSpectatorPlayers(res: ServerResponse): Promise<void> {
       .from("sat_players")
       .select("discord_id, x_coord, y_coord, hp, max_hp, state")
       .eq("active", true)
-      .neq("state", "fainted");
+      .neq("state", "fainted")
+      .not("discord_id", "like", "god:%");
     if (error) throw error;
 
       const explored = await loadExploredTilesCached();
@@ -281,6 +298,9 @@ async function buildStateResponse(userId: string, note?: string, opts?: { lite?:
   return {
     ok: true,
     note,
+    // Admin flag drives the hidden god-mode shortcut; god flag drives the on-screen badge.
+    admin: isSatscapeAdmin(realIdFromProfile(userId)),
+    god: isGodProfile(userId),
     player: playerState(view),
     viewport: {
       bounds: {
@@ -382,6 +402,7 @@ function combatState(view: ViewModel): Record<string, unknown> | null {
       y: primaryMon ? primaryMon.y : combat.monster_battle_y,
     },
     monsters,
+    terrain: readTerrain(combat),
     player: { x: combat.player_battle_x, y: combat.player_battle_y },
     turn: combat.turn_number,
     plan,
@@ -517,7 +538,23 @@ function readClaim(req: IncomingMessage): NonNullable<Claim> | null {
   const fromQuery = url.searchParams.get("t");
   const fromHeader = req.headers["x-satscape-token"];
   const token = (Array.isArray(fromHeader) ? fromHeader[0] : fromHeader) || fromQuery || null;
-  return verifyPlayToken(token);
+  const claim = verifyPlayToken(token);
+  if (!claim) return null;
+  // God mode: when the client requests it AND the (token-proven) user is a SatScape
+  // admin, transparently route this request to the namespaced `god:` profile. Every
+  // downstream handler then operates on the sandbox profile with no further changes.
+  // A non-admin (or a spoofed header) is simply ignored — they stay on their real id.
+  const wantGod = headerFlag(req, "x-satscape-god");
+  if (wantGod && isSatscapeAdmin(claim.userId)) {
+    return { ...claim, userId: godProfileId(claim.userId) };
+  }
+  return claim;
+}
+
+function headerFlag(req: IncomingMessage, name: string): boolean {
+  const raw = req.headers[name];
+  const v = Array.isArray(raw) ? raw[0] : raw;
+  return v === "1" || v === "true";
 }
 
 async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
@@ -671,6 +708,9 @@ const PLAY_HTML = /* html */ `<!doctype html>
   .map-badge::after { content:"Exploring"; }
   body.in-combat .map-badge { color:#ffd9c0; box-shadow:0 0 0 1px rgba(224,86,106,.55), 0 0 16px rgba(224,86,106,.3); }
   body.in-combat .map-badge::after { content:"⚔ Battle"; }
+  /* hidden admin/god mode — badge only appears once god mode is active (backtick toggles) */
+  body.godmode .map-badge { color:#fff7d6; background:rgba(60,42,6,.85); box-shadow:0 0 0 1px rgba(250,204,21,.75), 0 0 18px rgba(250,204,21,.45); }
+  body.godmode .map-badge::after { content:"👑 GOD MODE"; }
   /* note ribbon overlaid on the map's lower-left (stays clear of the D-pad) */
   .note-ribbon { position:absolute; left:18px; bottom:18px; max-width:min(58%, 460px); z-index:3; pointer-events:none;
     background:linear-gradient(180deg,rgba(243,228,194,.95),rgba(228,208,160,.95)); border-radius:9px; padding:8px 13px;
@@ -861,6 +901,7 @@ const PLAY_HTML = /* html */ `<!doctype html>
   if (token) localStorage.setItem("satscapeToken", token);
   var state = null, activeTab = location.hash === "#quests" ? "quests" : location.hash === "#shop" ? "shop" : "gear";
   var showWorldMap = false, battleAnimStart = performance.now(), lastCombatKey = "";
+  var godMode = false; // admin sandbox toggle (hidden; activated by the backtick key)
   var BREAD_STAMINA = ${SAT.BREAD_STAMINA}; // mirrors server SAT.BREAD_STAMINA — lets us cost a trip locally, no round-trip
   var reduceMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   var inflight = 0;   // battle POSTs in flight — pause the poll so it can't clobber optimistic state
@@ -902,8 +943,20 @@ const PLAY_HTML = /* html */ `<!doctype html>
     return dx * dx + dy * dy <= 30;
   }
   function api(path, body) {
-    return fetch(path, { method: body ? "POST" : "GET", headers: { "Content-Type":"application/json", "X-Satscape-Token": token }, body: body ? JSON.stringify(body) : undefined })
+    var headers = { "Content-Type":"application/json", "X-Satscape-Token": token };
+    if(godMode) headers["X-Satscape-God"] = "1"; // server ignores this unless the account is an admin
+    return fetch(path, { method: body ? "POST" : "GET", headers: headers, body: body ? JSON.stringify(body) : undefined })
       .then(function(r){ return r.json().then(function(j){ if(!r.ok) throw new Error(j.error || "Request failed"); return j; }); });
+  }
+  // Toggle the hidden admin/god sandbox. No-op (silently) for non-admin accounts.
+  function toggleGod(){
+    if(!state || !state.admin) return;
+    var next = !godMode;
+    // Send the desired state explicitly; flip the client flag only once the server confirms.
+    api("/satscape/api/god", { on: next }).then(function(res){
+      godMode = !!res.god;
+      setState(res.state || res);
+    }).catch(function(e){ note.textContent = e.message; });
   }
   // Minimap tiles accumulate client-side: a "full" payload seeds them; every (lite)
   // payload merges in the current viewport, so the minimap stays fresh without the
@@ -934,12 +987,19 @@ const PLAY_HTML = /* html */ `<!doctype html>
       document.getElementById("travelText").textContent = s.estimate.steps + " steps, " + s.estimate.breadNeeded + " bread, " + s.estimate.satCost + " sats.";
     }
     if (s.note) note.textContent = s.note; else if (state.note) note.textContent = state.note;
+    // Keep the client flag in sync with the server's authoritative view, and surface
+    // the (otherwise hidden) god badge only while actually in god mode.
+    godMode = !!(state && state.god);
+    document.body.classList.toggle("godmode", godMode);
     render();
   }
   function act(path, body) { api(path, body).then(setState).catch(function(e){ note.textContent = e.message; }); }
 
   /* ─── combat: client mirrors of the server rules (for instant, optimistic input) ─── */
   function clampA(n){ return Math.max(0, Math.min(7, Math.round(n))); }
+  function battleTerrain(c){ return (c && c.terrain) || []; }
+  function isImpassableJS(feats, x, y){ for(var i=0;i<feats.length;i++){ if(feats[i].x===x && feats[i].y===y) return true; } return false; }
+  function blocksSightJS(feats, x, y){ for(var i=0;i<feats.length;i++){ if(feats[i].kind==="rock" && feats[i].x===x && feats[i].y===y) return true; } return false; }
   function livingMonsters(c){ return (c.monsters || (c.monster ? [c.monster] : [])).filter(function(m){ return !m.dead && m.hp > 0; }); }
   function nearestMonster(c, from){
     var ms = livingMonsters(c), best = null, bd = Infinity;
@@ -955,7 +1015,7 @@ const PLAY_HTML = /* html */ `<!doctype html>
       var a = plan[i]; if(a.kind !== "move") continue;
       var d = DELTA[a.dir]; if(!d) continue;
       var next = { x:clampA(pos.x+d.x), y:clampA(pos.y+d.y) };
-      var blocked = false; for(var j=0;j<blockers.length;j++){ if(blockers[j].x===next.x && blockers[j].y===next.y){ blocked=true; break; } }
+      var blocked = isImpassableJS(battleTerrain(c), next.x, next.y); for(var j=0;j<blockers.length;j++){ if(blockers[j].x===next.x && blockers[j].y===next.y){ blocked=true; break; } }
       if(!blocked) pos = next;
     }
     return pos;
@@ -966,24 +1026,28 @@ const PLAY_HTML = /* html */ `<!doctype html>
     return dy > 0 ? "down" : "up";
   }
   // Mirror of battle.ts attackTilesForShape (geometry only) — for the on-board preview.
-  function attackTilesJS(from, target, shape){
+  // feats are terrain features: ranged rays stop at boulders, impassable tiles drop out.
+  function attackTilesJS(from, target, shape, feats){
+    feats = feats || [];
     var dir = attackDirJS(from, target);
     var DELTA = { up:{x:0,y:-1}, down:{x:0,y:1}, left:{x:-1,y:0}, right:{x:1,y:0} };
     var d = DELTA[dir];
     var lateral = (dir === "up" || dir === "down") ? {x:1,y:0} : {x:0,y:1};
     function f(n){ return { x:from.x+d.x*n, y:from.y+d.y*n }; }
+    // straight reach that halts the instant it meets a boulder (cover)
+    function los(n){ var o=[]; for(var i=1;i<=n;i++){ var p=f(i); if(p.x<0||p.x>7||p.y<0||p.y>7) break; if(blocksSightJS(feats,p.x,p.y)) break; o.push(p); } return o; }
     var raw = [];
-    if(shape === "longsword"){ raw.push(f(1), f(2)); }
-    else if(shape === "spear"){ raw.push(f(1), f(2), f(3)); }
+    if(shape === "longsword"){ raw = los(2); }
+    else if(shape === "spear"){ raw = los(3); }
     else if(shape === "hammer"){ var a=f(1); raw.push(a, {x:a.x+lateral.x,y:a.y+lateral.y}, f(2), {x:a.x+lateral.x+d.x,y:a.y+lateral.y+d.y}); }
     else if(shape === "cleave" || shape === "arc"){ var cc=f(1); raw.push(cc, {x:cc.x+lateral.x,y:cc.y+lateral.y}, {x:cc.x-lateral.x,y:cc.y-lateral.y}); }
     else if(shape === "star"){ raw.push({x:from.x-1,y:from.y-1},{x:from.x+1,y:from.y-1},{x:from.x-1,y:from.y+1},{x:from.x+1,y:from.y+1}, f(2)); }
     else if(shape === "slam"){ for(var yy=from.y-1;yy<=from.y+1;yy++) for(var xx=from.x-1;xx<=from.x+1;xx++) if(xx!==from.x||yy!==from.y) raw.push({x:xx,y:yy}); }
-    else if(shape === "bolt"){ for(var i=1;i<8;i++) raw.push(f(i)); }
+    else if(shape === "bolt"){ raw = los(7); }
     else if(shape === "nova"){ for(var y2=from.y-2;y2<=from.y+2;y2++) for(var x2=from.x-2;x2<=from.x+2;x2++) if(x2!==from.x||y2!==from.y) raw.push({x:x2,y:y2}); }
-    else { raw.push(f(1), f(2), f(3)); } // line / default
+    else { raw = los(3); } // line / default
     var out = [], seen = {};
-    for(var k=0;k<raw.length;k++){ var p=raw[k]; if(p.x<0||p.x>7||p.y<0||p.y>7) continue; var key=p.x+","+p.y; if(seen[key]) continue; seen[key]=1; out.push(p); }
+    for(var k=0;k<raw.length;k++){ var p=raw[k]; if(p.x<0||p.x>7||p.y<0||p.y>7) continue; if(isImpassableJS(feats,p.x,p.y)) continue; var key=p.x+","+p.y; if(seen[key]) continue; seen[key]=1; out.push(p); }
     return out;
   }
   function kitCard(c, id){ var k = c.kit || []; for(var i=0;i<k.length;i++) if(k[i].id===id) return k[i]; return null; }
@@ -1189,6 +1253,34 @@ const PLAY_HTML = /* html */ `<!doctype html>
   function drawArenaGrid(s){
     ctx.fillStyle="#10151c"; ctx.fillRect(0,0,play.width,play.height);
     for(var y=0;y<8;y++) for(var x=0;x<8;x++){ ctx.fillStyle=(x+y)%2?"#17212c":"#1f2a36"; ctx.fillRect(x*s,y*s,s,s); ctx.strokeStyle="#304052"; ctx.strokeRect(x*s,y*s,s,s); }
+    var feats = battleTerrain(state && state.combat);
+    for(var i=0;i<feats.length;i++) drawTileFeature(s, feats[i]);
+  }
+  function drawTileFeature(s, t){
+    var x = t.x*s, y = t.y*s;
+    if(t.kind === "pit"){
+      // a recessed dark chasm — impassable, but attacks fly over it
+      ctx.fillStyle="#05070b"; ctx.fillRect(x+1,y+1,s-2,s-2);
+      ctx.fillStyle="#010204"; ctx.beginPath(); ctx.ellipse(x+s/2, y+s*0.56, s*0.34, s*0.28, 0, 0, Math.PI*2); ctx.fill();
+      ctx.strokeStyle="rgba(71,85,105,.5)"; ctx.lineWidth=1.5; ctx.beginPath(); ctx.ellipse(x+s/2, y+s*0.46, s*0.34, s*0.24, 0, 0, Math.PI*2); ctx.stroke();
+    } else {
+      // an elevated boulder — impassable AND blocks line-of-sight (cover)
+      ctx.fillStyle="rgba(0,0,0,.4)"; ctx.beginPath(); ctx.ellipse(x+s/2, y+s*0.76, s*0.36, s*0.15, 0, 0, Math.PI*2); ctx.fill();
+      var grad = ctx.createLinearGradient(x, y+s*0.15, x, y+s*0.8);
+      grad.addColorStop(0, "#9aa6b6"); grad.addColorStop(1, "#475061");
+      ctx.beginPath();
+      ctx.moveTo(x+s*0.20, y+s*0.68);
+      ctx.lineTo(x+s*0.28, y+s*0.30);
+      ctx.lineTo(x+s*0.50, y+s*0.18);
+      ctx.lineTo(x+s*0.74, y+s*0.32);
+      ctx.lineTo(x+s*0.83, y+s*0.66);
+      ctx.lineTo(x+s*0.62, y+s*0.80);
+      ctx.lineTo(x+s*0.36, y+s*0.80);
+      ctx.closePath();
+      ctx.fillStyle = grad; ctx.fill();
+      ctx.strokeStyle="rgba(15,23,42,.6)"; ctx.lineWidth=1.5; ctx.stroke();
+      ctx.fillStyle="rgba(255,255,255,.22)"; ctx.beginPath(); ctx.ellipse(x+s*0.43, y+s*0.37, s*0.13, s*0.075, -0.5, 0, Math.PI*2); ctx.fill();
+    }
   }
   function drawHpBar(s, cx, topY, hp, maxHp, color){
     var w = s*0.72, h = 5, x = cx - w/2;
@@ -1233,7 +1325,7 @@ const PLAY_HTML = /* html */ `<!doctype html>
       if(a.kind === "move"){
         var d = DELTA[a.dir];
         if(d){
-          var nx = clampA(ppos.x+d.x), ny = clampA(ppos.y+d.y), blocked = false;
+          var nx = clampA(ppos.x+d.x), ny = clampA(ppos.y+d.y), blocked = isImpassableJS(battleTerrain(c), nx, ny);
           var blockers = mons.map(function(m){ return monBlockerAt(m, k); });
           for(var b=0;b<blockers.length;b++){ if(blockers[b].x===nx && blockers[b].y===ny){ blocked = true; break; } }
           if(!blocked) ppos = { x:nx, y:ny };
@@ -1243,7 +1335,7 @@ const PLAY_HTML = /* html */ `<!doctype html>
         if(card && card.kind !== "buff" && card.shape && monTargets.length){
           var tgt = null, bd = Infinity;
           for(var i=0;i<monTargets.length;i++){ var dd = Math.abs(monTargets[i].x-ppos.x)+Math.abs(monTargets[i].y-ppos.y); if(dd<bd){ bd = dd; tgt = monTargets[i]; } }
-          attacks.push({ order: attacks.length+1, tiles: attackTilesJS({x:ppos.x,y:ppos.y}, {x:tgt.x,y:tgt.y}, card.shape), from: {x:ppos.x,y:ppos.y}, target: tgt, emoji: card.emoji });
+          attacks.push({ order: attacks.length+1, tiles: attackTilesJS({x:ppos.x,y:ppos.y}, {x:tgt.x,y:tgt.y}, card.shape, battleTerrain(c)), from: {x:ppos.x,y:ppos.y}, target: tgt, emoji: card.emoji });
         }
       }
     }
@@ -1258,6 +1350,84 @@ const PLAY_HTML = /* html */ `<!doctype html>
     ctx.lineTo(ex + Math.cos(ang+2.5)*ah, ey + Math.sin(ang+2.5)*ah);
     ctx.lineTo(ex + Math.cos(ang-2.5)*ah, ey + Math.sin(ang-2.5)*ah);
     ctx.closePath(); ctx.fill();
+  }
+  /* ───────── whimsical attack FX (playback) ───────── */
+  // A crescent blade that sweeps through its arc as the step plays — scythe/sword swing.
+  function bladeSwing(cx, cy, ang, s, local, colorPrefix){
+    var sweep = Math.PI*1.15;
+    var a0 = ang - sweep/2 + sweep*local;
+    var alpha = Math.sin(Math.min(1,local)*Math.PI);
+    ctx.save(); ctx.translate(cx, cy); ctx.rotate(a0);
+    var rad = s*0.6;
+    ctx.strokeStyle = colorPrefix + (0.30*alpha) + ")"; ctx.lineWidth = 10; // motion blur
+    ctx.beginPath(); ctx.arc(0,0,rad*0.92,-0.55,0.55); ctx.stroke();
+    ctx.strokeStyle = colorPrefix + (0.95*alpha) + ")"; ctx.lineWidth = 3.5; // bright edge
+    ctx.beginPath(); ctx.arc(0,0,rad,-0.55,0.55); ctx.stroke();
+    ctx.restore();
+  }
+  // A flickering layered flame puff centered on a tile — fire breath.
+  function flameBlob(cx, cy, r, t){
+    var fl = 0.82 + Math.sin(t*11.0)*0.18;
+    ctx.fillStyle="rgba(127,29,29,.5)";  ctx.beginPath(); ctx.arc(cx,cy,r*1.02*fl,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle="rgba(234,88,12,.6)";  ctx.beginPath(); ctx.arc(cx,cy,r*0.70*fl,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle="rgba(250,204,21,.75)";ctx.beginPath(); ctx.arc(cx,cy,r*0.38*fl,0,Math.PI*2); ctx.fill();
+  }
+  // A flying projectile travelling from src toward the farthest struck tile.
+  function flyingShot(cx, cy, s, tiles, fallbackX, fallbackY, local, shaft, head){
+    var tip=null, bd=-1;
+    (tiles||[]).forEach(function(t){ var L=Math.pow(t.x*s+s/2-cx,2)+Math.pow(t.y*s+s/2-cy,2); if(L>bd){bd=L; tip=t;} });
+    var ex = tip ? tip.x*s+s/2 : fallbackX, ey = tip ? tip.y*s+s/2 : fallbackY;
+    var a = Math.atan2(ey-cy, ex-cx);
+    var px = cx + (ex-cx)*local, py = cy + (ey-cy)*local;
+    ctx.strokeStyle = shaft; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(px-Math.cos(a)*12, py-Math.sin(a)*12); ctx.lineTo(px, py); ctx.stroke();
+    ctx.fillStyle = head; ctx.beginPath();
+    ctx.moveTo(px+Math.cos(a)*7, py+Math.sin(a)*7);
+    ctx.lineTo(px+Math.cos(a+2.6)*7, py+Math.sin(a+2.6)*7);
+    ctx.lineTo(px+Math.cos(a-2.6)*7, py+Math.sin(a-2.6)*7);
+    ctx.closePath(); ctx.fill();
+  }
+  function shockRing(cx, cy, s, local, span, color){
+    var rr = local*s*span; if(rr<=0) return;
+    ctx.strokeStyle = color + (0.6*(1-local)) + ")"; ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.arc(cx,cy,rr,0,Math.PI*2); ctx.stroke();
+  }
+  function sparkBurst(cx, cy, local, color){
+    var alpha = Math.max(0, 1-local); if(alpha<=0) return;
+    for(var i=0;i<6;i++){ var a=i*Math.PI/3 + local*2; var r0=6+local*16, r1=r0+7;
+      ctx.strokeStyle=color+alpha+")"; ctx.lineWidth=2;
+      ctx.beginPath(); ctx.moveTo(cx+Math.cos(a)*r0, cy+Math.sin(a)*r0); ctx.lineTo(cx+Math.cos(a)*r1, cy+Math.sin(a)*r1); ctx.stroke(); }
+  }
+  // Monster strike FX, dispatched on the telegraphed pattern.
+  function drawMonsterFx(s, pattern, cx, cy, tiles, tx, ty, local){
+    if(reduceMotion) return;
+    var ang = Math.atan2(ty-cy, tx-cx);
+    if(pattern === "arrow" || pattern === "line"){ flyingShot(cx, cy, s, tiles, tx, ty, local, "rgba(250,250,250,.95)", "#fde047"); return; }
+    if(pattern === "breath"){ (tiles||[]).forEach(function(t){ flameBlob(t.x*s+s/2, t.y*s+s/2, s*0.5*(0.55+local*0.5), local*9 + t.x*0.6 + t.y*0.4); }); return; }
+    if(pattern === "slam"){ shockRing(cx, cy, s, local, 1.5, "rgba(248,250,252,"); shockRing(cx, cy, s, Math.max(0,local-0.25), 1.5, "rgba(248,113,113,"); return; }
+    bladeSwing(cx, cy, ang, s, local, "rgba(255,255,255,"); // cone / dash / default melee
+  }
+  // Player strike FX, dispatched on the played card's shape.
+  function drawPlayerFx(s, shape, cx, cy, tiles, local){
+    if(reduceMotion || !tiles || !tiles.length) return;
+    var gx=0, gy=0; tiles.forEach(function(t){ gx+=t.x*s+s/2; gy+=t.y*s+s/2; }); gx/=tiles.length; gy/=tiles.length;
+    var ang = Math.atan2(gy-cy, gx-cx);
+    if(shape === "bolt"){ flyingShot(cx, cy, s, tiles, gx, gy, local, "rgba(34,211,238,.95)", "#a5f3fc"); return; }
+    if(shape === "spear" || shape === "longsword"){
+      var reach = s*(shape==="spear"?2.3:1.5)*Math.sin(Math.min(1,local)*Math.PI);
+      ctx.save(); ctx.translate(cx,cy); ctx.rotate(ang);
+      ctx.strokeStyle="rgba(226,232,240,.95)"; ctx.lineWidth=5; ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(reach,0); ctx.stroke();
+      ctx.fillStyle="#f1f5f9"; ctx.beginPath(); ctx.moveTo(reach+9,0); ctx.lineTo(reach,-6); ctx.lineTo(reach,6); ctx.closePath(); ctx.fill();
+      ctx.restore(); return;
+    }
+    if(shape === "star"){
+      var alpha=Math.sin(Math.min(1,local)*Math.PI);
+      ctx.save(); ctx.translate(gx,gy); ctx.rotate(local*4);
+      for(var i=0;i<8;i++){ var a=i*Math.PI/4; ctx.strokeStyle="rgba(250,204,21,"+(0.9*alpha)+")"; ctx.lineWidth=3; ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(Math.cos(a)*s*0.5, Math.sin(a)*s*0.5); ctx.stroke(); }
+      ctx.restore(); return;
+    }
+    if(shape === "slam" || shape === "nova"){ shockRing(cx, cy, s, local, shape==="nova"?2.4:1.4, "rgba(34,211,238,"); return; }
+    bladeSwing(cx, cy, ang, s, local, "rgba(165,243,252,"); // cleave / arc / line / strike
   }
   function drawCardPreview(s, c){
     var attacks = previewPlan(c);
@@ -1343,7 +1513,6 @@ const PLAY_HTML = /* html */ `<!doctype html>
     var flash = 0.25 + Math.sin(local * Math.PI) * 0.4;
     // Screen shake when the player takes a hit this step (decays over the step).
     var shake = step.taken > 0 ? Math.sin(local * Math.PI * 7) * (1 - local) * 4 : 0;
-    var slashA = Math.max(0, 1 - Math.abs(local - 0.35) / 0.35); // slash visible mid-step
     ctx.save();
     ctx.translate(shake, 0);
     drawArenaGrid(s);
@@ -1365,20 +1534,22 @@ const PLAY_HTML = /* html */ `<!doctype html>
       var dyingNow = (m.act === "dead" || m.hp <= 0);
       var alpha = dyingNow ? Math.max(0.12, 1 - local) : 1;
       drawMonsterToken(s, mx, my, monColor(mi), alpha, attacking ? flash : 0);
-      if(attacking && slashA > 0){
-        var scx = mx*s+s/2, scy = my*s+s/2;
-        ctx.strokeStyle = "rgba(255,255,255," + (0.65 * slashA) + ")"; ctx.lineWidth = 3;
-        ctx.beginPath(); ctx.arc(scx, scy, s*0.46, local*4, local*4 + Math.PI*0.8); ctx.stroke();
-      }
+      if(attacking) drawMonsterFx(s, m.pattern, mx*s+s/2, my*s+s/2, m.attackTiles, ppx, ppy, local);
       if(!dyingNow) drawHpBar(s, mx*s+s/2, my*s+s/2 - s*.42, m.hp, m.maxHp || prev.maxHp || m.hp, monColor(mi));
       var dealtM = Math.max(0, (prev.hp != null ? prev.hp : m.hp) - m.hp);
-      if(dealtM > 0){ ctx.fillStyle = "rgba(134,239,172," + Math.max(0,1-local) + ")"; ctx.font = "bold 16px sans-serif"; ctx.fillText("-" + dealtM, mx*s+s/2-6, my*s+s/2 - s*0.5 - local*14); }
+      if(dealtM > 0){ sparkBurst(mx*s+s/2, my*s+s/2, local, "rgba(134,239,172,"); ctx.fillStyle = "rgba(134,239,172," + Math.max(0,1-local) + ")"; ctx.font = "bold 16px sans-serif"; ctx.fillText("-" + dealtM, mx*s+s/2-6, my*s+s/2 - s*0.5 - local*14); }
     });
     // player token — briefly flares toward red when struck this step
     var hitT = step.taken > 0 ? Math.max(0, 1 - local) : 0;
     ctx.fillStyle = hitT > 0 ? ("rgb(" + Math.round(96+159*hitT) + "," + Math.round(165-120*hitT) + "," + Math.round(250-180*hitT) + ")") : "#60a5fa";
     ctx.beginPath(); ctx.arc(ppx, ppy, s*.28 + hitT*2, 0, Math.PI*2); ctx.fill();
-    if(step.taken > 0){ ctx.fillStyle="rgba(248,113,113," + Math.max(0,1-local) + ")"; ctx.font="bold 18px sans-serif"; ctx.fillText("-" + step.taken, ppx-8, ppy - s*0.5 - local*16); }
+    // player attack FX — dispatched on the played card's shape (swing/thrust/bolt/burst)
+    var pc = state && state.combat;
+    var pcard = pc && step.player && step.player.kind === "card" ? kitCard(pc, step.player.cardId) : null;
+    if(pcard && pcard.kind !== "buff" && step.attackTiles && step.attackTiles.length){
+      drawPlayerFx(s, pcard.shape || "line", ppx, ppy, step.attackTiles, local);
+    }
+    if(step.taken > 0){ sparkBurst(ppx, ppy, local, "rgba(248,113,113,"); ctx.fillStyle="rgba(248,113,113," + Math.max(0,1-local) + ")"; ctx.font="bold 18px sans-serif"; ctx.fillText("-" + step.taken, ppx-8, ppy - s*0.5 - local*16); }
     ctx.restore();
     if(pb.shownIdx !== pb.idx){
       var line = step.line || "";
@@ -1602,6 +1773,10 @@ const PLAY_HTML = /* html */ `<!doctype html>
   function directionKey(e){ return { ArrowUp:"up", ArrowDown:"down", ArrowLeft:"left", ArrowRight:"right", w:"up", W:"up", s:"down", S:"down", a:"left", A:"left", d:"right", D:"right" }[e.key]; }
   window.addEventListener("keydown", function(e){
     if(typingTarget(document.activeElement)) return;
+    // Hidden admin shortcut: the backtick/tilde key toggles god mode. Does nothing
+    // unless the linked Discord account is in SATSCAPE_ADMIN_IDS (server-enforced),
+    // so it's inert and invisible for everyone else.
+    if(e.code === "Backquote"){ e.preventDefault(); toggleGod(); return; }
     if(e.key === "m" || e.key === "M"){
       e.preventDefault();
       if(!showWorldMap){ showWorldMap = true; render(); if(!(state && state.combat)) api("/satscape/api/state?full=1").then(setState).catch(function(){}); }

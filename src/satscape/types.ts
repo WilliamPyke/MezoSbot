@@ -69,8 +69,21 @@ export interface CombatSessionRow {
   player_status: string | null;
   /** JSON array of StatusEffect on the monster. Null = none. */
   monster_status: string | null;
+  /**
+   * JSON array of {@link TileFeature} — impassable / cover tiles for this arena.
+   * Null/empty = an open arena (and keeps fights working before the terrain migration
+   * is applied).
+   */
+  terrain: string | null;
   turn_number: number;
   created_at: string;
+}
+
+/** A non-floor arena tile: a pit (impassable) or a boulder (impassable + blocks line-of-sight). */
+export interface TileFeature {
+  x: number;
+  y: number;
+  kind: "pit" | "rock";
 }
 
 /** A computed (non-persisted) entity sitting on a tile. */

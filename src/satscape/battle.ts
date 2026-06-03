@@ -1,5 +1,5 @@
 import type { ShopItem } from "./items.js";
-import type { BattleMonster, CombatSessionRow, Direction, SatPlayerRow } from "./types.js";
+import type { BattleMonster, CombatSessionRow, Direction, SatPlayerRow, TileFeature } from "./types.js";
 import { bootBonus, ITEM_BY_ID } from "./towns.js";
 import {
   addStatus,
@@ -19,7 +19,7 @@ export const ARENA_SIZE = 8;
 
 export type BattleMove = Direction | "stay";
 export type WeaponPattern = "dagger" | "longsword" | "hammer" | "spear" | "arc" | "star";
-export type MonsterPattern = "line" | "cone" | "slam" | "dash";
+export type MonsterPattern = "line" | "cone" | "slam" | "dash" | "arrow" | "breath";
 
 export interface Point {
   x: number;
@@ -71,6 +71,8 @@ export interface StepMonster {
   /** Tiles this monster struck on this tick (empty unless it attacked this tick). */
   attackTiles: Point[];
   act: MonsterAct | "dead";
+  /** Attack pattern for this tick's strike — drives the playback FX (scythe/arrow/breath…). */
+  pattern?: MonsterPattern;
 }
 
 /** One step of the interleaved resolution, for the log + board preview. */
@@ -205,52 +207,133 @@ export function planGlyph(action: PlanAction): string {
 export function projectedPlayerPos(combat: CombatSessionRow, plan: PlanAction[]): Point {
   let pos = { x: combat.player_battle_x, y: combat.player_battle_y };
   const blockers = readMonsters(combat).filter((m) => m.hp > 0).map((m) => ({ x: m.x, y: m.y }));
+  const features = readTerrain(combat);
   for (const a of plan) {
     if (a.kind !== "move") continue;
     const d = DIR_DELTA[a.dir];
     const next = { x: clampArena(pos.x + d.x), y: clampArena(pos.y + d.y) };
-    if (blockers.some((b) => samePoint(next, b))) continue; // blocked — stay put
+    if (blockers.some((b) => samePoint(next, b)) || isImpassable(features, next)) continue; // blocked — stay put
     pos = next;
   }
   return pos;
 }
 
-export function startingBattlePositions(worldX: number, worldY: number): {
-  player: Point;
-  monster: Point;
-} {
-  const h = Math.abs((worldX * 31 + worldY * 17) | 0);
-  return {
-    player: { x: 2 + (h % 4), y: 6 },
-    monster: { x: 2 + ((h >> 2) % 4), y: 1 },
-  };
+/** The four arena edges the player can open a fight from. */
+export type ArenaEdge = "top" | "bottom" | "left" | "right";
+
+const ARENA_EDGES: ArenaEdge[] = ["top", "bottom", "left", "right"];
+const OPPOSITE_EDGE: Record<ArenaEdge, ArenaEdge> = { top: "bottom", bottom: "top", left: "right", right: "left" };
+
+/** A tile `depth` rows in from `edge`, at lateral offset `lateral` along that edge. */
+function edgePoint(edge: ArenaEdge, lateral: number, depth: number): Point {
+  const lat = clampArena(lateral);
+  const dep = clampArena(depth);
+  switch (edge) {
+    case "top": return { x: lat, y: dep };
+    case "bottom": return { x: lat, y: ARENA_SIZE - 1 - dep };
+    case "left": return { x: dep, y: lat };
+    case "right": return { x: ARENA_SIZE - 1 - dep, y: lat };
+  }
+}
+
+const randInt = (n: number): number => Math.floor(Math.random() * Math.max(1, n));
+
+/**
+ * Roll a fresh battle layout per encounter. The player opens from a randomly chosen
+ * edge and the monster pack masses on the *opposite* edge, each spread laterally —
+ * so fights are sometimes top-vs-bottom, sometimes left-vs-right, and the player
+ * isn't perennially stuck at the bottom looking up. Returns distinct in-arena tiles;
+ * attacks orient themselves toward their target (see attackTilesForShape), so any
+ * rotation of the setup plays correctly.
+ */
+export function rollBattleLayout(count: number): { player: Point; monsters: Point[] } {
+  const playerEdge = ARENA_EDGES[randInt(ARENA_EDGES.length)];
+  const foeEdge = OPPOSITE_EDGE[playerEdge];
+  const n = Math.max(1, Math.min(ARENA_SIZE, count));
+
+  // Player: 1–2 tiles in from its own edge, laterally centred-ish with a little jitter.
+  const player = edgePoint(playerEdge, 2 + randInt(4), 1 + randInt(2));
+
+  // Pack: spread along the opposite edge's front two rows from a shared lateral anchor,
+  // nudging off any tile already claimed (or the player's) so nothing overlaps.
+  const used = new Set<string>();
+  const monsters: Point[] = [];
+  const base = 1 + randInt(ARENA_SIZE - 2);
+  for (let i = 0; i < n; i++) {
+    let lateral = (base + i) % ARENA_SIZE;
+    let depth = i % 2; // alternate the back/front row off the edge
+    let p = edgePoint(foeEdge, lateral, depth);
+    let guard = 0;
+    while ((used.has(pointKey(p)) || samePoint(p, player)) && guard < ARENA_SIZE * 2) {
+      lateral = (lateral + 1) % ARENA_SIZE;
+      if (lateral === 0) depth = (depth + 1) % 2;
+      p = edgePoint(foeEdge, lateral, depth);
+      guard++;
+    }
+    used.add(pointKey(p));
+    monsters.push(p);
+  }
+  return { player, monsters };
+}
+
+/* ─────────── terrain ─────────── */
+
+/** Parse the persisted terrain JSON, tolerating null/garbage (empty = open arena). */
+export function readTerrain(combat: CombatSessionRow): TileFeature[] {
+  if (!combat.terrain) return [];
+  try {
+    const arr = JSON.parse(combat.terrain);
+    if (!Array.isArray(arr)) return [];
+    return arr
+      .filter((t) => t && Number.isFinite(t.x) && Number.isFinite(t.y) && (t.kind === "pit" || t.kind === "rock"))
+      .map((t) => ({ x: clampArena(t.x), y: clampArena(t.y), kind: t.kind as TileFeature["kind"] }));
+  } catch {
+    return [];
+  }
+}
+
+export function serializeTerrain(features: TileFeature[]): string {
+  return JSON.stringify(features);
+}
+
+/** True if nothing can stand on `p` (both pits and boulders block movement). */
+export function isImpassable(features: TileFeature[], p: Point): boolean {
+  return features.some((t) => t.x === p.x && t.y === p.y);
+}
+
+/** True if `p` blocks line-of-sight (boulders only — pits are open to fire over). */
+export function blocksSight(features: TileFeature[], p: Point): boolean {
+  return features.some((t) => t.kind === "rock" && t.x === p.x && t.y === p.y);
 }
 
 /**
- * Distinct starting tiles for `count` monsters along the top rows of the arena,
- * deterministically spread so they don't overlap (chess-like opening setup).
+ * Scatter a few impassable features across the arena so positioning matters: pits to
+ * path around and boulders that double as cover (they break ranged line-of-sight).
+ * Kept sparse (≈4–7 of 64 tiles) and never placed on a combatant's starting tile, so
+ * the board stays open enough to manoeuvre. Random per encounter.
  */
-export function startingMonsterPositions(worldX: number, worldY: number, count: number): Point[] {
-  const h = Math.abs((worldX * 31 + worldY * 17) | 0);
-  const n = Math.max(1, Math.min(ARENA_SIZE, count));
-  const used = new Set<string>();
-  const out: Point[] = [];
-  for (let i = 0; i < n; i++) {
-    const seed = hash(`${worldX}:${worldY}:${i}`);
-    let x = (1 + ((h >> (i * 2)) % (ARENA_SIZE - 2))) % ARENA_SIZE;
-    let y = i % 2 === 0 ? 1 : 0;
-    // nudge off any tile already taken
-    let guard = 0;
-    while (used.has(pointKey({ x, y })) && guard < ARENA_SIZE * 2) {
-      x = (x + 1) % ARENA_SIZE;
-      if (x === 0) y = (y + 1) % 2;
-      guard++;
+export function rollTerrain(player: Point, monsters: Point[]): TileFeature[] {
+  const occupied = new Set<string>([pointKey(player), ...monsters.map(pointKey)]);
+  const features: TileFeature[] = [];
+  const rocks = 2 + randInt(3); // 2–4 boulders (cover)
+  const pits = 1 + randInt(3); // 1–3 pits
+  const want: TileFeature["kind"][] = [
+    ...Array.from({ length: rocks }, () => "rock" as const),
+    ...Array.from({ length: pits }, () => "pit" as const),
+  ];
+  let guard = 0;
+  for (const kind of want) {
+    // Try a handful of random empty tiles; skip the feature if the arena is crowded.
+    for (let attempt = 0; attempt < 12 && guard < 200; attempt++, guard++) {
+      const p = { x: randInt(ARENA_SIZE), y: randInt(ARENA_SIZE) };
+      const key = pointKey(p);
+      if (occupied.has(key)) continue;
+      occupied.add(key);
+      features.push({ x: p.x, y: p.y, kind });
+      break;
     }
-    used.add(pointKey({ x, y }));
-    out.push({ x: clampArena(x), y: clampArena(y) });
-    void seed;
   }
-  return out;
+  return features;
 }
 
 /**
@@ -309,13 +392,14 @@ export function allMonstersDead(combat: CombatSessionRow): boolean {
 export function legalBattleMoves(combat: CombatSessionRow, player: SatPlayerRow): Point[] {
   const origin = { x: combat.player_battle_x, y: combat.player_battle_y };
   const occupied = readMonsters(combat).filter((m) => m.hp > 0).map((m) => ({ x: m.x, y: m.y }));
+  const features = readTerrain(combat);
   const range = battleMovePoints(combat, player);
   const out: Point[] = [];
   for (let y = 0; y < ARENA_SIZE; y++) {
     for (let x = 0; x < ARENA_SIZE; x++) {
       const p = { x, y };
       const dist = Math.abs(x - origin.x) + Math.abs(y - origin.y);
-      if (dist <= range && !occupied.some((o) => samePoint(p, o))) out.push(p);
+      if (dist <= range && !occupied.some((o) => samePoint(p, o)) && !isImpassable(features, p)) out.push(p);
     }
   }
   return out;
@@ -389,19 +473,29 @@ export function attackDirection(from: Point, to: Point): Direction {
  * decoupled (it comes from the card + weapon power), so the shape is purely
  * geometric. Unknown shapes fall back to a 3-tile line.
  */
-export function attackTilesForShape(from: Point, target: Point, shape: string): Point[] {
+export function attackTilesForShape(from: Point, target: Point, shape: string, features: TileFeature[] = []): Point[] {
   const dir = attackDirection(from, target);
   const d = DIR_DELTA[dir];
   const forward = (n: number) => ({ x: from.x + d.x * n, y: from.y + d.y * n });
   const lateral = dir === "up" || dir === "down" ? { x: 1, y: 0 } : { x: 0, y: 1 };
+  // A straight reach that stops the instant it meets a boulder (line-of-sight cover).
+  const losRay = (n: number): Point[] => {
+    const out: Point[] = [];
+    for (let i = 1; i <= n; i++) {
+      const p = forward(i);
+      if (!inArena(p) || blocksSight(features, p)) break;
+      out.push(p);
+    }
+    return out;
+  };
 
   const raw: Point[] = [];
   switch (shape) {
     case "longsword":
-      raw.push(forward(1), forward(2));
+      raw.push(...losRay(2));
       break;
     case "spear":
-      raw.push(forward(1), forward(2), forward(3));
+      raw.push(...losRay(3));
       break;
     case "hammer": {
       const anchor = forward(1);
@@ -430,8 +524,8 @@ export function attackTilesForShape(from: Point, target: Point, shape: string): 
         }
       }
       break;
-    case "bolt": // ranged: a straight line all the way across the arena
-      for (let i = 1; i < ARENA_SIZE; i++) raw.push(forward(i));
+    case "bolt": // ranged: a straight line until it hits a boulder or the arena edge
+      raw.push(...losRay(ARENA_SIZE - 1));
       break;
     case "nova":
       for (let yy = from.y - 2; yy <= from.y + 2; yy++) {
@@ -442,10 +536,11 @@ export function attackTilesForShape(from: Point, target: Point, shape: string): 
       break;
     case "line":
     default:
-      raw.push(forward(1), forward(2), forward(3));
+      raw.push(...losRay(3));
       break;
   }
-  return uniquePoints(raw.filter(inArena));
+  // Nothing can be struck on a tile nothing can stand on (pit/boulder).
+  return uniquePoints(raw.filter(inArena).filter((p) => !isImpassable(features, p)));
 }
 
 /**
@@ -464,6 +559,7 @@ function monsterIntentsFor(
   target: Point,
   turnNumber: number,
   blocked: (p: Point) => boolean,
+  features: TileFeature[] = [],
 ): MonsterIntent[] {
   const damage = Math.max(3, 3 + m.level * 2);
   const ability = monsterAbility(m.name);
@@ -485,7 +581,7 @@ function monsterIntentsFor(
         name: ability.name,
         description: monsterIntentDescription(pattern, move, dir, ability.apply),
         from, to,
-        attackTiles: monsterAttackTiles(to, dir, pattern, seed),
+        attackTiles: monsterAttackTiles(to, dir, pattern, seed, features),
         damage,
         apply: ability.apply,
       });
@@ -516,13 +612,14 @@ function monsterIntentsFor(
 export function monstersTelegraph(combat: CombatSessionRow): MonsterTelegraph[] {
   const monsters = readMonsters(combat).filter((m) => m.hp > 0);
   const target = { x: combat.player_battle_x, y: combat.player_battle_y };
+  const features = readTerrain(combat);
   const claimed = new Set<string>();
   for (const m of monsters) claimed.add(pointKey({ x: m.x, y: m.y }));
   const out: MonsterTelegraph[] = [];
   for (const m of monsters) {
     const self = pointKey({ x: m.x, y: m.y });
-    const blocked = (p: Point) => claimed.has(pointKey(p)) && pointKey(p) !== self;
-    const intents = monsterIntentsFor(m, target, combat.turn_number, blocked);
+    const blocked = (p: Point) => (claimed.has(pointKey(p)) && pointKey(p) !== self) || isImpassable(features, p);
+    const intents = monsterIntentsFor(m, target, combat.turn_number, blocked, features);
     claimed.delete(self);
     for (const it of intents) claimed.add(pointKey(it.to));
     out.push({ monster: m, intents });
@@ -572,6 +669,7 @@ export function simulateBattle(
   plan: PlanAction[],
 ): BattleResolution {
   const telegraph = monstersTelegraph(combat);
+  const features = readTerrain(combat);
   let playerPos = { x: combat.player_battle_x, y: combat.player_battle_y };
 
   // Working state per living monster: position/hp clone + this-round status bookkeeping.
@@ -612,6 +710,7 @@ export function simulateBattle(
       maxHp: mm.m.maxHp,
       attackTiles: tickStrikes[mm.m.id] ?? [],
       act: mm.m.hp <= 0 ? "dead" : (mm.intents[k]?.act ?? "rest"),
+      pattern: mm.intents[k]?.pattern,
     }));
   const primaryPos = (): Point => (mons[0] ? { x: mons[0].m.x, y: mons[0].m.y } : { x: combat.monster_battle_x, y: combat.monster_battle_y });
 
@@ -647,7 +746,7 @@ export function simulateBattle(
     if (action?.kind === "move") {
       const d = DIR_DELTA[action.dir];
       const next = { x: clampArena(playerPos.x + d.x), y: clampArena(playerPos.y + d.y) };
-      if (!livingPositions().some((p) => samePoint(p, next))) playerPos = next;
+      if (!livingPositions().some((p) => samePoint(p, next)) && !isImpassable(features, next)) playerPos = next;
       parts.push(`${planGlyph(action)} to ${arenaTag(playerPos)}`);
     } else if (action?.kind === "card") {
       const card = cardById(action.cardId);
@@ -667,7 +766,7 @@ export function simulateBattle(
         // monster whenever it advanced on the same tick the strike landed.
         const destOf = (mm: typeof mons[number]): Point => mm.intents[k]?.to ?? { x: mm.m.x, y: mm.m.y };
         const focus = nearestLiving(playerPos, destOf);
-        attackTiles = focus ? attackTilesForShape(playerPos, destOf(focus), card.shape ?? "line") : [];
+        attackTiles = focus ? attackTilesForShape(playerPos, destOf(focus), card.shape ?? "line", features) : [];
         const hits = mons.filter((mm) => mm.m.hp > 0 && attackTiles.some((p) => samePoint(p, destOf(mm))));
         if (hits.length) {
           const dmgEach = Math.max(1, (card.damage ?? 0) + Math.round(weapon.power) + empower);
@@ -753,14 +852,24 @@ function arenaTag(p: Point): string {
 
 function monsterPatternFor(monsterName: string, seed: number): MonsterPattern {
   const name = monsterName.toLowerCase();
+  // Ranged archers — snipe across the board with arrows.
+  if (name.includes("bandit") || name.includes("archer") || name.includes("sniper") || name.includes("hunter")) {
+    return seed % 2 === 0 ? "arrow" : "line";
+  }
+  // Breath-weapon brutes — wide fire/elemental cones.
+  if (name.includes("wyrm") || name.includes("dragon") || name.includes("drake") || name.includes("djinn")) {
+    return seed % 2 === 0 ? "breath" : "cone";
+  }
   if (name.includes("wolf") || name.includes("tiger") || name.includes("yeti")) return seed % 2 === 0 ? "cone" : "dash";
   if (name.includes("golem") || name.includes("wraith") || name.includes("revenant")) return seed % 2 === 0 ? "slam" : "line";
-  if (name.includes("naga") || name.includes("wyrm") || name.includes("scorpion")) return seed % 2 === 0 ? "line" : "cone";
+  if (name.includes("naga") || name.includes("scorpion")) return seed % 2 === 0 ? "line" : "cone";
   return (["line", "cone", "slam", "dash"] as const)[seed % 4];
 }
 
 function monsterStep(from: Point, target: Point, pattern: MonsterPattern, seed: number): Point {
   if (pattern === "slam") return { x: 0, y: 0 };
+  // Ranged attackers hold their ground and fire from afar rather than closing in.
+  if (pattern === "arrow") return { x: 0, y: 0 };
   const max = pattern === "dash" ? 2 : 1;
   const dx = target.x - from.x;
   const dy = target.y - from.y;
@@ -772,22 +881,49 @@ function monsterStep(from: Point, target: Point, pattern: MonsterPattern, seed: 
   return { x: 0, y: 0 };
 }
 
-function monsterAttackTiles(from: Point, dir: Direction, pattern: MonsterPattern, seed: number): Point[] {
+function monsterAttackTiles(from: Point, dir: Direction, pattern: MonsterPattern, seed: number, features: TileFeature[] = []): Point[] {
   const d = DIR_DELTA[dir];
   const lateral = dir === "up" || dir === "down" ? { x: 1, y: 0 } : { x: 0, y: 1 };
+  const forward = (n: number) => ({ x: from.x + d.x * n, y: from.y + d.y * n });
+  // Straight reach that halts at the first boulder (line-of-sight cover).
+  const losRay = (n: number): Point[] => {
+    const out: Point[] = [];
+    for (let i = 1; i <= n; i++) {
+      const p = forward(i);
+      if (!inArena(p) || blocksSight(features, p)) break;
+      out.push(p);
+    }
+    return out;
+  };
   const raw: Point[] = [];
   switch (pattern) {
     case "line":
-      for (let i = 1; i < ARENA_SIZE; i++) raw.push({ x: from.x + d.x * i, y: from.y + d.y * i });
+      raw.push(...losRay(3));
+      break;
+    case "arrow": // long-range sniper shot — flies clear across the arena until cover stops it
+      raw.push(...losRay(ARENA_SIZE - 1));
       break;
     case "cone":
       raw.push(
-        { x: from.x + d.x, y: from.y + d.y },
-        { x: from.x + d.x * 2, y: from.y + d.y * 2 },
+        forward(1),
+        forward(2),
         { x: from.x + d.x * 2 + lateral.x, y: from.y + d.y * 2 + lateral.y },
         { x: from.x + d.x * 2 - lateral.x, y: from.y + d.y * 2 - lateral.y },
       );
       break;
+    case "breath": {
+      // A wide fire-breath fan: widens as it travels and is cut short by a boulder
+      // directly ahead, so a rock in the throat of the cone shields the tiles behind it.
+      for (let i = 1; i <= 3; i++) {
+        const center = forward(i);
+        if (!inArena(center) || blocksSight(features, center)) break;
+        const width = i - 1; // 0, 1, 2 → a spreading cone
+        for (let w = -width; w <= width; w++) {
+          raw.push({ x: center.x + lateral.x * w, y: center.y + lateral.y * w });
+        }
+      }
+      break;
+    }
     case "slam":
       for (let y = from.y - 1; y <= from.y + 1; y++) {
         for (let x = from.x - 1; x <= from.x + 1; x++) {
@@ -796,13 +932,13 @@ function monsterAttackTiles(from: Point, dir: Direction, pattern: MonsterPattern
       }
       break;
     case "dash":
-      for (let i = 1; i <= 3; i++) raw.push({ x: from.x + d.x * i, y: from.y + d.y * i });
+      raw.push(...losRay(3));
       if (seed % 3 === 0) {
         raw.push({ x: from.x + d.x * 2 + lateral.x, y: from.y + d.y * 2 + lateral.y });
       }
       break;
   }
-  return uniquePoints(raw.filter(inArena));
+  return uniquePoints(raw.filter(inArena).filter((p) => !isImpassable(features, p)));
 }
 
 function monsterIntentDescription(pattern: MonsterPattern, move: Point, dir: Direction, apply: StatusEffect[]): string {
@@ -812,7 +948,9 @@ function monsterIntentDescription(pattern: MonsterPattern, move: Point, dir: Dir
   const fx = apply.length ? ` (inflicts ${apply.map((e) => e.kind).join(", ")})` : "";
   switch (pattern) {
     case "line": return `Will ${moveText}, then strike a straight ${dir} line${fx}.`;
+    case "arrow": return `Will ${moveText}, then loose a long-range arrow ${dir} across the field${fx}.`;
     case "cone": return `Will ${moveText}, then strike in a ${dir}-facing cone${fx}.`;
+    case "breath": return `Will ${moveText}, then exhale a wide ${dir}-facing breath${fx}.`;
     case "slam": return `Will ${moveText}, then slam all adjacent tiles${fx}.`;
     case "dash": return `Will ${moveText}, then lunge ${dir}${fx}.`;
   }

@@ -1,7 +1,8 @@
 import { supabase } from "../db.js";
 import { getBalance, getOrCreateUser } from "../balance.js";
+import { GOD_SANDBOX_BALANCE, isGodProfile } from "./admin.js";
 import { SAT, entityAt, viewportBounds } from "./engine.js";
-import { TOWN_BY_ID } from "./towns.js";
+import { ALL_ITEMS, TOWN_BY_ID } from "./towns.js";
 import type {
   CombatSessionRow,
   OtherPlayer,
@@ -25,6 +26,22 @@ export function effectiveHp(player: Pick<SatPlayerRow, "hp" | "max_hp">, balance
   return Math.max(0, Math.min(cur, cap));
 }
 
+/**
+ * Balance used for SatScape HP/economy. God/admin sandbox profiles report an
+ * effectively-infinite balance (so HP sits at max and never drops); everyone else
+ * uses the real `users.balance_sats` ledger.
+ */
+export async function getSatBalance(discordId: string): Promise<number> {
+  if (isGodProfile(discordId)) return GOD_SANDBOX_BALANCE;
+  return getBalance(discordId);
+}
+
+/** Grant the full item catalogue to a profile (god mode: equip anything, for free). */
+export async function grantAllItems(discordId: string): Promise<void> {
+  const rows = ALL_ITEMS.map((it) => ({ discord_id: discordId, item_id: it.id, quantity: 1 }));
+  await supabase.from("sat_inventories").upsert(rows, { onConflict: "discord_id,item_id" });
+}
+
 export async function getPlayer(discordId: string): Promise<SatPlayerRow | null> {
   const { data } = await supabase
     .from("sat_players")
@@ -37,7 +54,7 @@ export async function getPlayer(discordId: string): Promise<SatPlayerRow | null>
 /** Create or re-activate a player at the town origin. Caller must charge the buy-in first. */
 export async function startRun(discordId: string): Promise<SatPlayerRow> {
   await getOrCreateUser(discordId); // ensure FK target in `users` exists
-  const balance = await getBalance(discordId);
+  const balance = await getSatBalance(discordId);
   const spawn = TOWN_BY_ID.get("rest") ?? { cx: 0, cy: 0 };
   const { data, error } = await supabase
     .from("sat_players")
@@ -95,7 +112,13 @@ export async function getCombat(discordId: string): Promise<CombatSessionRow | n
 }
 
 export async function createCombat(session: CombatSessionRow): Promise<void> {
-  await supabase.from("sat_combat_sessions").upsert(session, { onConflict: "discord_id" });
+  const { error } = await supabase.from("sat_combat_sessions").upsert(session, { onConflict: "discord_id" });
+  // Graceful degradation before the terrain migration is applied: if the `terrain`
+  // column doesn't exist yet, retry without it so fights still start (empty arena).
+  if (error && /terrain/i.test(`${error.message} ${error.details ?? ""}`)) {
+    const { terrain: _omit, ...rest } = session;
+    await supabase.from("sat_combat_sessions").upsert(rest, { onConflict: "discord_id" });
+  }
 }
 
 export async function updateCombat(
@@ -245,6 +268,7 @@ async function othersInBox(
     .eq("active", true)
     .neq("state", "fainted")
     .neq("discord_id", selfId)
+    .not("discord_id", "like", "god:%")
     .gte("x_coord", minX)
     .lte("x_coord", maxX)
     .gte("y_coord", minY)
@@ -306,7 +330,7 @@ export async function loadView(discordId: string): Promise<ViewModel | null> {
   if (!player) return null;
   const b = viewportBounds(player.x_coord, player.y_coord);
   const [balance, combat, entities, others, explored, ownedItemIds] = await Promise.all([
-    getBalance(discordId),
+    getSatBalance(discordId),
     getCombat(discordId),
     loadViewportEntities(player.x_coord, player.y_coord),
     othersInBox(discordId, b.minX, b.maxX, b.minY, b.maxY),
