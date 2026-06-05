@@ -105,6 +105,10 @@ exports.config = {
         /** Delete duplicate target-link posts in quest channels for N minutes after a claim (0 = off). */
         linkDuplicateDeleteMinutes: parseInt(optional("QUEST_LINK_DUPLICATE_DELETE_MINUTES", "5"), 10),
     },
+    satscape: {
+        /** Discord IDs allowed to toggle SatScape god/admin mode (CSV). Distinct from ADMIN_IDS. */
+        adminIds: (process.env.SATSCAPE_ADMIN_IDS ?? "").split(",").map((s) => s.trim()).filter(Boolean),
+    },
     ledger: {
         guildId: optional("LEDGER_GUILD_ID", ""),
         channelId: optional("LEDGER_CHANNEL_ID", ""),

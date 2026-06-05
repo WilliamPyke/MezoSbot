@@ -6,6 +6,7 @@ import { join } from "node:path";
 const CHUNKS_DIR = join(__dirname, "..", "satscape", "world_gen", "chunks");
 import { supabase } from "../db.js";
 import { biomeAt, SAT } from "../satscape/engine.js";
+import { inWorldBounds } from "../satscape/world.js";
 import {
   MAX_PLAN,
   monstersTelegraph,
@@ -63,9 +64,11 @@ async function loadExploredTiles(): Promise<Array<{ x: number; y: number }>> {
       .order("y", { ascending: true })
       .range(from, from + pageSize - 1);
     if (error) throw error;
-    const page = (data ?? []).map((tile) => ({ x: tile.x, y: tile.y }));
-    tiles.push(...page);
-    if (page.length < pageSize) return tiles;
+    const rows = data ?? [];
+    // Drop tiles outside the current world — stale fog from before the map migration
+    // (their old coordinates land off-map and stretch the minimap with stray dots).
+    tiles.push(...rows.map((tile) => ({ x: tile.x, y: tile.y })).filter((t) => inWorldBounds(t.x, t.y)));
+    if (rows.length < pageSize) return tiles;
   }
 }
 
