@@ -173,6 +173,11 @@ function taskMirrorsScheduledEvent(task: ActiveQuestTask<EventAttendanceConfig>,
   return metadata?.scheduledEventId === event.id || metadata?.legacyEventQuestId != null;
 }
 
+function isLegacyEventQuestMirror(task: Pick<ActiveQuestTask, "quest">): boolean {
+  const metadata = task.quest.metadata as Record<string, unknown> | undefined;
+  return metadata?.legacyEventQuestId != null;
+}
+
 async function syncTaskQuestFromEvent(
   task: ActiveQuestTask<EventAttendanceConfig>,
   event: GuildScheduledEvent,
@@ -235,7 +240,7 @@ async function getActiveEventTasksForChannel(
     return [];
   });
 
-  return tasks.filter((task) => task.config.eventChannelId === channelId);
+  return tasks.filter((task) => !isLegacyEventQuestMirror(task) && task.config.eventChannelId === channelId);
 }
 
 async function startAttendance(
@@ -1187,6 +1192,7 @@ async function sweepMultiStepQuests(client: Client): Promise<void> {
   // Group by guildId
   const byGuild = new Map<string, Array<ActiveQuestTask<EventAttendanceConfig>>>();
   for (const task of guildTasks) {
+    if (isLegacyEventQuestMirror(task)) continue;
     const list = byGuild.get(task.quest.guild_id) ?? [];
     list.push(task);
     byGuild.set(task.quest.guild_id, list);
@@ -1317,7 +1323,7 @@ export async function handleMultiStepScheduledEventUpdate(
     console.warn("[QuestEngine] Failed to load event tasks for event sync:", (err as Error).message);
     return [];
   });
-  const matchingTasks = tasks.filter((task) => task.config.scheduledEventId === event.id);
+  const matchingTasks = tasks.filter((task) => !isLegacyEventQuestMirror(task) && task.config.scheduledEventId === event.id);
 
   for (const task of matchingTasks) {
     const syncedTask = await syncTaskQuestFromEvent(task, event);
