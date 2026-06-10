@@ -6,6 +6,7 @@ import { sendTransferReceivedDm } from "../notifications.js";
 import { supabase } from "../db.js";
 import { updateUserBadges } from "../badges.js";
 import { recordLedgerEntry } from "../ledger.js";
+import { replyInsufficientBalance } from "./responses.js";
 
 
 export const data = {
@@ -37,16 +38,16 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     return interaction.reply({ content: "❌ You can't tip bots.", flags: MessageFlags.Ephemeral });
   }
 
-  await interaction.deferReply();
-
   const balance = await getBalance(interaction.user.id);
   if (balance < amount) {
-    return interaction.editReply({ content: "❌ Insufficient balance." });
+    return replyInsufficientBalance(interaction);
   }
 
   if (!(await subtractBalance(interaction.user.id, amount))) {
-    return interaction.editReply({ content: "❌ Insufficient balance." });
+    return replyInsufficientBalance(interaction);
   }
+
+  await interaction.deferReply();
 
   await addBalance(target.id, amount);
   await registerDepositAddress(target.id);

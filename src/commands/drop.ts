@@ -4,6 +4,7 @@ import { subtractBalance, getBalance } from "../balance.js";
 import { roundSats } from "../format.js";
 import { buildDropEmbed, buildClaimButton, type Drop } from "../drops.js";
 import { recordLedgerEntry } from "../ledger.js";
+import { replyInsufficientBalance } from "./responses.js";
 
 export const data = {
   name: "drop",
@@ -29,16 +30,16 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     });
   }
 
-  await interaction.deferReply();
-
   const balance = await getBalance(interaction.user.id);
   if (balance < total) {
-    return interaction.editReply({ content: "❌ Insufficient balance." });
+    return replyInsufficientBalance(interaction);
   }
 
   if (!(await subtractBalance(interaction.user.id, total))) {
-    return interaction.editReply({ content: "❌ Insufficient balance." });
+    return replyInsufficientBalance(interaction);
   }
+
+  await interaction.deferReply();
 
   const { data: inserted } = await supabase
     .from("drops")

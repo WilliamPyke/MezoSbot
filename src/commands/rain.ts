@@ -7,6 +7,7 @@ import { getRainBannedTerms, messageMatchesAnyRainTerm, messageMatchesRainBan, n
 import { supabase } from "../db.js";
 import { updateUserBadges } from "../badges.js";
 import { recordLedgerEntry } from "../ledger.js";
+import { replyInsufficientBalance } from "./responses.js";
 
 
 export const data = {
@@ -42,11 +43,9 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   }
 
   const totalAmount = interaction.options.getNumber("amount", true);
-  await interaction.deferReply();
-
   const balance = await getBalance(interaction.user.id);
   if (balance < totalAmount) {
-    return interaction.editReply({ content: "❌ Insufficient balance." });
+    return replyInsufficientBalance(interaction);
   }
 
   const count = interaction.options.getInteger("count", true);
@@ -58,12 +57,14 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   const wordFilter = parseWordFilter(rawWords);
 
   if (customMessage && customMessage.length > 200) {
-    return interaction.editReply({ content: "❌ Message must be 200 characters or fewer." });
+    return interaction.reply({ content: "❌ Message must be 200 characters or fewer.", flags: MessageFlags.Ephemeral });
   }
 
   if ((rawWords?.trim().length ?? 0) > 0 && wordFilter.length === 0) {
-    return interaction.editReply({ content: "❌ Add at least one word or phrase to use the word filter." });
+    return interaction.reply({ content: "❌ Add at least one word or phrase to use the word filter.", flags: MessageFlags.Ephemeral });
   }
+
+  await interaction.deferReply();
 
   // Fetch recent messages, sort newest-first, pick the last N unique users
   let fetched;
@@ -124,7 +125,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   const totalNeeded = roundSats(perUser * activeUserIds.length);
 
   if (!(await subtractBalance(interaction.user.id, totalNeeded))) {
-    return interaction.editReply({ content: "❌ Insufficient balance." });
+    return replyInsufficientBalance(interaction);
   }
 
   // Parallelize balance additions, address registrations, and recipient DMs.

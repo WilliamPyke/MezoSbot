@@ -4,6 +4,7 @@ import { registerDepositAddress } from "../evm.js";
 import { formatSats, roundSats } from "../format.js";
 import { sendTransferReceivedDm } from "../notifications.js";
 import { recordLedgerEntry } from "../ledger.js";
+import { replyInsufficientBalance } from "./responses.js";
 
 export const data = {
   name: "distribute",
@@ -38,16 +39,17 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   }
 
   const totalNeeded = roundSats(perUser * validUsers.length);
-  await interaction.deferReply();
 
   const balance = await getBalance(interaction.user.id);
   if (balance < totalNeeded) {
-    return interaction.editReply({ content: "❌ Insufficient balance." });
+    return replyInsufficientBalance(interaction);
   }
 
   if (!(await subtractBalance(interaction.user.id, totalNeeded))) {
-    return interaction.editReply({ content: "❌ Insufficient balance." });
+    return replyInsufficientBalance(interaction);
   }
+
+  await interaction.deferReply();
 
   // Parallelize balance additions, address registrations, and recipient DMs.
   await Promise.all(

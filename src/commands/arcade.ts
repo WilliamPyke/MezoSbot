@@ -31,6 +31,7 @@ import {
   STAKE_TIERS,
   DEFAULT_PLATFORM_RAKE_BPS,
 } from "../arcade/economics.js";
+import { replyInsufficientBalance } from "./responses.js";
 
 const DEFAULT_ARCADE_DURATION_MINUTES = 3;
 const MAX_ARCADE_DURATION_MINUTES = 5;
@@ -332,17 +333,18 @@ async function runChallenge(interaction: ChatInputCommandInteraction) {
     return interaction.reply({ content: "❌ Bots can't play.", flags: MessageFlags.Ephemeral });
   }
 
-  await interaction.deferReply();
-
   const isStaked = stake > 0;
   if (isStaked) {
     const balance = await getBalance(interaction.user.id);
     if (balance < stake) {
-      return interaction.editReply({
-        content: `❌ Insufficient balance. You need **${formatSats(stake)}** to challenge with this stake.`,
-      });
+      return replyInsufficientBalance(
+        interaction,
+        `❌ Insufficient balance. You need **${formatSats(stake)}** to challenge with this stake.`,
+      );
     }
   }
+
+  await interaction.deferReply();
 
   const match = await createMatch({
     mode: isStaked ? "staked_pvp" : "free_pvp",
@@ -359,7 +361,7 @@ async function runChallenge(interaction: ChatInputCommandInteraction) {
   if (isStaked) {
     const fund = await fundEscrowFromBalance(match.id, interaction.user.id, stake);
     if (!fund.ok) {
-      return interaction.editReply({ content: `❌ ${fund.error}` });
+      return replyInsufficientBalance(interaction, `❌ ${fund.error}`);
     }
   }
 
@@ -381,17 +383,18 @@ async function runOffer(interaction: ChatInputCommandInteraction) {
   const stake = interaction.options.getNumber("stake") ?? 0;
   const matchDurationSeconds = durationSeconds(interaction);
 
-  await interaction.deferReply();
-
   const isStaked = stake > 0;
   if (isStaked) {
     const balance = await getBalance(interaction.user.id);
     if (balance < stake) {
-      return interaction.editReply({
-        content: `❌ Insufficient balance. You need **${formatSats(stake)}** to post this offer.`,
-      });
+      return replyInsufficientBalance(
+        interaction,
+        `❌ Insufficient balance. You need **${formatSats(stake)}** to post this offer.`,
+      );
     }
   }
+
+  await interaction.deferReply();
 
   const match = await createMatch({
     mode: isStaked ? "staked_pvp" : "free_pvp",
@@ -408,7 +411,7 @@ async function runOffer(interaction: ChatInputCommandInteraction) {
   if (isStaked) {
     const fund = await fundEscrowFromBalance(match.id, interaction.user.id, stake);
     if (!fund.ok) {
-      return interaction.editReply({ content: `❌ ${fund.error}` });
+      return replyInsufficientBalance(interaction, `❌ ${fund.error}`);
     }
   }
 
@@ -442,14 +445,15 @@ async function runTipfight(interaction: ChatInputCommandInteraction) {
     }
   }
 
-  await interaction.deferReply();
-
   const balance = await getBalance(interaction.user.id);
   if (balance < stake) {
-    return interaction.editReply({
-      content: `❌ Insufficient balance. You need **${formatSats(stake)}** to post this tipfight.`,
-    });
+    return replyInsufficientBalance(
+      interaction,
+      `❌ Insufficient balance. You need **${formatSats(stake)}** to post this tipfight.`,
+    );
   }
+
+  await interaction.deferReply();
 
   const match = await createMatch({
     mode: "tipfight",
@@ -465,7 +469,7 @@ async function runTipfight(interaction: ChatInputCommandInteraction) {
 
   const fund = await fundEscrowFromBalance(match.id, interaction.user.id, stake);
   if (!fund.ok) {
-    return interaction.editReply({ content: `❌ ${fund.error}` });
+    return replyInsufficientBalance(interaction, `❌ ${fund.error}`);
   }
 
   const content = target
