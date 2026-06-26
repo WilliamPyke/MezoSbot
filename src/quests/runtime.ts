@@ -15,6 +15,7 @@ import { supabase } from "../db.js";
 import { formatSats } from "../format.js";
 import { registerDepositAddress } from "../evm.js";
 import { sendTransferReceivedDm } from "../notifications.js";
+import { getSatsMultiplier, type SatsMultiplier } from "../multi.js";
 import {
   completeQuestTask,
   getActiveTasksByType,
@@ -283,6 +284,7 @@ async function stopAttendance(
   client: Client,
   task: ActiveQuestTask<EventAttendanceConfig>,
   userId: string,
+  multiplier: SatsMultiplier = 1,
   accrualEndMs = questWindowEndMs(task.quest),
 ): Promise<void> {
   const { data: row, error } = await supabase
@@ -314,7 +316,7 @@ async function stopAttendance(
     await completeAndNotify(client, task, userId, {
       kind: "event_attendance",
       accumulatedSeconds: accumulated,
-    });
+    }, multiplier);
   }
 }
 
@@ -322,11 +324,11 @@ async function updateConnectedAttendance(
   client: Client,
   task: ActiveQuestTask<EventAttendanceConfig>,
   userId: string,
-  options: { running: boolean; allowStart?: boolean; accrualEndMs?: number },
+  options: { running: boolean; allowStart?: boolean; accrualEndMs?: number; multiplier?: SatsMultiplier },
 ): Promise<void> {
   const accrualEndMs = questWindowEndMs(task.quest, options.accrualEndMs ?? Date.now());
   if (!options.running || !questWindowAllowsCompletion(task.quest, accrualEndMs, { ignoreStart: options.running })) {
-    await stopAttendance(client, task, userId, accrualEndMs);
+    await stopAttendance(client, task, userId, options.multiplier ?? 1, accrualEndMs);
     return;
   }
 
@@ -371,7 +373,7 @@ async function updateConnectedAttendance(
     await completeAndNotify(client, task, userId, {
       kind: "event_attendance",
       accumulatedSeconds: accumulated,
-    });
+    }, options.multiplier ?? 1);
   }
 }
 
@@ -858,12 +860,14 @@ export async function completeAndNotify(
   task: Pick<ActiveQuestTask, "id" | "quest_id" | "title" | "quest">,
   userId: string,
   proof?: Record<string, unknown>,
+  rewardMultiplier: SatsMultiplier = 1,
 ): Promise<QuestCompletionResult> {
   const result = await completeQuestTask({
     questId: task.quest_id,
     taskId: task.id,
     userId,
     proof,
+    rewardMultiplier,
   });
 
   if (!result.ok) return result;
@@ -931,6 +935,7 @@ async function completeRepeatableLinkWindowAndNotify(
   task: ActiveQuestTask<FirstLinkConfig>,
   userId: string,
   proof: Record<string, unknown>,
+  rewardMultiplier: SatsMultiplier = 1,
 ): Promise<QuestCompletionResult> {
   let result: QuestCompletionResult = { ok: false, reason: "unknown_error" };
 
@@ -940,6 +945,7 @@ async function completeRepeatableLinkWindowAndNotify(
       taskId: task.id,
       userId,
       proof,
+      rewardMultiplier,
     });
 
     if (!result.ok) return result;
@@ -957,6 +963,7 @@ async function completeRepeatableLinkWindowAndNotify(
         taskId: task.id,
         userId,
         proof,
+        rewardMultiplier,
       });
 
       if (repeatResult.ok && (repeatResult.rewardDeltaSats ?? 0) > 0) {
@@ -1142,7 +1149,13 @@ export async function handleMultiStepQuestMessage(client: Client, message: Messa
     if (!wonWindow) continue;
 
     await markFirstLinkWindowClaimed(task, message.author.id, linkIndex, message.id, matchedUrl);
-    await completeRepeatableLinkWindowAndNotify(client, task, message.author.id, proof);
+    await completeRepeatableLinkWindowAndNotify(
+      client,
+      task,
+      message.author.id,
+      proof,
+      getSatsMultiplier(message.member?.roles.cache.keys()),
+    );
   }
 }
 
@@ -1157,7 +1170,8 @@ export async function handleMultiStepQuestVoiceStateUpdate(
 
   if (oldState.guild.id && oldState.channelId) {
     const leavingTasks = await getActiveEventTasksForChannel(oldState.guild.id, oldState.channelId);
-    await Promise.all(leavingTasks.map((task) => stopAttendance(client, task, userId)));
+    const multiplier = getSatsMultiplier(oldState.member?.roles.cache.keys());
+    await Promise.all(leavingTasks.map((task) => stopAttendance(client, task, userId, multiplier)));
   }
 
   if (newState.guild.id && newState.channelId) {
@@ -1224,6 +1238,7 @@ async function sweepMultiStepQuests(client: Client): Promise<void> {
               running,
               allowStart: false,
               accrualEndMs,
+              multiplier: getSatsMultiplier(member.roles.cache.keys()),
             }).catch((err) => {
               console.warn(`[QuestEngine] Failed to update attendance for user ${userId}:`, err.message);
             });
@@ -1342,6 +1357,7 @@ export async function handleMultiStepScheduledEventUpdate(
         running,
         allowStart: running,
         accrualEndMs,
+        multiplier: getSatsMultiplier(member.roles.cache.keys()),
       });
     }
   }

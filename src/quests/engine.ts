@@ -464,12 +464,14 @@ export async function completeQuestTask(params: {
   taskId: number;
   userId: string;
   proof?: Record<string, unknown>;
+  rewardMultiplier?: number;
 }): Promise<QuestCompletionResult> {
   const { data, error } = await supabase.rpc("complete_quest_task_and_pay_delta", {
     p_quest_id: params.questId,
     p_task_id: params.taskId,
     p_user_id: params.userId,
     p_proof: params.proof ?? {},
+    p_reward_multiplier: params.rewardMultiplier ?? 1,
   });
 
   if (error) throw error;
@@ -481,12 +483,14 @@ export async function payRepeatableQuestTaskReward(params: {
   taskId: number;
   userId: string;
   proof?: Record<string, unknown>;
+  rewardMultiplier?: number;
 }): Promise<QuestCompletionResult> {
   const { data, error } = await supabase.rpc("pay_repeatable_quest_task_reward", {
     p_quest_id: params.questId,
     p_task_id: params.taskId,
     p_user_id: params.userId,
     p_proof: params.proof ?? {},
+    p_reward_multiplier: params.rewardMultiplier ?? 1,
   });
 
   if (error) {
@@ -502,6 +506,7 @@ async function payRepeatableQuestTaskRewardFallback(params: {
   taskId: number;
   userId: string;
   proof?: Record<string, unknown>;
+  rewardMultiplier?: number;
 }): Promise<QuestCompletionResult> {
   const { data: quest, error: questError } = await supabase
     .from("quests")
@@ -539,7 +544,9 @@ async function payRepeatableQuestTaskRewardFallback(params: {
   if (tierError) throw tierError;
 
   const rewardSats = Math.max(0, ...(tiers ?? []).map((tier) => roundSats(Number(tier.reward_sats))));
-  if (rewardSats <= 0) return { ok: false, reason: "reward_not_configured" };
+  const multiplier = params.rewardMultiplier === 2 ? 2 : 1;
+  const payoutSats = roundSats(rewardSats * multiplier);
+  if (payoutSats <= 0) return { ok: false, reason: "reward_not_configured" };
 
   const { data: rewardRow, error: rewardError } = await supabase
     .from("quest_user_rewards")
@@ -569,7 +576,7 @@ async function payRepeatableQuestTaskRewardFallback(params: {
 
   const { data: debited, error: debitError } = await supabase.rpc("subtract_balance_if_sufficient", {
     p_discord_id: quest.creator_id,
-    p_amount: rewardSats,
+    p_amount: payoutSats,
   });
   if (debitError) throw debitError;
   if (!debited) {
@@ -584,23 +591,23 @@ async function payRepeatableQuestTaskRewardFallback(params: {
       completedTaskCount: 1,
       tierRewardSats: rewardSats,
       previousPaidSats: previousPaid,
-      rewardDeltaSats: rewardSats,
+      rewardDeltaSats: payoutSats,
     };
   }
 
   const { error: creditError } = await supabase.rpc("add_balance", {
     p_discord_id: params.userId,
-    p_amount: rewardSats,
+    p_amount: payoutSats,
   });
   if (creditError) throw creditError;
 
-  const totalPaid = roundSats(previousPaid + rewardSats);
+  const totalPaid = roundSats(previousPaid + payoutSats);
   const { error: eventError } = await supabase
     .from("quest_reward_events")
     .insert({
       quest_id: params.questId,
       user_id: params.userId,
-      reward_delta_sats: rewardSats,
+      reward_delta_sats: payoutSats,
       total_paid_sats: totalPaid,
       completed_task_count: 1,
       reason: "repeatable_task",
@@ -613,7 +620,7 @@ async function payRepeatableQuestTaskRewardFallback(params: {
     completedTaskCount: 1,
     tierRewardSats: rewardSats,
     previousPaidSats: previousPaid,
-    rewardDeltaSats: rewardSats,
+    rewardDeltaSats: payoutSats,
     totalPaidSats: totalPaid,
   };
 }

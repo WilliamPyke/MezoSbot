@@ -743,7 +743,7 @@ async function handleDropButton(interaction: ButtonInteraction) {
       .setColor(0x00cc6a)
       .setTitle("🎉 Claimed!")
       .addFields(
-        { name: "Amount", value: `**${formatSats(drop.per_claim_sats)}**`, inline: true },
+        { name: "Amount", value: `**${formatSats(result.amountSats ?? drop.per_claim_sats)}**`, inline: true },
         { name: "Remaining", value: `**${result.remaining}**`, inline: true },
       );
 

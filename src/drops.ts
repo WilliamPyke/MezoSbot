@@ -10,10 +10,10 @@ import {
   type TextChannel,
 } from "discord.js";
 import { supabase } from "./db.js";
-import { addBalance } from "./balance.js";
 import { registerDepositAddress } from "./evm.js";
 import { recordLedgerEntry } from "./ledger.js";
 import { formatSats } from "./format.js";
+import { getMultiDropEnabled, getSatsMultiplier } from "./multi.js";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                             */
@@ -45,7 +45,28 @@ export interface ClaimResult {
   amountSats?: number;
   /** Drop creator (sender) */
   creatorId?: string;
+  /** Inserted drop_claims row id */
+  claimId?: number;
 }
+
+type AtomicClaimRpcResult = {
+  ok?: boolean;
+  reason?: string;
+  newCount?: number;
+  new_count?: number;
+  remaining?: number;
+  completed?: boolean;
+  amountSats?: number;
+  amount_sats?: number;
+  creatorId?: string;
+  creator_id?: string;
+  claimId?: number;
+  claim_id?: number;
+  claimUnits?: number;
+  claim_units?: number;
+  eligibleRoleId?: string;
+  eligible_role_id?: string;
+};
 
 /* ------------------------------------------------------------------ */
 /*  Build the drop embed + button                                     */
@@ -118,92 +139,92 @@ export async function processClaim(
   client: Client | null = null,
   guildId: string | null = null,
 ): Promise<ClaimResult> {
-  // Re-fetch the drop to get latest state
-  const { data: drop } = await supabase
+  const { data: dropRow, error: dropError } = await supabase
     .from("drops")
-    .select("*")
+    .select("creator_id")
     .eq("id", dropId)
-    .single();
+    .maybeSingle();
 
-  if (!drop || drop.status !== "active" || drop.claims_count >= drop.max_claims) {
-    return { ok: false, error: "This drop is no longer active." };
+  if (dropError || !dropRow?.creator_id) {
+    if (dropError) console.error("[Drops] Failed to load drop creator:", dropError.message);
+    return { ok: false, error: "This drop could not be claimed. Please try again." };
   }
 
-  if (drop.creator_id === claimantId) {
-    return { ok: false, error: "You can't claim your own drop." };
-  }
+  const requestedMultiplier = getSatsMultiplier(claimantRoleIds);
+  const creatorAllowsMulti = await getMultiDropEnabled(dropRow.creator_id as string);
 
-  const eligibleRoleId = drop.eligible_role_id as string | null | undefined;
-  if (eligibleRoleId && !claimantRoleIds.includes(eligibleRoleId)) {
-    return { ok: false, error: `Only members with <@&${eligibleRoleId}> can claim this drop.` };
-  }
-
-  // Check if already claimed
-  const { data: existing } = await supabase
-    .from("drop_claims")
-    .select("id")
-    .eq("drop_id", dropId)
-    .eq("claimant_id", claimantId)
-    .single();
-
-  if (existing) {
-    return { ok: false, error: "You've already claimed from this drop." };
-  }
-
-  // Insert claim
-  const { error: claimError } = await supabase.from("drop_claims").insert({
-    drop_id: dropId,
-    claimant_id: claimantId,
-    amount_sats: drop.per_claim_sats,
+  const { data, error } = await supabase.rpc("claim_drop_atomic", {
+    p_drop_id: dropId,
+    p_claimant_id: claimantId,
+    p_claimant_role_ids: claimantRoleIds,
+    p_claimant_multiplier: requestedMultiplier,
+    p_creator_allows_multi: creatorAllowsMulti,
   });
 
-  if (claimError) {
-    return { ok: false, error: "You've already claimed from this drop." };
+  if (error) {
+    console.error("[Drops] claim_drop_atomic failed:", error.message);
+    return { ok: false, error: "This drop could not be claimed. Please try again." };
   }
 
-  // Log the drop claim as rain in the database
-  const { error: rainError } = await supabase
-    .from("rains")
-    .insert({
-      sender_id: drop.creator_id,
-      amount_sats: drop.per_claim_sats,
-      recipient_count: 1,
-    });
-
-  if (rainError) {
-    console.error("[Drops] Failed to log drop claim to rains table:", rainError.message);
+  const result = (data ?? {}) as AtomicClaimRpcResult;
+  if (!result.ok) {
+    const eligibleRoleId = result.eligibleRoleId ?? result.eligible_role_id;
+    switch (result.reason) {
+      case "already_claimed":
+        return { ok: false, error: "You've already claimed from this drop." };
+      case "own_drop":
+        return { ok: false, error: "You can't claim your own drop." };
+      case "insufficient_remaining":
+        return { ok: false, error: "There aren't enough claims left for a 2x claim." };
+      case "ineligible_role":
+        return {
+          ok: false,
+          error: eligibleRoleId
+            ? `Only members with <@&${eligibleRoleId}> can claim this drop.`
+            : "You're not eligible to claim this drop.",
+        };
+      default:
+        return { ok: false, error: "This drop is no longer active." };
+    }
   }
 
-  // Update drop state
-  const newCount = drop.claims_count + 1;
-  const completed = newCount >= drop.max_claims;
-  const newStatus = completed ? "completed" : "active";
-  await supabase
-    .from("drops")
-    .update({ claims_count: newCount, status: newStatus })
-    .eq("id", dropId);
+  const newCount = result.newCount ?? result.new_count ?? 0;
+  const amountSats = result.amountSats ?? result.amount_sats ?? 0;
+  const creatorId = result.creatorId ?? result.creator_id;
+  const claimId = result.claimId ?? result.claim_id;
+  const remaining = result.remaining ?? 0;
+  const completed = result.completed === true;
 
-  // Credit the claimant
-  await addBalance(claimantId, drop.per_claim_sats);
-  await registerDepositAddress(claimantId);
+  if (!creatorId || amountSats <= 0) {
+    console.error("[Drops] claim_drop_atomic returned an incomplete success payload:", result);
+    return { ok: false, error: "This drop could not be claimed. Please try again." };
+  }
+
+  await registerDepositAddress(claimantId).catch((err) => {
+    console.warn(
+      `[Drops] Failed to register deposit address for claimant ${claimantId}:`,
+      (err as Error)?.message ?? err,
+    );
+  });
 
   recordLedgerEntry(client, {
     type: "drop_claim",
-    amountSats: drop.per_claim_sats,
-    senderId: drop.creator_id,
+    amountSats,
+    senderId: creatorId,
     receiverId: claimantId,
     guildId,
     referenceType: "drop_claims",
-    referenceId: String(dropId),
+    referenceId: claimId ? String(claimId) : String(dropId),
   });
 
   return {
     ok: true,
     newCount,
-    remaining: drop.max_claims - newCount,
+    remaining,
     completed,
-    amountSats: drop.per_claim_sats,
-    creatorId: drop.creator_id,
+    amountSats,
+    creatorId,
+    claimId,
   };
 }
 

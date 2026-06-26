@@ -31,6 +31,7 @@ import {
   getQuestTaskDefinition,
 } from "../quests/engine.js";
 import { buildQuestRuntimeEmbed, completeAndNotify, resetFirstLinkWindow, refreshQuestMessage } from "../quests/runtime.js";
+import { getSatsMultiplier } from "../multi.js";
 
 export const data = {
   name: "quest",
@@ -1135,6 +1136,9 @@ async function completeTaskOverride(interaction: ChatInputCommandInteraction) {
     return interaction.editReply({ content: `Task \`${taskKey}\` was not found on this quest.` });
   }
 
+  const targetMember = interaction.guild
+    ? await interaction.guild.members.fetch(user.id).catch(() => null)
+    : null;
   const result = await completeAndNotify(
     interaction.client,
     {
@@ -1162,6 +1166,7 @@ async function completeTaskOverride(interaction: ChatInputCommandInteraction) {
       completedBy: interaction.user.id,
       note,
     },
+    getSatsMultiplier(targetMember?.roles.cache.keys()),
   ).catch((err) => {
     throw new Error(`Could not complete task: ${(err as Error).message}`);
   });
@@ -1429,4 +1434,3 @@ export async function handleQuestEditInteraction(interaction: Interaction): Prom
 
   await interaction.editReply({ content: replyText });
 }
-

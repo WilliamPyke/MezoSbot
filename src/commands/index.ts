@@ -21,6 +21,7 @@ import * as arcade from "./arcade.js";
 import * as quest from "./quest.js";
 import * as wallet from "./wallet.js";
 import * as satscape from "./satscape.js";
+import * as multi from "./multi.js";
 import { gameboyCommands } from "./gameboy.js";
 import { config } from "../config.js";
 
@@ -47,6 +48,7 @@ const baseCommands = [
   quest,
   wallet,
   satscape,
+  multi,
 ];
 
 // Merge base commands + gameboy button commands into a single list

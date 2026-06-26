@@ -8,6 +8,7 @@ import { supabase } from "../db.js";
 import { updateUserBadges } from "../badges.js";
 import { recordLedgerEntry } from "../ledger.js";
 import { replyInsufficientBalance } from "./responses.js";
+import { getSatsMultiplier } from "../multi.js";
 
 
 export const data = {
@@ -91,6 +92,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   }
 
   const activeUserIds: string[] = [];
+  const recipientRoleIds = new Map<string, string[]>();
   const seen = new Set<string>();
 
   for (const msg of sorted) {
@@ -99,14 +101,12 @@ export async function execute(interaction: ChatInputCommandInteraction) {
 
     seen.add(msg.author.id);
 
-    if (role) {
-      const member = await interaction.guild.members.fetch(msg.author.id).catch(() => null);
-      if (!member || !member.roles.cache.has(role.id)) {
-        continue;
-      }
-    }
+    const member = await interaction.guild.members.fetch(msg.author.id).catch(() => null);
+    const roleIds = member ? [...member.roles.cache.keys()] : [];
+    if (role && (!member || !member.roles.cache.has(role.id))) continue;
 
     activeUserIds.push(msg.author.id);
+    recipientRoleIds.set(msg.author.id, roleIds);
     if (activeUserIds.length >= count) break;
   }
 
@@ -117,12 +117,22 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     return interaction.editReply({ content: "❌ No recently active users found in this channel." });
   }
 
-  const perUser = roundSats(totalAmount / activeUserIds.length);
-  if (perUser <= 0) {
+  const recipientPayouts = activeUserIds.map((uid) => ({
+    uid,
+    multiplier: getSatsMultiplier(recipientRoleIds.get(uid)),
+    amount: 0,
+  }));
+  const totalWeight = recipientPayouts.reduce((sum, recipient) => sum + recipient.multiplier, 0);
+  const perUnit = Math.floor((totalAmount / totalWeight) * 10 ** 10) / 10 ** 10;
+  if (perUnit <= 0) {
     return interaction.editReply({ content: "❌ Amount too small to split." });
   }
 
-  const totalNeeded = roundSats(perUser * activeUserIds.length);
+  let totalNeeded = 0;
+  for (const recipient of recipientPayouts) {
+    recipient.amount = roundSats(perUnit * recipient.multiplier);
+    totalNeeded = roundSats(totalNeeded + recipient.amount);
+  }
 
   if (!(await subtractBalance(interaction.user.id, totalNeeded))) {
     return replyInsufficientBalance(interaction);
@@ -130,14 +140,14 @@ export async function execute(interaction: ChatInputCommandInteraction) {
 
   // Parallelize balance additions, address registrations, and recipient DMs.
   await Promise.all(
-    activeUserIds.map(async (uid) => {
-      await addBalance(uid, perUser);
-      await registerDepositAddress(uid).catch(() => {});
+    recipientPayouts.map(async (recipient) => {
+      await addBalance(recipient.uid, recipient.amount);
+      await registerDepositAddress(recipient.uid).catch(() => {});
       await sendTransferReceivedDm({
         client: interaction.client,
-        recipientId: uid,
+        recipientId: recipient.uid,
         senderId: interaction.user.id,
-        amountSats: perUser,
+        amountSats: recipient.amount,
         kind: "rain",
         customMessage,
       });
@@ -158,7 +168,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     guildId: interaction.guildId,
     referenceType: "rains",
     referenceId: rainRow?.id != null ? String(rainRow.id) : null,
-    metadata: { recipient_count: activeUserIds.length, per_user_sats: perUser },
+    metadata: { recipient_count: activeUserIds.length, per_unit_sats: perUnit, multi_recipient_count: recipientPayouts.filter((recipient) => recipient.multiplier === 2).length },
   });
 
   // Update rainer badge roles in Discord
@@ -176,7 +186,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     .setTitle("🌧️ It's Raining Sats!")
     .setDescription(`<@${interaction.user.id}> made it rain!`)
     .addFields(
-      { name: "Per User", value: `**${formatSats(perUser)}**`, inline: true },
+      { name: "Base Share", value: `**${formatSats(perUnit)}**`, inline: true },
       { name: "Total", value: `**${formatSats(totalNeeded)}**`, inline: true },
       { name: "Recipients", value: `**${activeUserIds.length}**`, inline: true },
       { name: "Rained On", value: recipients, inline: false },

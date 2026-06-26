@@ -14,6 +14,7 @@ import { formatSats } from "./format.js";
 import { recordLedgerEntry } from "./ledger.js";
 import { registerDepositAddress } from "./evm.js";
 import { sendTransferReceivedDm } from "./notifications.js";
+import { getSatsMultiplier, type SatsMultiplier } from "./multi.js";
 
 export type EventQuestRow = {
   id: number;
@@ -210,6 +211,7 @@ async function stopAttendance(
   client: Client,
   quest: EventQuestRow,
   userId: string,
+  multiplier: SatsMultiplier = 1,
   accrualEndMs = eventWindowEndMs(quest),
 ): Promise<void> {
   const { data: row, error } = await supabase
@@ -238,18 +240,18 @@ async function stopAttendance(
     .eq("user_id", userId)
     .is("rewarded_at", null);
 
-  await tryAwardQuest(client, quest, userId);
+  await tryAwardQuest(client, quest, userId, multiplier);
 }
 
 async function updateConnectedAttendance(
   client: Client,
   quest: EventQuestRow,
   userId: string,
-  options: { running: boolean; allowStart?: boolean; accrualEndMs?: number },
+  options: { running: boolean; allowStart?: boolean; accrualEndMs?: number; multiplier?: SatsMultiplier },
 ): Promise<void> {
   const accrualEndMs = eventWindowEndMs(quest, options.accrualEndMs ?? Date.now());
   if (!options.running || !eventWindowAllowsAttendance(quest, accrualEndMs, { ignoreStart: options.running })) {
-    await stopAttendance(client, quest, userId, accrualEndMs);
+    await stopAttendance(client, quest, userId, options.multiplier ?? 1, accrualEndMs);
     return;
   }
 
@@ -292,7 +294,7 @@ async function updateConnectedAttendance(
   }
 
   if (accumulated >= quest.min_minutes * 60) {
-    await tryAwardQuest(client, quest, userId);
+    await tryAwardQuest(client, quest, userId, options.multiplier ?? 1);
   }
 }
 
@@ -350,10 +352,16 @@ async function refreshQuestMessage(client: Client, questId: number): Promise<voi
   await message?.edit({ embeds: [embed], allowedMentions: { parse: [] } }).catch(() => {});
 }
 
-async function tryAwardQuest(client: Client, quest: EventQuestRow, userId: string): Promise<void> {
+async function tryAwardQuest(
+  client: Client,
+  quest: EventQuestRow,
+  userId: string,
+  multiplier: SatsMultiplier = 1,
+): Promise<void> {
   const { data: awarded, error } = await supabase.rpc("claim_event_quest_reward", {
     p_quest_id: quest.id,
     p_user_id: userId,
+    p_reward_multiplier: multiplier,
   });
 
   if (error) {
@@ -361,10 +369,11 @@ async function tryAwardQuest(client: Client, quest: EventQuestRow, userId: strin
     return;
   }
   if (awarded !== true) return;
+  const rewardAmount = quest.reward_sats * multiplier;
 
   recordLedgerEntry(client, {
     type: "event_quest_reward",
-    amountSats: quest.reward_sats,
+    amountSats: rewardAmount,
     senderId: quest.creator_id,
     receiverId: userId,
     guildId: quest.guild_id,
@@ -378,7 +387,7 @@ async function tryAwardQuest(client: Client, quest: EventQuestRow, userId: strin
     client,
     recipientId: userId,
     senderId: quest.creator_id,
-    amountSats: quest.reward_sats,
+    amountSats: rewardAmount,
     kind: "quest",
     customMessage: `Completed event quest: ${quest.event_name}`,
   });
@@ -397,7 +406,8 @@ export async function handleQuestVoiceStateUpdate(
 
   if (oldState.guild.id && oldState.channelId) {
     const leavingQuests = await getActiveQuestsForChannel(oldState.guild.id, oldState.channelId);
-    await Promise.all(leavingQuests.map((quest) => stopAttendance(client, quest, userId)));
+    const multiplier = getSatsMultiplier(oldState.member?.roles.cache.keys());
+    await Promise.all(leavingQuests.map((quest) => stopAttendance(client, quest, userId, multiplier)));
   }
 
   if (newState.guild.id && newState.channelId) {
@@ -454,6 +464,7 @@ async function sweepEventQuests(client: Client): Promise<void> {
             running: true,
             allowStart: false,
             accrualEndMs,
+            multiplier: getSatsMultiplier(member.roles.cache.keys()),
           });
         }
       }
@@ -475,7 +486,10 @@ async function sweepEventQuests(client: Client): Promise<void> {
 
     for (const [userId, member] of channel.members) {
       if (member.user.bot) continue;
-      await updateConnectedAttendance(client, syncedQuest, userId, { running: true });
+      await updateConnectedAttendance(client, syncedQuest, userId, {
+        running: true,
+        multiplier: getSatsMultiplier(member.roles.cache.keys()),
+      });
     }
   }
 }
@@ -515,6 +529,7 @@ export async function handleEventQuestScheduledEventUpdate(
         running,
         allowStart: running,
         accrualEndMs,
+        multiplier: getSatsMultiplier(member.roles.cache.keys()),
       });
     }
     await refreshQuestMessage(client, syncedQuest.id);
