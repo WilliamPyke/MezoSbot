@@ -463,11 +463,17 @@ function scrapeUrlsFromMessageSurface(linkedMessage: Message): string[] {
 async function expandDiscordMessageLinks(
   message: Message,
   posterUrls: string[],
+  excludedMessageKeys?: ReadonlySet<string>,
   authoritativeByMessageId?: Map<string, string>,
 ): Promise<string[]> {
   const expanded = new Set<string>();
 
   for (const link of discordMessageLinks(posterUrls)) {
+    // Never scrape quest announcement messages: their embeds display the
+    // current target link, so expanding them would let users win by pasting
+    // a link to the quest message itself.
+    if (excludedMessageKeys?.has(`${link.channelId}:${link.messageId}`)) continue;
+
     const authoritative = authoritativeByMessageId?.get(link.messageId);
     if (authoritative) {
       expanded.add(authoritative);
@@ -486,15 +492,21 @@ async function expandDiscordMessageLinks(
   return [...expanded];
 }
 
-async function collectMessageUrls(message: Message): Promise<CollectedMessageUrls> {
+async function collectMessageUrls(
+  message: Message,
+  excludedMessageKeys?: ReadonlySet<string>,
+): Promise<CollectedMessageUrls> {
   const posterUrls = collectPosterUrls(message);
-  const expandedUrls = await expandDiscordMessageLinks(message, posterUrls);
+  const expandedUrls = await expandDiscordMessageLinks(message, posterUrls, excludedMessageKeys);
   const allUrls = [...new Set([...posterUrls, ...expandedUrls])];
   return { posterUrls, expandedUrls, allUrls };
 }
 
-async function collectMessageUrlsWithDelayedEmbedFetch(message: Message): Promise<CollectedMessageUrls> {
-  let collected = await collectMessageUrls(message);
+async function collectMessageUrlsWithDelayedEmbedFetch(
+  message: Message,
+  excludedMessageKeys?: ReadonlySet<string>,
+): Promise<CollectedMessageUrls> {
+  let collected = await collectMessageUrls(message, excludedMessageKeys);
   const needsEmbedHydration =
     collected.allUrls.length === 0 ||
     (extractDiscordEventIds(collected.allUrls).length === 0 && discordMessageLinks(collected.posterUrls).length > 0);
@@ -504,7 +516,7 @@ async function collectMessageUrlsWithDelayedEmbedFetch(message: Message): Promis
   const freshMessage = await message.channel.messages.fetch(message.id).catch(() => null);
   if (!freshMessage) return collected;
 
-  const fresh = await collectMessageUrls(freshMessage);
+  const fresh = await collectMessageUrls(freshMessage, excludedMessageKeys);
   collected = {
     posterUrls: [...new Set([...collected.posterUrls, ...fresh.posterUrls])],
     expandedUrls: [...new Set([...collected.expandedUrls, ...fresh.expandedUrls])],
@@ -513,37 +525,14 @@ async function collectMessageUrlsWithDelayedEmbedFetch(message: Message): Promis
   return collected;
 }
 
-function activeRotatingLinkUrl(config: FirstLinkConfig): string | null {
-  const list = resolveLinkList(config);
-  if (list.length === 0) return null;
-  const refreshMinutes = Number.isFinite(config.refreshMinutes) && config.refreshMinutes >= 1
-    ? Math.floor(config.refreshMinutes)
-    : 60;
-  const index = currentLinkIndex(refreshMinutes, list.length, config.rotationStartMs ?? null);
-  return list[index] ?? null;
-}
-
 function urlsForTaskMatching(
   message: Message,
   task: ActiveQuestTask<FirstLinkConfig>,
   collected: CollectedMessageUrls,
 ): string[] {
-  const config = task.config;
-  const posterDiscordLinks = discordMessageLinks(collected.posterUrls);
-  const questMessageId = task.quest.message_id;
-  const questChannelId = task.quest.channel_id;
-
-  const linksToQuestAnnouncement = questMessageId && questChannelId
-    && posterDiscordLinks.some((link) => link.messageId === questMessageId && link.channelId === questChannelId);
-
-  if (
-    linksToQuestAnnouncement
-    && (config.source === "rotating_list" || config.source === "nearest_event")
-  ) {
-    const activeUrl = activeRotatingLinkUrl(config);
-    if (activeUrl) return [activeUrl];
-  }
-
+  // Links to quest announcement messages are excluded during URL expansion
+  // (see expandDiscordMessageLinks) so pasting the quest message's own link
+  // never counts as posting the target link.
   if (isPosterContentOnlyDiscordMessageLinks(message, collected.posterUrls) && collected.expandedUrls.length > 0) {
     return collected.expandedUrls;
   }
@@ -1116,7 +1105,14 @@ export async function handleMultiStepQuestMessage(client: Client, message: Messa
     console.log(`[QuestEngine] Message ${message.id} in link-quest channel ${message.channelId} by ${message.author.id}: contentLen=${message.content.length} embeds=${message.embeds.length}`);
   }
 
-  const collected = await collectMessageUrlsWithDelayedEmbedFetch(message);
+  const questAnnouncementKeys = new Set<string>();
+  for (const task of tasks) {
+    if (task.quest.channel_id && task.quest.message_id) {
+      questAnnouncementKeys.add(`${task.quest.channel_id}:${task.quest.message_id}`);
+    }
+  }
+
+  const collected = await collectMessageUrlsWithDelayedEmbedFetch(message, questAnnouncementKeys);
   if (channelHasTask) {
     console.log(`[QuestEngine] Message ${message.id} extracted urls=${JSON.stringify(collected.allUrls)}`);
   }
