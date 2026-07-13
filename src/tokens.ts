@@ -69,6 +69,18 @@ export function tokenAmountToUnits(amount: number, symbol: TokenSymbol): bigint 
   return ethers.parseUnits(roundTokenAmount(amount, symbol).toFixed(Math.min(token.decimals, 10)), token.decimals);
 }
 
+export function tokenDecimalToUnits(amount: string, symbol: TokenSymbol): bigint {
+  const token = getTokenConfig(symbol);
+  if (symbol === "SATS") return satsToTokenUnitsForString(amount, token.decimals);
+  return ethers.parseUnits(amount.trim(), token.decimals);
+}
+
+function satsToTokenUnitsForString(sats: string, decimals: number): bigint {
+  const btc = ethers.parseUnits(sats.trim(), 8);
+  if (decimals >= 8) return btc * 10n ** BigInt(decimals - 8);
+  return btc / 10n ** BigInt(8 - decimals);
+}
+
 export function tokenUnitsToAmount(units: bigint, symbol: TokenSymbol): number {
   const token = getTokenConfig(symbol);
   const value = Number(ethers.formatUnits(units, token.decimals));

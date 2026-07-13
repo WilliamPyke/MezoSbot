@@ -27,6 +27,9 @@ const notify_js_1 = require("./arcade/notify.js");
 const spectate_js_1 = require("./arcade/spectate.js");
 const db_js_2 = require("./arcade/db.js");
 const matchmaking_js_1 = require("./arcade/matchmaking.js");
+const interactions_js_3 = require("./imgnai/interactions.js");
+const service_js_1 = require("./imgnai/service.js");
+const catalog_js_1 = require("./imgnai/catalog.js");
 process.on("unhandledRejection", (err) => {
     console.error("Unhandled rejection:", err?.message ?? err);
 });
@@ -296,6 +299,24 @@ client.on(discord_js_1.Events.InteractionCreate, async (interaction) => {
             console.warn(`[SatScape] Interaction ${cid} failed:`, err?.message ?? err);
         }
         console.log(`[Discord] SatScape ${cid} done in ${Date.now() - startMs}ms`);
+        return;
+    }
+    if ((0, interactions_js_3.isGenerationInteraction)(interaction)) {
+        const cid = ("customId" in interaction && interaction.customId) || "";
+        console.log(`[Discord] imgnAI interaction ${cid} from ${tag} (arrivalLag=${arrivalLagMs}ms)`);
+        try {
+            await (0, interactions_js_3.handleGenerationInteraction)(interaction);
+        }
+        catch (err) {
+            const message = err?.message ?? String(err);
+            console.warn(`[imgnAI] Interaction ${cid} failed:`, message);
+            if ("followUp" in interaction && (interaction.deferred || interaction.replied)) {
+                await interaction.followUp({ content: `Could not update image generation: ${message}`, flags: discord_js_1.MessageFlags.Ephemeral }).catch(() => { });
+            }
+            else if ("reply" in interaction) {
+                await interaction.reply({ content: `Could not update image generation: ${message}`, flags: discord_js_1.MessageFlags.Ephemeral }).catch(() => { });
+            }
+        }
         return;
     }
     if ((0, quest_js_1.isQuestBuilderInteraction)(interaction)) {
@@ -676,6 +697,8 @@ async function main() {
     // Resolve any withdrawals left pending from a previous session
     (0, evm_js_1.recoverPendingWithdrawals)().catch((err) => console.error("[Recovery] Failed:", err?.message ?? err));
     await connectDiscordWithRetry();
+    (0, catalog_js_1.refreshKatanaModels)(true).catch((err) => console.warn("[imgnAI] Initial model refresh failed:", err?.message ?? err));
+    (0, service_js_1.startImgnaiWorker)(client);
     (0, evm_js_1.startDepositPoller)((discordId, amountSats, gasSats, txHash, token) => {
         console.log(`Auto-deposit: ${(0, tokens_js_1.formatTokenAmount)(amountSats, token)} for ${discordId}`);
         (0, ledger_js_1.recordLedgerEntry)(client, {

@@ -30,6 +30,8 @@ async function execute(interaction) {
     const address = await (0, evm_js_1.registerDepositAddress)(interaction.user.id);
     const explorer = config_js_1.config.evm.explorerUrl;
     const depositAsset = token === "SATS" ? "native BTC (credited as SATS)" : (0, tokens_js_1.tokenLabel)(token);
+    const isAdmin = config_js_1.config.discord.adminIds.includes(interaction.user.id);
+    const minimum = token === "SATS" || isAdmin ? null : config_js_1.config.deposits.minimums[token];
     const qrBuffer = await qrcode_1.default.toBuffer(address, {
         width: 256,
         margin: 2,
@@ -40,7 +42,7 @@ async function execute(interaction) {
         .setColor(0x5865f2)
         .setTitle(`📍 Your ${(0, tokens_js_1.tokenLabel)(token)} Deposit Address`)
         .setDescription(`\`${address}\``)
-        .addFields({ name: "How It Works", value: `Send **${depositAsset}** on Mezo to this address. Your balance is credited automatically after polling.` }, { name: "Important", value: "Only send the selected token on the configured Mezo network." }, { name: "Explorer", value: `[View on Explorer](${explorer}/address/${address})` })
+        .addFields({ name: "How It Works", value: `Send **${depositAsset}** on Mezo to this address. Your balance is credited automatically after polling.` }, ...(minimum ? [{ name: "Minimum deposit", value: `Deposits accumulate until at least **${minimum} ${(0, tokens_js_1.tokenLabel)(token)}** is present.` }] : []), ...(token !== "SATS" ? [{ name: "Sweep timing", value: `ERC-20 funds are swept after roughly **${Math.ceil(config_js_1.config.deposits.erc20SweepDelayMs / 60000)} minutes**, allowing nearby deposits to be combined.` }] : []), { name: "Important", value: "Only send the selected token on the configured Mezo network." }, { name: "Explorer", value: `[View on Explorer](${explorer}/address/${address})` })
         .setThumbnail("attachment://deposit-qr.png")
         .setFooter({ text: "This address is unique to you" })
         .setTimestamp();

@@ -34,7 +34,9 @@ export type LedgerEntryType =
   | "arcade_refund"
   | "arcade_payout"
   | "arcade_rake"
-  | "gameboy_bid";
+  | "gameboy_bid"
+  | "image_generation"
+  | "image_generation_refund";
 
 const TYPE_LABELS: Record<LedgerEntryType, string> = {
   deposit: "Deposit",
@@ -54,6 +56,8 @@ const TYPE_LABELS: Record<LedgerEntryType, string> = {
   arcade_payout: "Arcade Payout",
   arcade_rake: "Platform Fee",
   gameboy_bid: "Game Bid",
+  image_generation: "Image Generation",
+  image_generation_refund: "Image Generation Refund",
 };
 
 export type LedgerPartyId = string | "treasury" | "platform" | null;

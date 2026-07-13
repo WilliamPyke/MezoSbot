@@ -69,6 +69,9 @@ import { setMatchSettledHandler } from "./arcade/notify.js";
 import { setDisplayNameResolver } from "./arcade/spectate.js";
 import { getMatch as getArcadeMatch } from "./arcade/db.js";
 import { expireStaleQueueEntries } from "./arcade/matchmaking.js";
+import { handleGenerationInteraction, isGenerationInteraction } from "./imgnai/interactions.js";
+import { startImgnaiWorker } from "./imgnai/service.js";
+import { refreshKatanaModels } from "./imgnai/catalog.js";
 
 process.on("unhandledRejection", (err) => {
   console.error("Unhandled rejection:", (err as Error)?.message ?? err);
@@ -392,6 +395,23 @@ client.on(Events.InteractionCreate, async (interaction) => {
       console.warn(`[SatScape] Interaction ${cid} failed:`, (err as Error)?.message ?? err);
     }
     console.log(`[Discord] SatScape ${cid} done in ${Date.now() - startMs}ms`);
+    return;
+  }
+
+  if (isGenerationInteraction(interaction)) {
+    const cid = ("customId" in interaction && interaction.customId) || "";
+    console.log(`[Discord] imgnAI interaction ${cid} from ${tag} (arrivalLag=${arrivalLagMs}ms)`);
+    try {
+      await handleGenerationInteraction(interaction);
+    } catch (err) {
+      const message = (err as Error)?.message ?? String(err);
+      console.warn(`[imgnAI] Interaction ${cid} failed:`, message);
+      if ("followUp" in interaction && (interaction.deferred || interaction.replied)) {
+        await interaction.followUp({ content: `Could not update image generation: ${message}`, flags: MessageFlags.Ephemeral }).catch(() => {});
+      } else if ("reply" in interaction) {
+        await interaction.reply({ content: `Could not update image generation: ${message}`, flags: MessageFlags.Ephemeral }).catch(() => {});
+      }
+    }
     return;
   }
 
@@ -832,6 +852,11 @@ async function main() {
   );
 
   await connectDiscordWithRetry();
+
+  refreshKatanaModels(true).catch((err) =>
+    console.warn("[imgnAI] Initial model refresh failed:", (err as Error)?.message ?? err)
+  );
+  startImgnaiWorker(client);
 
   startDepositPoller((discordId, amountSats, gasSats, txHash, token) => {
     console.log(`Auto-deposit: ${formatTokenAmount(amountSats, token)} for ${discordId}`);

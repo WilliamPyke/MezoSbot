@@ -2,6 +2,7 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.getOrCreateUser = getOrCreateUser;
 exports.getBalance = getBalance;
+exports.getMusdBalanceAtomic = getMusdBalanceAtomic;
 exports.getBalances = getBalances;
 exports.addBalance = addBalance;
 exports.subtractBalance = subtractBalance;
@@ -12,6 +13,7 @@ exports.getDiscordForWallet = getDiscordForWallet;
 const db_js_1 = require("./db.js");
 const format_js_1 = require("./format.js");
 const tokens_js_1 = require("./tokens.js");
+const musd_js_1 = require("./imgnai/musd.js");
 async function getOrCreateUser(discordId) {
     // Use upsert with onConflict to avoid duplicate inserts, select to return the row
     const { data, error } = await db_js_1.supabase
@@ -46,6 +48,20 @@ async function getBalance(discordId, token = "SATS") {
         .eq("discord_id", discordId)
         .single();
     return data?.balance_sats ?? 0;
+}
+/** Exact MUSD balance used by payment paths. Requires the atomic-balance migration. */
+async function getMusdBalanceAtomic(discordId) {
+    const { data, error } = await db_js_1.supabase
+        .from("user_token_balances")
+        .select("balance_atomic, balance")
+        .eq("discord_id", discordId)
+        .eq("token", "MUSD")
+        .maybeSingle();
+    if (error)
+        throw error;
+    if (data?.balance_atomic != null)
+        return BigInt(String(data.balance_atomic));
+    return (0, musd_js_1.parseMusd)(String(data?.balance ?? "0"));
 }
 async function getBalances(discordId) {
     const sats = await getBalance(discordId, "SATS");

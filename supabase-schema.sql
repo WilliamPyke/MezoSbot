@@ -1008,6 +1008,12 @@ CREATE TABLE IF NOT EXISTS bot_settings (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- imgnAI Katana tables and functions are maintained in
+-- migrations/2026-07-13_imgnai_katana.sql followed by
+-- migrations/2026-07-13_imgnai_atomic_musd.sql and
+-- migrations/2026-07-13_protocol_operations.sql; apply them after the
+-- multi-token migration.
+
 CREATE TABLE IF NOT EXISTS ledger_entries (
   id BIGSERIAL PRIMARY KEY,
   transaction_id TEXT NOT NULL UNIQUE,

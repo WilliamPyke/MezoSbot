@@ -1,6 +1,7 @@
 import { supabase } from "./db.js";
 import { roundSats } from "./format.js";
 import { TOKEN_SYMBOLS, roundTokenAmount, type TokenSymbol } from "./tokens.js";
+import { parseMusd } from "./imgnai/musd.js";
 
 export async function getOrCreateUser(discordId: string) {
   // Use upsert with onConflict to avoid duplicate inserts, select to return the row
@@ -40,6 +41,19 @@ export async function getBalance(discordId: string, token: TokenSymbol = "SATS")
     .single();
 
   return data?.balance_sats ?? 0;
+}
+
+/** Exact MUSD balance used by payment paths. Requires the atomic-balance migration. */
+export async function getMusdBalanceAtomic(discordId: string): Promise<bigint> {
+  const { data, error } = await supabase
+    .from("user_token_balances")
+    .select("balance_atomic, balance")
+    .eq("discord_id", discordId)
+    .eq("token", "MUSD")
+    .maybeSingle();
+  if (error) throw error;
+  if (data?.balance_atomic != null) return BigInt(String(data.balance_atomic));
+  return parseMusd(String(data?.balance ?? "0"));
 }
 
 export async function getBalances(discordId: string): Promise<Record<TokenSymbol, number>> {

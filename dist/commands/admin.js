@@ -11,6 +11,9 @@ const db_js_1 = require("../db.js");
 const badges_js_1 = require("../badges.js");
 const rainBans_js_1 = require("../rainBans.js");
 const format_js_1 = require("../format.js");
+const catalog_js_1 = require("../imgnai/catalog.js");
+const payments_js_1 = require("../imgnai/payments.js");
+const types_js_1 = require("../imgnai/types.js");
 const CUSTOM_ID_PREFIX = "admin";
 const COLOR_MAIN = 0x2ecc71; // Green
 const COLOR_BADGES = 0xf1c40f; // Gold
@@ -54,6 +57,95 @@ async function renderMainMenu() {
         .setCustomId(`${CUSTOM_ID_PREFIX}:dismiss`)
         .setLabel("Dismiss Panel")
         .setStyle(discord_js_1.ButtonStyle.Danger));
+    const row2 = new discord_js_1.ActionRowBuilder().addComponents(new discord_js_1.ButtonBuilder()
+        .setCustomId(`${CUSTOM_ID_PREFIX}:menu_imgnai`)
+        .setLabel("imgnAI Models")
+        .setStyle(discord_js_1.ButtonStyle.Primary));
+    return { embeds: [embed], components: [row, row2] };
+}
+async function renderImgnaiMenu(guildId, page, statusText) {
+    const [models, disabled, operations] = await Promise.all([
+        (0, catalog_js_1.refreshKatanaModels)(),
+        (0, catalog_js_1.getDisabledModelKeys)(guildId),
+        (0, payments_js_1.getImgnaiOperationalStatus)(),
+    ]);
+    const pageModels = models.filter((model) => model.isLegacy === (page === "legacy"));
+    const health = (0, catalog_js_1.getCatalogHealth)();
+    const lines = pageModels.map((model) => `${disabled.has(model.modelKey) ? "🔴" : "🟢"} **${model.displayName}** · ${(0, types_js_1.formatMusd)(model.costMusdAtomic)}`);
+    const satsLiability = operations.userSatsLiability == null || operations.poolSatsLiability == null
+        ? null
+        : operations.userSatsLiability + operations.poolSatsLiability;
+    const satsExcess = operations.treasurySats == null || satsLiability == null
+        ? null
+        : operations.treasurySats - satsLiability;
+    const musdAssets = operations.treasuryMusd == null || operations.katanaMusd == null || operations.unsweptMusdAtomic == null
+        ? null
+        : operations.treasuryMusd + operations.katanaMusd + operations.unsweptMusdAtomic;
+    const musdObligations = operations.userMusdAtomic == null || operations.pendingMusdAtomic == null
+        ? null
+        : operations.userMusdAtomic + operations.pendingMusdAtomic;
+    const operational = [
+        `Treasury: **${operations.treasuryMusd == null ? "Unavailable" : (0, types_js_1.formatMusd)(operations.treasuryMusd)}**`,
+        `Katana wallet: **${operations.katanaMusd == null ? "Unavailable" : (0, types_js_1.formatMusd)(operations.katanaMusd)}**`,
+        `Unswept MUSD: **${operations.unsweptMusdAtomic == null ? "Unavailable" : (0, types_js_1.formatMusd)(operations.unsweptMusdAtomic)}**`,
+        `MUSD coverage: **${musdAssets == null || musdObligations == null ? "Unavailable" : `${(0, types_js_1.formatMusd)(musdAssets)} assets / ${(0, types_js_1.formatMusd)(musdObligations)} obligations`}**`,
+        `SATS backing: **${operations.treasurySats == null || satsLiability == null ? "Unavailable" : `${(0, format_js_1.formatSats)(operations.treasurySats)} / ${(0, format_js_1.formatSats)(satsLiability)} liabilities`}**`,
+        `Treasury excess: **${satsExcess == null ? "Unavailable" : (0, format_js_1.formatSats)(satsExcess)}** · required reserve ${(0, format_js_1.formatSats)(operations.gasReserveMinimumSats)}`,
+        `Sweep gas sponsor: **${operations.gasSponsorSats == null ? "Unavailable" : (0, format_js_1.formatSats)(operations.gasSponsorSats)}**${operations.gasSponsorIsTreasury ? " · ⚠ treasury fallback" : " · dedicated"}`,
+        `Sweeps: **${operations.pendingSweeps ?? "Unavailable"} pending** · **${operations.sweepErrors ?? "Unavailable"} errors**`,
+        `Pending jobs: **${operations.pendingJobs}**`,
+        `Catalog: **${health.cachedModels} SFW models**${health.cacheAgeMs == null ? "" : ` · refreshed ${Math.floor(health.cacheAgeMs / 1000)}s ago`}`,
+    ].join("\n");
+    const embed = new discord_js_1.EmbedBuilder()
+        .setColor(COLOR_CONFIG)
+        .setTitle(`imgnAI Models · ${page === "current" ? "Current" : "Legacy"}`)
+        .setDescription(`${statusText ? `${statusText}\n\n` : ""}${lines.join("\n") || "No models are available on this page."}`)
+        .addFields({ name: "Payment health", value: operational })
+        .setFooter({ text: "New SFW models are enabled by default for this server." })
+        .setTimestamp();
+    if (health.lastError)
+        embed.addFields({ name: "Catalog warning", value: health.lastError.slice(0, 1024) });
+    const warnings = [
+        satsExcess != null && satsExcess < operations.gasReserveMinimumSats ? "Treasury SATS excess is below the protected gas reserve." : null,
+        operations.gasSponsorSats != null && operations.gasSponsorSats < operations.gasReserveMinimumSats ? "Sweep gas sponsor is below its minimum reserve." : null,
+        musdAssets != null && musdObligations != null && musdAssets < musdObligations ? "MUSD assets are below user and pending-job obligations." : null,
+        operations.sweepErrors ? `${operations.sweepErrors} ERC-20 sweep checkpoint(s) have errors.` : null,
+        operations.lastSweepGasError,
+    ].filter((item) => !!item);
+    if (warnings.length > 0)
+        embed.addFields({ name: "Operational warnings", value: warnings.join("\n").slice(0, 1024) });
+    const components = [];
+    if (pageModels.length > 0) {
+        components.push(new discord_js_1.ActionRowBuilder().addComponents(new discord_js_1.StringSelectMenuBuilder()
+            .setCustomId(`${CUSTOM_ID_PREFIX}:imgnai_select:${page}`)
+            .setPlaceholder("Choose a model to manage")
+            .addOptions(pageModels.slice(0, 25).map((model) => ({
+            label: model.displayName.slice(0, 100),
+            value: model.modelKey,
+            description: `${disabled.has(model.modelKey) ? "Disabled" : "Enabled"} · ${(0, types_js_1.formatMusd)(model.costMusdAtomic)}`.slice(0, 100),
+        })))));
+    }
+    components.push(new discord_js_1.ActionRowBuilder().addComponents(new discord_js_1.ButtonBuilder()
+        .setCustomId(`${CUSTOM_ID_PREFIX}:imgnai_page:${page === "current" ? "legacy" : "current"}`)
+        .setLabel(page === "current" ? "Legacy models" : "Current models")
+        .setStyle(discord_js_1.ButtonStyle.Secondary), new discord_js_1.ButtonBuilder().setCustomId(`${CUSTOM_ID_PREFIX}:menu_main`).setLabel("Back").setStyle(discord_js_1.ButtonStyle.Secondary)));
+    return { embeds: [embed], components };
+}
+async function renderImgnaiModelDetail(guildId, modelKey, page) {
+    const [models, disabled] = await Promise.all([(0, catalog_js_1.refreshKatanaModels)(), (0, catalog_js_1.getDisabledModelKeys)(guildId)]);
+    const model = models.find((item) => item.modelKey === modelKey);
+    if (!model)
+        return renderImgnaiMenu(guildId, page, "That model is no longer in the Katana catalog.");
+    const enabled = !disabled.has(model.modelKey);
+    const embed = new discord_js_1.EmbedBuilder()
+        .setColor(enabled ? COLOR_MAIN : COLOR_RAINBAN)
+        .setTitle(model.displayName)
+        .setDescription(model.description || "No description provided.")
+        .addFields({ name: "Status", value: enabled ? "Enabled" : "Disabled", inline: true }, { name: "Creator", value: model.creator || "imgnAI", inline: true }, { name: "Cost", value: (0, types_js_1.formatMusd)(model.costMusdAtomic), inline: true }, { name: "Quality", value: model.supportsUhd ? "Standard and UHD" : "Standard", inline: true }, { name: "Aspect ratios", value: model.aspectRatios.join(", ").slice(0, 1024), inline: false });
+    const row = new discord_js_1.ActionRowBuilder().addComponents(new discord_js_1.ButtonBuilder()
+        .setCustomId(`${CUSTOM_ID_PREFIX}:imgnai_toggle:${model.modelKey}:${page}:${enabled ? "disable" : "enable"}`)
+        .setLabel(enabled ? "Disable model" : "Enable model")
+        .setStyle(enabled ? discord_js_1.ButtonStyle.Danger : discord_js_1.ButtonStyle.Success), new discord_js_1.ButtonBuilder().setCustomId(`${CUSTOM_ID_PREFIX}:imgnai_page:${page}`).setLabel("Back to models").setStyle(discord_js_1.ButtonStyle.Secondary));
     return { embeds: [embed], components: [row] };
 }
 async function renderLedgerMenu(guildId) {
@@ -339,6 +431,20 @@ async function handleAdminInteraction(interaction) {
             const menu = await renderLedgerMenu(btnInteraction.guildId);
             await btnInteraction.editReply(menu);
         }
+        else if (action === "menu_imgnai") {
+            await btnInteraction.editReply(await renderImgnaiMenu(btnInteraction.guildId, "current"));
+        }
+        else if (action === "imgnai_page") {
+            const page = parts[2] === "legacy" ? "legacy" : "current";
+            await btnInteraction.editReply(await renderImgnaiMenu(btnInteraction.guildId, page));
+        }
+        else if (action === "imgnai_toggle") {
+            const modelKey = parts[2];
+            const page = parts[3] === "legacy" ? "legacy" : "current";
+            const enabled = parts[4] === "enable";
+            await (0, catalog_js_1.setGuildModelEnabled)(btnInteraction.guildId, modelKey, enabled, btnInteraction.user.id);
+            await btnInteraction.editReply(await renderImgnaiModelDetail(btnInteraction.guildId, modelKey, page));
+        }
         else if (action === "ledger_clear") {
             await (0, ledger_js_1.clearLedgerChannelConfig)();
             const menu = await renderLedgerMenu(btnInteraction.guildId);
@@ -450,6 +556,10 @@ async function handleAdminInteraction(interaction) {
             const questId = parseInt(selInteraction.values[0], 10);
             const panel = await renderQuestDetail(selInteraction.guildId, questId);
             await selInteraction.editReply(panel);
+        }
+        else if (action === "imgnai_select") {
+            const page = parts[2] === "legacy" ? "legacy" : "current";
+            await selInteraction.editReply(await renderImgnaiModelDetail(selInteraction.guildId, selInteraction.values[0], page));
         }
     }
     // Handle ChannelSelectMenu interaction

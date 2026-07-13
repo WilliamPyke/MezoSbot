@@ -12,6 +12,7 @@ A Discord bot for depositing and using native SATS, MUSD, MEZO, and mUSDC on Mez
 - **Drop**: Create a drop — first N users to `/claim` get sats (rain/airdrop style)
 - **Browser stream**: Built-in WebRTC viewer endpoint for low-latency cloud play
 - **Auto snapshot recovery**: Emulator saves full state snapshots plus SRAM fallback and resumes from the latest snapshot after restarts/redeploys
+- **imgnAI generation**: Generate SFW images with Katana and pay the exact model cost from your MUSD balance
 
 ## Setup
 
@@ -48,6 +49,17 @@ cp .env.example .env
 | `ARCADE_TOKEN_SECRET` | Optional HMAC secret for Slice Arcade browser tokens. Falls back to `TREASURY_PRIVATE_KEY` if unset. |
 | `DEPOSIT_POLL_MS` | Deposit wallet chain polling interval (default `15000`) |
 | `DEPOSIT_ADDRESS_REFRESH_MS` | Supabase address-list cache refresh interval (default `300000`) |
+| `SWEEP_GAS_SPONSOR_PRIVATE_KEY` | Dedicated hot key that funds ERC-20 deposit-wallet sweep gas; recommended before public deposits |
+| `PROTOCOL_GAS_RESERVE_MIN_SATS` | Protected operational SATS reserve; ERC-20 operations stop before crossing it (default `1000`) |
+| `ERC20_SWEEP_DELAY_MS` | Delay before sweeping an ERC-20 deposit so nearby deposits can be combined (default `300000`) |
+| `MUSD_MIN_DEPOSIT` | Public-user MUSD minimum; smaller deposits accumulate uncredited until the threshold (default `0.10`) |
+| `MEZO_MIN_DEPOSIT` | Public-user MEZO minimum (default `1.00`) |
+| `MUSDC_MIN_DEPOSIT` | Public-user mUSDC minimum (default `0.10`) |
+| `IMGNAI_BASE_URL` | Katana agent API base URL (default `https://kat.imgnai.com`) |
+| `IMGNAI_X402_TARGET_MUSD` | Target prepaid Katana wallet balance funded from treasury (default `1.00`) |
+| `IMGNAI_MODEL_CACHE_MS` | Live model catalog cache duration (default `300000`) |
+| `IMGNAI_IMAGE_TIMEOUT_MS` | Image polling deadline before background recovery (default `600000`) |
+| `IMGNAI_PROMPT_MAX_LENGTH` | Maximum Discord prompt length (default `2000`) |
 
 ### 2.1 WebRTC Runtime Dependency
 
@@ -84,6 +96,7 @@ npm run dev
 | `/link <address>` | Link your EVM wallet |
 | `/deposit [token]` | Get your personal deposit address and token-specific instructions |
 | `/balance` | Check all token balances |
+| `/generate` | Configure and generate one Katana image paid from your MUSD balance |
 | `/withdraw <amount> [address] [token]` | Withdraw a token to an address |
 | `/tip <user> <amount> [token] [message]` | Tip another user with an optional message |
 | `/distribute <amount> <@users> [token]` | Split a token among multiple users |
@@ -103,6 +116,20 @@ Recipients receive DMs when they are credited from tips, rains, distributions, a
 
 Token arguments are optional and default to native SATS, preserving the original command behavior.
 Rain banned-word filtering requires `DISCORD_MESSAGE_CONTENT_INTENT=true` and the Message Content privileged intent enabled in Discord Developer Portal.
+
+## imgnAI Katana Generation
+
+Apply `migrations/2026-07-13_imgnai_katana.sql`, then `migrations/2026-07-13_imgnai_atomic_musd.sql`, then `migrations/2026-07-13_protocol_operations.sql`, after the multi-token migration before enabling `/generate`. The atomic migration backfills exact 18-decimal MUSD units and keeps the legacy floating columns only as compatibility mirrors. The operations migration adds delayed sweeps, gas-funding audit records, and solvency metrics. The bot uses the existing Mezo mainnet treasury signer and MUSD contract; no imgnAI API key is required.
+
+- `/generate` opens a private setup with prompt, SFW model, aspect ratio, quality, live MUSD price, and balance.
+- The confirmed amount is atomically reserved from the user's internal MUSD balance. The public progress message is edited into the final downloadable image.
+- Katana's x402 wallet balance is checked before each job and replenished from swept treasury MUSD when it cannot cover the request.
+- Katana quotes, reservations, top-ups, charges, and refunds use exact 18-decimal atomic MUSD integers end-to-end.
+- x402 top-ups remain facilitator-sponsored. Ordinary ERC-20 deposit sweeps use the dedicated sweep-gas sponsor and stop if its protected reserve would be crossed.
+- Public ERC-20 deposits enforce configured minimums and are swept after a durable delay; admins bypass the public minimums for testing.
+- `/admin` → **imgnAI Models** lets Manage Server users disable or re-enable current and legacy SFW models for that server. New SFW catalog models default to enabled.
+- Validation and pre-payment failures refund immediately. Paid provider failures remain pending until Katana confirms the refund; policy/Terms violations may remain charged.
+- Jobs, polling, delivery, and refunds resume after restarts. Completed prompts are redacted from job records after 72 hours.
 
 **All amounts use sats** and support decimals (e.g. `100.5`, `0.25`) for easier denomination. Precision: 6 decimal places.
 

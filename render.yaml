@@ -35,8 +35,22 @@ services:
         value: "18"
       - key: TREASURY_PRIVATE_KEY
         sync: false
+      - key: SWEEP_GAS_SPONSOR_PRIVATE_KEY
+        sync: false
+      - key: PROTOCOL_GAS_RESERVE_MIN_SATS
+        value: "1000"
       - key: EXPLORER_URL
         value: "https://explorer.mezo.org"
+      - key: IMGNAI_BASE_URL
+        value: "https://kat.imgnai.com"
+      - key: IMGNAI_X402_TARGET_MUSD
+        value: "1.00"
+      - key: IMGNAI_MODEL_CACHE_MS
+        value: "300000"
+      - key: IMGNAI_IMAGE_TIMEOUT_MS
+        value: "600000"
+      - key: IMGNAI_PROMPT_MAX_LENGTH
+        value: "2000"
       - key: PUBLIC_BASE_URL
         value: "https://play.mallard.sh"
       - key: MEZO_DEFAULT_NETWORK
@@ -66,11 +80,19 @@ services:
       - key: SKIP_WITHDRAWAL_MIN
         value: "false"
       - key: DEPOSIT_ADMIN_ONLY
-        value: "false"
+        value: "true"
       - key: DEPOSIT_POLL_MS
         value: "60000"
       - key: DEPOSIT_ADDRESS_REFRESH_MS
         value: "900000"
+      - key: ERC20_SWEEP_DELAY_MS
+        value: "300000"
+      - key: MUSD_MIN_DEPOSIT
+        value: "0.10"
+      - key: MEZO_MIN_DEPOSIT
+        value: "1.00"
+      - key: MUSDC_MIN_DEPOSIT
+        value: "0.10"
       - key: POKEMON_ENABLED
         value: "true"
       - key: POKEMON_TEXT_INPUT_ENABLED

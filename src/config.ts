@@ -46,6 +46,8 @@ export const config = {
     tokenContract: required("TOKEN_CONTRACT"),
     tokenDecimals: parseInt(optional("TOKEN_DECIMALS", "18"), 10),
     treasuryPrivateKey: required("TREASURY_PRIVATE_KEY"),
+    sweepGasSponsorPrivateKey: optional("SWEEP_GAS_SPONSOR_PRIVATE_KEY", ""),
+    protocolGasReserveMinSats: parseFloat(optional("PROTOCOL_GAS_RESERVE_MIN_SATS", "1000")),
     explorerUrl: optional("EXPLORER_URL", "https://explorer.mezo.org"),
     skipWithdrawalMin: process.env.SKIP_WITHDRAWAL_MIN === "1" || process.env.SKIP_WITHDRAWAL_MIN === "true",
     tokens: {
@@ -90,13 +92,26 @@ export const config = {
    */
   publicBaseUrl: publicBaseUrl(),
   arcadeTokenSecret: process.env.ARCADE_TOKEN_SECRET ?? process.env.TREASURY_PRIVATE_KEY ?? "",
-  depositAdminOnly: process.env.DEPOSIT_ADMIN_ONLY === "1" || process.env.DEPOSIT_ADMIN_ONLY === "true",
+  depositAdminOnly: optionalBool("DEPOSIT_ADMIN_ONLY", true),
   deposits: {
     pollMs: parseInt(optional("DEPOSIT_POLL_MS", "60000"), 10),
     addressRefreshMs: parseInt(optional("DEPOSIT_ADDRESS_REFRESH_MS", "900000"), 10),
     balanceConcurrency: parseInt(optional("DEPOSIT_BALANCE_CONCURRENCY", "8"), 10),
     balanceBatchSize: parseInt(optional("DEPOSIT_BALANCE_BATCH_SIZE", "25"), 10),
     initialPollDelayMs: parseInt(optional("DEPOSIT_INITIAL_POLL_DELAY_MS", "15000"), 10),
+    erc20SweepDelayMs: parseInt(optional("ERC20_SWEEP_DELAY_MS", "300000"), 10),
+    minimums: {
+      MUSD: optional("MUSD_MIN_DEPOSIT", "0.10"),
+      MEZO: optional("MEZO_MIN_DEPOSIT", "1.00"),
+      MUSDC: optional("MUSDC_MIN_DEPOSIT", "0.10"),
+    },
+  },
+  imgnai: {
+    baseUrl: optional("IMGNAI_BASE_URL", "https://kat.imgnai.com").replace(/\/+$/, ""),
+    x402TargetMusd: optional("IMGNAI_X402_TARGET_MUSD", "1.00"),
+    modelCacheMs: parseInt(optional("IMGNAI_MODEL_CACHE_MS", "300000"), 10),
+    imageTimeoutMs: parseInt(optional("IMGNAI_IMAGE_TIMEOUT_MS", "600000"), 10),
+    promptMaxLength: parseInt(optional("IMGNAI_PROMPT_MAX_LENGTH", "2000"), 10),
   },
   walletVerification: {
     challengeSats: parseFloat(optional("WALLET_VERIFY_CHALLENGE_SATS", "10")),

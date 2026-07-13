@@ -25,6 +25,8 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   const address = await registerDepositAddress(interaction.user.id);
   const explorer = config.evm.explorerUrl;
   const depositAsset = token === "SATS" ? "native BTC (credited as SATS)" : tokenLabel(token);
+  const isAdmin = config.discord.adminIds.includes(interaction.user.id);
+  const minimum = token === "SATS" || isAdmin ? null : config.deposits.minimums[token];
 
   const qrBuffer = await QRCode.toBuffer(address, {
     width: 256,
@@ -40,6 +42,8 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     .setDescription(`\`${address}\``)
     .addFields(
       { name: "How It Works", value: `Send **${depositAsset}** on Mezo to this address. Your balance is credited automatically after polling.` },
+      ...(minimum ? [{ name: "Minimum deposit", value: `Deposits accumulate until at least **${minimum} ${tokenLabel(token)}** is present.` }] : []),
+      ...(token !== "SATS" ? [{ name: "Sweep timing", value: `ERC-20 funds are swept after roughly **${Math.ceil(config.deposits.erc20SweepDelayMs / 60000)} minutes**, allowing nearby deposits to be combined.` }] : []),
       { name: "Important", value: "Only send the selected token on the configured Mezo network." },
       { name: "Explorer", value: `[View on Explorer](${explorer}/address/${address})` },
     )
