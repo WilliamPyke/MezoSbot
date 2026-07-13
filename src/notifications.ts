@@ -1,5 +1,5 @@
 import { EmbedBuilder, type Client } from "discord.js";
-import { formatSats } from "./format.js";
+import { formatTokenAmount, type TokenSymbol } from "./tokens.js";
 
 export type TransferNotificationKind = "tip" | "rain" | "distribute" | "drop" | "quest";
 
@@ -32,6 +32,7 @@ type SendTransferReceivedDmParams = {
   recipientId: string;
   senderId: string;
   amountSats: number;
+  token?: TokenSymbol;
   kind: TransferNotificationKind;
   customMessage?: string;
 };
@@ -41,6 +42,7 @@ export async function sendTransferReceivedDm({
   recipientId,
   senderId,
   amountSats,
+  token = "SATS",
   kind,
   customMessage,
 }: SendTransferReceivedDmParams): Promise<void> {
@@ -50,7 +52,7 @@ export async function sendTransferReceivedDm({
     .addFields(
       { name: "From", value: `<@${senderId}>`, inline: true },
       { name: "Type", value: LABELS[kind], inline: true },
-      { name: "Amount", value: `**${formatSats(amountSats)}**`, inline: true },
+      { name: "Amount", value: `**${formatTokenAmount(amountSats, token)}**`, inline: true },
     )
     .setFooter({ text: "Use /balance to check your total" })
     .setTimestamp();

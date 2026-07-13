@@ -5,22 +5,25 @@ exports.execute = execute;
 const discord_js_1 = require("discord.js");
 const db_js_1 = require("../db.js");
 const balance_js_1 = require("../balance.js");
-const format_js_1 = require("../format.js");
 const drops_js_1 = require("../drops.js");
 const ledger_js_1 = require("../ledger.js");
+const responses_js_1 = require("./responses.js");
+const tokens_js_1 = require("../tokens.js");
 exports.data = {
     name: "drop",
-    description: "Create a sats drop - first users to claim get sats",
+    description: "Create a token drop",
     options: [
-        { name: "total", type: 10, description: "Total sats to drop (e.g. 100 or 100.5)", required: true, minValue: 0.000001 },
-        { name: "per_claim", type: 10, description: "Sats per claim (e.g. 10 or 10.5)", required: true, minValue: 0.000001 },
+        { name: "total", type: 10, description: "Total token amount to drop", required: true, minValue: 0.000001 },
+        { name: "per_claim", type: 10, description: "Token amount per claim", required: true, minValue: 0.000001 },
         { name: "max_claims", type: 4, description: "Max number of claims", required: true, minValue: 1 },
+        { name: "token", type: 3, description: "Token to drop", required: false, choices: tokens_js_1.TOKEN_CHOICES },
         { name: "role", type: 8, description: "Only members with this role can claim", required: false },
     ],
 };
 async function execute(interaction) {
-    const total = (0, format_js_1.roundSats)(interaction.options.getNumber("total", true));
-    const perClaim = (0, format_js_1.roundSats)(interaction.options.getNumber("per_claim", true));
+    const token = (0, tokens_js_1.parseToken)(interaction.options.getString("token"));
+    const total = (0, tokens_js_1.roundTokenAmount)(interaction.options.getNumber("total", true), token);
+    const perClaim = (0, tokens_js_1.roundTokenAmount)(interaction.options.getNumber("per_claim", true), token);
     const maxClaims = interaction.options.getInteger("max_claims", true);
     const role = interaction.options.getRole("role");
     if (perClaim * maxClaims > total) {
@@ -29,14 +32,14 @@ async function execute(interaction) {
             flags: discord_js_1.MessageFlags.Ephemeral,
         });
     }
-    await interaction.deferReply();
-    const balance = await (0, balance_js_1.getBalance)(interaction.user.id);
+    const balance = await (0, balance_js_1.getBalance)(interaction.user.id, token);
     if (balance < total) {
-        return interaction.editReply({ content: "❌ Insufficient balance." });
+        return (0, responses_js_1.replyInsufficientBalance)(interaction);
     }
-    if (!(await (0, balance_js_1.subtractBalance)(interaction.user.id, total))) {
-        return interaction.editReply({ content: "❌ Insufficient balance." });
+    if (!(await (0, balance_js_1.subtractBalance)(interaction.user.id, total, token))) {
+        return (0, responses_js_1.replyInsufficientBalance)(interaction);
     }
+    await interaction.deferReply();
     const { data: inserted } = await db_js_1.supabase
         .from("drops")
         .insert({
@@ -46,6 +49,7 @@ async function execute(interaction) {
         per_claim_sats: perClaim,
         max_claims: maxClaims,
         eligible_role_id: role?.id ?? null,
+        token,
     })
         .select("id")
         .single();
@@ -56,6 +60,7 @@ async function execute(interaction) {
     (0, ledger_js_1.recordLedgerEntry)(interaction.client, {
         type: "drop_create",
         amountSats: total,
+        token,
         senderId: interaction.user.id,
         receiverId: null,
         guildId: interaction.guildId,
@@ -73,6 +78,7 @@ async function execute(interaction) {
         max_claims: maxClaims,
         claims_count: 0,
         status: "active",
+        token,
     };
     const embed = (0, drops_js_1.buildDropEmbed)(drop, []);
     const row = (0, drops_js_1.buildClaimButton)(dropId);

@@ -32,6 +32,7 @@ import {
 } from "../quests/engine.js";
 import { buildQuestRuntimeEmbed, completeAndNotify, resetFirstLinkWindow, refreshQuestMessage } from "../quests/runtime.js";
 import { getSatsMultiplier } from "../multi.js";
+import { TOKEN_CHOICES, formatTokenAmount, parseToken, roundTokenAmount, tokenLabel, type TokenSymbol } from "../tokens.js";
 
 export const data = {
   name: "quest",
@@ -41,6 +42,7 @@ export const data = {
       name: "create",
       type: 1 as const,
       description: "Open the unified quest builder",
+      options: [{ name: "token", type: 3 as const, description: "Reward token", required: false, choices: TOKEN_CHOICES }],
     },
     {
       name: "complete_task",
@@ -101,6 +103,7 @@ type QuestBuilderSession = {
   guildId: string;
   channelId: string;
   creatorId: string;
+  token: TokenSymbol;
   events: QuestBuilderEventOption[];
 
   eventEnabled: boolean;
@@ -170,6 +173,7 @@ async function createBuilderSession(interaction: ChatInputCommandInteraction): P
     guildId: interaction.guild!.id,
     channelId: interaction.channelId,
     creatorId: interaction.user.id,
+    token: parseToken(interaction.options.getString("token")),
     events: events.slice(0, 25).map(toBuilderEventOption),
 
     eventEnabled: false,
@@ -319,13 +323,13 @@ function buildBuilderEmbed(session: QuestBuilderSession): EmbedBuilder {
   const rewards: string[] = [];
   if (session.rewardSats1) {
     if (activeTaskCount(session) === 2) {
-      rewards.push(`↳ **1 task** → ${formatSats(session.rewardSats1)}`);
-      rewards.push(`↳ **2 tasks** → ${session.rewardSats2 ? formatSats(session.rewardSats2) : "Not set"}`);
+      rewards.push(`↳ **1 task** → ${formatTokenAmount(session.rewardSats1, session.token)}`);
+      rewards.push(`↳ **2 tasks** → ${session.rewardSats2 ? formatTokenAmount(session.rewardSats2, session.token) : "Not set"}`);
     } else if (isSingleEventMode(session)) {
-      rewards.push(`↳ **${formatSats(session.rewardSats1)}** per qualifying attendee`);
+      rewards.push(`↳ **${formatTokenAmount(session.rewardSats1, session.token)}** per qualifying attendee`);
       if (session.maxRewards) rewards.push(`↳ Cap: **${session.maxRewards}** attendees`);
     } else {
-      rewards.push(`↳ **${formatSats(session.rewardSats1)}** per qualifying user`);
+      rewards.push(`↳ **${formatTokenAmount(session.rewardSats1, session.token)}** per qualifying user`);
     }
   } else {
     rewards.push("Not set");
@@ -777,19 +781,19 @@ async function handleModal(interaction: ModalSubmitInteraction): Promise<void> {
 
   const reward1 = Number(reward1Raw);
   if (!Number.isFinite(reward1) || reward1 <= 0) {
-    await interaction.reply({ content: "Reward must be a positive number of sats.", flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: `Reward must be a positive ${tokenLabel(session.token)} amount.`, flags: MessageFlags.Ephemeral });
     return;
   }
-  session.rewardSats1 = roundSats(reward1);
+  session.rewardSats1 = roundTokenAmount(reward1, session.token);
 
   if (activeTaskCount(session) === 2) {
     const reward2Raw = interaction.fields.getTextInputValue("reward2").trim();
     const reward2 = Number(reward2Raw);
     if (!Number.isFinite(reward2) || reward2 <= 0) {
-      await interaction.reply({ content: "Tier 2 reward must be a positive number of sats.", flags: MessageFlags.Ephemeral });
+      await interaction.reply({ content: `Tier 2 reward must be a positive ${tokenLabel(session.token)} amount.`, flags: MessageFlags.Ephemeral });
       return;
     }
-    session.rewardSats2 = roundSats(reward2);
+    session.rewardSats2 = roundTokenAmount(reward2, session.token);
   } else {
     session.rewardSats2 = null;
   }
@@ -867,6 +871,7 @@ async function publishSession(interaction: ButtonInteraction, session: QuestBuil
       guildId: session.guildId,
       channelId: session.channelId,
       creatorId: session.creatorId,
+      token: session.token,
       event,
       reward: session.rewardSats1!,
       minMinutes: session.minMinutes,
@@ -917,6 +922,7 @@ async function createEventQuestFromSelection(input: {
   reward: number;
   minMinutes: number;
   maxRewards: number | null;
+  token: TokenSymbol;
 }): Promise<{ ok: true; quest: EventQuestRow; embed: EmbedBuilder } | { ok: false; error: string }> {
   if (!input.event.channelId || !eventIsVoiceLike(input.event)) {
     return { ok: false, error: "That event is not attached to a voice or stage channel." };
@@ -925,12 +931,12 @@ async function createEventQuestFromSelection(input: {
     return { ok: false, error: "That event is not scheduled or active anymore." };
   }
 
-  const balance = await getBalance(input.creatorId);
+  const balance = await getBalance(input.creatorId, input.token);
   if (balance < input.reward) return { ok: false, error: "Insufficient balance to fund even one quest reward." };
-  if (input.maxRewards !== null && balance < roundSats(input.reward * input.maxRewards)) {
+  if (input.maxRewards !== null && balance < roundTokenAmount(input.reward * input.maxRewards, input.token)) {
     return {
       ok: false,
-      error: `Insufficient balance for ${input.maxRewards} rewards (${formatSats(roundSats(input.reward * input.maxRewards))}).`,
+      error: `Insufficient balance for ${input.maxRewards} rewards (${formatTokenAmount(roundTokenAmount(input.reward * input.maxRewards, input.token), input.token)}).`,
     };
   }
 
@@ -944,6 +950,7 @@ async function createEventQuestFromSelection(input: {
       event_name: input.event.name,
       event_channel_id: input.event.channelId,
       reward_sats: input.reward,
+      token: input.token,
       min_minutes: input.minMinutes,
       max_rewards: input.maxRewards,
       scheduled_start_at: input.event.scheduledStartAt?.toISOString() ?? null,
@@ -961,6 +968,7 @@ async function createEventQuestFromSelection(input: {
     guildId: input.guildId,
     channelId: input.channelId,
     creatorId: input.creatorId,
+    token: input.token,
     title: input.event.name,
     description: `Attend ${input.event.name} for ${input.minMinutes} minute${input.minMinutes === 1 ? "" : "s"}.`,
     startsAt: input.event.scheduledStartAt?.toISOString() ?? null,
@@ -990,6 +998,7 @@ async function createEventQuestFromSelection(input: {
     event_name: input.event.name,
     event_channel_id: input.event.channelId,
     reward_sats: input.reward,
+    token: input.token,
     min_minutes: input.minMinutes,
     max_rewards: input.maxRewards,
     rewards_count: 0,
@@ -1063,7 +1072,7 @@ async function createMultiStepQuestFromSession(
   }
 
   const maxReward = Math.max(...rewardTiers.map((tier) => tier.rewardSats));
-  const balance = await getBalance(session.creatorId);
+  const balance = await getBalance(session.creatorId, session.token);
   if (balance < maxReward) {
     return { ok: false, error: "Insufficient balance to cover at least one full payout." };
   }
@@ -1079,6 +1088,7 @@ async function createMultiStepQuestFromSession(
       guildId: session.guildId,
       channelId: session.channelId,
       creatorId: session.creatorId,
+      token: session.token,
       title,
       description,
       startsAt,
@@ -1154,6 +1164,7 @@ async function completeTaskOverride(interaction: ChatInputCommandInteraction) {
         title: snapshot.quest.title,
         description: snapshot.quest.description,
         status: snapshot.quest.status,
+        token: snapshot.quest.token,
         max_reward_sats: snapshot.quest.max_reward_sats,
         starts_at: snapshot.quest.starts_at,
         ends_at: snapshot.quest.ends_at,
@@ -1176,7 +1187,7 @@ async function completeTaskOverride(interaction: ChatInputCommandInteraction) {
   }
 
   const rewardText = (result.rewardDeltaSats ?? 0) > 0
-    ? ` Paid **${formatSats(result.rewardDeltaSats ?? 0)}**.`
+    ? ` Paid **${formatTokenAmount(result.rewardDeltaSats ?? 0, snapshot.quest.token)}**.`
     : " No new tier payout was due.";
   const duplicateText = result.insertedCompletion === false ? " This user had already completed that task." : "";
 

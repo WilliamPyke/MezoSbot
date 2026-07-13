@@ -4,6 +4,12 @@ import { supabase } from "./db.js";
 import { addBalance } from "./balance.js";
 import { recordLedgerEntry } from "./ledger.js";
 import { verifyWalletFromDeposit } from "./walletVerification.js";
+import { TOKEN_SYMBOLS, assertTokenConfigured, tokenAmountToUnits, tokenUnitsToAmount, type TokenSymbol } from "./tokens.js";
+
+const ERC20_ABI = [
+  "function balanceOf(address owner) view returns (uint256)",
+  "function transfer(address to, uint256 amount) returns (bool)",
+];
 
 let provider: ethers.JsonRpcProvider;
 let wallet: ethers.Wallet;
@@ -19,16 +25,40 @@ export function getProvider() {
  * throw BAD_DATA.  This helper unwraps the array before parsing.
  */
 async function rawRpcCall(method: string, params: unknown[]): Promise<unknown> {
-  const res = await fetch(config.evm.rpcUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ jsonrpc: "2.0", method, params, id: 1 }),
-  });
-  const data: unknown = await res.json();
-  const item = Array.isArray(data) ? data[0] : data;
-  const rpc = item as { error?: { message?: string }; result?: unknown };
-  if (rpc.error) throw new Error(rpc.error.message ?? JSON.stringify(rpc.error));
-  return rpc.result ?? null;
+  const attempts = 4;
+  let lastError: unknown = null;
+
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      const res = await fetch(config.evm.rpcUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", method, params, id: 1 }),
+      });
+
+      const text = await res.text();
+      if (!res.ok) {
+        throw new Error(`RPC HTTP ${res.status}: ${text.slice(0, 200)}`);
+      }
+
+      const data: unknown = text ? JSON.parse(text) : null;
+      const item = Array.isArray(data) ? data[0] : data;
+      const rpc = item as { error?: { message?: string }; result?: unknown };
+      if (rpc.error) {
+        const rpcError = new Error(rpc.error.message ?? JSON.stringify(rpc.error)) as RpcError;
+        rpcError.rpcError = true;
+        throw rpcError;
+      }
+      return rpc.result ?? null;
+    } catch (err) {
+      lastError = err;
+      if ((err as RpcError)?.rpcError) throw err;
+      if (attempt === attempts - 1) break;
+      await new Promise((r) => setTimeout(r, 250 * 2 ** attempt));
+    }
+  }
+
+  throw lastError;
 }
 
 export function getTreasuryAddress(): string {
@@ -69,8 +99,11 @@ type DepositAddressRow = {
   last_checked_balance: string | null;
 };
 
+type RpcError = Error & { rpcError?: boolean };
+
 const depositAddressCache = new Map<string, DepositAddressRow>();
 const depositRegistrationPromises = new Map<string, Promise<string>>();
+const sweepPromises = new Map<string, Promise<string | null>>();
 let depositAddressCacheLoadedAt = 0;
 let depositAddressCacheRefresh: Promise<void> | null = null;
 const DEPOSIT_UPDATE_BATCH_SIZE = 500;
@@ -289,14 +322,97 @@ async function estimateNativeTransferGas(to: string, value: bigint): Promise<big
   return addGasLimitBuffer(estimatedGas);
 }
 
+export async function getNativeBalance(address: string): Promise<bigint> {
+  const raw = await rawRpcCall("eth_getBalance", [address, "latest"]) as string;
+  return BigInt(raw ?? "0x0");
+}
+
+export async function getTokenBalance(address: string, token: TokenSymbol): Promise<bigint> {
+  if (token === "SATS") return getNativeBalance(address);
+  const cfg = assertTokenConfigured(token);
+  const contract = new ethers.Contract(cfg.contractAddress!, ERC20_ABI, provider);
+  return BigInt(await contract.balanceOf(address));
+}
+
+async function sweepErc20ToTreasury(discordId: string, token: Exclude<TokenSymbol, "SATS">): Promise<string | null> {
+  const cfg = assertTokenConfigured(token);
+  const userWallet = getUserDepositWallet(discordId);
+  const contract = new ethers.Contract(cfg.contractAddress!, ERC20_ABI, userWallet);
+  const tokenBalance = BigInt(await contract.balanceOf(userWallet.address));
+  if (tokenBalance <= 0n) return null;
+
+  const gasPrice = await getGasPrice();
+  const estimated = BigInt(await contract.transfer.estimateGas(wallet.address, tokenBalance));
+  const gasLimit = addGasLimitBuffer(estimated);
+  const requiredGas = gasLimit * gasPrice;
+  const nativeBalance = await getNativeBalance(userWallet.address);
+  if (nativeBalance < requiredGas) {
+    const funding = requiredGas - nativeBalance;
+    const hash = await sendRawNativeTransfer(wallet, userWallet.address, funding, NATIVE_TRANSFER_GAS_LIMIT, gasPrice);
+    for (let i = 0; i < 20; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+      if (await getNativeBalance(userWallet.address) >= requiredGas) break;
+      if (i === 19) throw new Error(`Gas funding ${hash} did not confirm`);
+    }
+  }
+  const tx = await contract.transfer(wallet.address, tokenBalance, { gasLimit, gasPrice });
+  for (let i = 0; i < 40; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    const receipt = await rawRpcCall("eth_getTransactionReceipt", [tx.hash]) as { status: string } | null;
+    if (!receipt) continue;
+    if (parseInt(receipt.status, 16) !== 1) throw new Error(`${token} sweep reverted`);
+    return tx.hash as string;
+  }
+  throw new Error(`${token} sweep confirmation timed out`);
+}
+
+async function sendRawNativeTransfer(
+  signer: ethers.Wallet,
+  to: string,
+  value: bigint,
+  gasLimit: bigint,
+  gasPrice: bigint,
+): Promise<string> {
+  const nonceRaw = await rawRpcCall("eth_getTransactionCount", [signer.address, "pending"]) as string;
+  const signed = await signer.signTransaction({
+    to,
+    value,
+    gasLimit,
+    gasPrice,
+    nonce: Number(BigInt(nonceRaw ?? "0x0")),
+    chainId: config.evm.chainId,
+    type: 0,
+  });
+  const hash = ethers.keccak256(signed);
+  try {
+    const submitted = await rawRpcCall("eth_sendRawTransaction", [signed]) as string | null;
+    return submitted ?? hash;
+  } catch (err) {
+    const msg = ((err as Error)?.message ?? "").toLowerCase();
+    if (msg.includes("already known") || msg.includes("known transaction")) return hash;
+    throw err;
+  }
+}
+
 /**
  * Sweep funds from a user's deposit address to the treasury.
  * Gas price is pinned on the tx, so cost = exactly gasLimit * gasPrice.
  * value = balance - gasCost → wallet is drained to 0 with no dust.
  */
 export async function sweepToTreasury(discordId: string): Promise<string | null> {
+  const pending = sweepPromises.get(discordId);
+  if (pending) return pending;
+
+  const sweep = sweepToTreasuryUnlocked(discordId).finally(() => {
+    sweepPromises.delete(discordId);
+  });
+  sweepPromises.set(discordId, sweep);
+  return sweep;
+}
+
+async function sweepToTreasuryUnlocked(discordId: string): Promise<string | null> {
   const userWallet = getUserDepositWallet(discordId);
-  const balance = await provider.getBalance(userWallet.address);
+  const balance = await getNativeBalance(userWallet.address);
   if (balance === 0n) return null;
 
   const gasPrice = await getGasPrice();
@@ -313,13 +429,7 @@ export async function sweepToTreasury(discordId: string): Promise<string | null>
     return null;
   }
 
-  const tx = await userWallet.sendTransaction({
-    to: wallet.address,
-    value: sendAmount,
-    gasLimit,
-    gasPrice,
-  });
-  return tx.hash;
+  return sendRawNativeTransfer(userWallet, wallet.address, sendAmount, gasLimit, gasPrice);
 }
 
 /**
@@ -329,7 +439,7 @@ export async function sweepToTreasury(discordId: string): Promise<string | null>
  */
 export async function fundGasAndSweep(discordId: string): Promise<string | null> {
   const userWallet = getUserDepositWallet(discordId);
-  const balance = await provider.getBalance(userWallet.address);
+  const balance = await getNativeBalance(userWallet.address);
   if (balance === 0n) return null;
 
   const gasPrice = await getGasPrice();
@@ -340,19 +450,14 @@ export async function fundGasAndSweep(discordId: string): Promise<string | null>
   const gasFunding = gasCost;
 
   console.log(`Funding gas for ${discordId}: sending ${gasFunding} wei from treasury`);
-  const fundTx = await wallet.sendTransaction({
-    to: userWallet.address,
-    value: gasFunding,
-    gasLimit,
-    gasPrice,
-  });
-  console.log(`Gas funding tx: ${fundTx.hash}`);
+  const fundHash = await sendRawNativeTransfer(wallet, userWallet.address, gasFunding, gasLimit, gasPrice);
+  console.log(`Gas funding tx: ${fundHash}`);
 
   // Wait for the funding tx to be mined (poll manually since tx.wait() is broken)
   let funded = false;
   for (let i = 0; i < 20; i++) {
     await new Promise((r) => setTimeout(r, 3000));
-    const newBal = await provider.getBalance(userWallet.address);
+    const newBal = await getNativeBalance(userWallet.address);
     if (newBal > balance) {
       funded = true;
       break;
@@ -378,7 +483,7 @@ export async function fundGasAndSweep(discordId: string): Promise<string | null>
  * hadn't mined yet.
  */
 export function startDepositPoller(
-  onDeposit?: (discordId: string, amountSats: number, gasSats: number, txHash: string) => void
+  onDeposit?: (discordId: string, amount: number, gasSats: number, txHash: string, token: TokenSymbol) => void
 ) {
   let isPolling = false;
   const balanceConcurrency = clampPositiveInt(config.deposits.balanceConcurrency, 8);
@@ -405,6 +510,18 @@ export function startDepositPoller(
 
       const updates: Array<{ row: DepositAddressRow; balance: string }> = [];
       let gasPriceForPoll: bigint | null = null;
+
+      const configuredErc20 = TOKEN_SYMBOLS.filter((symbol): symbol is Exclude<TokenSymbol, "SATS"> => {
+        if (symbol === "SATS") return false;
+        try { return !!assertTokenConfigured(symbol).contractAddress; } catch { return false; }
+      });
+      const { data: tokenCheckpoints } = configuredErc20.length > 0
+        ? await supabase.from("deposit_token_balances").select("discord_id, token, last_checked_balance")
+        : { data: [] };
+      const checkpointMap = new Map<string, bigint>();
+      for (const checkpoint of tokenCheckpoints ?? []) {
+        checkpointMap.set(`${checkpoint.discord_id}:${checkpoint.token}`, BigInt(checkpoint.last_checked_balance ?? "0"));
+      }
 
       for (let i = 0; i < rows.length; i += balanceBatchSize) {
         const batch = rows.slice(i, i + balanceBatchSize);
@@ -458,7 +575,7 @@ export function startDepositPoller(
                   block_number: 0,
                 });
                 await addBalance(row.discord_id, netSats);
-                onDeposit?.(row.discord_id, netSats, gasSats, txId);
+                onDeposit?.(row.discord_id, netSats, gasSats, txId, "SATS");
               }
             } else {
               console.log(
@@ -477,6 +594,46 @@ export function startDepositPoller(
 
           if (bal !== prev) {
             updates.push({ row, balance: bal.toString() });
+          }
+
+          for (const token of configuredErc20) {
+            try {
+              const current = await getTokenBalance(row.address, token);
+              const key = `${row.discord_id}:${token}`;
+              const previous = checkpointMap.get(key) ?? 0n;
+              if (current > previous) {
+                const amount = tokenUnitsToAmount(current - previous, token);
+                if (amount > 0) {
+                  const txId = `auto-${token.toLowerCase()}-${Date.now()}-${row.discord_id}`;
+                  const { data: credited, error: creditError } = await supabase.rpc("credit_token_deposit", {
+                    p_discord_id: row.discord_id,
+                    p_token: token,
+                    p_expected_balance: previous.toString(),
+                    p_observed_balance: current.toString(),
+                    p_amount: amount,
+                    p_tx_hash: txId,
+                  });
+                  if (creditError) throw creditError;
+                  if (credited === true) onDeposit?.(row.discord_id, amount, 0, txId, token);
+                }
+              }
+              if (current > 0n) {
+                try {
+                  await sweepErc20ToTreasury(row.discord_id, token);
+                } catch (error) {
+                  console.error(`[Deposits] ${token} sweep failed for ${row.discord_id}:`, (error as Error).message);
+                }
+              }
+              const checkpointBalance = await getTokenBalance(row.address, token);
+              if (checkpointBalance !== previous) {
+                await supabase.from("deposit_token_balances").upsert({
+                  discord_id: row.discord_id, token, last_checked_balance: checkpointBalance.toString(), updated_at: new Date().toISOString(),
+                }, { onConflict: "discord_id,token" });
+                checkpointMap.set(key, checkpointBalance);
+              }
+            } catch (error) {
+              console.warn(`[Deposits] ${token} balance check failed for ${row.discord_id}:`, (error as Error).message);
+            }
           }
         }
 
@@ -513,10 +670,35 @@ export interface WithdrawResult {
  *  Waits for on-chain confirmation before returning success. */
 export async function withdraw(
   toAddress: string,
-  amountSats: number
+  amountSats: number,
+  token: TokenSymbol = "SATS",
 ): Promise<WithdrawResult> {
   const normalized = toAddress.toLowerCase().trim();
   if (!/^0x[a-fA-F0-9]{40}$/.test(normalized)) return { error: "Invalid address" };
+
+  if (token !== "SATS") {
+    const cfg = assertTokenConfigured(token);
+    const units = tokenAmountToUnits(amountSats, token);
+    if (units <= 0n) return { error: "Amount too small" };
+    try {
+      const contract = new ethers.Contract(cfg.contractAddress!, ERC20_ABI, wallet);
+      const treasuryBalance = BigInt(await contract.balanceOf(wallet.address));
+      if (treasuryBalance < units) return { error: `Treasury has insufficient ${token}` };
+      const tx = await contract.transfer(normalized, units);
+      for (let i = 0; i < 40; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 3000));
+        const receipt = await rawRpcCall("eth_getTransactionReceipt", [tx.hash]) as { status: string } | null;
+        if (!receipt) continue;
+        if (parseInt(receipt.status, 16) !== 1) {
+          return { txHash: tx.hash, confirmed: false, error: "Transaction reverted on-chain" };
+        }
+        return { txHash: tx.hash, sentSats: amountSats, confirmed: true };
+      }
+      return { txHash: tx.hash, confirmed: false, error: "Receipt timeout: transaction not confirmed after 2 minutes" };
+    } catch (error) {
+      return { error: (error as Error).message };
+    }
+  }
 
   const value = satsToTokenUnits(amountSats);
   if (value <= 0n) return { error: "Amount too small" };
@@ -617,12 +799,14 @@ export async function recoverPendingWithdrawals(): Promise<void> {
   console.log(`[Recovery] Found ${stale.length} stale pending withdrawal(s) to resolve`);
 
   for (const w of stale) {
+    const withdrawalToken = (w.token ?? "SATS") as TokenSymbol;
     if (!w.tx_hash) {
       // sendTransaction never got a hash — safe to refund
-      await addBalance(w.discord_id, w.amount_sats);
+      await addBalance(w.discord_id, w.amount_sats, withdrawalToken);
       recordLedgerEntry(null, {
         type: "withdrawal_refund",
         amountSats: w.amount_sats,
+        token: withdrawalToken,
         senderId: "treasury",
         receiverId: w.discord_id,
         referenceType: "withdrawals",
@@ -642,10 +826,11 @@ export async function recoverPendingWithdrawals(): Promise<void> {
           await supabase.from("withdrawals").update({ status: "completed" }).eq("id", w.id);
           console.log(`[Recovery] Withdrawal ${w.id}: tx confirmed on-chain → marked completed (no refund)`);
         } else {
-          await addBalance(w.discord_id, w.amount_sats);
+          await addBalance(w.discord_id, w.amount_sats, withdrawalToken);
           recordLedgerEntry(null, {
             type: "withdrawal_refund",
             amountSats: w.amount_sats,
+            token: withdrawalToken,
             senderId: "treasury",
             receiverId: w.discord_id,
             referenceType: "withdrawals",
@@ -679,10 +864,11 @@ export async function recoverPendingWithdrawals(): Promise<void> {
             console.log(`[Recovery] Withdrawal ${w.id}: tx in mempool on retry — leaving pending`);
           } else {
             // Still null after retry — tx genuinely dropped
-            await addBalance(w.discord_id, w.amount_sats);
+            await addBalance(w.discord_id, w.amount_sats, withdrawalToken);
             recordLedgerEntry(null, {
               type: "withdrawal_refund",
               amountSats: w.amount_sats,
+              token: withdrawalToken,
               senderId: "treasury",
               receiverId: w.discord_id,
               referenceType: "withdrawals",
@@ -704,4 +890,12 @@ export async function recoverPendingWithdrawals(): Promise<void> {
 export async function getTreasuryBalanceSats(): Promise<number> {
   const bal = await provider.getBalance(wallet.address);
   return tokenUnitsToSats(bal);
+}
+
+export async function getTreasuryBalances(): Promise<Record<TokenSymbol, number>> {
+  const entries = await Promise.all(TOKEN_SYMBOLS.map(async (token) => {
+    const units = await getTokenBalance(wallet.address, token);
+    return [token, tokenUnitsToAmount(units, token)] as const;
+  }));
+  return Object.fromEntries(entries) as Record<TokenSymbol, number>;
 }

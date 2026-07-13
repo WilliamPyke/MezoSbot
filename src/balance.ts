@@ -1,5 +1,6 @@
 import { supabase } from "./db.js";
 import { roundSats } from "./format.js";
+import { TOKEN_SYMBOLS, roundTokenAmount, type TokenSymbol } from "./tokens.js";
 
 export async function getOrCreateUser(discordId: string) {
   // Use upsert with onConflict to avoid duplicate inserts, select to return the row
@@ -22,7 +23,16 @@ export async function getOrCreateUser(discordId: string) {
   return data as { discord_id: string; wallet_address: string | null; balance_sats: number };
 }
 
-export async function getBalance(discordId: string): Promise<number> {
+export async function getBalance(discordId: string, token: TokenSymbol = "SATS"): Promise<number> {
+  if (token !== "SATS") {
+    const { data } = await supabase
+      .from("user_token_balances")
+      .select("balance")
+      .eq("discord_id", discordId)
+      .eq("token", token)
+      .maybeSingle();
+    return Number(data?.balance ?? 0);
+  }
   const { data } = await supabase
     .from("users")
     .select("balance_sats")
@@ -32,19 +42,43 @@ export async function getBalance(discordId: string): Promise<number> {
   return data?.balance_sats ?? 0;
 }
 
-export async function addBalance(discordId: string, amountSats: number): Promise<void> {
-  await getOrCreateUser(discordId);
-  const rounded = roundSats(amountSats);
-  await supabase.rpc("add_balance", { p_discord_id: discordId, p_amount: rounded });
+export async function getBalances(discordId: string): Promise<Record<TokenSymbol, number>> {
+  const sats = await getBalance(discordId, "SATS");
+  const { data } = await supabase
+    .from("user_token_balances")
+    .select("token, balance")
+    .eq("discord_id", discordId);
+  const balances = { SATS: sats, MUSD: 0, MEZO: 0, MUSDC: 0 } satisfies Record<TokenSymbol, number>;
+  for (const row of data ?? []) {
+    if ((TOKEN_SYMBOLS as readonly string[]).includes(row.token) && row.token !== "SATS") {
+      balances[row.token as TokenSymbol] = Number(row.balance ?? 0);
+    }
+  }
+  return balances;
 }
 
-export async function subtractBalance(discordId: string, amountSats: number): Promise<boolean> {
-  const rounded = roundSats(amountSats);
-  if (rounded <= 0) return false;
-  const { data } = await supabase.rpc("subtract_balance_if_sufficient", {
-    p_discord_id: discordId,
-    p_amount: rounded,
+export async function addBalance(discordId: string, amountSats: number, token: TokenSymbol = "SATS"): Promise<void> {
+  await getOrCreateUser(discordId);
+  const rounded = token === "SATS" ? roundSats(amountSats) : roundTokenAmount(amountSats, token);
+  if (token === "SATS") {
+    await supabase.rpc("add_balance", { p_discord_id: discordId, p_amount: rounded });
+    return;
+  }
+  const { error } = await supabase.rpc("add_token_balance", {
+    p_discord_id: discordId, p_token: token, p_amount: rounded,
   });
+  if (error) throw error;
+}
+
+export async function subtractBalance(discordId: string, amountSats: number, token: TokenSymbol = "SATS"): Promise<boolean> {
+  const rounded = token === "SATS" ? roundSats(amountSats) : roundTokenAmount(amountSats, token);
+  if (rounded <= 0) return false;
+  const { data, error } = token === "SATS"
+    ? await supabase.rpc("subtract_balance_if_sufficient", { p_discord_id: discordId, p_amount: rounded })
+    : await supabase.rpc("subtract_token_balance_if_sufficient", {
+      p_discord_id: discordId, p_token: token, p_amount: rounded,
+    });
+  if (error) throw error;
   return data === true;
 }
 

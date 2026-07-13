@@ -2,6 +2,7 @@ import { EmbedBuilder, MessageFlags, type ChatInputCommandInteraction } from "di
 import { supabase } from "../db.js";
 import { formatSats } from "../format.js";
 import { config } from "../config.js";
+import { formatTokenAmount, parseToken } from "../tokens.js";
 
 export const data = {
   name: "history",
@@ -16,14 +17,14 @@ export async function execute(interaction: ChatInputCommandInteraction) {
 
   const { data: deposits } = await supabase
     .from("deposits")
-    .select("tx_hash, amount_sats, created_at")
+    .select("tx_hash, amount_sats, token, created_at")
     .eq("discord_id", userId)
     .order("created_at", { ascending: false })
     .limit(5);
 
   const { data: withdrawals } = await supabase
     .from("withdrawals")
-    .select("tx_hash, amount_sats, to_address, status, created_at")
+    .select("tx_hash, amount_sats, token, to_address, status, created_at")
     .eq("discord_id", userId)
     .order("created_at", { ascending: false })
     .limit(5);
@@ -40,7 +41,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
       const link = d.tx_hash.startsWith("0x")
         ? `[\`${d.tx_hash.slice(0, 10)}...\`](${explorer}/tx/${d.tx_hash})`
         : `\`${d.tx_hash.slice(0, 16)}...\``;
-      return `📥 **${formatSats(d.amount_sats)}** — ${link} <t:${ts}:R>`;
+      return `📥 **${formatTokenAmount(d.amount_sats, parseToken(d.token))}** — ${link} <t:${ts}:R>`;
     });
     embed.addFields({ name: "Deposits", value: lines.join("\n") });
   } else {
@@ -53,7 +54,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
       const ts = Math.floor(new Date(w.created_at).getTime() / 1000);
       const addr = `\`${w.to_address.slice(0, 10)}...\``;
       const icon = w.status === "pending" ? "⏳" : "✅";
-      return `📤 ${icon} **${formatSats(w.amount_sats)}** → ${addr} <t:${ts}:R>`;
+      return `📤 ${icon} **${formatTokenAmount(w.amount_sats, parseToken(w.token))}** → ${addr} <t:${ts}:R>`;
     });
     embed.addFields({ name: "Withdrawals", value: lines.join("\n") });
   } else {

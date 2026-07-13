@@ -10,10 +10,10 @@ exports.updateDropMessage = updateDropMessage;
  */
 const discord_js_1 = require("discord.js");
 const db_js_1 = require("./db.js");
-const balance_js_1 = require("./balance.js");
 const evm_js_1 = require("./evm.js");
 const ledger_js_1 = require("./ledger.js");
-const format_js_1 = require("./format.js");
+const multi_js_1 = require("./multi.js");
+const tokens_js_1 = require("./tokens.js");
 /* ------------------------------------------------------------------ */
 /*  Build the drop embed + button                                     */
 /* ------------------------------------------------------------------ */
@@ -22,9 +22,9 @@ function buildDropEmbed(drop, claimedBy) {
     const completed = drop.status === "completed";
     const embed = new discord_js_1.EmbedBuilder()
         .setColor(completed ? 0x95a5a6 : 0xf0b232)
-        .setTitle("🎁 Sats Drop!")
-        .setDescription(`<@${drop.creator_id}> dropped **${(0, format_js_1.formatSats)(drop.total_sats)}**!`)
-        .addFields({ name: "Per Claim", value: `**${(0, format_js_1.formatSats)(drop.per_claim_sats)}**`, inline: true }, { name: "Claimed", value: `**${drop.claims_count}/${drop.max_claims}**`, inline: true }, { name: "Remaining", value: completed ? "✅ All claimed!" : `**${remaining}**`, inline: true })
+        .setTitle(`🎁 ${drop.token ?? "SATS"} Drop!`)
+        .setDescription(`<@${drop.creator_id}> dropped **${(0, tokens_js_1.formatTokenAmount)(drop.total_sats, drop.token ?? "SATS")}**!`)
+        .addFields({ name: "Per Claim", value: `**${(0, tokens_js_1.formatTokenAmount)(drop.per_claim_sats, drop.token ?? "SATS")}**`, inline: true }, { name: "Claimed", value: `**${drop.claims_count}/${drop.max_claims}**`, inline: true }, { name: "Remaining", value: completed ? "✅ All claimed!" : `**${remaining}**`, inline: true })
         .setTimestamp();
     if (drop.eligible_role_id) {
         embed.addFields({ name: "Eligible Role", value: `<@&${drop.eligible_role_id}>`, inline: true });
@@ -63,79 +63,83 @@ async function getClaimants(dropId) {
 /*  Process a claim (shared by button handler and /claim command)      */
 /* ------------------------------------------------------------------ */
 async function processClaim(dropId, claimantId, claimantRoleIds = [], client = null, guildId = null) {
-    // Re-fetch the drop to get latest state
-    const { data: drop } = await db_js_1.supabase
+    const { data: dropRow, error: dropError } = await db_js_1.supabase
         .from("drops")
-        .select("*")
+        .select("creator_id, token")
         .eq("id", dropId)
-        .single();
-    if (!drop || drop.status !== "active" || drop.claims_count >= drop.max_claims) {
-        return { ok: false, error: "This drop is no longer active." };
+        .maybeSingle();
+    if (dropError || !dropRow?.creator_id) {
+        if (dropError)
+            console.error("[Drops] Failed to load drop creator:", dropError.message);
+        return { ok: false, error: "This drop could not be claimed. Please try again." };
     }
-    if (drop.creator_id === claimantId) {
-        return { ok: false, error: "You can't claim your own drop." };
-    }
-    const eligibleRoleId = drop.eligible_role_id;
-    if (eligibleRoleId && !claimantRoleIds.includes(eligibleRoleId)) {
-        return { ok: false, error: `Only members with <@&${eligibleRoleId}> can claim this drop.` };
-    }
-    // Check if already claimed
-    const { data: existing } = await db_js_1.supabase
-        .from("drop_claims")
-        .select("id")
-        .eq("drop_id", dropId)
-        .eq("claimant_id", claimantId)
-        .single();
-    if (existing) {
-        return { ok: false, error: "You've already claimed from this drop." };
-    }
-    // Insert claim
-    const { error: claimError } = await db_js_1.supabase.from("drop_claims").insert({
-        drop_id: dropId,
-        claimant_id: claimantId,
-        amount_sats: drop.per_claim_sats,
+    const requestedMultiplier = (0, multi_js_1.getSatsMultiplier)(claimantRoleIds);
+    const creatorAllowsMulti = await (0, multi_js_1.getMultiDropEnabled)(dropRow.creator_id);
+    const token = (0, tokens_js_1.parseToken)(dropRow.token);
+    const { data, error } = await db_js_1.supabase.rpc("claim_drop_atomic", {
+        p_drop_id: dropId,
+        p_claimant_id: claimantId,
+        p_claimant_role_ids: claimantRoleIds,
+        p_claimant_multiplier: requestedMultiplier,
+        p_creator_allows_multi: creatorAllowsMulti,
     });
-    if (claimError) {
-        return { ok: false, error: "You've already claimed from this drop." };
+    if (error) {
+        console.error("[Drops] claim_drop_atomic failed:", error.message);
+        return { ok: false, error: "This drop could not be claimed. Please try again." };
     }
-    // Log the drop claim as rain in the database
-    const { error: rainError } = await db_js_1.supabase
-        .from("rains")
-        .insert({
-        sender_id: drop.creator_id,
-        amount_sats: drop.per_claim_sats,
-        recipient_count: 1,
+    const result = (data ?? {});
+    if (!result.ok) {
+        const eligibleRoleId = result.eligibleRoleId ?? result.eligible_role_id;
+        switch (result.reason) {
+            case "already_claimed":
+                return { ok: false, error: "You've already claimed from this drop." };
+            case "own_drop":
+                return { ok: false, error: "You can't claim your own drop." };
+            case "insufficient_remaining":
+                return { ok: false, error: "There aren't enough claims left for a 2x claim." };
+            case "ineligible_role":
+                return {
+                    ok: false,
+                    error: eligibleRoleId
+                        ? `Only members with <@&${eligibleRoleId}> can claim this drop.`
+                        : "You're not eligible to claim this drop.",
+                };
+            default:
+                return { ok: false, error: "This drop is no longer active." };
+        }
+    }
+    const newCount = result.newCount ?? result.new_count ?? 0;
+    const amountSats = result.amountSats ?? result.amount_sats ?? 0;
+    const creatorId = result.creatorId ?? result.creator_id;
+    const claimId = result.claimId ?? result.claim_id;
+    const remaining = result.remaining ?? 0;
+    const completed = result.completed === true;
+    if (!creatorId || amountSats <= 0) {
+        console.error("[Drops] claim_drop_atomic returned an incomplete success payload:", result);
+        return { ok: false, error: "This drop could not be claimed. Please try again." };
+    }
+    await (0, evm_js_1.registerDepositAddress)(claimantId).catch((err) => {
+        console.warn(`[Drops] Failed to register deposit address for claimant ${claimantId}:`, err?.message ?? err);
     });
-    if (rainError) {
-        console.error("[Drops] Failed to log drop claim to rains table:", rainError.message);
-    }
-    // Update drop state
-    const newCount = drop.claims_count + 1;
-    const completed = newCount >= drop.max_claims;
-    const newStatus = completed ? "completed" : "active";
-    await db_js_1.supabase
-        .from("drops")
-        .update({ claims_count: newCount, status: newStatus })
-        .eq("id", dropId);
-    // Credit the claimant
-    await (0, balance_js_1.addBalance)(claimantId, drop.per_claim_sats);
-    await (0, evm_js_1.registerDepositAddress)(claimantId);
     (0, ledger_js_1.recordLedgerEntry)(client, {
         type: "drop_claim",
-        amountSats: drop.per_claim_sats,
-        senderId: drop.creator_id,
+        amountSats,
+        token,
+        senderId: creatorId,
         receiverId: claimantId,
         guildId,
         referenceType: "drop_claims",
-        referenceId: String(dropId),
+        referenceId: claimId ? String(claimId) : String(dropId),
     });
     return {
         ok: true,
         newCount,
-        remaining: drop.max_claims - newCount,
+        remaining,
         completed,
-        amountSats: drop.per_claim_sats,
-        creatorId: drop.creator_id,
+        amountSats,
+        creatorId,
+        claimId,
+        token,
     };
 }
 /* ------------------------------------------------------------------ */

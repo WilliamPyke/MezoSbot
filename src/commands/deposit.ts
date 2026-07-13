@@ -2,10 +2,12 @@ import { ActionRowBuilder, AttachmentBuilder, ButtonBuilder, ButtonStyle, EmbedB
 import QRCode from "qrcode";
 import { registerDepositAddress } from "../evm.js";
 import { config } from "../config.js";
+import { TOKEN_CHOICES, assertTokenConfigured, parseToken, tokenLabel } from "../tokens.js";
 
 export const data = {
   name: "deposit",
-  description: "Get your personal deposit address",
+  description: "Get your personal token deposit address",
+  options: [{ name: "token", type: 3 as const, description: "Token to deposit", required: false, choices: TOKEN_CHOICES }],
 };
 
 export async function execute(interaction: ChatInputCommandInteraction) {
@@ -15,8 +17,14 @@ export async function execute(interaction: ChatInputCommandInteraction) {
 
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
+  const token = parseToken(interaction.options.getString("token"));
+  try { assertTokenConfigured(token); } catch (error) {
+    return interaction.editReply({ content: `❌ ${(error as Error).message}` });
+  }
+
   const address = await registerDepositAddress(interaction.user.id);
   const explorer = config.evm.explorerUrl;
+  const depositAsset = token === "SATS" ? "native BTC (credited as SATS)" : tokenLabel(token);
 
   const qrBuffer = await QRCode.toBuffer(address, {
     width: 256,
@@ -28,11 +36,11 @@ export async function execute(interaction: ChatInputCommandInteraction) {
 
   const embed = new EmbedBuilder()
     .setColor(0x5865f2)
-    .setTitle("📍 Your Deposit Address")
+    .setTitle(`📍 Your ${tokenLabel(token)} Deposit Address`)
     .setDescription(`\`${address}\``)
     .addFields(
-      { name: "How It Works", value: "Send BTC to this address from any wallet. Your balance is credited **automatically** within ~15 seconds." },
-      { name: "Network Fee", value: "A small gas fee (~3 sats) is deducted per deposit." },
+      { name: "How It Works", value: `Send **${depositAsset}** on Mezo to this address. Your balance is credited automatically after polling.` },
+      { name: "Important", value: "Only send the selected token on the configured Mezo network." },
       { name: "Explorer", value: `[View on Explorer](${explorer}/address/${address})` },
     )
     .setThumbnail("attachment://deposit-qr.png")
@@ -42,7 +50,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   const webButton = new ButtonBuilder()
     .setLabel("Deposit via Wallet")
     .setStyle(ButtonStyle.Link)
-    .setURL(`${config.depositWebUrl}?uid=${interaction.user.id}`)
+    .setURL(`${config.depositWebUrl}?uid=${interaction.user.id}&token=${token}`)
     .setEmoji("🌐");
 
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(webButton);

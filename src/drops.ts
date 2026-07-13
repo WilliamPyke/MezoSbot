@@ -14,6 +14,7 @@ import { registerDepositAddress } from "./evm.js";
 import { recordLedgerEntry } from "./ledger.js";
 import { formatSats } from "./format.js";
 import { getMultiDropEnabled, getSatsMultiplier } from "./multi.js";
+import { formatTokenAmount, parseToken, type TokenSymbol } from "./tokens.js";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                             */
@@ -30,6 +31,7 @@ export interface Drop {
   max_claims: number;
   claims_count: number;
   status: string;
+  token: TokenSymbol;
 }
 
 export interface ClaimResult {
@@ -47,6 +49,7 @@ export interface ClaimResult {
   creatorId?: string;
   /** Inserted drop_claims row id */
   claimId?: number;
+  token?: TokenSymbol;
 }
 
 type AtomicClaimRpcResult = {
@@ -78,10 +81,10 @@ export function buildDropEmbed(drop: Drop, claimedBy: string[]): EmbedBuilder {
 
   const embed = new EmbedBuilder()
     .setColor(completed ? 0x95a5a6 : 0xf0b232)
-    .setTitle("🎁 Sats Drop!")
-    .setDescription(`<@${drop.creator_id}> dropped **${formatSats(drop.total_sats)}**!`)
+    .setTitle(`🎁 ${drop.token ?? "SATS"} Drop!`)
+    .setDescription(`<@${drop.creator_id}> dropped **${formatTokenAmount(drop.total_sats, drop.token ?? "SATS")}**!`)
     .addFields(
-      { name: "Per Claim", value: `**${formatSats(drop.per_claim_sats)}**`, inline: true },
+      { name: "Per Claim", value: `**${formatTokenAmount(drop.per_claim_sats, drop.token ?? "SATS")}**`, inline: true },
       { name: "Claimed", value: `**${drop.claims_count}/${drop.max_claims}**`, inline: true },
       { name: "Remaining", value: completed ? "✅ All claimed!" : `**${remaining}**`, inline: true },
     )
@@ -141,7 +144,7 @@ export async function processClaim(
 ): Promise<ClaimResult> {
   const { data: dropRow, error: dropError } = await supabase
     .from("drops")
-    .select("creator_id")
+    .select("creator_id, token")
     .eq("id", dropId)
     .maybeSingle();
 
@@ -152,6 +155,7 @@ export async function processClaim(
 
   const requestedMultiplier = getSatsMultiplier(claimantRoleIds);
   const creatorAllowsMulti = await getMultiDropEnabled(dropRow.creator_id as string);
+  const token = parseToken(dropRow.token);
 
   const { data, error } = await supabase.rpc("claim_drop_atomic", {
     p_drop_id: dropId,
@@ -210,6 +214,7 @@ export async function processClaim(
   recordLedgerEntry(client, {
     type: "drop_claim",
     amountSats,
+    token,
     senderId: creatorId,
     receiverId: claimantId,
     guildId,
@@ -225,6 +230,7 @@ export async function processClaim(
     amountSats,
     creatorId,
     claimId,
+    token,
   };
 }
 

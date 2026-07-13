@@ -5,27 +5,30 @@ import { supabase } from "../db.js";
 import { config } from "../config.js";
 import { recordLedgerEntry } from "../ledger.js";
 import { formatSats } from "../format.js";
+import { TOKEN_CHOICES, formatTokenAmount, parseToken, roundTokenAmount } from "../tokens.js";
 
 const MIN_WITHDRAWAL_SATS = parseFloat(process.env.MIN_WITHDRAWAL_SATS ?? "50");
 
 export const data = {
   name: "withdraw",
-  description: "Withdraw sats to an EVM address",
+  description: "Withdraw a token to an EVM address",
   options: [
-    { name: "amount", type: 10 as const, description: "Amount in sats", required: true, minValue: 0.000001 },
+    { name: "amount", type: 10 as const, description: "Token amount", required: true, minValue: 0.000001 },
     { name: "address", type: 3 as const, description: "Destination address (0x...) — defaults to linked wallet", required: false },
+    { name: "token", type: 3 as const, description: "Token to withdraw", required: false, choices: TOKEN_CHOICES },
   ],
 };
 
 export async function execute(interaction: ChatInputCommandInteraction) {
-  const amount = interaction.options.getNumber("amount", true);
   const addressOpt = interaction.options.getString("address");
+  const token = parseToken(interaction.options.getString("token"));
+  const amount = roundTokenAmount(interaction.options.getNumber("amount", true), token);
 
   if (addressOpt && !/^0x[a-fA-F0-9]{40}$/i.test(addressOpt)) {
     return interaction.reply({ content: "❌ Invalid address.", flags: MessageFlags.Ephemeral });
   }
 
-  if (!config.evm.skipWithdrawalMin && amount < MIN_WITHDRAWAL_SATS) {
+  if (token === "SATS" && !config.evm.skipWithdrawalMin && amount < MIN_WITHDRAWAL_SATS) {
     return interaction.reply({ content: `❌ Minimum withdrawal is **${MIN_WITHDRAWAL_SATS.toLocaleString()} sats**.`, flags: MessageFlags.Ephemeral });
   }
 
@@ -69,7 +72,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   }
 
   // 2. Deduct balance atomically
-  if (!(await subtractBalance(interaction.user.id, amount))) {
+  if (!(await subtractBalance(interaction.user.id, amount, token))) {
     return interaction.editReply({ content: "❌ Insufficient balance." });
   }
 
@@ -79,6 +82,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     amount_sats: amount,
     to_address: address.toLowerCase(),
     status: "pending",
+    token,
   }).select("id").single();
 
   const withdrawalId = row?.id;
@@ -86,6 +90,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   recordLedgerEntry(interaction.client, {
     type: "withdrawal",
     amountSats: amount,
+    token,
     senderId: interaction.user.id,
     receiverId: "treasury",
     guildId: interaction.guildId,
@@ -94,15 +99,16 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   });
 
   // 3. Send the transaction and wait for receipt
-  const result = await withdraw(address, amount);
+  const result = await withdraw(address, amount, token);
 
   // 4. Handle failure — refund balance + mark failed
   if (result.error && !result.confirmed) {
-    await addBalance(interaction.user.id, amount);
+    await addBalance(interaction.user.id, amount, token);
 
     recordLedgerEntry(interaction.client, {
       type: "withdrawal_refund",
       amountSats: amount,
+      token,
       senderId: "treasury",
       receiverId: interaction.user.id,
       guildId: interaction.guildId,
@@ -142,7 +148,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     .setColor(0x00cc6a)
     .setTitle("✅ Withdrawal Confirmed")
     .addFields(
-      { name: "Amount", value: `**${formatSats(amount)}**`, inline: true },
+      { name: "Amount", value: `**${formatTokenAmount(amount, token)}**`, inline: true },
       { name: "To", value: `\`${address.slice(0, 10)}...${address.slice(-8)}\``, inline: true },
     );
 

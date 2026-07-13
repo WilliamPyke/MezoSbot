@@ -50,6 +50,20 @@ exports.config = {
         treasuryPrivateKey: required("TREASURY_PRIVATE_KEY"),
         explorerUrl: optional("EXPLORER_URL", "https://explorer.mezo.org"),
         skipWithdrawalMin: process.env.SKIP_WITHDRAWAL_MIN === "1" || process.env.SKIP_WITHDRAWAL_MIN === "true",
+        tokens: {
+            MUSD: {
+                contractAddress: optional("MUSD_TOKEN_CONTRACT", "0xdD468A1DDc392dcdbEf6db6e34E89AA338F9F186"),
+                decimals: parseInt(optional("MUSD_TOKEN_DECIMALS", "18"), 10),
+            },
+            MEZO: {
+                contractAddress: optional("MEZO_TOKEN_CONTRACT", "0x7B7c000000000000000000000000000000000001"),
+                decimals: parseInt(optional("MEZO_TOKEN_DECIMALS", "18"), 10),
+            },
+            MUSDC: {
+                contractAddress: optional("MUSDC_TOKEN_CONTRACT", "0x04671C72Aab5AC02A03c1098314b1BB6B560c197"),
+                decimals: parseInt(optional("MUSDC_TOKEN_DECIMALS", "6"), 10),
+            },
+        },
     },
     web: {
         mezoDefaultNetwork: optional("MEZO_DEFAULT_NETWORK", optional("MEZO_NETWORK", optional("CHAIN_ID", "31612") === "31611" ? "testnet" : "mainnet")),

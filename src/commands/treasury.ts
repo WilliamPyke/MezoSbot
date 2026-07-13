@@ -1,6 +1,6 @@
 import { EmbedBuilder, MessageFlags, type ChatInputCommandInteraction } from "discord.js";
-import { getTreasuryAddress, getTreasuryBalanceSats } from "../evm.js";
-import { formatSats } from "../format.js";
+import { getTreasuryAddress, getTreasuryBalances } from "../evm.js";
+import { formatTokenAmount, tokenLabel, TOKEN_SYMBOLS } from "../tokens.js";
 import { config } from "../config.js";
 
 export const data = {
@@ -12,7 +12,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
   try {
-    const bal = await getTreasuryBalanceSats();
+    const balances = await getTreasuryBalances();
     const addr = getTreasuryAddress();
     const explorer = config.evm.explorerUrl;
 
@@ -20,7 +20,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
       .setColor(0xf0b232)
       .setTitle("🏦 Treasury")
       .addFields(
-        { name: "Balance", value: `**${formatSats(bal)}**`, inline: true },
+        { name: "Balances", value: TOKEN_SYMBOLS.map((token) => `**${tokenLabel(token)}:** ${formatTokenAmount(balances[token], token)}`).join("\n"), inline: true },
         { name: "Address", value: `[\`${addr.slice(0, 10)}...${addr.slice(-8)}\`](${explorer}/address/${addr})`, inline: true },
       )
       .setTimestamp();

@@ -7,21 +7,24 @@ import { supabase } from "../db.js";
 import { updateUserBadges } from "../badges.js";
 import { recordLedgerEntry } from "../ledger.js";
 import { replyInsufficientBalance } from "./responses.js";
+import { TOKEN_CHOICES, formatTokenAmount, parseToken, roundTokenAmount } from "../tokens.js";
 
 
 export const data = {
   name: "tip",
-  description: "Send sats to another user",
+  description: "Send a token to another user",
   options: [
     { name: "user", type: 6 as const, description: "User to tip", required: true },
-    { name: "amount", type: 10 as const, description: "Amount in sats (e.g. 100 or 100.5)", required: true, minValue: 0.000001 },
+    { name: "amount", type: 10 as const, description: "Token amount (e.g. 100 or 100.5)", required: true, minValue: 0.000001 },
+    { name: "token", type: 3 as const, description: "Token to tip (defaults to SATS)", required: false, choices: TOKEN_CHOICES },
     { name: "message", type: 3 as const, description: "Optional message for the recipient", required: false },
   ],
 };
 
 export async function execute(interaction: ChatInputCommandInteraction) {
   const target = interaction.options.getUser("user", true);
-  const amount = interaction.options.getNumber("amount", true);
+  const token = parseToken(interaction.options.getString("token"));
+  const amount = roundTokenAmount(interaction.options.getNumber("amount", true), token);
   const rawMessage = interaction.options.getString("message");
   const trimmedMessage = rawMessage?.trim() ?? "";
   const customMessage = trimmedMessage.length > 0 ? trimmedMessage : undefined;
@@ -38,24 +41,25 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     return interaction.reply({ content: "❌ You can't tip bots.", flags: MessageFlags.Ephemeral });
   }
 
-  const balance = await getBalance(interaction.user.id);
+  const balance = await getBalance(interaction.user.id, token);
   if (balance < amount) {
     return replyInsufficientBalance(interaction);
   }
 
-  if (!(await subtractBalance(interaction.user.id, amount))) {
+  if (!(await subtractBalance(interaction.user.id, amount, token))) {
     return replyInsufficientBalance(interaction);
   }
 
   await interaction.deferReply();
 
-  await addBalance(target.id, amount);
+  await addBalance(target.id, amount, token);
   await registerDepositAddress(target.id);
   await sendTransferReceivedDm({
     client: interaction.client,
     recipientId: target.id,
     senderId: interaction.user.id,
     amountSats: amount,
+    token,
     kind: "tip",
     customMessage,
   });
@@ -64,11 +68,13 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     sender_id: interaction.user.id,
     recipient_id: target.id,
     amount_sats: amount,
+    token,
   }).select("id").single();
 
   recordLedgerEntry(interaction.client, {
     type: "tip",
     amountSats: amount,
+    token,
     senderId: interaction.user.id,
     receiverId: target.id,
     guildId: interaction.guildId,
@@ -90,7 +96,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     .addFields(
       { name: "From", value: `<@${interaction.user.id}>`, inline: true },
       { name: "To", value: `<@${target.id}>`, inline: true },
-      { name: "Amount", value: `**${formatSats(amount)}**`, inline: true },
+      { name: "Amount", value: `**${formatTokenAmount(amount, token)}**`, inline: true },
     )
     .setTimestamp();
 

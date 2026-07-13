@@ -13,6 +13,7 @@ import { config as appConfig } from "../config.js";
 import { recordLedgerEntry } from "../ledger.js";
 import { supabase } from "../db.js";
 import { formatSats } from "../format.js";
+import { formatTokenAmount, parseToken } from "../tokens.js";
 import { registerDepositAddress } from "../evm.js";
 import { sendTransferReceivedDm } from "../notifications.js";
 import { getSatsMultiplier, type SatsMultiplier } from "../multi.js";
@@ -714,7 +715,7 @@ export function buildQuestRuntimeEmbed(snapshot: Awaited<ReturnType<typeof getQu
   const tierLines = snapshot.tiers.length === 0
     ? "No reward tiers set."
     : snapshot.tiers.map((tier) =>
-      `↳ **${tier.completed_task_count} task${tier.completed_task_count === 1 ? "" : "s"}** → **${formatSats(tier.reward_sats)}**`,
+      `↳ **${tier.completed_task_count} task${tier.completed_task_count === 1 ? "" : "s"}** → **${formatTokenAmount(tier.reward_sats, parseToken(snapshot.quest.token))}**`,
     ).join("\n");
 
   const embed = new EmbedBuilder()
@@ -785,7 +786,7 @@ export function buildQuestRuntimeEmbed(snapshot: Awaited<ReturnType<typeof getQu
 
   embed.addFields(
     { name: "Status", value: status.label, inline: true },
-    { name: "Max payout", value: `**${formatSats(snapshot.quest.max_reward_sats)}**`, inline: true },
+    { name: "Max payout", value: `**${formatTokenAmount(snapshot.quest.max_reward_sats, parseToken(snapshot.quest.token))}**`, inline: true },
   );
 
   return embed;
@@ -865,6 +866,7 @@ export async function completeAndNotify(
     recordLedgerEntry(client, {
       type: "quest_reward",
       amountSats: result.rewardDeltaSats ?? 0,
+      token: parseToken(task.quest.token),
       senderId: task.quest.creator_id,
       receiverId: userId,
       guildId: task.quest.guild_id,
@@ -879,6 +881,7 @@ export async function completeAndNotify(
       recipientId: userId,
       senderId: task.quest.creator_id,
       amountSats: result.rewardDeltaSats ?? 0,
+      token: parseToken(task.quest.token),
       kind: "quest",
       customMessage: `Completed quest task: ${task.title}`,
     });
@@ -900,6 +903,7 @@ async function notifyQuestReward(
   recordLedgerEntry(client, {
     type: "quest_reward",
     amountSats: rewardSats,
+    token: parseToken(task.quest.token),
     senderId: task.quest.creator_id,
     receiverId: userId,
     guildId: task.quest.guild_id,
@@ -914,6 +918,7 @@ async function notifyQuestReward(
     recipientId: userId,
     senderId: task.quest.creator_id,
     amountSats: rewardSats,
+    token: parseToken(task.quest.token),
     kind: "quest",
     customMessage: `Completed quest task: ${task.title}`,
   });

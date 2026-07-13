@@ -4,8 +4,8 @@ exports.data = void 0;
 exports.execute = execute;
 const discord_js_1 = require("discord.js");
 const db_js_1 = require("../db.js");
-const format_js_1 = require("../format.js");
 const config_js_1 = require("../config.js");
+const tokens_js_1 = require("../tokens.js");
 exports.data = {
     name: "history",
     description: "View your recent deposit and withdrawal history",
@@ -16,13 +16,13 @@ async function execute(interaction) {
     const explorer = config_js_1.config.evm.explorerUrl;
     const { data: deposits } = await db_js_1.supabase
         .from("deposits")
-        .select("tx_hash, amount_sats, created_at")
+        .select("tx_hash, amount_sats, token, created_at")
         .eq("discord_id", userId)
         .order("created_at", { ascending: false })
         .limit(5);
     const { data: withdrawals } = await db_js_1.supabase
         .from("withdrawals")
-        .select("tx_hash, amount_sats, to_address, status, created_at")
+        .select("tx_hash, amount_sats, token, to_address, status, created_at")
         .eq("discord_id", userId)
         .order("created_at", { ascending: false })
         .limit(5);
@@ -37,7 +37,7 @@ async function execute(interaction) {
             const link = d.tx_hash.startsWith("0x")
                 ? `[\`${d.tx_hash.slice(0, 10)}...\`](${explorer}/tx/${d.tx_hash})`
                 : `\`${d.tx_hash.slice(0, 16)}...\``;
-            return `📥 **${(0, format_js_1.formatSats)(d.amount_sats)}** — ${link} <t:${ts}:R>`;
+            return `📥 **${(0, tokens_js_1.formatTokenAmount)(d.amount_sats, (0, tokens_js_1.parseToken)(d.token))}** — ${link} <t:${ts}:R>`;
         });
         embed.addFields({ name: "Deposits", value: lines.join("\n") });
     }
@@ -50,7 +50,7 @@ async function execute(interaction) {
             const ts = Math.floor(new Date(w.created_at).getTime() / 1000);
             const addr = `\`${w.to_address.slice(0, 10)}...\``;
             const icon = w.status === "pending" ? "⏳" : "✅";
-            return `📤 ${icon} **${(0, format_js_1.formatSats)(w.amount_sats)}** → ${addr} <t:${ts}:R>`;
+            return `📤 ${icon} **${(0, tokens_js_1.formatTokenAmount)(w.amount_sats, (0, tokens_js_1.parseToken)(w.token))}** → ${addr} <t:${ts}:R>`;
         });
         embed.addFields({ name: "Withdrawals", value: lines.join("\n") });
     }

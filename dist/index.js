@@ -4,6 +4,7 @@ const discord_js_1 = require("discord.js");
 const node_dns_1 = require("node:dns");
 const config_js_1 = require("./config.js");
 const format_js_1 = require("./format.js");
+const tokens_js_1 = require("./tokens.js");
 const evm_js_1 = require("./evm.js");
 const ledger_js_1 = require("./ledger.js");
 const index_js_1 = require("./commands/index.js");
@@ -585,6 +586,7 @@ async function handleDropButton(interaction) {
             recipientId: interaction.user.id,
             senderId: result.creatorId,
             amountSats: result.amountSats,
+            token: result.token,
             kind: "drop",
         });
         // Update drop creator's badge roles in Discord (since their rained total increased)
@@ -603,7 +605,7 @@ async function handleDropButton(interaction) {
         const claimEmbed = new discord_js_1.EmbedBuilder()
             .setColor(0x00cc6a)
             .setTitle("🎉 Claimed!")
-            .addFields({ name: "Amount", value: `**${(0, format_js_1.formatSats)(drop.per_claim_sats)}**`, inline: true }, { name: "Remaining", value: `**${result.remaining}**`, inline: true });
+            .addFields({ name: "Amount", value: `**${(0, tokens_js_1.formatTokenAmount)(result.amountSats ?? drop.per_claim_sats, result.token ?? "SATS")}**`, inline: true }, { name: "Remaining", value: `**${result.remaining}**`, inline: true });
         await interaction.editReply({ embeds: [claimEmbed] });
         try {
             const claimedBy = await (0, drops_js_1.getClaimants)(dropId);
@@ -674,11 +676,12 @@ async function main() {
     // Resolve any withdrawals left pending from a previous session
     (0, evm_js_1.recoverPendingWithdrawals)().catch((err) => console.error("[Recovery] Failed:", err?.message ?? err));
     await connectDiscordWithRetry();
-    (0, evm_js_1.startDepositPoller)((discordId, amountSats, gasSats, txHash) => {
-        console.log(`Auto-deposit: ${(0, format_js_1.formatSats)(amountSats)} (gas: ~${(0, format_js_1.formatSats)(gasSats)}) for ${discordId}`);
+    (0, evm_js_1.startDepositPoller)((discordId, amountSats, gasSats, txHash, token) => {
+        console.log(`Auto-deposit: ${(0, tokens_js_1.formatTokenAmount)(amountSats, token)} for ${discordId}`);
         (0, ledger_js_1.recordLedgerEntry)(client, {
             type: "deposit",
             amountSats,
+            token,
             senderId: "treasury",
             receiverId: discordId,
             referenceType: "deposits",
@@ -689,7 +692,7 @@ async function main() {
             const embed = new discord_js_1.EmbedBuilder()
                 .setColor(0x00cc6a)
                 .setTitle("✅ Deposit Received!")
-                .addFields({ name: "Credited", value: `**${(0, format_js_1.formatSats)(amountSats)}**`, inline: true });
+                .addFields({ name: "Credited", value: `**${(0, tokens_js_1.formatTokenAmount)(amountSats, token)}**`, inline: true });
             if (gasSats > 0) {
                 embed.addFields({ name: "Gas Deducted", value: `~${(0, format_js_1.formatSats)(gasSats)}`, inline: true });
             }

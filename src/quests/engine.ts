@@ -1,5 +1,6 @@
 import { supabase, type QuestRow, type QuestTaskRow, type QuestRewardTierRow } from "../db.js";
 import { roundSats } from "../format.js";
+import type { TokenSymbol } from "../tokens.js";
 
 export type QuestTaskType =
   | "event_attendance"
@@ -11,6 +12,7 @@ export type QuestDefinitionInput = {
   guildId: string;
   channelId: string;
   creatorId: string;
+  token?: TokenSymbol;
   title: string;
   description?: string | null;
   startsAt?: string | null;
@@ -34,6 +36,7 @@ export type QuestDraftInput = {
   guildId: string;
   channelId: string;
   creatorId: string;
+  token?: TokenSymbol;
   title: string;
   description?: string | null;
   startsAt?: string | null;
@@ -57,14 +60,14 @@ export type QuestCompletionResult = {
 };
 
 export type QuestSnapshot = {
-  quest: Pick<QuestRow, "id" | "guild_id" | "channel_id" | "message_id" | "creator_id" | "title" | "description" | "status" | "max_reward_sats" | "starts_at" | "ends_at" | "metadata">;
+  quest: Pick<QuestRow, "id" | "guild_id" | "channel_id" | "message_id" | "creator_id" | "title" | "description" | "status" | "token" | "max_reward_sats" | "starts_at" | "ends_at" | "metadata">;
   tasks: Array<Pick<QuestTaskRow, "id" | "task_key" | "type" | "title" | "description" | "config" | "sort_order" | "status">>;
   tiers: Array<Pick<QuestRewardTierRow, "completed_task_count" | "reward_sats">>;
 };
 
 export type ActiveQuestTask<TConfig extends Record<string, unknown> = Record<string, unknown>> =
   QuestTaskRow & {
-    quest: Pick<QuestRow, "id" | "guild_id" | "channel_id" | "message_id" | "creator_id" | "title" | "description" | "status" | "max_reward_sats" | "starts_at" | "ends_at" | "metadata">;
+    quest: Pick<QuestRow, "id" | "guild_id" | "channel_id" | "message_id" | "creator_id" | "title" | "description" | "status" | "token" | "max_reward_sats" | "starts_at" | "ends_at" | "metadata">;
     config: TConfig;
   };
 
@@ -144,6 +147,7 @@ export async function createQuestDefinition(input: QuestDefinitionInput): Promis
       guild_id: input.guildId,
       channel_id: input.channelId,
       creator_id: input.creatorId,
+      token: input.token ?? "SATS",
       title: input.title,
       description: input.description ?? null,
       max_reward_sats: maxReward,
@@ -151,7 +155,7 @@ export async function createQuestDefinition(input: QuestDefinitionInput): Promis
       ends_at: input.endsAt ?? null,
       metadata: input.metadata ?? {},
     })
-    .select("id, guild_id, channel_id, message_id, creator_id, title, description, status, max_reward_sats, starts_at, ends_at, metadata")
+    .select("id, guild_id, channel_id, message_id, creator_id, title, description, status, token, max_reward_sats, starts_at, ends_at, metadata")
     .single();
 
   if (questError || !quest) throw questError ?? new Error("Quest insert failed");
@@ -208,6 +212,7 @@ export async function getQuestSnapshot(questId: number): Promise<QuestSnapshot |
       title,
       description,
       status,
+      token,
       max_reward_sats,
       starts_at,
       ends_at,
@@ -252,6 +257,7 @@ export async function getQuestSnapshot(questId: number): Promise<QuestSnapshot |
       starts_at: row.starts_at,
       ends_at: row.ends_at,
       metadata: row.metadata,
+      token: row.token,
     },
     tasks: [...(row.quest_tasks ?? [])].sort((a, b) => a.sort_order - b.sort_order || a.id - b.id),
     tiers: [...(row.quest_reward_tiers ?? [])].sort((a, b) => a.completed_task_count - b.completed_task_count),
@@ -268,6 +274,7 @@ export async function createQuestDraft(input: QuestDraftInput): Promise<QuestSna
       guild_id: input.guildId,
       channel_id: input.channelId,
       creator_id: input.creatorId,
+      token: input.token ?? "SATS",
       title: input.title,
       description: input.description ?? null,
       status: "draft",
@@ -276,7 +283,7 @@ export async function createQuestDraft(input: QuestDraftInput): Promise<QuestSna
       ends_at: input.endsAt ?? null,
       metadata: input.metadata ?? {},
     })
-    .select("id, guild_id, channel_id, message_id, creator_id, title, description, status, max_reward_sats, starts_at, ends_at, metadata")
+    .select("id, guild_id, channel_id, message_id, creator_id, title, description, status, token, max_reward_sats, starts_at, ends_at, metadata")
     .single();
 
   if (questError || !quest) throw questError ?? new Error("Quest draft insert failed");
@@ -405,6 +412,7 @@ export async function getActiveTasksByType<TConfig extends Record<string, unknow
         title,
         description,
         status,
+        token,
         max_reward_sats,
         starts_at,
         ends_at,
@@ -445,6 +453,7 @@ export async function getAllActiveTasksByType<TConfig extends Record<string, unk
         title,
         description,
         status,
+        token,
         max_reward_sats,
         starts_at,
         ends_at,
@@ -466,7 +475,11 @@ export async function completeQuestTask(params: {
   proof?: Record<string, unknown>;
   rewardMultiplier?: number;
 }): Promise<QuestCompletionResult> {
-  const { data, error } = await supabase.rpc("complete_quest_task_and_pay_delta", {
+  const { data: quest } = await supabase.from("quests").select("token").eq("id", params.questId).maybeSingle();
+  const token = (quest?.token ?? "SATS") as TokenSymbol;
+  const { data, error } = await supabase.rpc(token === "SATS"
+    ? "complete_quest_task_and_pay_delta"
+    : "complete_quest_task_and_pay_delta_token", {
     p_quest_id: params.questId,
     p_task_id: params.taskId,
     p_user_id: params.userId,
@@ -485,7 +498,11 @@ export async function payRepeatableQuestTaskReward(params: {
   proof?: Record<string, unknown>;
   rewardMultiplier?: number;
 }): Promise<QuestCompletionResult> {
-  const { data, error } = await supabase.rpc("pay_repeatable_quest_task_reward", {
+  const { data: quest } = await supabase.from("quests").select("token").eq("id", params.questId).maybeSingle();
+  const token = (quest?.token ?? "SATS") as TokenSymbol;
+  const { data, error } = await supabase.rpc(token === "SATS"
+    ? "pay_repeatable_quest_task_reward"
+    : "pay_repeatable_quest_task_reward_token", {
     p_quest_id: params.questId,
     p_task_id: params.taskId,
     p_user_id: params.userId,
@@ -510,7 +527,7 @@ async function payRepeatableQuestTaskRewardFallback(params: {
 }): Promise<QuestCompletionResult> {
   const { data: quest, error: questError } = await supabase
     .from("quests")
-    .select("id, creator_id, status, starts_at, ends_at")
+    .select("id, creator_id, status, token, starts_at, ends_at")
     .eq("id", params.questId)
     .maybeSingle();
   if (questError) throw questError;
@@ -574,10 +591,12 @@ async function payRepeatableQuestTaskRewardFallback(params: {
     ignoreDuplicates: true,
   });
 
-  const { data: debited, error: debitError } = await supabase.rpc("subtract_balance_if_sufficient", {
-    p_discord_id: quest.creator_id,
-    p_amount: payoutSats,
-  });
+  const questToken = (quest.token ?? "SATS") as TokenSymbol;
+  const { data: debited, error: debitError } = questToken === "SATS"
+    ? await supabase.rpc("subtract_balance_if_sufficient", { p_discord_id: quest.creator_id, p_amount: payoutSats })
+    : await supabase.rpc("subtract_token_balance_if_sufficient", {
+      p_discord_id: quest.creator_id, p_token: questToken, p_amount: payoutSats,
+    });
   if (debitError) throw debitError;
   if (!debited) {
     await supabase
@@ -595,10 +614,11 @@ async function payRepeatableQuestTaskRewardFallback(params: {
     };
   }
 
-  const { error: creditError } = await supabase.rpc("add_balance", {
-    p_discord_id: params.userId,
-    p_amount: payoutSats,
-  });
+  const { error: creditError } = questToken === "SATS"
+    ? await supabase.rpc("add_balance", { p_discord_id: params.userId, p_amount: payoutSats })
+    : await supabase.rpc("add_token_balance", {
+      p_discord_id: params.userId, p_token: questToken, p_amount: payoutSats,
+    });
   if (creditError) throw creditError;
 
   const totalPaid = roundSats(previousPaid + payoutSats);

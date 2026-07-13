@@ -9,22 +9,25 @@ const db_js_1 = require("../db.js");
 const config_js_1 = require("../config.js");
 const ledger_js_1 = require("../ledger.js");
 const format_js_1 = require("../format.js");
+const tokens_js_1 = require("../tokens.js");
 const MIN_WITHDRAWAL_SATS = parseFloat(process.env.MIN_WITHDRAWAL_SATS ?? "50");
 exports.data = {
     name: "withdraw",
-    description: "Withdraw sats to an EVM address",
+    description: "Withdraw a token to an EVM address",
     options: [
-        { name: "amount", type: 10, description: "Amount in sats", required: true, minValue: 0.000001 },
+        { name: "amount", type: 10, description: "Token amount", required: true, minValue: 0.000001 },
         { name: "address", type: 3, description: "Destination address (0x...) — defaults to linked wallet", required: false },
+        { name: "token", type: 3, description: "Token to withdraw", required: false, choices: tokens_js_1.TOKEN_CHOICES },
     ],
 };
 async function execute(interaction) {
-    const amount = interaction.options.getNumber("amount", true);
     const addressOpt = interaction.options.getString("address");
+    const token = (0, tokens_js_1.parseToken)(interaction.options.getString("token"));
+    const amount = (0, tokens_js_1.roundTokenAmount)(interaction.options.getNumber("amount", true), token);
     if (addressOpt && !/^0x[a-fA-F0-9]{40}$/i.test(addressOpt)) {
         return interaction.reply({ content: "❌ Invalid address.", flags: discord_js_1.MessageFlags.Ephemeral });
     }
-    if (!config_js_1.config.evm.skipWithdrawalMin && amount < MIN_WITHDRAWAL_SATS) {
+    if (token === "SATS" && !config_js_1.config.evm.skipWithdrawalMin && amount < MIN_WITHDRAWAL_SATS) {
         return interaction.reply({ content: `❌ Minimum withdrawal is **${MIN_WITHDRAWAL_SATS.toLocaleString()} sats**.`, flags: discord_js_1.MessageFlags.Ephemeral });
     }
     await interaction.deferReply({ flags: discord_js_1.MessageFlags.Ephemeral });
@@ -62,7 +65,7 @@ async function execute(interaction) {
         });
     }
     // 2. Deduct balance atomically
-    if (!(await (0, balance_js_1.subtractBalance)(interaction.user.id, amount))) {
+    if (!(await (0, balance_js_1.subtractBalance)(interaction.user.id, amount, token))) {
         return interaction.editReply({ content: "❌ Insufficient balance." });
     }
     // 2. Insert withdrawal as PENDING
@@ -71,11 +74,13 @@ async function execute(interaction) {
         amount_sats: amount,
         to_address: address.toLowerCase(),
         status: "pending",
+        token,
     }).select("id").single();
     const withdrawalId = row?.id;
     (0, ledger_js_1.recordLedgerEntry)(interaction.client, {
         type: "withdrawal",
         amountSats: amount,
+        token,
         senderId: interaction.user.id,
         receiverId: "treasury",
         guildId: interaction.guildId,
@@ -83,13 +88,14 @@ async function execute(interaction) {
         referenceId: withdrawalId != null ? String(withdrawalId) : null,
     });
     // 3. Send the transaction and wait for receipt
-    const result = await (0, evm_js_1.withdraw)(address, amount);
+    const result = await (0, evm_js_1.withdraw)(address, amount, token);
     // 4. Handle failure — refund balance + mark failed
     if (result.error && !result.confirmed) {
-        await (0, balance_js_1.addBalance)(interaction.user.id, amount);
+        await (0, balance_js_1.addBalance)(interaction.user.id, amount, token);
         (0, ledger_js_1.recordLedgerEntry)(interaction.client, {
             type: "withdrawal_refund",
             amountSats: amount,
+            token,
             senderId: "treasury",
             receiverId: interaction.user.id,
             guildId: interaction.guildId,
@@ -124,7 +130,7 @@ async function execute(interaction) {
     const embed = new discord_js_1.EmbedBuilder()
         .setColor(0x00cc6a)
         .setTitle("✅ Withdrawal Confirmed")
-        .addFields({ name: "Amount", value: `**${(0, format_js_1.formatSats)(amount)}**`, inline: true }, { name: "To", value: `\`${address.slice(0, 10)}...${address.slice(-8)}\``, inline: true });
+        .addFields({ name: "Amount", value: `**${(0, tokens_js_1.formatTokenAmount)(amount, token)}**`, inline: true }, { name: "To", value: `\`${address.slice(0, 10)}...${address.slice(-8)}\``, inline: true });
     if (result.gasSats) {
         embed.addFields({ name: "Network Fee", value: `~${(0, format_js_1.formatSats)(result.gasSats)}`, inline: true }, { name: "Received", value: `~${(0, format_js_1.formatSats)(result.sentSats)}`, inline: true });
     }

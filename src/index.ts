@@ -14,6 +14,7 @@ import {
 import { setDefaultResultOrder } from "node:dns";
 import { config } from "./config.js";
 import { formatSats } from "./format.js";
+import { formatTokenAmount } from "./tokens.js";
 import { initEVM, getTreasuryAddress, startDepositPoller, registerDepositAddress, recoverPendingWithdrawals } from "./evm.js";
 import { bindLedgerClient, recordLedgerEntry } from "./ledger.js";
 import { commands, commandsData } from "./commands/index.js";
@@ -720,6 +721,7 @@ async function handleDropButton(interaction: ButtonInteraction) {
       recipientId: interaction.user.id,
       senderId: result.creatorId,
       amountSats: result.amountSats,
+      token: result.token,
       kind: "drop",
     });
 
@@ -743,7 +745,7 @@ async function handleDropButton(interaction: ButtonInteraction) {
       .setColor(0x00cc6a)
       .setTitle("🎉 Claimed!")
       .addFields(
-        { name: "Amount", value: `**${formatSats(result.amountSats ?? drop.per_claim_sats)}**`, inline: true },
+        { name: "Amount", value: `**${formatTokenAmount(result.amountSats ?? drop.per_claim_sats, result.token ?? "SATS")}**`, inline: true },
         { name: "Remaining", value: `**${result.remaining}**`, inline: true },
       );
 
@@ -831,11 +833,12 @@ async function main() {
 
   await connectDiscordWithRetry();
 
-  startDepositPoller((discordId, amountSats, gasSats, txHash) => {
-    console.log(`Auto-deposit: ${formatSats(amountSats)} (gas: ~${formatSats(gasSats)}) for ${discordId}`);
+  startDepositPoller((discordId, amountSats, gasSats, txHash, token) => {
+    console.log(`Auto-deposit: ${formatTokenAmount(amountSats, token)} for ${discordId}`);
     recordLedgerEntry(client, {
       type: "deposit",
       amountSats,
+      token,
       senderId: "treasury",
       receiverId: discordId,
       referenceType: "deposits",
@@ -847,7 +850,7 @@ async function main() {
         .setColor(0x00cc6a)
         .setTitle("✅ Deposit Received!")
         .addFields(
-          { name: "Credited", value: `**${formatSats(amountSats)}**`, inline: true },
+          { name: "Credited", value: `**${formatTokenAmount(amountSats, token)}**`, inline: true },
         );
 
       if (gasSats > 0) {

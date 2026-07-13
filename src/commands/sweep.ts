@@ -1,7 +1,7 @@
 import { EmbedBuilder, MessageFlags, type ChatInputCommandInteraction } from "discord.js";
 import { config, tokenUnitsToSats } from "../config.js";
 import {
-  getProvider,
+  getNativeBalance,
   sweepToTreasury,
   fundGasAndSweep,
   registerDepositAddress,
@@ -40,7 +40,6 @@ export async function execute(interaction: ChatInputCommandInteraction) {
 
   const target = interaction.options.getUser("user");
   const shouldFundGas = interaction.options.getBoolean("fund_gas") ?? true;
-  const provider = getProvider();
 
   let rows: Row[];
   if (target) {
@@ -61,7 +60,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
 
   for (const row of rows) {
     try {
-      const bal = await provider.getBalance(row.address);
+      const bal = await getNativeBalance(row.address);
       if (bal === 0n) {
         skipped++;
         continue;

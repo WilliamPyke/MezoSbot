@@ -33,7 +33,6 @@ async function execute(interaction) {
     await interaction.deferReply({ flags: discord_js_1.MessageFlags.Ephemeral });
     const target = interaction.options.getUser("user");
     const shouldFundGas = interaction.options.getBoolean("fund_gas") ?? true;
-    const provider = (0, evm_js_1.getProvider)();
     let rows;
     if (target) {
         const addr = await (0, evm_js_1.registerDepositAddress)(target.id);
@@ -52,7 +51,7 @@ async function execute(interaction) {
     const details = [];
     for (const row of rows) {
         try {
-            const bal = await provider.getBalance(row.address);
+            const bal = await (0, evm_js_1.getNativeBalance)(row.address);
             if (bal === 0n) {
                 skipped++;
                 continue;

@@ -2,6 +2,7 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.getOrCreateUser = getOrCreateUser;
 exports.getBalance = getBalance;
+exports.getBalances = getBalances;
 exports.addBalance = addBalance;
 exports.subtractBalance = subtractBalance;
 exports.subtractBalances = subtractBalances;
@@ -10,6 +11,7 @@ exports.getWalletForUser = getWalletForUser;
 exports.getDiscordForWallet = getDiscordForWallet;
 const db_js_1 = require("./db.js");
 const format_js_1 = require("./format.js");
+const tokens_js_1 = require("./tokens.js");
 async function getOrCreateUser(discordId) {
     // Use upsert with onConflict to avoid duplicate inserts, select to return the row
     const { data, error } = await db_js_1.supabase
@@ -28,7 +30,16 @@ async function getOrCreateUser(discordId) {
     }
     return data;
 }
-async function getBalance(discordId) {
+async function getBalance(discordId, token = "SATS") {
+    if (token !== "SATS") {
+        const { data } = await db_js_1.supabase
+            .from("user_token_balances")
+            .select("balance")
+            .eq("discord_id", discordId)
+            .eq("token", token)
+            .maybeSingle();
+        return Number(data?.balance ?? 0);
+    }
     const { data } = await db_js_1.supabase
         .from("users")
         .select("balance_sats")
@@ -36,19 +47,44 @@ async function getBalance(discordId) {
         .single();
     return data?.balance_sats ?? 0;
 }
-async function addBalance(discordId, amountSats) {
-    await getOrCreateUser(discordId);
-    const rounded = (0, format_js_1.roundSats)(amountSats);
-    await db_js_1.supabase.rpc("add_balance", { p_discord_id: discordId, p_amount: rounded });
+async function getBalances(discordId) {
+    const sats = await getBalance(discordId, "SATS");
+    const { data } = await db_js_1.supabase
+        .from("user_token_balances")
+        .select("token, balance")
+        .eq("discord_id", discordId);
+    const balances = { SATS: sats, MUSD: 0, MEZO: 0, MUSDC: 0 };
+    for (const row of data ?? []) {
+        if (tokens_js_1.TOKEN_SYMBOLS.includes(row.token) && row.token !== "SATS") {
+            balances[row.token] = Number(row.balance ?? 0);
+        }
+    }
+    return balances;
 }
-async function subtractBalance(discordId, amountSats) {
-    const rounded = (0, format_js_1.roundSats)(amountSats);
+async function addBalance(discordId, amountSats, token = "SATS") {
+    await getOrCreateUser(discordId);
+    const rounded = token === "SATS" ? (0, format_js_1.roundSats)(amountSats) : (0, tokens_js_1.roundTokenAmount)(amountSats, token);
+    if (token === "SATS") {
+        await db_js_1.supabase.rpc("add_balance", { p_discord_id: discordId, p_amount: rounded });
+        return;
+    }
+    const { error } = await db_js_1.supabase.rpc("add_token_balance", {
+        p_discord_id: discordId, p_token: token, p_amount: rounded,
+    });
+    if (error)
+        throw error;
+}
+async function subtractBalance(discordId, amountSats, token = "SATS") {
+    const rounded = token === "SATS" ? (0, format_js_1.roundSats)(amountSats) : (0, tokens_js_1.roundTokenAmount)(amountSats, token);
     if (rounded <= 0)
         return false;
-    const { data } = await db_js_1.supabase.rpc("subtract_balance_if_sufficient", {
-        p_discord_id: discordId,
-        p_amount: rounded,
-    });
+    const { data, error } = token === "SATS"
+        ? await db_js_1.supabase.rpc("subtract_balance_if_sufficient", { p_discord_id: discordId, p_amount: rounded })
+        : await db_js_1.supabase.rpc("subtract_token_balance_if_sufficient", {
+            p_discord_id: discordId, p_token: token, p_amount: rounded,
+        });
+    if (error)
+        throw error;
     return data === true;
 }
 async function subtractBalances(debits) {

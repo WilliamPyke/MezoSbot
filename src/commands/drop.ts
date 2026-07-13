@@ -5,21 +5,24 @@ import { roundSats } from "../format.js";
 import { buildDropEmbed, buildClaimButton, type Drop } from "../drops.js";
 import { recordLedgerEntry } from "../ledger.js";
 import { replyInsufficientBalance } from "./responses.js";
+import { TOKEN_CHOICES, parseToken, roundTokenAmount } from "../tokens.js";
 
 export const data = {
   name: "drop",
-  description: "Create a sats drop - first users to claim get sats",
+  description: "Create a token drop",
   options: [
-    { name: "total", type: 10 as const, description: "Total sats to drop (e.g. 100 or 100.5)", required: true, minValue: 0.000001 },
-    { name: "per_claim", type: 10 as const, description: "Sats per claim (e.g. 10 or 10.5)", required: true, minValue: 0.000001 },
+    { name: "total", type: 10 as const, description: "Total token amount to drop", required: true, minValue: 0.000001 },
+    { name: "per_claim", type: 10 as const, description: "Token amount per claim", required: true, minValue: 0.000001 },
     { name: "max_claims", type: 4 as const, description: "Max number of claims", required: true, minValue: 1 },
+    { name: "token", type: 3 as const, description: "Token to drop", required: false, choices: TOKEN_CHOICES },
     { name: "role", type: 8 as const, description: "Only members with this role can claim", required: false },
   ],
 };
 
 export async function execute(interaction: ChatInputCommandInteraction) {
-  const total = roundSats(interaction.options.getNumber("total", true));
-  const perClaim = roundSats(interaction.options.getNumber("per_claim", true));
+  const token = parseToken(interaction.options.getString("token"));
+  const total = roundTokenAmount(interaction.options.getNumber("total", true), token);
+  const perClaim = roundTokenAmount(interaction.options.getNumber("per_claim", true), token);
   const maxClaims = interaction.options.getInteger("max_claims", true);
   const role = interaction.options.getRole("role");
 
@@ -30,12 +33,12 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     });
   }
 
-  const balance = await getBalance(interaction.user.id);
+  const balance = await getBalance(interaction.user.id, token);
   if (balance < total) {
     return replyInsufficientBalance(interaction);
   }
 
-  if (!(await subtractBalance(interaction.user.id, total))) {
+  if (!(await subtractBalance(interaction.user.id, total, token))) {
     return replyInsufficientBalance(interaction);
   }
 
@@ -50,6 +53,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
       per_claim_sats: perClaim,
       max_claims: maxClaims,
       eligible_role_id: role?.id ?? null,
+      token,
     })
     .select("id")
     .single();
@@ -63,6 +67,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   recordLedgerEntry(interaction.client, {
     type: "drop_create",
     amountSats: total,
+    token,
     senderId: interaction.user.id,
     receiverId: null,
     guildId: interaction.guildId,
@@ -81,6 +86,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     max_claims: maxClaims,
     claims_count: 0,
     status: "active",
+    token,
   };
 
   const embed = buildDropEmbed(drop, []);

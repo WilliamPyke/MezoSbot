@@ -4,6 +4,7 @@ import { getBalance } from "./balance.js";
 import { config as appConfig } from "./config.js";
 import { supabase } from "./db.js";
 import { roundSats } from "./format.js";
+import { formatTokenAmount, type TokenSymbol } from "./tokens.js";
 
 const LEDGER_COLOR = 0x00cc6a;
 const SETTING_GUILD = "ledger_guild_id";
@@ -60,6 +61,7 @@ export type LedgerPartyId = string | "treasury" | "platform" | null;
 export type RecordLedgerParams = {
   type: LedgerEntryType;
   amountSats: number;
+  token?: TokenSymbol;
   senderId?: LedgerPartyId;
   receiverId?: LedgerPartyId;
   guildId?: string | null;
@@ -77,6 +79,7 @@ export type LedgerEntryRow = {
   transaction_id: string;
   type: LedgerEntryType;
   amount_sats: number;
+  token?: TokenSymbol;
   sender_id: string | null;
   receiver_id: string | null;
   sender_balance_sats: number | null;
@@ -88,7 +91,8 @@ export type LedgerEntryRow = {
   created_at: string;
 };
 
-function formatLedgerAmount(amountSats: number): string {
+function formatLedgerAmount(amountSats: number, token: TokenSymbol = "SATS"): string {
+  if (token !== "SATS") return formatTokenAmount(amountSats, token);
   const rounded = roundSats(amountSats);
   if (rounded === 0) return "0 ⚡";
   const isWhole = Math.abs(rounded - Math.round(rounded)) < 1e-12;
@@ -170,12 +174,12 @@ export function buildLedgerEmbed(entry: LedgerEntryRow, senderLine: string, rece
     .setColor(LEDGER_COLOR)
     .setTitle(`Transaction: ${label}`)
     .addFields(
-      { name: "Amount", value: formatLedgerAmount(entry.amount_sats), inline: false },
+      { name: "Amount", value: formatLedgerAmount(entry.amount_sats, entry.token ?? "SATS"), inline: false },
       { name: "Sender", value: senderLine, inline: false },
       {
         name: "Sender Balance",
         value: entry.sender_balance_sats != null
-          ? formatLedgerAmount(entry.sender_balance_sats)
+          ? formatLedgerAmount(entry.sender_balance_sats, entry.token ?? "SATS")
           : "N/A",
         inline: false,
       },
@@ -183,7 +187,7 @@ export function buildLedgerEmbed(entry: LedgerEntryRow, senderLine: string, rece
       {
         name: "Receiver Balance",
         value: entry.receiver_balance_sats != null
-          ? formatLedgerAmount(entry.receiver_balance_sats)
+          ? formatLedgerAmount(entry.receiver_balance_sats, entry.token ?? "SATS")
           : "N/A",
         inline: false,
       },
@@ -192,9 +196,9 @@ export function buildLedgerEmbed(entry: LedgerEntryRow, senderLine: string, rece
     .setFooter({ text: `⚡ Timestamp • ${ts}` });
 }
 
-async function balanceForParty(partyId: LedgerPartyId): Promise<number | null> {
+async function balanceForParty(partyId: LedgerPartyId, token: TokenSymbol = "SATS"): Promise<number | null> {
   if (!partyId || partyId === "treasury" || partyId === "platform") return null;
-  return getBalance(partyId);
+  return getBalance(partyId, token);
 }
 
 async function postLedgerEmbed(client: Client, entry: LedgerEntryRow): Promise<void> {
@@ -240,14 +244,16 @@ async function recordLedgerEntryAsync(client: Client | null, params: RecordLedge
   const transactionId = randomUUID().replace(/-/g, "");
   const senderId = params.senderId ?? null;
   const receiverId = params.receiverId ?? null;
+  const token = params.token ?? "SATS";
 
-  const senderBalance = await balanceForParty(senderId);
-  const receiverBalance = await balanceForParty(receiverId);
+  const senderBalance = await balanceForParty(senderId, token);
+  const receiverBalance = await balanceForParty(receiverId, token);
 
   const row = {
     transaction_id: transactionId,
     type: params.type,
     amount_sats: amountSats,
+    token,
     sender_id: senderId,
     receiver_id: receiverId,
     sender_balance_sats: senderBalance,

@@ -1,6 +1,6 @@
 # MezoSbot
 
-A Discord bot for depositing sats from an EVM network (Mezo), and tipping, distributing, and dropping them to other users.
+A Discord bot for depositing and using native SATS, MUSD, MEZO, and mUSDC on Mezo.
 
 ## Features
 
@@ -82,12 +82,12 @@ npm run dev
 | Command | Description |
 |---------|-------------|
 | `/link <address>` | Link your EVM wallet |
-| `/deposit` | Get deposit address and instructions |
-| `/balance` | Check your sats balance |
-| `/withdraw <amount> <address>` | Withdraw sats to an address |
-| `/tip <user> <amount> [message]` | Tip another user with an optional message |
-| `/distribute <amount> <@users>` | Split sats among multiple users |
-| `/rain <amount> <count> [role] [message]` | Rain sats on recently active users (optionally role-filtered) |
+| `/deposit [token]` | Get your personal deposit address and token-specific instructions |
+| `/balance` | Check all token balances |
+| `/withdraw <amount> [address] [token]` | Withdraw a token to an address |
+| `/tip <user> <amount> [token] [message]` | Tip another user with an optional message |
+| `/distribute <amount> <@users> [token]` | Split a token among multiple users |
+| `/rain <amount> <count> [token] [role] [message]` | Rain a token on recently active users (optionally role-filtered) |
 | `/rainban` | Manage server-wide banned words and phrases excluded from rain recipient searches |
 | `/drop <total> <per_claim> <max_claims> [role]` | Create a claimable drop (optionally role-gated) |
 | `/claim <drop_id>` | Claim from an active drop |
@@ -100,6 +100,8 @@ npm run dev
 | `/arcade leaderboard` | Top validated scores |
 
 Recipients receive DMs when they are credited from tips, rains, distributions, and drop claims.
+
+Token arguments are optional and default to native SATS, preserving the original command behavior.
 Rain banned-word filtering requires `DISCORD_MESSAGE_CONTENT_INTENT=true` and the Message Content privileged intent enabled in Discord Developer Portal.
 
 **All amounts use sats** and support decimals (e.g. `100.5`, `0.25`) for easier denomination. Precision: 6 decimal places.

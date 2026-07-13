@@ -2,7 +2,7 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.sendTransferReceivedDm = sendTransferReceivedDm;
 const discord_js_1 = require("discord.js");
-const format_js_1 = require("./format.js");
+const tokens_js_1 = require("./tokens.js");
 const TITLES = {
     tip: "⚡ You Received a Tip!",
     rain: "🌧️ You Were Rained On!",
@@ -24,11 +24,11 @@ const COLORS = {
     drop: 0xf0b232,
     quest: 0x00cc6a,
 };
-async function sendTransferReceivedDm({ client, recipientId, senderId, amountSats, kind, customMessage, }) {
+async function sendTransferReceivedDm({ client, recipientId, senderId, amountSats, token = "SATS", kind, customMessage, }) {
     const embed = new discord_js_1.EmbedBuilder()
         .setColor(COLORS[kind])
         .setTitle(TITLES[kind])
-        .addFields({ name: "From", value: `<@${senderId}>`, inline: true }, { name: "Type", value: LABELS[kind], inline: true }, { name: "Amount", value: `**${(0, format_js_1.formatSats)(amountSats)}**`, inline: true })
+        .addFields({ name: "From", value: `<@${senderId}>`, inline: true }, { name: "Type", value: LABELS[kind], inline: true }, { name: "Amount", value: `**${(0, tokens_js_1.formatTokenAmount)(amountSats, token)}**`, inline: true })
         .setFooter({ text: "Use /balance to check your total" })
         .setTimestamp();
     if (customMessage) {

@@ -9,14 +9,16 @@ import { updateUserBadges } from "../badges.js";
 import { recordLedgerEntry } from "../ledger.js";
 import { replyInsufficientBalance } from "./responses.js";
 import { getSatsMultiplier } from "../multi.js";
+import { TOKEN_CHOICES, floorTokenAmount, formatTokenAmount, parseToken, roundTokenAmount, tokenLabel } from "../tokens.js";
 
 
 export const data = {
   name: "rain",
-  description: "Rain sats on recently active users in this channel",
+  description: "Rain a token on recently active users in this channel",
   options: [
-    { name: "amount", type: 10 as const, description: "Total sats to rain", required: true, minValue: 0.000001 },
+    { name: "amount", type: 10 as const, description: "Total token amount to rain", required: true, minValue: 0.000001 },
     { name: "count", type: 4 as const, description: "Number of users to rain on", required: true, minValue: 1, maxValue: 50 },
+    { name: "token", type: 3 as const, description: "Token to rain", required: false, choices: TOKEN_CHOICES },
     { name: "role", type: 8 as const, description: "Only rain on users with this role", required: false },
     { name: "message", type: 3 as const, description: "Optional message for recipients", required: false },
     { name: "words", type: 3 as const, description: "Only count messages containing these words/phrases", required: false },
@@ -44,7 +46,8 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   }
 
   const totalAmount = interaction.options.getNumber("amount", true);
-  const balance = await getBalance(interaction.user.id);
+  const token = parseToken(interaction.options.getString("token"));
+  const balance = await getBalance(interaction.user.id, token);
   if (balance < totalAmount) {
     return replyInsufficientBalance(interaction);
   }
@@ -123,31 +126,32 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     amount: 0,
   }));
   const totalWeight = recipientPayouts.reduce((sum, recipient) => sum + recipient.multiplier, 0);
-  const perUnit = Math.floor((totalAmount / totalWeight) * 10 ** 10) / 10 ** 10;
+  const perUnit = floorTokenAmount(totalAmount / totalWeight, token);
   if (perUnit <= 0) {
     return interaction.editReply({ content: "❌ Amount too small to split." });
   }
 
   let totalNeeded = 0;
   for (const recipient of recipientPayouts) {
-    recipient.amount = roundSats(perUnit * recipient.multiplier);
-    totalNeeded = roundSats(totalNeeded + recipient.amount);
+    recipient.amount = roundTokenAmount(perUnit * recipient.multiplier, token);
+    totalNeeded = roundTokenAmount(totalNeeded + recipient.amount, token);
   }
 
-  if (!(await subtractBalance(interaction.user.id, totalNeeded))) {
+  if (!(await subtractBalance(interaction.user.id, totalNeeded, token))) {
     return replyInsufficientBalance(interaction);
   }
 
   // Parallelize balance additions, address registrations, and recipient DMs.
   await Promise.all(
     recipientPayouts.map(async (recipient) => {
-      await addBalance(recipient.uid, recipient.amount);
+      await addBalance(recipient.uid, recipient.amount, token);
       await registerDepositAddress(recipient.uid).catch(() => {});
       await sendTransferReceivedDm({
         client: interaction.client,
         recipientId: recipient.uid,
         senderId: interaction.user.id,
         amountSats: recipient.amount,
+        token,
         kind: "rain",
         customMessage,
       });
@@ -158,11 +162,13 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     sender_id: interaction.user.id,
     amount_sats: totalNeeded,
     recipient_count: activeUserIds.length,
+    token,
   }).select("id").single();
 
   recordLedgerEntry(interaction.client, {
     type: "rain",
     amountSats: totalNeeded,
+    token,
     senderId: interaction.user.id,
     receiverId: null,
     guildId: interaction.guildId,
@@ -183,11 +189,11 @@ export async function execute(interaction: ChatInputCommandInteraction) {
 
   const embed = new EmbedBuilder()
     .setColor(0x3498db)
-    .setTitle("🌧️ It's Raining Sats!")
+    .setTitle(`🌧️ It's Raining ${tokenLabel(token)}!`)
     .setDescription(`<@${interaction.user.id}> made it rain!`)
     .addFields(
-      { name: "Base Share", value: `**${formatSats(perUnit)}**`, inline: true },
-      { name: "Total", value: `**${formatSats(totalNeeded)}**`, inline: true },
+      { name: "Base Share", value: `**${formatTokenAmount(perUnit, token)}**`, inline: true },
+      { name: "Total", value: `**${formatTokenAmount(totalNeeded, token)}**`, inline: true },
       { name: "Recipients", value: `**${activeUserIds.length}**`, inline: true },
       { name: "Rained On", value: recipients, inline: false },
     )

@@ -4,6 +4,7 @@ import { processClaim, updateDropMessage, type Drop } from "../drops.js";
 import { formatSats } from "../format.js";
 import { sendTransferReceivedDm } from "../notifications.js";
 import { updateUserBadges } from "../badges.js";
+import { formatTokenAmount, parseToken } from "../tokens.js";
 
 
 export const data = {
@@ -49,6 +50,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     recipientId: interaction.user.id,
     senderId: result.creatorId ?? drop.creator_id,
     amountSats: result.amountSats ?? drop.per_claim_sats,
+    token: parseToken(drop.token),
     kind: "drop",
   });
 
@@ -64,7 +66,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     .setColor(0x00cc6a)
     .setTitle("🎉 Claimed!")
     .addFields(
-      { name: "Amount", value: `**${formatSats(result.amountSats ?? drop.per_claim_sats)}**`, inline: true },
+      { name: "Amount", value: `**${formatTokenAmount(result.amountSats ?? drop.per_claim_sats, parseToken(drop.token))}**`, inline: true },
       { name: "Remaining", value: `**${result.remaining}**`, inline: true },
     );
 

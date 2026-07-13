@@ -3,6 +3,7 @@ import { config } from "../config.js";
 import { addBalance, subtractBalance } from "../balance.js";
 import { formatSats } from "../format.js";
 import { recordLedgerEntry } from "../ledger.js";
+import { TOKEN_CHOICES, formatTokenAmount, parseToken, roundTokenAmount } from "../tokens.js";
 
 export const data = {
   name: "credit",
@@ -10,7 +11,8 @@ export const data = {
   default_member_permissions: "0",
   options: [
     { name: "user", type: 6 as const, description: "User to credit", required: true },
-    { name: "amount", type: 10 as const, description: "Sats to add (negative to debit)", required: true },
+    { name: "amount", type: 10 as const, description: "Token amount to add (negative to debit)", required: true },
+    { name: "token", type: 3 as const, description: "Token to adjust", required: false, choices: TOKEN_CHOICES },
     { name: "reason", type: 3 as const, description: "Reason for adjustment", required: false },
   ],
 };
@@ -21,8 +23,9 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   }
 
   const target = interaction.options.getUser("user", true);
-  const amount = interaction.options.getNumber("amount", true);
   const reason = interaction.options.getString("reason") ?? "Manual adjustment";
+  const token = parseToken(interaction.options.getString("token"));
+  const amount = roundTokenAmount(interaction.options.getNumber("amount", true), token);
 
   if (amount === 0) {
     return interaction.reply({ content: "❌ Amount can't be zero.", flags: MessageFlags.Ephemeral });
@@ -31,9 +34,9 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
   if (amount > 0) {
-    await addBalance(target.id, amount);
+    await addBalance(target.id, amount, token);
   } else {
-    if (!(await subtractBalance(target.id, Math.abs(amount)))) {
+    if (!(await subtractBalance(target.id, Math.abs(amount), token))) {
       return interaction.editReply({ content: "❌ User doesn't have enough balance to debit that amount." });
     }
   }
@@ -41,6 +44,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   recordLedgerEntry(interaction.client, {
     type: amount > 0 ? "admin_credit" : "admin_debit",
     amountSats: Math.abs(amount),
+    token,
     senderId: amount > 0 ? "treasury" : target.id,
     receiverId: amount > 0 ? target.id : "treasury",
     guildId: interaction.guildId,
@@ -55,7 +59,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     .setTitle(`🔧 Balance ${action}`)
     .addFields(
       { name: "User", value: `<@${target.id}>`, inline: true },
-      { name: "Amount", value: `**${formatSats(Math.abs(amount))}**`, inline: true },
+      { name: "Amount", value: `**${formatTokenAmount(Math.abs(amount), token)}**`, inline: true },
       { name: "Reason", value: reason },
     )
     .setTimestamp();

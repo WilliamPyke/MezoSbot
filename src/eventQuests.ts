@@ -11,6 +11,7 @@ import {
 } from "discord.js";
 import { supabase } from "./db.js";
 import { formatSats } from "./format.js";
+import { formatTokenAmount, parseToken, type TokenSymbol } from "./tokens.js";
 import { recordLedgerEntry } from "./ledger.js";
 import { registerDepositAddress } from "./evm.js";
 import { sendTransferReceivedDm } from "./notifications.js";
@@ -26,6 +27,7 @@ export type EventQuestRow = {
   event_name: string;
   event_channel_id: string;
   reward_sats: number;
+  token: TokenSymbol;
   min_minutes: number;
   max_rewards: number | null;
   rewards_count: number;
@@ -319,7 +321,7 @@ export function buildEventQuestEmbed(quest: EventQuestRow): EmbedBuilder {
       ].join("\n"),
     )
     .addFields(
-      { name: "Rewards:", value: `↳ **${formatSats(quest.reward_sats)}** ⚡ Per Person`, inline: false },
+      { name: "Rewards:", value: `↳ **${formatTokenAmount(quest.reward_sats, parseToken(quest.token))}** Per Person`, inline: false },
       { name: "Requirements:", value: `↳ Join <#${quest.event_channel_id}> for **${cleanMinutes}**`, inline: false },
       { name: "Event", value: `[Open Discord Event](${cleanEventUrl})`, inline: true },
     )
@@ -358,7 +360,9 @@ async function tryAwardQuest(
   userId: string,
   multiplier: SatsMultiplier = 1,
 ): Promise<void> {
-  const { data: awarded, error } = await supabase.rpc("claim_event_quest_reward", {
+  const { data: awarded, error } = await supabase.rpc(parseToken(quest.token) === "SATS"
+    ? "claim_event_quest_reward"
+    : "claim_event_quest_reward_token", {
     p_quest_id: quest.id,
     p_user_id: userId,
     p_reward_multiplier: multiplier,
@@ -374,6 +378,7 @@ async function tryAwardQuest(
   recordLedgerEntry(client, {
     type: "event_quest_reward",
     amountSats: rewardAmount,
+    token: parseToken(quest.token),
     senderId: quest.creator_id,
     receiverId: userId,
     guildId: quest.guild_id,
@@ -388,6 +393,7 @@ async function tryAwardQuest(
     recipientId: userId,
     senderId: quest.creator_id,
     amountSats: rewardAmount,
+    token: parseToken(quest.token),
     kind: "quest",
     customMessage: `Completed event quest: ${quest.event_name}`,
   });
