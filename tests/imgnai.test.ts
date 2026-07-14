@@ -8,6 +8,11 @@ import {
   type KatanaImageModel,
 } from "../src/imgnai/types.js";
 import { musdToDecimal, parseMusd } from "../src/imgnai/musd.js";
+import {
+  IMGN_WORKER_IDLE_DELAY_MS,
+  IMGN_WORKER_MIN_DELAY_MS,
+  nextGenerationWorkerDelay,
+} from "../src/imgnai/schedule.js";
 
 const base: KatanaImageModel = {
   modelKey: "pink-image",
@@ -44,4 +49,17 @@ test("MUSD decimal conversion is exact at 18 decimals", () => {
   const amount = parseMusd("123456789.000000000000000001");
   assert.equal(amount, 123456789000000000000000001n);
   assert.equal(musdToDecimal(amount), "123456789.000000000000000001");
+});
+
+test("generation worker sleeps when idle and wakes at persisted retry times", () => {
+  const now = Date.parse("2026-07-14T00:00:00.000Z");
+  assert.equal(nextGenerationWorkerDelay([], now), IMGN_WORKER_IDLE_DELAY_MS);
+  assert.equal(
+    nextGenerationWorkerDelay([{ next_retry_at: new Date(now + 12_345).toISOString() }], now),
+    12_345,
+  );
+  assert.equal(
+    nextGenerationWorkerDelay([{ next_retry_at: null }], now),
+    IMGN_WORKER_MIN_DELAY_MS,
+  );
 });

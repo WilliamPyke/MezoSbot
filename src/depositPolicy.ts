@@ -14,3 +14,13 @@ export function preservesGasReserve(
 export function nextSweepTime(nowMs: number, delayMs: number): number {
   return nowMs + Math.max(0, delayMs);
 }
+
+export function pollableDepositRows<T extends { discord_id: string }>(
+  rows: T[],
+  adminOnly: boolean,
+  adminIds: readonly string[],
+): T[] {
+  if (!adminOnly) return rows;
+  const allowed = new Set(adminIds);
+  return rows.filter((row) => allowed.has(row.discord_id));
+}

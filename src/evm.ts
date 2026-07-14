@@ -5,13 +5,14 @@ import { supabase } from "./db.js";
 import { addBalance } from "./balance.js";
 import { recordLedgerEntry } from "./ledger.js";
 import { verifyWalletFromDeposit } from "./walletVerification.js";
-import { meetsPublicDepositMinimum, nextSweepTime, preservesGasReserve } from "./depositPolicy.js";
+import { meetsPublicDepositMinimum, nextSweepTime, pollableDepositRows, preservesGasReserve } from "./depositPolicy.js";
 import { TOKEN_SYMBOLS, assertTokenConfigured, tokenAmountToUnits, tokenDecimalToUnits, tokenUnitsToAmount, type TokenSymbol } from "./tokens.js";
 
 const ERC20_ABI = [
   "function balanceOf(address owner) view returns (uint256)",
   "function transfer(address to, uint256 amount) returns (bool)",
 ];
+const ERC20_INTERFACE = new ethers.Interface(ERC20_ABI);
 
 let provider: ethers.JsonRpcProvider;
 let wallet: ethers.Wallet;
@@ -28,12 +29,32 @@ export function getProvider() {
  * (e.g. `[{"jsonrpc":"2.0","result":{...}}]`), which causes ethers v6 to
  * throw BAD_DATA.  This helper unwraps the array before parsing.
  */
-async function rawRpcCall(method: string, params: unknown[]): Promise<unknown> {
+let depositRpcQueue: Promise<void> = Promise.resolve();
+let nextDepositRpcAt = 0;
+
+async function waitForDepositRpcSlot(): Promise<void> {
+  const requestsPerSecond = clampPositiveInt(config.deposits.rpcRequestsPerSecond, 8);
+  const intervalMs = Math.ceil(1000 / requestsPerSecond);
+  const slot = depositRpcQueue.then(async () => {
+    const waitMs = Math.max(0, nextDepositRpcAt - Date.now());
+    if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs));
+    nextDepositRpcAt = Date.now() + intervalMs;
+  });
+  depositRpcQueue = slot.catch(() => {});
+  await slot;
+}
+
+async function rawRpcCall(
+  method: string,
+  params: unknown[],
+  options: { rateLimited?: boolean } = {},
+): Promise<unknown> {
   const attempts = 4;
   let lastError: unknown = null;
 
   for (let attempt = 0; attempt < attempts; attempt++) {
     try {
+      if (options.rateLimited) await waitForDepositRpcSlot();
       const res = await fetch(config.evm.rpcUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -121,7 +142,14 @@ const depositRegistrationPromises = new Map<string, Promise<string>>();
 const sweepPromises = new Map<string, Promise<string | null>>();
 let depositAddressCacheLoadedAt = 0;
 let depositAddressCacheRefresh: Promise<void> | null = null;
+const depositTokenBalanceCache = new Map<string, bigint>();
+const depositTokenSweepAfterCache = new Map<string, number | null>();
+let depositTokenCacheLoadedAt = 0;
+let depositTokenCacheRefresh: Promise<void> | null = null;
+const depositWarningLastLoggedAt = new Map<string, number>();
+const depositWarningSuppressed = new Map<string, number>();
 const DEPOSIT_UPDATE_BATCH_SIZE = 500;
+const DEPOSIT_WARNING_INTERVAL_MS = 15 * 60_000;
 
 function clampPositiveInt(value: number, fallback: number): number {
   return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
@@ -129,6 +157,19 @@ function clampPositiveInt(value: number, fallback: number): number {
 
 function yieldToEventLoop(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve));
+}
+
+function warnDepositOnce(key: string, message: string): void {
+  const now = Date.now();
+  const last = depositWarningLastLoggedAt.get(key) ?? 0;
+  if (now - last < DEPOSIT_WARNING_INTERVAL_MS) {
+    depositWarningSuppressed.set(key, (depositWarningSuppressed.get(key) ?? 0) + 1);
+    return;
+  }
+  const suppressed = depositWarningSuppressed.get(key) ?? 0;
+  depositWarningLastLoggedAt.set(key, now);
+  depositWarningSuppressed.set(key, 0);
+  console.warn(`${message}${suppressed > 0 ? ` (${suppressed} similar warnings suppressed)` : ""}`);
 }
 
 async function mapWithConcurrency<T, R>(
@@ -177,9 +218,17 @@ async function refreshDepositAddressCache(force = false): Promise<void> {
   if (depositAddressCacheRefresh) return depositAddressCacheRefresh;
 
   depositAddressCacheRefresh = (async () => {
-    const { data, error } = await supabase
+    if (config.depositAdminOnly && config.discord.adminIds.length === 0) {
+      depositAddressCache.clear();
+      depositAddressCacheLoadedAt = Date.now();
+      return;
+    }
+
+    let query = supabase
       .from("deposit_addresses")
       .select("discord_id, address, last_checked_balance");
+    if (config.depositAdminOnly) query = query.in("discord_id", config.discord.adminIds);
+    const { data, error } = await query;
 
     if (error) {
       console.error("Failed to refresh deposit address cache:", error.message);
@@ -197,6 +246,53 @@ async function refreshDepositAddressCache(force = false): Promise<void> {
   });
 
   return depositAddressCacheRefresh;
+}
+
+async function refreshDepositTokenCache(force = false): Promise<void> {
+  const now = Date.now();
+  if (
+    !force &&
+    depositTokenCacheLoadedAt > 0 &&
+    now - depositTokenCacheLoadedAt < config.deposits.addressRefreshMs
+  ) {
+    return;
+  }
+  if (depositTokenCacheRefresh) return depositTokenCacheRefresh;
+
+  depositTokenCacheRefresh = (async () => {
+    if (config.depositAdminOnly && config.discord.adminIds.length === 0) {
+      depositTokenBalanceCache.clear();
+      depositTokenSweepAfterCache.clear();
+      depositTokenCacheLoadedAt = Date.now();
+      return;
+    }
+
+    let query = supabase
+      .from("deposit_token_balances")
+      .select("discord_id, token, last_checked_balance, sweep_after");
+    if (config.depositAdminOnly) query = query.in("discord_id", config.discord.adminIds);
+    const { data, error } = await query;
+    if (error) {
+      warnDepositOnce("checkpoint-refresh", `[Deposits] Failed to refresh token checkpoints: ${error.message}`);
+      return;
+    }
+
+    depositTokenBalanceCache.clear();
+    depositTokenSweepAfterCache.clear();
+    for (const checkpoint of data ?? []) {
+      const key = `${checkpoint.discord_id}:${checkpoint.token}`;
+      depositTokenBalanceCache.set(key, BigInt(checkpoint.last_checked_balance ?? "0"));
+      depositTokenSweepAfterCache.set(
+        key,
+        checkpoint.sweep_after ? new Date(checkpoint.sweep_after).getTime() : null,
+      );
+    }
+    depositTokenCacheLoadedAt = Date.now();
+  })().finally(() => {
+    depositTokenCacheRefresh = null;
+  });
+
+  return depositTokenCacheRefresh;
 }
 
 async function updateDepositAddressBalances(
@@ -347,6 +443,29 @@ export async function getTokenBalance(address: string, token: TokenSymbol): Prom
   const cfg = assertTokenConfigured(token);
   const contract = new ethers.Contract(cfg.contractAddress!, ERC20_ABI, provider);
   return BigInt(await contract.balanceOf(address));
+}
+
+async function getDepositNativeBalance(address: string): Promise<bigint> {
+  const raw = await rawRpcCall(
+    "eth_getBalance",
+    [address, "latest"],
+    { rateLimited: true },
+  ) as string;
+  return BigInt(raw ?? "0x0");
+}
+
+async function getDepositTokenBalance(
+  address: string,
+  token: Exclude<TokenSymbol, "SATS">,
+): Promise<bigint> {
+  const cfg = assertTokenConfigured(token);
+  const data = ERC20_INTERFACE.encodeFunctionData("balanceOf", [address]);
+  const raw = await rawRpcCall(
+    "eth_call",
+    [{ to: cfg.contractAddress, data }, "latest"],
+    { rateLimited: true },
+  ) as string;
+  return BigInt(raw ?? "0x0");
 }
 
 async function sweepErc20ToTreasury(
@@ -596,27 +715,37 @@ export function startDepositPoller(
 
     try {
       await refreshDepositAddressCache(depositAddressCacheLoadedAt === 0);
-      const rows = Array.from(depositAddressCache.values());
+      const rows = pollableDepositRows(
+        Array.from(depositAddressCache.values()),
+        config.depositAdminOnly,
+        config.discord.adminIds,
+      );
 
       if (rows.length === 0) return;
 
       const updates: Array<{ row: DepositAddressRow; balance: string }> = [];
       let gasPriceForPoll: bigint | null = null;
+      let balanceCheckFailures = 0;
+      let firstBalanceCheckError = "";
+
+      const captureBalanceFailure = (reason: unknown) => {
+        balanceCheckFailures += 1;
+        if (!firstBalanceCheckError) {
+          firstBalanceCheckError = String((reason as Error)?.message ?? reason)
+            .replace(/\s+/g, " ")
+            .slice(0, 300);
+        }
+      };
 
       const configuredErc20 = TOKEN_SYMBOLS.filter((symbol): symbol is Exclude<TokenSymbol, "SATS"> => {
         if (symbol === "SATS") return false;
         try { return !!assertTokenConfigured(symbol).contractAddress; } catch { return false; }
       });
-      const { data: tokenCheckpoints } = configuredErc20.length > 0
-        ? await supabase.from("deposit_token_balances").select("discord_id, token, last_checked_balance, sweep_after")
-        : { data: [] };
-      const checkpointMap = new Map<string, bigint>();
-      const sweepAfterMap = new Map<string, number | null>();
-      for (const checkpoint of tokenCheckpoints ?? []) {
-        const key = `${checkpoint.discord_id}:${checkpoint.token}`;
-        checkpointMap.set(key, BigInt(checkpoint.last_checked_balance ?? "0"));
-        sweepAfterMap.set(key, checkpoint.sweep_after ? new Date(checkpoint.sweep_after).getTime() : null);
+      if (configuredErc20.length > 0) {
+        await refreshDepositTokenCache(depositTokenCacheLoadedAt === 0);
       }
+      const checkpointMap = depositTokenBalanceCache;
+      const sweepAfterMap = depositTokenSweepAfterCache;
 
       for (let i = 0; i < rows.length; i += balanceBatchSize) {
         const batch = rows.slice(i, i + balanceBatchSize);
@@ -624,13 +753,16 @@ export function startDepositPoller(
           batch,
           balanceConcurrency,
           async (row) => {
-            const bal = await provider.getBalance(row.address);
+            const bal = await getDepositNativeBalance(row.address);
             return { row, bal };
           },
         );
 
         for (const result of balanceChecks) {
-          if (result.status === "rejected") continue;
+          if (result.status === "rejected") {
+            captureBalanceFailure(result.reason);
+            continue;
+          }
 
           const { row, bal } = result.value;
           const prev = BigInt(row.last_checked_balance || "0");
@@ -693,7 +825,7 @@ export function startDepositPoller(
 
           for (const token of configuredErc20) {
             try {
-              const current = await getTokenBalance(row.address, token);
+              const current = await getDepositTokenBalance(row.address, token);
               const key = `${row.discord_id}:${token}`;
               const previous = checkpointMap.get(key) ?? 0n;
               let belowPublicMinimum = false;
@@ -728,6 +860,7 @@ export function startDepositPoller(
                   if (credited === true) {
                     onDeposit?.(row.discord_id, amount, 0, txId, token);
                     const sweepAfter = nextSweepTime(Date.now(), config.deposits.erc20SweepDelayMs);
+                    checkpointMap.set(key, current);
                     sweepAfterMap.set(key, sweepAfter);
                     await supabase.from("deposit_token_balances").update({
                       sweep_after: new Date(sweepAfter).toISOString(),
@@ -767,7 +900,10 @@ export function startDepositPoller(
                   }
                   checkpointMap.set(key, 0n);
                 } catch (error) {
-                  console.error(`[Deposits] ${token} sweep failed for ${row.discord_id}:`, (error as Error).message);
+                  warnDepositOnce(
+                    `sweep-${token}`,
+                    `[Deposits] ${token} sweep failed: ${String((error as Error).message).slice(0, 300)}`,
+                  );
                   const retryAt = new Date(Date.now() + Math.max(60_000, config.deposits.pollMs)).toISOString();
                   sweepAfterMap.set(key, new Date(retryAt).getTime());
                   await supabase.from("deposit_token_balances").update({
@@ -776,7 +912,7 @@ export function startDepositPoller(
                 }
               }
               const wasSwept = checkpointMap.get(key) === 0n && previous !== 0n && sweepAfterMap.get(key) == null;
-              const checkpointBalance = wasSwept ? 0n : await getTokenBalance(row.address, token);
+              const checkpointBalance = wasSwept ? 0n : current;
               if (!belowPublicMinimum && !wasSwept && checkpointBalance !== previous) {
                 await supabase.from("deposit_token_balances").upsert({
                   discord_id: row.discord_id, token, last_checked_balance: checkpointBalance.toString(), updated_at: new Date().toISOString(),
@@ -784,7 +920,7 @@ export function startDepositPoller(
                 checkpointMap.set(key, checkpointBalance);
               }
             } catch (error) {
-              console.warn(`[Deposits] ${token} balance check failed for ${row.discord_id}:`, (error as Error).message);
+              captureBalanceFailure(error);
             }
           }
         }
@@ -793,9 +929,16 @@ export function startDepositPoller(
       }
 
       await updateDepositAddressBalances(updates);
+      if (balanceCheckFailures > 0) {
+        warnDepositOnce(
+          "balance-check",
+          `[Deposits] ${balanceCheckFailures} balance check(s) failed during this poll; first error: ${firstBalanceCheckError}`,
+        );
+      }
       if (Date.now() - startedAt > config.deposits.pollMs) {
-        console.warn(
-          `[Deposits] Poll took ${Date.now() - startedAt}ms for ${rows.length} address(es); consider raising DEPOSIT_POLL_MS or lowering DEPOSIT_BALANCE_CONCURRENCY`
+        warnDepositOnce(
+          "slow-poll",
+          `[Deposits] Poll took ${Date.now() - startedAt}ms for ${rows.length} address(es); checks are rate-limited to protect the RPC endpoint`,
         );
       }
     } finally {

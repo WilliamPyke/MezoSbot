@@ -85,6 +85,8 @@ services:
         value: "60000"
       - key: DEPOSIT_ADDRESS_REFRESH_MS
         value: "900000"
+      - key: DEPOSIT_RPC_REQUESTS_PER_SECOND
+        value: "8"
       - key: ERC20_SWEEP_DELAY_MS
         value: "300000"
       - key: MUSD_MIN_DEPOSIT

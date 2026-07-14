@@ -47,8 +47,9 @@ cp .env.example .env
 | `STUN_SERVERS` | Comma-separated STUN servers for WebRTC |
 | `PUBLIC_BASE_URL` | Public URL of this bot's HTTP server (used for Slice Arcade browser-play links). E.g. `https://mezosbot.example.com` or `mezosbot.example.com`. Defaults to `http://localhost:<STREAM_PORT>` for local dev. |
 | `ARCADE_TOKEN_SECRET` | Optional HMAC secret for Slice Arcade browser tokens. Falls back to `TREASURY_PRIVATE_KEY` if unset. |
-| `DEPOSIT_POLL_MS` | Deposit wallet chain polling interval (default `15000`) |
-| `DEPOSIT_ADDRESS_REFRESH_MS` | Supabase address-list cache refresh interval (default `300000`) |
+| `DEPOSIT_POLL_MS` | Deposit wallet chain polling interval (default `60000`) |
+| `DEPOSIT_ADDRESS_REFRESH_MS` | Supabase address/checkpoint cache refresh interval (default `900000`) |
+| `DEPOSIT_RPC_REQUESTS_PER_SECOND` | Maximum deposit balance reads per second across all poll workers (default `8`, below Mezo's public RPC limit) |
 | `SWEEP_GAS_SPONSOR_PRIVATE_KEY` | Dedicated hot key that funds ERC-20 deposit-wallet sweep gas; recommended before public deposits |
 | `PROTOCOL_GAS_RESERVE_MIN_SATS` | Protected operational SATS reserve; ERC-20 operations stop before crossing it (default `1000`) |
 | `ERC20_SWEEP_DELAY_MS` | Delay before sweeping an ERC-20 deposit so nearby deposits can be combined (default `300000`) |

@@ -97,6 +97,7 @@ exports.config = {
         addressRefreshMs: parseInt(optional("DEPOSIT_ADDRESS_REFRESH_MS", "900000"), 10),
         balanceConcurrency: parseInt(optional("DEPOSIT_BALANCE_CONCURRENCY", "8"), 10),
         balanceBatchSize: parseInt(optional("DEPOSIT_BALANCE_BATCH_SIZE", "25"), 10),
+        rpcRequestsPerSecond: parseInt(optional("DEPOSIT_RPC_REQUESTS_PER_SECOND", "8"), 10),
         initialPollDelayMs: parseInt(optional("DEPOSIT_INITIAL_POLL_DELAY_MS", "15000"), 10),
         erc20SweepDelayMs: parseInt(optional("ERC20_SWEEP_DELAY_MS", "300000"), 10),
         minimums: {

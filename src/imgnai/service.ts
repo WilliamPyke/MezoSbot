@@ -15,11 +15,20 @@ import { recordLedgerEntry } from "../ledger.js";
 import { getTreasuryAddress } from "../evm.js";
 import { ensureKatanaBalance, getKatanaWalletBalance, katanaWalletFetch, createSignInWithXHeader } from "./payments.js";
 import { musdToNumber, parseMusd } from "./musd.js";
+import {
+  IMGN_PROMPT_CLEANUP_INTERVAL_MS,
+  IMGN_WORKER_ERROR_DELAY_MS,
+  IMGN_WORKER_MIN_DELAY_MS,
+  nextGenerationWorkerDelay,
+} from "./schedule.js";
 import { formatMusd, type GenerationJob, type GenerationQuality, type KatanaImageModel } from "./types.js";
 
 const ACTIVE_STATUSES = ["reserved", "funding", "submitted", "polling", "delivery_pending", "refund_pending", "inconclusive"];
 const processing = new Set<string>();
 let workerTimer: NodeJS.Timeout | null = null;
+let workerDueAt = 0;
+let workerRunning = false;
+let nextPromptCleanupAt = 0;
 
 type GenerationAsset = {
   original_data_url?: string;
@@ -451,35 +460,80 @@ async function processJob(client: Client, jobId: string): Promise<void> {
   }
 }
 
-async function workerTick(client: Client): Promise<void> {
-  const now = new Date().toISOString();
-  const { data, error } = await supabase
-    .from("imgnai_generation_jobs")
-    .select("id")
-    .in("status", ACTIVE_STATUSES)
-    .or(`next_retry_at.is.null,next_retry_at.lte.${now}`)
-    .order("created_at", { ascending: true })
-    .limit(10);
-  if (error) {
-    console.warn("[imgnAI] Worker query failed:", error.message);
-    return;
-  }
-  await Promise.all((data ?? []).map((row) => processJob(client, String(row.id))));
+function scheduleWorker(client: Client, delayMs: number): void {
+  const delay = Math.max(0, delayMs);
+  const dueAt = Date.now() + delay;
+  if (workerTimer && workerDueAt <= dueAt) return;
+  if (workerTimer) clearTimeout(workerTimer);
+  workerDueAt = dueAt;
+  workerTimer = setTimeout(() => {
+    workerTimer = null;
+    workerDueAt = 0;
+    void workerTick(client);
+  }, delay);
+}
 
-  const cutoff = new Date(Date.now() - 72 * 60 * 60 * 1000).toISOString();
-  await supabase.from("imgnai_generation_jobs")
+async function redactExpiredPrompts(nowMs: number): Promise<void> {
+  if (nowMs < nextPromptCleanupAt) return;
+  nextPromptCleanupAt = nowMs + IMGN_PROMPT_CLEANUP_INTERVAL_MS;
+  const now = new Date(nowMs).toISOString();
+  const cutoff = new Date(nowMs - 72 * 60 * 60 * 1000).toISOString();
+  const { error } = await supabase.from("imgnai_generation_jobs")
     .update({ prompt: null, updated_at: now })
     .in("status", ["completed", "refunded", "policy_failed"])
     .lt("updated_at", cutoff)
     .not("prompt", "is", null);
+  if (error) console.warn("[imgnAI] Prompt cleanup failed:", error.message);
+}
+
+async function workerTick(client: Client): Promise<void> {
+  if (workerRunning) {
+    scheduleWorker(client, IMGN_WORKER_MIN_DELAY_MS);
+    return;
+  }
+
+  workerRunning = true;
+  let nextDelay = IMGN_WORKER_ERROR_DELAY_MS;
+  try {
+    const nowMs = Date.now();
+    const { data, error } = await supabase
+      .from("imgnai_generation_jobs")
+      .select("id, next_retry_at")
+      .in("status", ACTIVE_STATUSES)
+      .order("next_retry_at", { ascending: true, nullsFirst: true })
+      .limit(10);
+    if (error) {
+      console.warn("[imgnAI] Worker query failed:", error.message);
+      return;
+    }
+
+    const jobs = (data ?? []).map((row) => ({
+      id: String(row.id),
+      next_retry_at: row.next_retry_at ? String(row.next_retry_at) : null,
+    }));
+    const dueJobs = jobs.filter((job) => {
+      if (!job.next_retry_at) return true;
+      const retryAt = new Date(job.next_retry_at).getTime();
+      return !Number.isFinite(retryAt) || retryAt <= nowMs;
+    });
+    await Promise.all(dueJobs.map((job) => processJob(client, job.id)));
+    await redactExpiredPrompts(nowMs);
+    nextDelay = dueJobs.length > 0
+      ? IMGN_WORKER_MIN_DELAY_MS
+      : nextGenerationWorkerDelay(jobs, Date.now());
+  } finally {
+    workerRunning = false;
+    scheduleWorker(client, nextDelay);
+  }
 }
 
 export function startImgnaiWorker(client: Client): void {
-  if (workerTimer) return;
-  void workerTick(client);
-  workerTimer = setInterval(() => void workerTick(client), 5_000);
+  if (workerTimer || workerRunning) return;
+  scheduleWorker(client, 0);
 }
 
 export function queueGeneration(client: Client, jobId: string): void {
-  void processJob(client, jobId);
+  void processJob(client, jobId).finally(() => {
+    scheduleWorker(client, IMGN_WORKER_MIN_DELAY_MS);
+  });
 }
