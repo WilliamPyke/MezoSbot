@@ -73,10 +73,15 @@ function jobFrom(data: unknown): GenerationJob {
 }
 
 async function patchJob(jobId: string, patch: Record<string, unknown>): Promise<void> {
-  const { error } = await supabase.from("imgnai_generation_jobs").update({
-    ...patch,
-    updated_at: new Date().toISOString(),
-  }).eq("id", jobId);
+  const { error } = await supabase
+    .from("imgnai_generation_jobs")
+    .update({
+      ...patch,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", jobId)
+    .is("refunded_at", null)
+    .is("completed_at", null);
   if (error) throw error;
 }
 
@@ -152,6 +157,15 @@ async function submitJob(client: Client, job: GenerationJob): Promise<void> {
   let balanceBeforeSubmission: bigint | null = null;
   try {
     balanceBeforeSubmission = await ensureKatanaBalance(quotedAtomic(job));
+  } catch (error) {
+    // Katana has not been contacted yet, so no generation payment could have
+    // been made. Keeping this reservation inconclusive would strand user funds.
+    console.warn(`[imgnAI] Pre-submission funding failed for ${job.id}:`, (error as Error).message);
+    await refundUnpaidJob(client, job, (error as Error).message);
+    return;
+  }
+
+  try {
     const body = {
       requests: [{
         type: "image",
@@ -176,6 +190,7 @@ async function submitJob(client: Client, job: GenerationJob): Promise<void> {
       if (response.status === 402 || (response.status >= 400 && response.status < 500)) {
         return refundUnpaidJob(client, job, detail);
       }
+      console.warn(`[imgnAI] Submission was inconclusive for ${job.id}:`, detail);
       await patchJob(job.id, {
         status: "inconclusive",
         error_code: "submission_inconclusive",
@@ -205,6 +220,7 @@ async function submitJob(client: Client, job: GenerationJob): Promise<void> {
       metadata: { model: job.model_key, prompt_hash: job.prompt_hash, amount_musd_atomic: quotedAtomic(job).toString() },
     });
   } catch (error) {
+    console.warn(`[imgnAI] Submission threw for ${job.id}:`, (error as Error).message);
     if (balanceBeforeSubmission != null) {
       const currentBalance = await getKatanaWalletBalance().catch(() => null);
       if (currentBalance != null && currentBalance >= balanceBeforeSubmission) {
@@ -439,6 +455,10 @@ async function processJob(client: Client, jobId: string): Promise<void> {
   try {
     const job = await getJob(jobId);
     if (!job) return;
+    // A reservation becomes runnable only after its public status message has
+    // been posted. This prevents the worker racing the interaction's refund
+    // path when Discord rejects that message.
+    if (job.status === "reserved" && !job.status_message_id) return;
     if (job.status === "reserved" || job.status === "funding") await submitJob(client, job);
     else if (["submitted", "polling"].includes(job.status) || (job.status === "inconclusive" && job.katana_request_id)) await pollJob(client, job);
     else if (job.status === "inconclusive") {

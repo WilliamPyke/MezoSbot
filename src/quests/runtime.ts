@@ -9,6 +9,7 @@ import {
   type VoiceBasedChannel,
   type VoiceState,
 } from "discord.js";
+import { randomUUID } from "node:crypto";
 import { config as appConfig } from "../config.js";
 import { recordLedgerEntry } from "../ledger.js";
 import { supabase } from "../db.js";
@@ -44,11 +45,11 @@ type FirstLinkConfig = {
   refreshMinutes: number;
   // Rotating-list mode (current).
   linkList?: string[];
-  // Quantized window-boundary timestamp (ms) when the rotation should begin
-  // at index 0. Anchoring lets the quest start at link 1 of N regardless of
-  // wall-clock phase. Aligned to refreshMinutes window so rotation transitions
-  // line up with window-claim boundaries.
+  // Quantized window-boundary timestamp (ms) when the rotation begins.
+  // Aligned to refreshMinutes so target changes and claim windows stay in sync.
   rotationStartMs?: number;
+  // Private per-quest entropy used to produce a stable randomized order.
+  rotationSeed?: string;
   // Legacy single-event mode: treated as a 1-item rotation.
   expectedEventId?: string;
   expectedEventUrl?: string;
@@ -89,13 +90,43 @@ export function currentLinkIndex(
   listLength: number,
   rotationStartMs: number | null = null,
   now = Date.now(),
+  rotationSeed?: string,
 ): number {
   if (listLength <= 1) return 0;
   const safeMins = Number.isFinite(refreshMinutes) && refreshMinutes >= 1 ? Math.floor(refreshMinutes) : 60;
   const windowMs = safeMins * 60_000;
   const reference = typeof rotationStartMs === "number" && Number.isFinite(rotationStartMs) ? rotationStartMs : 0;
   const elapsed = Math.max(0, now - reference);
-  return Math.floor(elapsed / windowMs) % listLength;
+  const windowNumber = Math.floor(elapsed / windowMs);
+  if (!rotationSeed) return windowNumber % listLength;
+
+  const cycle = Math.floor(windowNumber / listLength);
+  const position = windowNumber % listLength;
+  const shuffled = seededLinkOrder(listLength, `${rotationSeed}:${cycle}`);
+  if (cycle > 0 && shuffled[0] === seededLinkOrder(listLength, `${rotationSeed}:${cycle - 1}`)[listLength - 1]) {
+    [shuffled[0], shuffled[1]] = [shuffled[1], shuffled[0]];
+  }
+  return shuffled[position];
+}
+
+function seededLinkOrder(length: number, seed: string): number[] {
+  let state = 2166136261;
+  for (let i = 0; i < seed.length; i += 1) {
+    state = Math.imul(state ^ seed.charCodeAt(i), 16777619) >>> 0;
+  }
+  const next = () => {
+    state += 0x6d2b79f5;
+    let value = state;
+    value = Math.imul(value ^ (value >>> 15), value | 1);
+    value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
+    return ((value ^ (value >>> 14)) >>> 0) / 4294967296;
+  };
+  const order = Array.from({ length }, (_, index) => index);
+  for (let i = order.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(next() * (i + 1));
+    [order[i], order[j]] = [order[j], order[i]];
+  }
+  return order;
 }
 
 export function quantizeRotationAnchor(refreshMinutes: number, now = Date.now()): number {
@@ -577,6 +608,7 @@ function messageMatchesFirstLinkTask(
   message: Message,
   task: ActiveQuestTask<FirstLinkConfig>,
   collected: CollectedMessageUrls,
+  now = Date.now(),
 ): boolean {
   const config = task.config;
   if (!config || message.channelId !== config.targetChannelId) return false;
@@ -597,7 +629,7 @@ function messageMatchesFirstLinkTask(
     const refreshMinutes = Number.isFinite(config.refreshMinutes) && config.refreshMinutes >= 1
       ? Math.floor(config.refreshMinutes)
       : 60;
-    const index = currentLinkIndex(refreshMinutes, list.length, config.rotationStartMs ?? null);
+    const index = currentLinkIndex(refreshMinutes, list.length, config.rotationStartMs ?? null, now, config.rotationSeed);
     const targetNorm = normalizeUrlForMatch(list[index]);
     if (!targetNorm) return false;
 
@@ -638,15 +670,13 @@ async function claimFirstLinkWindow(
   task: ActiveQuestTask<FirstLinkConfig>,
   userId: string,
   proof: Record<string, unknown>,
+  windowStart: string,
 ): Promise<boolean> {
-  const refreshMinutes = Number.isFinite(task.config.refreshMinutes) && task.config.refreshMinutes >= 1
-    ? Math.floor(task.config.refreshMinutes)
-    : 60;
   const { data, error } = await supabase
     .from("quest_task_window_claims")
     .insert({
       task_id: task.id,
-      window_start: linkWindowStartIso(refreshMinutes, task.config.rotationStartMs ?? null),
+      window_start: windowStart,
       user_id: userId,
       proof,
     })
@@ -669,14 +699,12 @@ async function markFirstLinkWindowClaimed(
   linkIndex: number,
   winnerMessageId: string,
   matchedUrl: string | null,
+  windowStart: string,
 ): Promise<void> {
-  const refreshMinutes = Number.isFinite(task.config.refreshMinutes) && task.config.refreshMinutes >= 1
-    ? Math.floor(task.config.refreshMinutes)
-    : 60;
   const metadata = (task.quest.metadata ?? {}) as Record<string, unknown>;
   const currentLinkClaim: FirstLinkClaimMetadata = {
     taskId: task.id,
-    windowStart: linkWindowStartIso(refreshMinutes, task.config.rotationStartMs ?? null),
+    windowStart,
     userId,
     linkIndex,
     claimedAt: nowIso(),
@@ -742,7 +770,7 @@ export function buildQuestRuntimeEmbed(snapshot: Awaited<ReturnType<typeof getQu
     const anchor = typeof config.rotationStartMs === "number" && Number.isFinite(config.rotationStartMs)
       ? config.rotationStartMs
       : null;
-    const index = currentLinkIndex(refreshMinutes, list.length, anchor);
+    const index = currentLinkIndex(refreshMinutes, list.length, anchor, Date.now(), config.rotationSeed);
     const current = list[index];
     const windowStart = linkWindowStartIso(refreshMinutes, anchor);
     const claim = (snapshot.quest.metadata as Record<string, unknown> | null | undefined)?.currentLinkClaim as FirstLinkClaimMetadata | undefined;
@@ -1019,6 +1047,8 @@ async function maybeDeleteDuplicateLinkPost(
       refreshMinutes,
       list.length,
       task.config.rotationStartMs ?? null,
+      Date.now(),
+      task.config.rotationSeed,
     );
     const targetNorm = normalizeUrlForMatch(list[linkIndex]);
     if (!targetNorm) continue;
@@ -1128,14 +1158,22 @@ export async function handleMultiStepQuestMessage(client: Client, message: Messa
 
   for (const task of tasks) {
     if (!questWindowAllowsCompletion(task.quest)) continue;
-    if (!messageMatchesFirstLinkTask(message, task, collected)) continue;
-
     const matchUrls = urlsForTaskMatching(message, task, collected);
     const list = resolveLinkList(task.config);
     const refreshMinutes = Number.isFinite(task.config.refreshMinutes) && task.config.refreshMinutes >= 1
       ? Math.floor(task.config.refreshMinutes)
       : 60;
-    const linkIndex = currentLinkIndex(refreshMinutes, list.length, task.config.rotationStartMs ?? null);
+    // Pin all decisions to one instant, then require the Discord message itself
+    // to have been created during that window. Without this check, a user can
+    // pre-post the predictable next link and let embed-fetch/quest-card refresh
+    // latency carry its processing across the rotation boundary.
+    const evaluatedAt = Date.now();
+    const windowStartMs = linkWindowStartMs(refreshMinutes, task.config.rotationStartMs ?? null, evaluatedAt);
+    if (message.createdTimestamp < windowStartMs) continue;
+    if (!messageMatchesFirstLinkTask(message, task, collected, evaluatedAt)) continue;
+
+    const windowStart = new Date(windowStartMs).toISOString();
+    const linkIndex = currentLinkIndex(refreshMinutes, list.length, task.config.rotationStartMs ?? null, evaluatedAt, task.config.rotationSeed);
     const matchedUrl = list[linkIndex] ?? matchUrls[0] ?? null;
 
     const proof = {
@@ -1146,10 +1184,10 @@ export async function handleMultiStepQuestMessage(client: Client, message: Messa
       url: matchUrls[0] ?? null,
       matchedUrl,
     };
-    const wonWindow = await claimFirstLinkWindow(task, message.author.id, proof);
+    const wonWindow = await claimFirstLinkWindow(task, message.author.id, proof, windowStart);
     if (!wonWindow) continue;
 
-    await markFirstLinkWindowClaimed(task, message.author.id, linkIndex, message.id, matchedUrl);
+    await markFirstLinkWindowClaimed(task, message.author.id, linkIndex, message.id, matchedUrl, windowStart);
     await completeRepeatableLinkWindowAndNotify(
       client,
       task,
@@ -1283,12 +1321,12 @@ async function sweepRotatingLinkQuests(client: Client): Promise<void> {
 
     // Back-fill rotationStartMs and refreshMinutes for quests created before anchored rotation existed.
     let rotationStartMs = config.rotationStartMs ?? null;
-    const needsBackfill = typeof rotationStartMs !== "number" || !Number.isFinite(rotationStartMs) || config.refreshMinutes !== refreshMinutes;
+    const needsBackfill = typeof rotationStartMs !== "number" || !Number.isFinite(rotationStartMs) || config.refreshMinutes !== refreshMinutes || !config.rotationSeed;
     if (needsBackfill) {
       if (typeof rotationStartMs !== "number" || !Number.isFinite(rotationStartMs)) {
         rotationStartMs = quantizeRotationAnchor(refreshMinutes);
       }
-      const newConfig = { ...config, rotationStartMs, refreshMinutes };
+      const newConfig = { ...config, rotationStartMs, refreshMinutes, rotationSeed: config.rotationSeed ?? randomUUID() };
       const { error: configError } = await supabase
         .from("quest_tasks")
         .update({ config: newConfig })
@@ -1300,7 +1338,7 @@ async function sweepRotatingLinkQuests(client: Client): Promise<void> {
       task.config = newConfig;
     }
 
-    const index = currentLinkIndex(refreshMinutes, list.length, rotationStartMs);
+    const index = currentLinkIndex(refreshMinutes, list.length, rotationStartMs, Date.now(), task.config.rotationSeed);
     const windowStart = linkWindowStartIso(refreshMinutes, rotationStartMs);
     const metadata = (task.quest.metadata ?? {}) as Record<string, unknown>;
     const lastRendered = metadata.lastRenderedLinkIndex;

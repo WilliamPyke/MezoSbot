@@ -120,7 +120,7 @@ Rain banned-word filtering requires `DISCORD_MESSAGE_CONTENT_INTENT=true` and th
 
 ## imgnAI Katana Generation
 
-Apply `migrations/2026-07-13_imgnai_katana.sql`, then `migrations/2026-07-13_imgnai_atomic_musd.sql`, then `migrations/2026-07-13_protocol_operations.sql`, after the multi-token migration before enabling `/generate`. The atomic migration backfills exact 18-decimal MUSD units and keeps the legacy floating columns only as compatibility mirrors. The operations migration adds delayed sweeps, gas-funding audit records, and solvency metrics. The bot uses the existing Mezo mainnet treasury signer and MUSD contract; no imgnAI API key is required.
+Apply `migrations/2026-07-13_imgnai_katana.sql`, then `migrations/2026-07-13_imgnai_atomic_musd.sql`, `migrations/2026-07-13_protocol_operations.sql`, and `migrations/2026-07-16_imgnai_reconciliation_safety.sql`, after the multi-token migration before enabling `/generate`. The atomic migration backfills exact 18-decimal MUSD units and keeps the legacy floating columns only as compatibility mirrors. The operations migrations add delayed sweeps, gas-funding audit records, solvency metrics, and terminal-state safeguards for refunded generations. The bot uses the existing Mezo mainnet treasury signer and MUSD contract; no imgnAI API key is required.
 
 - `/generate` opens a private setup with prompt, SFW model, aspect ratio, quality, live MUSD price, and balance.
 - The confirmed amount is atomically reserved from the user's internal MUSD balance. The public progress message is edited into the final downloadable image.

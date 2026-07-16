@@ -20,6 +20,7 @@ import {
   type ModalSubmitInteraction,
   type StringSelectMenuInteraction,
 } from "discord.js";
+import { randomUUID } from "node:crypto";
 import { getBalance } from "../balance.js";
 import { config as appConfig } from "../config.js";
 import { supabase } from "../db.js";
@@ -1056,7 +1057,7 @@ async function createMultiStepQuestFromSession(
         targetChannelId: session.linkChannelId,
         source: session.linkSource,
         ...(session.linkSource === "rotating_list"
-          ? { linkList: session.linkList, rotationStartMs }
+          ? { linkList: session.linkList, rotationStartMs, rotationSeed: randomUUID() }
           : {}),
         refreshMinutes: session.linkRefreshMinutes,
       },
@@ -1404,6 +1405,7 @@ export async function handleQuestEditInteraction(interaction: Interaction): Prom
     ...config,
     linkList: newLinkList,
     rotationStartMs: currentRotationStart,
+    rotationSeed: typeof config.rotationSeed === "string" ? config.rotationSeed : randomUUID(),
   };
 
   const { error: dbError } = await supabase
