@@ -1,6 +1,6 @@
 import { EmbedBuilder, MessageFlags, type ChatInputCommandInteraction } from "discord.js";
 import { subtractBalance, addBalance, getBalance } from "../balance.js";
-import { registerDepositAddress } from "../evm.js";
+import { getSweepGasSponsorAddress, registerDepositAddress, withdraw } from "../evm.js";
 import { formatSats } from "../format.js";
 import { sendTransferReceivedDm } from "../notifications.js";
 import { supabase } from "../db.js";
@@ -8,36 +8,50 @@ import { updateUserBadges } from "../badges.js";
 import { recordLedgerEntry } from "../ledger.js";
 import { replyInsufficientBalance } from "./responses.js";
 import { TOKEN_CHOICES, formatTokenAmount, parseToken, roundTokenAmount } from "../tokens.js";
+import { config } from "../config.js";
 
 
 export const data = {
   name: "tip",
   description: "Send a token to another user",
   options: [
-    { name: "user", type: 6 as const, description: "User to tip", required: true },
     { name: "amount", type: 10 as const, description: "Token amount (e.g. 100 or 100.5)", required: true, minValue: 0.000001 },
+    { name: "user", type: 6 as const, description: "User to tip", required: false },
+    { name: "sponsor", type: 5 as const, description: "Admin: tip SATS to the sweep gas sponsor", required: false },
     { name: "token", type: 3 as const, description: "Token to tip (defaults to SATS)", required: false, choices: TOKEN_CHOICES },
     { name: "message", type: 3 as const, description: "Optional message for the recipient", required: false },
   ],
 };
 
 export async function execute(interaction: ChatInputCommandInteraction) {
-  const target = interaction.options.getUser("user", true);
+  const target = interaction.options.getUser("user");
+  const sponsor = interaction.options.getBoolean("sponsor") ?? false;
   const token = parseToken(interaction.options.getString("token"));
   const amount = roundTokenAmount(interaction.options.getNumber("amount", true), token);
   const rawMessage = interaction.options.getString("message");
   const trimmedMessage = rawMessage?.trim() ?? "";
   const customMessage = trimmedMessage.length > 0 ? trimmedMessage : undefined;
 
+  if ((target == null) === !sponsor) {
+    return interaction.reply({ content: "❌ Choose exactly one destination: a user or the gas sponsor.", flags: MessageFlags.Ephemeral });
+  }
+  if (sponsor && !config.discord.adminIds.includes(interaction.user.id)) {
+    return interaction.reply({ content: "❌ Gas sponsor tips are admin only.", flags: MessageFlags.Ephemeral });
+  }
+  if (sponsor && token !== "SATS") {
+    return interaction.reply({ content: "❌ The gas sponsor accepts SATS only.", flags: MessageFlags.Ephemeral });
+  }
+
+
   if (customMessage && customMessage.length > 200) {
     return interaction.reply({ content: "❌ Message must be 200 characters or fewer.", flags: MessageFlags.Ephemeral });
   }
 
-  if (target.id === interaction.user.id) {
+  if (target?.id === interaction.user.id) {
     return interaction.reply({ content: "❌ You can't tip yourself.", flags: MessageFlags.Ephemeral });
   }
 
-  if (target.bot) {
+  if (target?.bot) {
     return interaction.reply({ content: "❌ You can't tip bots.", flags: MessageFlags.Ephemeral });
   }
 
@@ -51,6 +65,38 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   }
 
   await interaction.deferReply();
+
+  if (sponsor) {
+    const result = await withdraw(getSweepGasSponsorAddress(), amount, "SATS");
+    if (result.error || !result.confirmed) {
+      await addBalance(interaction.user.id, amount, "SATS");
+      return interaction.editReply({ content: `❌ Sponsor tip failed and was refunded: ${result.error ?? "transaction was not confirmed"}` });
+    }
+    recordLedgerEntry(interaction.client, {
+      type: "tip",
+      amountSats: amount,
+      token: "SATS",
+      senderId: interaction.user.id,
+      receiverId: "platform",
+      guildId: interaction.guildId,
+      referenceType: "gas_sponsor_tip",
+      referenceId: result.txHash ?? null,
+      metadata: { destination: "sweep_gas_sponsor", sent_sats: result.sentSats, gas_sats: result.gasSats },
+    });
+    return interaction.editReply({
+      embeds: [new EmbedBuilder()
+        .setColor(0x00cc6a)
+        .setTitle("⛽ Gas Sponsor Funded")
+        .addFields(
+          { name: "Contributed", value: `**${formatSats(amount)}**`, inline: true },
+          { name: "Received", value: `**${formatSats(result.sentSats ?? 0)}**`, inline: true },
+          { name: "Network gas", value: `~${formatSats(result.gasSats ?? 0)}`, inline: true },
+        )
+        .setTimestamp()],
+    });
+  }
+
+  if (!target) throw new Error("Tip destination was not resolved");
 
   await addBalance(target.id, amount, token);
   await registerDepositAddress(target.id);

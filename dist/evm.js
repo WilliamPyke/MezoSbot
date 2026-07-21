@@ -111,9 +111,10 @@ function initEVM() {
         batchMaxCount: 1,
     });
     wallet = new ethers_1.ethers.Wallet(config_js_1.config.evm.treasuryPrivateKey, provider);
-    sweepGasSponsorWallet = new ethers_1.ethers.Wallet(config_js_1.config.evm.sweepGasSponsorPrivateKey || config_js_1.config.evm.treasuryPrivateKey, provider);
-    if (!config_js_1.config.depositAdminOnly && !config_js_1.config.evm.sweepGasSponsorPrivateKey) {
-        console.warn("[Deposits] Public deposits are enabled without SWEEP_GAS_SPONSOR_PRIVATE_KEY; sweeps will use treasury excess only");
+    const derivedSweepSponsorKey = ethers_1.ethers.keccak256(ethers_1.ethers.toUtf8Bytes(`mezosbot-sweep-gas-sponsor-v1:${config_js_1.config.evm.treasuryPrivateKey}`));
+    sweepGasSponsorWallet = new ethers_1.ethers.Wallet(config_js_1.config.evm.sweepGasSponsorPrivateKey || derivedSweepSponsorKey, provider);
+    if (!config_js_1.config.evm.sweepGasSponsorPrivateKey) {
+        console.log(`[Deposits] Using derived sweep gas sponsor ${sweepGasSponsorWallet.address}`);
     }
     provider.on("error", () => { });
     return { provider, wallet };
@@ -383,8 +384,9 @@ async function getTokenBalance(address, token) {
     if (token === "SATS")
         return getNativeBalance(address);
     const cfg = (0, tokens_js_1.assertTokenConfigured)(token);
-    const contract = new ethers_1.ethers.Contract(cfg.contractAddress, ERC20_ABI, provider);
-    return BigInt(await contract.balanceOf(address));
+    const data = ERC20_INTERFACE.encodeFunctionData("balanceOf", [address]);
+    const raw = await rawRpcCall("eth_call", [{ to: cfg.contractAddress, data }, "latest"]);
+    return BigInt(raw ?? "0x0");
 }
 async function getDepositNativeBalance(address) {
     const raw = await rawRpcCall("eth_getBalance", [address, "latest"], { rateLimited: true });
@@ -410,13 +412,18 @@ async function sweepErc20ToTreasury(discordId, token, creditedUnits, allowGasSpo
 async function sweepErc20ToTreasuryUnlocked(discordId, token, creditedUnits, allowGasSponsorship = true) {
     const cfg = (0, tokens_js_1.assertTokenConfigured)(token);
     const userWallet = getUserDepositWallet(discordId);
-    const contract = new ethers_1.ethers.Contract(cfg.contractAddress, ERC20_ABI, userWallet);
-    const liveBalance = BigInt(await contract.balanceOf(userWallet.address));
+    const liveBalance = await getTokenBalance(userWallet.address, token);
     const tokenBalance = creditedUnits == null ? liveBalance : (liveBalance < creditedUnits ? liveBalance : creditedUnits);
     if (tokenBalance <= 0n)
         return null;
     const gasPrice = await getGasPrice();
-    const estimated = BigInt(await contract.transfer.estimateGas(wallet.address, tokenBalance));
+    const transferData = ERC20_INTERFACE.encodeFunctionData("transfer", [wallet.address, tokenBalance]);
+    const estimatedRaw = await rawRpcCall("eth_estimateGas", [{
+            from: userWallet.address,
+            to: cfg.contractAddress,
+            data: transferData,
+        }]);
+    const estimated = BigInt(estimatedRaw);
     const gasLimit = addGasLimitBuffer(estimated);
     const requiredGas = gasLimit * gasPrice;
     const nativeBalance = await getNativeBalance(userWallet.address);
@@ -425,15 +432,25 @@ async function sweepErc20ToTreasuryUnlocked(discordId, token, creditedUnits, all
             throw new Error(`${token} deposit wallet does not have enough gas`);
         const funding = requiredGas - nativeBalance;
         const sponsorBalance = await getNativeBalance(sweepGasSponsorWallet.address);
-        const minimumReserve = (0, config_js_1.satsToTokenUnits)(config_js_1.config.evm.protocolGasReserveMinSats);
+        const sponsorIsTreasury = sweepGasSponsorWallet.address.toLowerCase() === wallet.address.toLowerCase();
+        // A dedicated hot wallet contains no user backing, so every sat deposited
+        // into it is explicitly available for sweep gas. The configured reserve is
+        // only meaningful when sponsorship falls back to the treasury.
+        const minimumReserve = sponsorIsTreasury
+            ? (0, config_js_1.satsToTokenUnits)(config_js_1.config.evm.protocolGasReserveMinSats)
+            : 0n;
         let protectedBacking = 0n;
-        if (sweepGasSponsorWallet.address === wallet.address) {
+        if (sponsorIsTreasury) {
             const liabilities = await getProtocolOperationalSnapshot();
             protectedBacking = (0, config_js_1.satsToTokenUnits)(liabilities.userSatsLiability + liabilities.poolSatsLiability);
         }
         const sponsorTxGas = NATIVE_TRANSFER_GAS_LIMIT * gasPrice;
         if (!(0, depositPolicy_js_1.preservesGasReserve)(sponsorBalance, funding + sponsorTxGas, protectedBacking, minimumReserve)) {
-            lastSweepGasError = "Sweep gas sponsor is below its protected reserve";
+            const availableSats = (0, config_js_1.tokenUnitsToSats)(sponsorBalance);
+            const requiredSats = (0, config_js_1.tokenUnitsToSats)(funding + sponsorTxGas + protectedBacking + minimumReserve);
+            lastSweepGasError = sponsorIsTreasury
+                ? `Treasury sponsorship would breach protected SATS backing (available ${availableSats}, required ${requiredSats} sats); configure and fund SWEEP_GAS_SPONSOR_PRIVATE_KEY`
+                : `Dedicated sweep sponsor needs at least ${requiredSats} sats but has ${availableSats}`;
             throw new Error(lastSweepGasError);
         }
         const operationId = (0, node_crypto_1.randomUUID)();
@@ -472,15 +489,34 @@ async function sweepErc20ToTreasuryUnlocked(discordId, token, creditedUnits, all
             throw error;
         }
     }
-    const tx = await contract.transfer(wallet.address, tokenBalance, { gasLimit, gasPrice });
+    const nonceRaw = await rawRpcCall("eth_getTransactionCount", [userWallet.address, "pending"]);
+    const signed = await userWallet.signTransaction({
+        to: cfg.contractAddress,
+        data: transferData,
+        gasLimit,
+        gasPrice,
+        nonce: Number(BigInt(nonceRaw ?? "0x0")),
+        chainId: config_js_1.config.evm.chainId,
+        type: 0,
+    });
+    const expectedHash = ethers_1.ethers.keccak256(signed);
+    let txHash = expectedHash;
+    try {
+        txHash = await rawRpcCall("eth_sendRawTransaction", [signed]) ?? expectedHash;
+    }
+    catch (error) {
+        const message = String(error?.message ?? error).toLowerCase();
+        if (!message.includes("already known") && !message.includes("known transaction"))
+            throw error;
+    }
     for (let i = 0; i < 40; i++) {
         await new Promise((resolve) => setTimeout(resolve, 3000));
-        const receipt = await rawRpcCall("eth_getTransactionReceipt", [tx.hash]);
+        const receipt = await rawRpcCall("eth_getTransactionReceipt", [txHash]);
         if (!receipt)
             continue;
         if (parseInt(receipt.status, 16) !== 1)
             throw new Error(`${token} sweep reverted`);
-        return tx.hash;
+        return txHash;
     }
     throw new Error(`${token} sweep confirmation timed out`);
 }

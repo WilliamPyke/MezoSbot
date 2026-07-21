@@ -13,24 +13,34 @@ const tokens_js_1 = require("../tokens.js");
 exports.data = {
     name: "deposit",
     description: "Get your personal token deposit address",
-    options: [{ name: "token", type: 3, description: "Token to deposit", required: false, choices: tokens_js_1.TOKEN_CHOICES }],
+    options: [
+        { name: "token", type: 3, description: "Token to deposit", required: false, choices: tokens_js_1.TOKEN_CHOICES },
+        { name: "sponsor", type: 5, description: "Admin: fund the ERC-20 sweep gas wallet", required: false },
+    ],
 };
 async function execute(interaction) {
     if (config_js_1.config.depositAdminOnly && !config_js_1.config.discord.adminIds.includes(interaction.user.id)) {
         return interaction.reply({ content: "❌ Deposits are currently disabled.", flags: discord_js_1.MessageFlags.Ephemeral });
     }
     await interaction.deferReply({ flags: discord_js_1.MessageFlags.Ephemeral });
+    const sponsor = interaction.options.getBoolean("sponsor") ?? false;
+    const isAdmin = config_js_1.config.discord.adminIds.includes(interaction.user.id);
+    if (sponsor && !isAdmin) {
+        return interaction.editReply({ content: "❌ Gas sponsor deposits are admin only." });
+    }
     const token = (0, tokens_js_1.parseToken)(interaction.options.getString("token"));
+    if (sponsor && token !== "SATS") {
+        return interaction.editReply({ content: "❌ The gas sponsor accepts native BTC/SATS only." });
+    }
     try {
         (0, tokens_js_1.assertTokenConfigured)(token);
     }
     catch (error) {
         return interaction.editReply({ content: `❌ ${error.message}` });
     }
-    const address = await (0, evm_js_1.registerDepositAddress)(interaction.user.id);
+    const address = sponsor ? (0, evm_js_1.getSweepGasSponsorAddress)() : await (0, evm_js_1.registerDepositAddress)(interaction.user.id);
     const explorer = config_js_1.config.evm.explorerUrl;
     const depositAsset = token === "SATS" ? "native BTC (credited as SATS)" : (0, tokens_js_1.tokenLabel)(token);
-    const isAdmin = config_js_1.config.discord.adminIds.includes(interaction.user.id);
     const minimum = token === "SATS" || isAdmin ? null : config_js_1.config.deposits.minimums[token];
     const qrBuffer = await qrcode_1.default.toBuffer(address, {
         width: 256,
@@ -42,9 +52,12 @@ async function execute(interaction) {
         .setColor(0x5865f2)
         .setTitle(`📍 Your ${(0, tokens_js_1.tokenLabel)(token)} Deposit Address`)
         .setDescription(`\`${address}\``)
-        .addFields({ name: "How It Works", value: `Send **${depositAsset}** on Mezo to this address. Your balance is credited automatically after polling.` }, ...(minimum ? [{ name: "Minimum deposit", value: `Deposits accumulate until at least **${minimum} ${(0, tokens_js_1.tokenLabel)(token)}** is present.` }] : []), ...(token !== "SATS" ? [{ name: "Sweep timing", value: `ERC-20 funds are swept after roughly **${Math.ceil(config_js_1.config.deposits.erc20SweepDelayMs / 60000)} minutes**, allowing nearby deposits to be combined.` }] : []), { name: "Important", value: "Only send the selected token on the configured Mezo network." }, { name: "Explorer", value: `[View on Explorer](${explorer}/address/${address})` })
+        .setTitle(sponsor ? "⛽ Sweep Gas Sponsor Address" : `📍 Your ${(0, tokens_js_1.tokenLabel)(token)} Deposit Address`)
+        .addFields({ name: "How It Works", value: sponsor
+            ? "Send **native BTC** on Mezo to this dedicated operational wallet. It pays ERC-20 sweep gas and is not credited to a user balance."
+            : `Send **${depositAsset}** on Mezo to this address. Your balance is credited automatically after polling.` }, ...(minimum ? [{ name: "Minimum deposit", value: `Deposits accumulate until at least **${minimum} ${(0, tokens_js_1.tokenLabel)(token)}** is present.` }] : []), ...(token !== "SATS" ? [{ name: "Sweep timing", value: `ERC-20 funds are swept after roughly **${Math.ceil(config_js_1.config.deposits.erc20SweepDelayMs / 60000)} minutes**, allowing nearby deposits to be combined.` }] : []), { name: "Important", value: "Only send the selected token on the configured Mezo network." }, { name: "Explorer", value: `[View on Explorer](${explorer}/address/${address})` })
         .setThumbnail("attachment://deposit-qr.png")
-        .setFooter({ text: "This address is unique to you" })
+        .setFooter({ text: sponsor ? "Dedicated protocol gas wallet" : "This address is unique to you" })
         .setTimestamp();
     const webButton = new discord_js_1.ButtonBuilder()
         .setLabel("Deposit via Wallet")
@@ -55,6 +68,6 @@ async function execute(interaction) {
     await interaction.editReply({
         embeds: [embed],
         files: [attachment],
-        components: [row],
+        components: sponsor ? [] : [row],
     });
 }

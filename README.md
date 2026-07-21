@@ -50,7 +50,7 @@ cp .env.example .env
 | `DEPOSIT_POLL_MS` | Deposit wallet chain polling interval (default `60000`) |
 | `DEPOSIT_ADDRESS_REFRESH_MS` | Supabase address/checkpoint cache refresh interval (default `900000`) |
 | `DEPOSIT_RPC_REQUESTS_PER_SECOND` | Maximum deposit balance reads per second across all poll workers (default `8`, below Mezo's public RPC limit) |
-| `SWEEP_GAS_SPONSOR_PRIVATE_KEY` | Dedicated hot key that funds ERC-20 deposit-wallet sweep gas; recommended before public deposits |
+| `SWEEP_GAS_SPONSOR_PRIVATE_KEY` | Optional dedicated hot key for ERC-20 sweep gas; otherwise a separate wallet is deterministically derived from the treasury key |
 | `PROTOCOL_GAS_RESERVE_MIN_SATS` | Protected operational SATS reserve; ERC-20 operations stop before crossing it (default `1000`) |
 | `ERC20_SWEEP_DELAY_MS` | Delay before sweeping an ERC-20 deposit so nearby deposits can be combined (default `300000`) |
 | `MUSD_MIN_DEPOSIT` | Public-user MUSD minimum; smaller deposits accumulate uncredited until the threshold (default `0.10`) |

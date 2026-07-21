@@ -149,7 +149,9 @@ async function renderImgnaiMenu(guildId: string, page: "current" | "legacy", sta
   if (health.lastError) embed.addFields({ name: "Catalog warning", value: health.lastError.slice(0, 1024) });
   const warnings = [
     satsExcess != null && satsExcess < operations.gasReserveMinimumSats ? "Treasury SATS excess is below the protected gas reserve." : null,
-    operations.gasSponsorSats != null && operations.gasSponsorSats < operations.gasReserveMinimumSats ? "Sweep gas sponsor is below its minimum reserve." : null,
+    operations.gasSponsorIsTreasury && operations.gasSponsorSats != null && operations.gasSponsorSats < operations.gasReserveMinimumSats
+      ? "Treasury sweep sponsorship is below its protected reserve."
+      : null,
     musdAssets != null && musdObligations != null && musdAssets < musdObligations ? "MUSD assets are below user and pending-job obligations." : null,
     operations.sweepErrors ? `${operations.sweepErrors} ERC-20 sweep checkpoint(s) have errors.` : null,
     operations.lastSweepGasError,

@@ -101,12 +101,15 @@ export function initEVM() {
     batchMaxCount: 1,
   });
   wallet = new ethers.Wallet(config.evm.treasuryPrivateKey, provider);
+  const derivedSweepSponsorKey = ethers.keccak256(ethers.toUtf8Bytes(
+    `mezosbot-sweep-gas-sponsor-v1:${config.evm.treasuryPrivateKey}`,
+  ));
   sweepGasSponsorWallet = new ethers.Wallet(
-    config.evm.sweepGasSponsorPrivateKey || config.evm.treasuryPrivateKey,
+    config.evm.sweepGasSponsorPrivateKey || derivedSweepSponsorKey,
     provider,
   );
-  if (!config.depositAdminOnly && !config.evm.sweepGasSponsorPrivateKey) {
-    console.warn("[Deposits] Public deposits are enabled without SWEEP_GAS_SPONSOR_PRIVATE_KEY; sweeps will use treasury excess only");
+  if (!config.evm.sweepGasSponsorPrivateKey) {
+    console.log(`[Deposits] Using derived sweep gas sponsor ${sweepGasSponsorWallet.address}`);
   }
 
   provider.on("error", () => {});
@@ -442,8 +445,9 @@ export async function getNativeBalance(address: string): Promise<bigint> {
 export async function getTokenBalance(address: string, token: TokenSymbol): Promise<bigint> {
   if (token === "SATS") return getNativeBalance(address);
   const cfg = assertTokenConfigured(token);
-  const contract = new ethers.Contract(cfg.contractAddress!, ERC20_ABI, provider);
-  return BigInt(await contract.balanceOf(address));
+  const data = ERC20_INTERFACE.encodeFunctionData("balanceOf", [address]);
+  const raw = await rawRpcCall("eth_call", [{ to: cfg.contractAddress, data }, "latest"]) as string;
+  return BigInt(raw ?? "0x0");
 }
 
 async function getDepositNativeBalance(address: string): Promise<bigint> {
@@ -493,13 +497,18 @@ async function sweepErc20ToTreasuryUnlocked(
 ): Promise<string | null> {
   const cfg = assertTokenConfigured(token);
   const userWallet = getUserDepositWallet(discordId);
-  const contract = new ethers.Contract(cfg.contractAddress!, ERC20_ABI, userWallet);
-  const liveBalance = BigInt(await contract.balanceOf(userWallet.address));
+  const liveBalance = await getTokenBalance(userWallet.address, token);
   const tokenBalance = creditedUnits == null ? liveBalance : (liveBalance < creditedUnits ? liveBalance : creditedUnits);
   if (tokenBalance <= 0n) return null;
 
   const gasPrice = await getGasPrice();
-  const estimated = BigInt(await contract.transfer.estimateGas(wallet.address, tokenBalance));
+  const transferData = ERC20_INTERFACE.encodeFunctionData("transfer", [wallet.address, tokenBalance]);
+  const estimatedRaw = await rawRpcCall("eth_estimateGas", [{
+    from: userWallet.address,
+    to: cfg.contractAddress,
+    data: transferData,
+  }]) as string;
+  const estimated = BigInt(estimatedRaw);
   const gasLimit = addGasLimitBuffer(estimated);
   const requiredGas = gasLimit * gasPrice;
   const nativeBalance = await getNativeBalance(userWallet.address);
@@ -507,15 +516,25 @@ async function sweepErc20ToTreasuryUnlocked(
     if (!allowGasSponsorship) throw new Error(`${token} deposit wallet does not have enough gas`);
     const funding = requiredGas - nativeBalance;
     const sponsorBalance = await getNativeBalance(sweepGasSponsorWallet.address);
-    const minimumReserve = satsToTokenUnits(config.evm.protocolGasReserveMinSats);
+    const sponsorIsTreasury = sweepGasSponsorWallet.address.toLowerCase() === wallet.address.toLowerCase();
+    // A dedicated hot wallet contains no user backing, so every sat deposited
+    // into it is explicitly available for sweep gas. The configured reserve is
+    // only meaningful when sponsorship falls back to the treasury.
+    const minimumReserve = sponsorIsTreasury
+      ? satsToTokenUnits(config.evm.protocolGasReserveMinSats)
+      : 0n;
     let protectedBacking = 0n;
-    if (sweepGasSponsorWallet.address === wallet.address) {
+    if (sponsorIsTreasury) {
       const liabilities = await getProtocolOperationalSnapshot();
       protectedBacking = satsToTokenUnits(liabilities.userSatsLiability + liabilities.poolSatsLiability);
     }
     const sponsorTxGas = NATIVE_TRANSFER_GAS_LIMIT * gasPrice;
     if (!preservesGasReserve(sponsorBalance, funding + sponsorTxGas, protectedBacking, minimumReserve)) {
-      lastSweepGasError = "Sweep gas sponsor is below its protected reserve";
+      const availableSats = tokenUnitsToSats(sponsorBalance);
+      const requiredSats = tokenUnitsToSats(funding + sponsorTxGas + protectedBacking + minimumReserve);
+      lastSweepGasError = sponsorIsTreasury
+        ? `Treasury sponsorship would breach protected SATS backing (available ${availableSats}, required ${requiredSats} sats); configure and fund SWEEP_GAS_SPONSOR_PRIVATE_KEY`
+        : `Dedicated sweep sponsor needs at least ${requiredSats} sats but has ${availableSats}`;
       throw new Error(lastSweepGasError);
     }
 
@@ -552,13 +571,30 @@ async function sweepErc20ToTreasuryUnlocked(
       throw error;
     }
   }
-  const tx = await contract.transfer(wallet.address, tokenBalance, { gasLimit, gasPrice });
+  const nonceRaw = await rawRpcCall("eth_getTransactionCount", [userWallet.address, "pending"]) as string;
+  const signed = await userWallet.signTransaction({
+    to: cfg.contractAddress!,
+    data: transferData,
+    gasLimit,
+    gasPrice,
+    nonce: Number(BigInt(nonceRaw ?? "0x0")),
+    chainId: config.evm.chainId,
+    type: 0,
+  });
+  const expectedHash = ethers.keccak256(signed);
+  let txHash = expectedHash;
+  try {
+    txHash = (await rawRpcCall("eth_sendRawTransaction", [signed]) as string | null) ?? expectedHash;
+  } catch (error) {
+    const message = String((error as Error)?.message ?? error).toLowerCase();
+    if (!message.includes("already known") && !message.includes("known transaction")) throw error;
+  }
   for (let i = 0; i < 40; i++) {
     await new Promise((resolve) => setTimeout(resolve, 3000));
-    const receipt = await rawRpcCall("eth_getTransactionReceipt", [tx.hash]) as { status: string } | null;
+    const receipt = await rawRpcCall("eth_getTransactionReceipt", [txHash]) as { status: string } | null;
     if (!receipt) continue;
     if (parseInt(receipt.status, 16) !== 1) throw new Error(`${token} sweep reverted`);
-    return tx.hash as string;
+    return txHash;
   }
   throw new Error(`${token} sweep confirmation timed out`);
 }
