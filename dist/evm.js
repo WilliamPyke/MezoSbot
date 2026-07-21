@@ -9,6 +9,7 @@ exports.getUserDepositAddress = getUserDepositAddress;
 exports.registerDepositAddress = registerDepositAddress;
 exports.getNativeBalance = getNativeBalance;
 exports.getTokenBalance = getTokenBalance;
+exports.sweepDepositTokenToTreasury = sweepDepositTokenToTreasury;
 exports.getProtocolOperationalSnapshot = getProtocolOperationalSnapshot;
 exports.getSweepGasSponsorBalanceSats = getSweepGasSponsorBalanceSats;
 exports.getLastSweepGasError = getLastSweepGasError;
@@ -137,6 +138,7 @@ let depositAddressCacheLoadedAt = 0;
 let depositAddressCacheRefresh = null;
 const depositTokenBalanceCache = new Map();
 const depositTokenSweepAfterCache = new Map();
+const erc20SweepPromises = new Map();
 let depositTokenCacheLoadedAt = 0;
 let depositTokenCacheRefresh = null;
 const depositWarningLastLoggedAt = new Map();
@@ -394,7 +396,18 @@ async function getDepositTokenBalance(address, token) {
     const raw = await rawRpcCall("eth_call", [{ to: cfg.contractAddress, data }, "latest"], { rateLimited: true });
     return BigInt(raw ?? "0x0");
 }
-async function sweepErc20ToTreasury(discordId, token, creditedUnits) {
+async function sweepErc20ToTreasury(discordId, token, creditedUnits, allowGasSponsorship = true) {
+    const key = `${discordId}:${token}`;
+    const pending = erc20SweepPromises.get(key);
+    if (pending)
+        return pending;
+    const sweep = sweepErc20ToTreasuryUnlocked(discordId, token, creditedUnits, allowGasSponsorship).finally(() => {
+        erc20SweepPromises.delete(key);
+    });
+    erc20SweepPromises.set(key, sweep);
+    return sweep;
+}
+async function sweepErc20ToTreasuryUnlocked(discordId, token, creditedUnits, allowGasSponsorship = true) {
     const cfg = (0, tokens_js_1.assertTokenConfigured)(token);
     const userWallet = getUserDepositWallet(discordId);
     const contract = new ethers_1.ethers.Contract(cfg.contractAddress, ERC20_ABI, userWallet);
@@ -408,6 +421,8 @@ async function sweepErc20ToTreasury(discordId, token, creditedUnits) {
     const requiredGas = gasLimit * gasPrice;
     const nativeBalance = await getNativeBalance(userWallet.address);
     if (nativeBalance < requiredGas) {
+        if (!allowGasSponsorship)
+            throw new Error(`${token} deposit wallet does not have enough gas`);
         const funding = requiredGas - nativeBalance;
         const sponsorBalance = await getNativeBalance(sweepGasSponsorWallet.address);
         const minimumReserve = (0, config_js_1.satsToTokenUnits)(config_js_1.config.evm.protocolGasReserveMinSats);
@@ -468,6 +483,34 @@ async function sweepErc20ToTreasury(discordId, token, creditedUnits) {
         return tx.hash;
     }
     throw new Error(`${token} sweep confirmation timed out`);
+}
+/** Immediately sweep an ERC-20 deposit wallet with sponsored gas.
+ * This moves on-chain assets only and never debits a user's credited balance. */
+async function sweepDepositTokenToTreasury(discordId, token, allowGasSponsorship = true) {
+    const userWallet = getUserDepositWallet(discordId);
+    const amountAtomic = await getTokenBalance(userWallet.address, token);
+    if (amountAtomic <= 0n)
+        return { txHash: null, amountAtomic: 0n };
+    const txHash = await sweepErc20ToTreasury(discordId, token, amountAtomic, allowGasSponsorship);
+    if (!txHash)
+        return { txHash: null, amountAtomic: 0n };
+    const key = `${discordId}:${token}`;
+    const now = new Date().toISOString();
+    const { error } = await db_js_1.supabase.from("deposit_token_balances").upsert({
+        discord_id: discordId,
+        token,
+        last_checked_balance: "0",
+        sweep_after: null,
+        last_sweep_at: now,
+        last_sweep_error: null,
+        updated_at: now,
+    }, { onConflict: "discord_id,token" });
+    depositTokenBalanceCache.set(key, 0n);
+    depositTokenSweepAfterCache.set(key, null);
+    if (error) {
+        throw new Error(`${token} swept in ${txHash}, but checkpoint reset failed: ${error.message}`);
+    }
+    return { txHash, amountAtomic };
 }
 async function sendRawNativeTransfer(signer, to, value, gasLimit, gasPrice) {
     const nonceRaw = await rawRpcCall("eth_getTransactionCount", [signer.address, "pending"]);

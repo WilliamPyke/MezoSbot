@@ -144,6 +144,7 @@ let depositAddressCacheLoadedAt = 0;
 let depositAddressCacheRefresh: Promise<void> | null = null;
 const depositTokenBalanceCache = new Map<string, bigint>();
 const depositTokenSweepAfterCache = new Map<string, number | null>();
+const erc20SweepPromises = new Map<string, Promise<string | null>>();
 let depositTokenCacheLoadedAt = 0;
 let depositTokenCacheRefresh: Promise<void> | null = null;
 const depositWarningLastLoggedAt = new Map<string, number>();
@@ -472,6 +473,23 @@ async function sweepErc20ToTreasury(
   discordId: string,
   token: Exclude<TokenSymbol, "SATS">,
   creditedUnits?: bigint,
+  allowGasSponsorship = true,
+): Promise<string | null> {
+  const key = `${discordId}:${token}`;
+  const pending = erc20SweepPromises.get(key);
+  if (pending) return pending;
+  const sweep = sweepErc20ToTreasuryUnlocked(discordId, token, creditedUnits, allowGasSponsorship).finally(() => {
+    erc20SweepPromises.delete(key);
+  });
+  erc20SweepPromises.set(key, sweep);
+  return sweep;
+}
+
+async function sweepErc20ToTreasuryUnlocked(
+  discordId: string,
+  token: Exclude<TokenSymbol, "SATS">,
+  creditedUnits?: bigint,
+  allowGasSponsorship = true,
 ): Promise<string | null> {
   const cfg = assertTokenConfigured(token);
   const userWallet = getUserDepositWallet(discordId);
@@ -486,6 +504,7 @@ async function sweepErc20ToTreasury(
   const requiredGas = gasLimit * gasPrice;
   const nativeBalance = await getNativeBalance(userWallet.address);
   if (nativeBalance < requiredGas) {
+    if (!allowGasSponsorship) throw new Error(`${token} deposit wallet does not have enough gas`);
     const funding = requiredGas - nativeBalance;
     const sponsorBalance = await getNativeBalance(sweepGasSponsorWallet.address);
     const minimumReserve = satsToTokenUnits(config.evm.protocolGasReserveMinSats);
@@ -542,6 +561,40 @@ async function sweepErc20ToTreasury(
     return tx.hash as string;
   }
   throw new Error(`${token} sweep confirmation timed out`);
+}
+
+/** Immediately sweep an ERC-20 deposit wallet with sponsored gas.
+ * This moves on-chain assets only and never debits a user's credited balance. */
+export async function sweepDepositTokenToTreasury(
+  discordId: string,
+  token: Exclude<TokenSymbol, "SATS">,
+  allowGasSponsorship = true,
+): Promise<{ txHash: string | null; amountAtomic: bigint }> {
+  const userWallet = getUserDepositWallet(discordId);
+  const amountAtomic = await getTokenBalance(userWallet.address, token);
+  if (amountAtomic <= 0n) return { txHash: null, amountAtomic: 0n };
+
+  const txHash = await sweepErc20ToTreasury(discordId, token, amountAtomic, allowGasSponsorship);
+  if (!txHash) return { txHash: null, amountAtomic: 0n };
+
+  const key = `${discordId}:${token}`;
+  const now = new Date().toISOString();
+  const { error } = await supabase.from("deposit_token_balances").upsert({
+    discord_id: discordId,
+    token,
+    last_checked_balance: "0",
+    sweep_after: null,
+    last_sweep_at: now,
+    last_sweep_error: null,
+    updated_at: now,
+  }, { onConflict: "discord_id,token" });
+
+  depositTokenBalanceCache.set(key, 0n);
+  depositTokenSweepAfterCache.set(key, null);
+  if (error) {
+    throw new Error(`${token} swept in ${txHash}, but checkpoint reset failed: ${error.message}`);
+  }
+  return { txHash, amountAtomic };
 }
 
 async function sendRawNativeTransfer(
