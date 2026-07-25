@@ -96,6 +96,23 @@ export async function subtractBalance(discordId: string, amountSats: number, tok
   return data === true;
 }
 
+export async function reserveWithdrawalBalances(
+  discordId: string,
+  amount: number,
+  token: Exclude<TokenSymbol, "SATS">,
+  gasSats: number,
+): Promise<"ok" | "insufficient_token" | "insufficient_sats"> {
+  const { data, error } = await supabase.rpc("reserve_token_withdrawal", {
+    p_discord_id: discordId,
+    p_token: token,
+    p_token_amount: roundTokenAmount(amount, token),
+    p_gas_sats: roundSats(gasSats),
+  });
+  if (error) throw error;
+  if (data === "ok" || data === "insufficient_token" || data === "insufficient_sats") return data;
+  throw new Error(`Unexpected withdrawal reservation result: ${String(data)}`);
+}
+
 export async function subtractBalances(
   debits: Array<{ discordId: string; amountSats: number }>,
 ): Promise<void> {

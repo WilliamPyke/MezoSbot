@@ -8,6 +8,7 @@ import {
   getPendingWalletVerification,
   getVerifiedWallets,
 } from "../walletVerification.js";
+import { canInteractionUseDeposits } from "../depositAccess.js";
 
 export const data = {
   name: "wallet",
@@ -35,9 +36,15 @@ export async function execute(interaction: ChatInputCommandInteraction) {
 }
 
 async function verify(interaction: ChatInputCommandInteraction) {
+  if (!canInteractionUseDeposits(interaction)) {
+    return interaction.reply({
+      content: "❌ Wallet verification requires the G4, G5, or G6 role.",
+      flags: MessageFlags.Ephemeral,
+    });
+  }
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
-  const depositAddress = await registerDepositAddress(interaction.user.id);
+  const depositAddress = await registerDepositAddress(interaction.user.id, { enableDeposits: true });
   const challenge = await createWalletVerificationChallenge(interaction.user.id, depositAddress);
   const expires = Math.floor(Date.parse(challenge.expires_at) / 1000);
 

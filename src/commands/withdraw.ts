@@ -1,6 +1,6 @@
 import { EmbedBuilder, MessageFlags, type ChatInputCommandInteraction } from "discord.js";
-import { withdraw } from "../evm.js";
-import { subtractBalance, addBalance, getWalletForUser } from "../balance.js";
+import { quoteErc20WithdrawalGas, withdraw, type Erc20WithdrawalGasQuote } from "../evm.js";
+import { subtractBalance, addBalance, getWalletForUser, reserveWithdrawalBalances } from "../balance.js";
 import { supabase } from "../db.js";
 import { config } from "../config.js";
 import { recordLedgerEntry } from "../ledger.js";
@@ -71,19 +71,43 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     });
   }
 
-  // 2. Deduct balance atomically
-  if (!(await subtractBalance(interaction.user.id, amount, token))) {
-    return interaction.editReply({ content: "❌ Insufficient balance." });
+  // 2. Reserve the asset and, for ERC-20s, the sats required for network gas.
+  let gasQuote: Erc20WithdrawalGasQuote | undefined;
+  if (token === "SATS") {
+    if (!(await subtractBalance(interaction.user.id, amount, token))) {
+      return interaction.editReply({ content: "❌ Insufficient balance." });
+    }
+  } else {
+    try {
+      gasQuote = await quoteErc20WithdrawalGas(address, amount, token);
+    } catch (error) {
+      return interaction.editReply({ content: `❌ Unable to estimate withdrawal gas: ${(error as Error).message}` });
+    }
+    const reserved = await reserveWithdrawalBalances(interaction.user.id, amount, token, gasQuote.gasSats);
+    if (reserved === "insufficient_token") {
+      return interaction.editReply({ content: `❌ Insufficient ${token} balance.` });
+    }
+    if (reserved === "insufficient_sats") {
+      return interaction.editReply({
+        content: `❌ Insufficient sats balance to fund the network fee (~${formatSats(gasQuote.gasSats)}).`,
+      });
+    }
   }
 
-  // 2. Insert withdrawal as PENDING
-  const { data: row } = await supabase.from("withdrawals").insert({
+  // 3. Insert withdrawal as PENDING
+  const { data: row, error: insertError } = await supabase.from("withdrawals").insert({
     discord_id: interaction.user.id,
     amount_sats: amount,
     to_address: address.toLowerCase(),
     status: "pending",
     token,
   }).select("id").single();
+
+  if (insertError) {
+    await addBalance(interaction.user.id, amount, token);
+    if (gasQuote) await addBalance(interaction.user.id, gasQuote.gasSats, "SATS");
+    return interaction.editReply({ content: "❌ Could not create the withdrawal. Your balance was refunded." });
+  }
 
   const withdrawalId = row?.id;
 
@@ -97,13 +121,27 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     referenceType: "withdrawals",
     referenceId: withdrawalId != null ? String(withdrawalId) : null,
   });
+  if (gasQuote) {
+    recordLedgerEntry(interaction.client, {
+      type: "withdrawal_network_fee",
+      amountSats: gasQuote.gasSats,
+      token: "SATS",
+      senderId: interaction.user.id,
+      receiverId: "treasury",
+      guildId: interaction.guildId,
+      referenceType: "withdrawals",
+      referenceId: withdrawalId != null ? String(withdrawalId) : null,
+      metadata: { withdrawal_token: token },
+    });
+  }
 
-  // 3. Send the transaction and wait for receipt
-  const result = await withdraw(address, amount, token);
+  // 4. Send the transaction and wait for receipt
+  const result = await withdraw(address, amount, token, gasQuote);
 
-  // 4. Handle failure — refund balance + mark failed
+  // 5. Handle failure — refund both the asset and reserved gas
   if (result.error && !result.confirmed) {
     await addBalance(interaction.user.id, amount, token);
+    if (gasQuote) await addBalance(interaction.user.id, gasQuote.gasSats, "SATS");
 
     recordLedgerEntry(interaction.client, {
       type: "withdrawal_refund",
@@ -114,8 +152,20 @@ export async function execute(interaction: ChatInputCommandInteraction) {
       guildId: interaction.guildId,
       referenceType: "withdrawals",
       referenceId: withdrawalId != null ? String(withdrawalId) : null,
-      metadata: { reason: "withdrawal_failed" },
+      metadata: { reason: "withdrawal_failed", refunded_gas_sats: gasQuote?.gasSats ?? 0 },
     });
+    if (gasQuote) {
+      recordLedgerEntry(interaction.client, {
+        type: "withdrawal_network_fee_refund",
+        amountSats: gasQuote.gasSats,
+        token: "SATS",
+        senderId: "treasury",
+        receiverId: interaction.user.id,
+        guildId: interaction.guildId,
+        referenceType: "withdrawals",
+        referenceId: withdrawalId != null ? String(withdrawalId) : null,
+      });
+    }
 
     if (withdrawalId) {
       await supabase.from("withdrawals").update({
@@ -134,7 +184,27 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     }
   }
 
-  // 5. Transaction confirmed on-chain — mark completed
+  // The quote reserves the gas-limit maximum; return any unused portion after
+  // the receipt reports the actual gas consumed.
+  if (gasQuote && result.confirmed && result.gasSats != null) {
+    const unusedGasSats = Math.max(0, gasQuote.gasSats - result.gasSats);
+    if (unusedGasSats > 0) {
+      await addBalance(interaction.user.id, unusedGasSats, "SATS");
+      recordLedgerEntry(interaction.client, {
+        type: "withdrawal_network_fee_refund",
+        amountSats: unusedGasSats,
+        token: "SATS",
+        senderId: "treasury",
+        receiverId: interaction.user.id,
+        guildId: interaction.guildId,
+        referenceType: "withdrawals",
+        referenceId: withdrawalId != null ? String(withdrawalId) : null,
+        metadata: { reason: "unused_gas_reservation" },
+      });
+    }
+  }
+
+  // 6. Transaction confirmed on-chain — mark completed
   if (withdrawalId) {
     await supabase.from("withdrawals").update({
       status: "completed",
@@ -153,10 +223,10 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     );
 
   if (result.gasSats) {
-    embed.addFields(
-      { name: "Network Fee", value: `~${formatSats(result.gasSats)}`, inline: true },
-      { name: "Received", value: `~${formatSats(result.sentSats!)}`, inline: true },
-    );
+    embed.addFields({ name: "Network Fee", value: `~${formatSats(result.gasSats)}`, inline: true });
+    if (token === "SATS") {
+      embed.addFields({ name: "Received", value: `~${formatSats(result.sentSats!)}`, inline: true });
+    }
   }
 
   if (result.txHash) {

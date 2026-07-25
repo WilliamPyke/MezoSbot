@@ -16,6 +16,7 @@ exports.getLastSweepGasError = getLastSweepGasError;
 exports.sweepToTreasury = sweepToTreasury;
 exports.fundGasAndSweep = fundGasAndSweep;
 exports.startDepositPoller = startDepositPoller;
+exports.quoteErc20WithdrawalGas = quoteErc20WithdrawalGas;
 exports.withdraw = withdraw;
 exports.recoverPendingWithdrawals = recoverPendingWithdrawals;
 exports.getTreasuryBalanceSats = getTreasuryBalanceSats;
@@ -188,6 +189,10 @@ function normalizeDepositRow(row) {
         discord_id: row.discord_id,
         address: row.address.toLowerCase(),
         last_checked_balance: row.last_checked_balance ?? "0",
+        deposits_enabled: row.deposits_enabled ?? false,
+        native_sweep_tx_hash: row.native_sweep_tx_hash ?? null,
+        native_sweep_balance: row.native_sweep_balance ?? null,
+        native_sweep_started_at: row.native_sweep_started_at ?? null,
     };
 }
 async function refreshDepositAddressCache(force = false) {
@@ -200,16 +205,10 @@ async function refreshDepositAddressCache(force = false) {
     if (depositAddressCacheRefresh)
         return depositAddressCacheRefresh;
     depositAddressCacheRefresh = (async () => {
-        if (config_js_1.config.depositAdminOnly && config_js_1.config.discord.adminIds.length === 0) {
-            depositAddressCache.clear();
-            depositAddressCacheLoadedAt = Date.now();
-            return;
-        }
         let query = db_js_1.supabase
             .from("deposit_addresses")
-            .select("discord_id, address, last_checked_balance");
-        if (config_js_1.config.depositAdminOnly)
-            query = query.in("discord_id", config_js_1.config.discord.adminIds);
+            .select("discord_id, address, last_checked_balance, deposits_enabled, native_sweep_tx_hash, native_sweep_balance, native_sweep_started_at")
+            .eq("deposits_enabled", true);
         const { data, error } = await query;
         if (error) {
             console.error("Failed to refresh deposit address cache:", error.message);
@@ -236,17 +235,9 @@ async function refreshDepositTokenCache(force = false) {
     if (depositTokenCacheRefresh)
         return depositTokenCacheRefresh;
     depositTokenCacheRefresh = (async () => {
-        if (config_js_1.config.depositAdminOnly && config_js_1.config.discord.adminIds.length === 0) {
-            depositTokenBalanceCache.clear();
-            depositTokenSweepAfterCache.clear();
-            depositTokenCacheLoadedAt = Date.now();
-            return;
-        }
         let query = db_js_1.supabase
             .from("deposit_token_balances")
             .select("discord_id, token, last_checked_balance, sweep_after");
-        if (config_js_1.config.depositAdminOnly)
-            query = query.in("discord_id", config_js_1.config.discord.adminIds);
         const { data, error } = await query;
         if (error) {
             warnDepositOnce("checkpoint-refresh", `[Deposits] Failed to refresh token checkpoints: ${error.message}`);
@@ -293,20 +284,32 @@ async function updateDepositAddressBalances(updates) {
     }
 }
 /** Register a user's deposit address for polling */
-async function registerDepositAddress(discordId) {
+async function registerDepositAddress(discordId, options = {}) {
     const address = getUserDepositAddress(discordId);
     const normalizedAddress = address.toLowerCase();
     const cached = depositAddressCache.get(discordId);
-    if (cached?.address === normalizedAddress)
+    if (cached?.address === normalizedAddress && (!options.enableDeposits || cached.deposits_enabled))
         return address;
     const pending = depositRegistrationPromises.get(discordId);
-    if (pending)
-        return pending;
+    if (pending) {
+        const pendingAddress = await pending;
+        if (options.enableDeposits && !depositAddressCache.get(discordId)?.deposits_enabled) {
+            return registerDepositAddress(discordId, options);
+        }
+        return pendingAddress;
+    }
     const registration = (async () => {
+        if (options.enableDeposits) {
+            const { error: enableError } = await db_js_1.supabase
+                .from("deposit_addresses")
+                .upsert({ discord_id: discordId, address: normalizedAddress, deposits_enabled: true }, { onConflict: "discord_id" });
+            if (enableError)
+                throw enableError;
+        }
         const { data, error } = await db_js_1.supabase
             .from("deposit_addresses")
-            .upsert({ discord_id: discordId, address: normalizedAddress }, { onConflict: "discord_id", ignoreDuplicates: true })
-            .select("discord_id, address, last_checked_balance")
+            .upsert({ discord_id: discordId, address: normalizedAddress, deposits_enabled: options.enableDeposits === true }, { onConflict: "discord_id", ignoreDuplicates: true })
+            .select("discord_id, address, last_checked_balance, deposits_enabled, native_sweep_tx_hash, native_sweep_balance, native_sweep_started_at")
             .maybeSingle();
         if (error)
             throw error;
@@ -314,7 +317,7 @@ async function registerDepositAddress(discordId) {
         if (!row) {
             const { data: existing, error: existingError } = await db_js_1.supabase
                 .from("deposit_addresses")
-                .select("discord_id, address, last_checked_balance")
+                .select("discord_id, address, last_checked_balance, deposits_enabled, native_sweep_tx_hash, native_sweep_balance, native_sweep_started_at")
                 .eq("discord_id", discordId)
                 .maybeSingle();
             if (existingError)
@@ -325,6 +328,10 @@ async function registerDepositAddress(discordId) {
             discord_id: discordId,
             address: normalizedAddress,
             last_checked_balance: "0",
+            deposits_enabled: options.enableDeposits === true,
+            native_sweep_tx_hash: null,
+            native_sweep_balance: null,
+            native_sweep_started_at: null,
         }));
         return address;
     })().finally(() => {
@@ -592,37 +599,123 @@ async function getSweepGasSponsorBalanceSats() {
 function getLastSweepGasError() {
     return lastSweepGasError;
 }
+async function ensureErc20WithdrawalGas(token, gasCost, gasPrice) {
+    const liabilities = await getProtocolOperationalSnapshot();
+    const protectedBacking = (0, config_js_1.satsToTokenUnits)(liabilities.userSatsLiability + liabilities.poolSatsLiability);
+    const treasuryNative = await getNativeBalance(wallet.address);
+    const requiredTreasuryBalance = protectedBacking + gasCost;
+    const funding = (0, depositPolicy_js_1.withdrawalGasFundingShortfall)(treasuryNative, gasCost, protectedBacking);
+    if (funding === 0n)
+        return;
+    const sponsorBalance = await getNativeBalance(sweepGasSponsorWallet.address);
+    const sponsorTxGas = NATIVE_TRANSFER_GAS_LIMIT * gasPrice;
+    if (sponsorBalance < funding + sponsorTxGas) {
+        throw new Error(`Gas sponsor needs about ${(0, config_js_1.tokenUnitsToSats)(funding + sponsorTxGas)} sats ` +
+            `but has ${(0, config_js_1.tokenUnitsToSats)(sponsorBalance)} sats`);
+    }
+    const operationId = (0, node_crypto_1.randomUUID)();
+    const { error: operationError } = await db_js_1.supabase.from("protocol_gas_operations").insert({
+        id: operationId,
+        operation_type: "erc20_withdrawal_funding",
+        token,
+        sponsor_address: sweepGasSponsorWallet.address,
+        recipient_address: wallet.address,
+        amount_wei: funding.toString(),
+        status: "pending",
+    });
+    if (operationError)
+        throw operationError;
+    try {
+        const hash = await sendRawNativeTransfer(sweepGasSponsorWallet, wallet.address, funding, NATIVE_TRANSFER_GAS_LIMIT, gasPrice);
+        for (let i = 0; i < 20; i++) {
+            await new Promise((resolve) => setTimeout(resolve, 3000));
+            if (await getNativeBalance(wallet.address) >= requiredTreasuryBalance) {
+                await db_js_1.supabase.from("protocol_gas_operations").update({
+                    status: "completed", tx_hash: hash, updated_at: new Date().toISOString(),
+                }).eq("id", operationId);
+                return;
+            }
+        }
+        throw new Error(`Withdrawal gas funding ${hash} did not confirm`);
+    }
+    catch (error) {
+        await db_js_1.supabase.from("protocol_gas_operations").update({
+            status: "failed",
+            error_message: String(error.message).slice(0, 2000),
+            updated_at: new Date().toISOString(),
+        }).eq("id", operationId);
+        throw error;
+    }
+}
 /**
  * Sweep funds from a user's deposit address to the treasury.
  * Gas price is pinned on the tx, so cost = exactly gasLimit * gasPrice.
  * value = balance - gasCost → wallet is drained to 0 with no dust.
  */
-async function sweepToTreasury(discordId) {
+async function sweepToTreasury(discordId, maximumBalance, expectedCheckpoint) {
     const pending = sweepPromises.get(discordId);
     if (pending)
         return pending;
-    const sweep = sweepToTreasuryUnlocked(discordId).finally(() => {
+    const sweep = sweepToTreasuryUnlocked(discordId, maximumBalance, expectedCheckpoint).finally(() => {
         sweepPromises.delete(discordId);
     });
     sweepPromises.set(discordId, sweep);
     return sweep;
 }
-async function sweepToTreasuryUnlocked(discordId) {
+async function sweepToTreasuryUnlocked(discordId, maximumBalance, expectedCheckpoint) {
     const userWallet = getUserDepositWallet(discordId);
     const balance = await getNativeBalance(userWallet.address);
     if (balance === 0n)
         return null;
+    // Never sweep funds that arrived after the poll snapshot being credited.
+    const sweepBalance = maximumBalance == null || balance < maximumBalance ? balance : maximumBalance;
     const gasPrice = await getGasPrice();
     const gasLimit = 21000n;
     const gasCost = gasLimit * gasPrice;
     // No buffer needed: we pin gasPrice on the tx, so actual cost is
     // exactly gasLimit * gasPrice.  value + gasCost = balance → 0 dust.
-    const sendAmount = balance - gasCost;
+    const sendAmount = sweepBalance - gasCost;
     if (sendAmount <= 0n) {
-        console.log(`Sweep skipped for ${discordId}: balance ${balance} wei < gas ${gasCost} wei`);
+        console.log(`Sweep skipped for ${discordId}: balance ${sweepBalance} wei < gas ${gasCost} wei`);
         return null;
     }
-    return sendRawNativeTransfer(userWallet, wallet.address, sendAmount, gasLimit, gasPrice);
+    const nonceRaw = await rawRpcCall("eth_getTransactionCount", [userWallet.address, "pending"]);
+    const signed = await userWallet.signTransaction({
+        to: wallet.address,
+        value: sendAmount,
+        gasLimit,
+        gasPrice,
+        nonce: Number(BigInt(nonceRaw ?? "0x0")),
+        chainId: config_js_1.config.evm.chainId,
+        type: 0,
+    });
+    const expectedHash = ethers_1.ethers.keccak256(signed);
+    const { data: began, error: beginError } = await db_js_1.supabase.rpc("begin_native_deposit_sweep", {
+        p_discord_id: discordId,
+        p_expected_balance: (expectedCheckpoint ?? sweepBalance).toString(),
+        p_tx_hash: expectedHash,
+    });
+    if (beginError)
+        throw beginError;
+    if (began !== true)
+        return null;
+    const row = depositAddressCache.get(discordId);
+    if (row) {
+        row.native_sweep_tx_hash = expectedHash;
+        row.native_sweep_balance = sweepBalance.toString();
+        row.native_sweep_started_at = new Date().toISOString();
+    }
+    try {
+        return await rawRpcCall("eth_sendRawTransaction", [signed]) ?? expectedHash;
+    }
+    catch (error) {
+        const message = String(error?.message ?? error).toLowerCase();
+        if (message.includes("already known") || message.includes("known transaction"))
+            return expectedHash;
+        // Keep the durable pending marker: a gateway timeout can be ambiguous, and
+        // the poller will reconcile the expected hash before allowing more credit.
+        throw error;
+    }
 }
 /**
  * Fund gas from treasury to a user's deposit wallet, wait for it to arrive,
@@ -657,7 +750,53 @@ async function fundGasAndSweep(discordId) {
         return null;
     }
     // Now sweep — deposit wallet has enough for gas
-    return sweepToTreasury(discordId);
+    return sweepToTreasury(discordId, balance + gasFunding, balance);
+}
+async function reconcileNativeDepositSweep(row) {
+    const txHash = row.native_sweep_tx_hash;
+    if (!txHash)
+        return "ready";
+    const receipt = await rawRpcCall("eth_getTransactionReceipt", [txHash]);
+    if (receipt) {
+        const rpc = parseInt(receipt.status, 16) === 1
+            ? "finish_native_deposit_sweep"
+            : "cancel_native_deposit_sweep";
+        const { data: changed, error } = await db_js_1.supabase.rpc(rpc, {
+            p_discord_id: row.discord_id,
+            p_tx_hash: txHash,
+        });
+        if (error)
+            throw error;
+        if (changed === true) {
+            if (rpc === "finish_native_deposit_sweep")
+                row.last_checked_balance = "0";
+            row.native_sweep_tx_hash = null;
+            row.native_sweep_balance = null;
+            row.native_sweep_started_at = null;
+        }
+        return "ready";
+    }
+    const startedAt = row.native_sweep_started_at ? Date.parse(row.native_sweep_started_at) : Date.now();
+    if (Date.now() - startedAt < 10 * 60_000)
+        return "pending";
+    // A hash absent from both receipt and transaction lookups for ten minutes is
+    // treated as never broadcast/dropped. Clearing only the sweep marker leaves
+    // the already-credited checkpoint intact, so retrying cannot double-credit.
+    const tx = await rawRpcCall("eth_getTransactionByHash", [txHash]);
+    if (tx != null)
+        return "pending";
+    const { data: changed, error } = await db_js_1.supabase.rpc("cancel_native_deposit_sweep", {
+        p_discord_id: row.discord_id,
+        p_tx_hash: txHash,
+    });
+    if (error)
+        throw error;
+    if (changed === true) {
+        row.native_sweep_tx_hash = null;
+        row.native_sweep_balance = null;
+        row.native_sweep_started_at = null;
+    }
+    return "ready";
 }
 /**
  * Poll all registered deposit addresses for new funds.
@@ -682,7 +821,10 @@ function startDepositPoller(onDeposit) {
         const startedAt = Date.now();
         try {
             await refreshDepositAddressCache(depositAddressCacheLoadedAt === 0);
-            const rows = (0, depositPolicy_js_1.pollableDepositRows)(Array.from(depositAddressCache.values()), config_js_1.config.depositAdminOnly, config_js_1.config.discord.adminIds);
+            // Once an address has been issued it remains polled even if configuration
+            // later becomes more restrictive, so funds sent to an old address cannot
+            // become stranded. New addresses are enabled only after an access check.
+            const rows = Array.from(depositAddressCache.values());
             if (rows.length === 0)
                 return;
             const updates = [];
@@ -715,6 +857,9 @@ function startDepositPoller(onDeposit) {
             for (let i = 0; i < rows.length; i += balanceBatchSize) {
                 const batch = rows.slice(i, i + balanceBatchSize);
                 const balanceChecks = await mapWithConcurrency(batch, balanceConcurrency, async (row) => {
+                    if (await reconcileNativeDepositSweep(row) === "pending") {
+                        return { row, bal: null };
+                    }
                     const bal = await getDepositNativeBalance(row.address);
                     return { row, bal };
                 });
@@ -724,46 +869,67 @@ function startDepositPoller(onDeposit) {
                         continue;
                     }
                     const { row, bal } = result.value;
-                    const prev = BigInt(row.last_checked_balance || "0");
-                    // Credit only when balance INCREASES (new deposit arrived).
-                    if (bal > prev) {
-                        const diff = bal - prev;
-                        const usedForWalletVerification = await (0, walletVerification_js_1.verifyWalletFromDeposit)(row.discord_id, row.address, provider).catch((err) => {
-                            console.warn(`[WalletVerify] Deposit verification check failed for ${row.discord_id}:`, err?.message ?? err);
-                            return false;
-                        });
-                        // Exact gas cost: matches the pinned gasPrice on the sweep tx.
-                        gasPriceForPoll ??= await getGasPrice();
-                        const gasCost = 21000n * gasPriceForPoll;
-                        const netDeposit = diff - gasCost;
-                        if (usedForWalletVerification) {
-                            console.log(`Wallet verification deposit locked for ${row.discord_id}`);
-                        }
-                        else if (netDeposit > 0n) {
-                            const netSats = (0, config_js_1.tokenUnitsToSats)(netDeposit);
-                            const gasSats = (0, config_js_1.tokenUnitsToSats)(gasCost);
-                            if (netSats > 0) {
-                                const txId = `auto-${Date.now()}-${row.discord_id}`;
-                                await db_js_1.supabase.from("deposits").insert({
-                                    discord_id: row.discord_id,
-                                    tx_hash: txId,
-                                    amount_sats: netSats,
-                                    block_number: 0,
+                    if (bal !== null) {
+                        const prev = BigInt(row.last_checked_balance || "0");
+                        // Credit only when balance INCREASES (new deposit arrived).
+                        if (bal > prev) {
+                            const diff = bal - prev;
+                            const usedForWalletVerification = await (0, walletVerification_js_1.verifyWalletFromDeposit)(row.discord_id, row.address, provider).catch((err) => {
+                                console.warn(`[WalletVerify] Deposit verification check failed for ${row.discord_id}:`, err?.message ?? err);
+                                return false;
+                            });
+                            // Exact gas cost: matches the pinned gasPrice on the sweep tx.
+                            gasPriceForPoll ??= await getGasPrice();
+                            const gasCost = 21000n * gasPriceForPoll;
+                            const netDeposit = diff - gasCost;
+                            if (usedForWalletVerification) {
+                                const { data: advanced, error } = await db_js_1.supabase.rpc("advance_native_deposit_checkpoint", {
+                                    p_discord_id: row.discord_id,
+                                    p_expected_balance: prev.toString(),
+                                    p_observed_balance: bal.toString(),
                                 });
-                                await (0, balance_js_1.addBalance)(row.discord_id, netSats);
-                                onDeposit?.(row.discord_id, netSats, gasSats, txId, "SATS");
+                                if (error)
+                                    throw error;
+                                if (advanced === true) {
+                                    row.last_checked_balance = bal.toString();
+                                    sweepToTreasury(row.discord_id, bal).catch((err) => {
+                                        console.error(`Verification sweep failed for ${row.discord_id}:`, err?.message ?? err);
+                                    });
+                                }
+                                console.log(`Wallet verification deposit locked for ${row.discord_id}`);
+                            }
+                            else if (netDeposit > 0n) {
+                                const netSats = (0, config_js_1.tokenUnitsToSats)(netDeposit);
+                                const gasSats = (0, config_js_1.tokenUnitsToSats)(gasCost);
+                                if (netSats > 0) {
+                                    const txId = `auto-${Date.now()}-${row.discord_id}`;
+                                    const { data: credited, error } = await db_js_1.supabase.rpc("credit_native_deposit", {
+                                        p_discord_id: row.discord_id,
+                                        p_expected_balance: prev.toString(),
+                                        p_observed_balance: bal.toString(),
+                                        p_amount_sats: netSats,
+                                        p_tx_hash: txId,
+                                    });
+                                    if (error)
+                                        throw error;
+                                    if (credited === true) {
+                                        row.last_checked_balance = bal.toString();
+                                        onDeposit?.(row.discord_id, netSats, gasSats, txId, "SATS");
+                                        sweepToTreasury(row.discord_id, bal).catch((err) => {
+                                            console.error(`Sweep failed for ${row.discord_id}:`, err?.message ?? err);
+                                        });
+                                    }
+                                }
+                            }
+                            else {
+                                console.log(`Deposit too small to cover gas for ${row.discord_id}: ${diff} wei < gas ${gasCost} wei`);
                             }
                         }
-                        else {
-                            console.log(`Deposit too small to cover gas for ${row.discord_id}: ${diff} wei < gas ${gasCost} wei`);
-                        }
-                        // Sweep immediately after crediting a new deposit.
-                        sweepToTreasury(row.discord_id).catch((err) => {
-                            console.error(`Sweep failed for ${row.discord_id}:`, err?.message ?? err);
-                        });
-                    }
-                    if (bal !== prev) {
-                        updates.push({ row, balance: bal.toString() });
+                        // A decrease outside a recorded sweep can only be an older/manual
+                        // sweep. Reset to zero so any funds left or arriving concurrently
+                        // are observed as a fresh increase on the next poll.
+                        if (bal < prev)
+                            updates.push({ row, balance: "0" });
                     }
                     for (const token of configuredErc20) {
                         try {
@@ -884,10 +1050,27 @@ function startDepositPoller(onDeposit) {
     // Initial poll after Discord has had a moment to settle.
     setTimeout(poll, initialPollDelayMs);
 }
+/** Quote the maximum native gas charged for an ERC-20 withdrawal. */
+async function quoteErc20WithdrawalGas(toAddress, amount, token) {
+    const normalized = toAddress.toLowerCase().trim();
+    if (!/^0x[a-fA-F0-9]{40}$/.test(normalized))
+        throw new Error("Invalid address");
+    const cfg = (0, tokens_js_1.assertTokenConfigured)(token);
+    const units = (0, tokens_js_1.tokenAmountToUnits)(amount, token);
+    if (units <= 0n)
+        throw new Error("Amount too small");
+    const data = ERC20_INTERFACE.encodeFunctionData("transfer", [normalized, units]);
+    const estimated = BigInt(await rawRpcCall("eth_estimateGas", [{
+            from: wallet.address, to: cfg.contractAddress, data,
+        }]));
+    const gasLimit = addGasLimitBuffer(estimated);
+    const gasPrice = await getGasPrice();
+    return { gasLimit, gasPrice, gasSats: (0, config_js_1.tokenUnitsToSats)(gasLimit * gasPrice) };
+}
 /** Withdraw sats from treasury to an address (native send).
  *  Gas fee is deducted from the send amount so the treasury stays solvent.
  *  Waits for on-chain confirmation before returning success. */
-async function withdraw(toAddress, amountSats, token = "SATS") {
+async function withdraw(toAddress, amountSats, token = "SATS", gasQuote) {
     const normalized = toAddress.toLowerCase().trim();
     if (!/^0x[a-fA-F0-9]{40}$/.test(normalized))
         return { error: "Invalid address" };
@@ -897,33 +1080,48 @@ async function withdraw(toAddress, amountSats, token = "SATS") {
         if (units <= 0n)
             return { error: "Amount too small" };
         try {
-            const contract = new ethers_1.ethers.Contract(cfg.contractAddress, ERC20_ABI, wallet);
-            const treasuryBalance = BigInt(await contract.balanceOf(wallet.address));
+            const treasuryBalance = await getTokenBalance(wallet.address, token);
             if (treasuryBalance < units)
                 return { error: `Treasury has insufficient ${token}` };
-            const gasPrice = await getGasPrice();
-            const estimatedGas = BigInt(await contract.transfer.estimateGas(normalized, units));
-            const gasLimit = addGasLimitBuffer(estimatedGas);
+            const gasPrice = gasQuote?.gasPrice ?? await getGasPrice();
+            const transferData = ERC20_INTERFACE.encodeFunctionData("transfer", [normalized, units]);
+            const gasLimit = gasQuote?.gasLimit ?? (await quoteErc20WithdrawalGas(normalized, amountSats, token)).gasLimit;
             const gasCost = gasLimit * gasPrice;
-            const treasuryNative = await getNativeBalance(wallet.address);
-            const liabilities = await getProtocolOperationalSnapshot();
-            const protectedSats = liabilities.userSatsLiability + liabilities.poolSatsLiability + config_js_1.config.evm.protocolGasReserveMinSats;
-            const protectedUnits = (0, config_js_1.satsToTokenUnits)(protectedSats);
-            if (!(0, depositPolicy_js_1.preservesGasReserve)(treasuryNative, gasCost, 0n, protectedUnits)) {
-                return { error: `Protocol gas reserve is too low for a ${token} withdrawal` };
+            await ensureErc20WithdrawalGas(token, gasCost, gasPrice);
+            const nonceRaw = await rawRpcCall("eth_getTransactionCount", [wallet.address, "pending"]);
+            const signed = await wallet.signTransaction({
+                to: cfg.contractAddress,
+                data: transferData,
+                gasLimit,
+                gasPrice,
+                nonce: Number(BigInt(nonceRaw ?? "0x0")),
+                chainId: config_js_1.config.evm.chainId,
+                type: 0,
+            });
+            const expectedHash = ethers_1.ethers.keccak256(signed);
+            let txHash = expectedHash;
+            try {
+                txHash = await rawRpcCall("eth_sendRawTransaction", [signed]) ?? expectedHash;
             }
-            const tx = await contract.transfer(normalized, units, { gasLimit, gasPrice });
+            catch (error) {
+                const message = String(error?.message ?? error).toLowerCase();
+                if (!message.includes("already known") && !message.includes("known transaction"))
+                    throw error;
+            }
             for (let i = 0; i < 40; i++) {
                 await new Promise((resolve) => setTimeout(resolve, 3000));
-                const receipt = await rawRpcCall("eth_getTransactionReceipt", [tx.hash]);
+                const receipt = await rawRpcCall("eth_getTransactionReceipt", [txHash]);
                 if (!receipt)
                     continue;
                 if (parseInt(receipt.status, 16) !== 1) {
-                    return { txHash: tx.hash, confirmed: false, error: "Transaction reverted on-chain" };
+                    return { txHash, confirmed: false, error: "Transaction reverted on-chain" };
                 }
-                return { txHash: tx.hash, sentSats: amountSats, confirmed: true };
+                const actualGasCost = receipt.gasUsed
+                    ? BigInt(receipt.gasUsed) * BigInt(receipt.effectiveGasPrice ?? gasPrice)
+                    : gasCost;
+                return { txHash, sentSats: amountSats, gasSats: (0, config_js_1.tokenUnitsToSats)(actualGasCost), confirmed: true };
             }
-            return { txHash: tx.hash, confirmed: false, error: "Receipt timeout: transaction not confirmed after 2 minutes" };
+            return { txHash, confirmed: false, error: "Receipt timeout: transaction not confirmed after 2 minutes" };
         }
         catch (error) {
             return { error: error.message };

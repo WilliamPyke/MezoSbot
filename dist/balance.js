@@ -6,6 +6,7 @@ exports.getMusdBalanceAtomic = getMusdBalanceAtomic;
 exports.getBalances = getBalances;
 exports.addBalance = addBalance;
 exports.subtractBalance = subtractBalance;
+exports.reserveWithdrawalBalances = reserveWithdrawalBalances;
 exports.subtractBalances = subtractBalances;
 exports.linkWallet = linkWallet;
 exports.getWalletForUser = getWalletForUser;
@@ -102,6 +103,19 @@ async function subtractBalance(discordId, amountSats, token = "SATS") {
     if (error)
         throw error;
     return data === true;
+}
+async function reserveWithdrawalBalances(discordId, amount, token, gasSats) {
+    const { data, error } = await db_js_1.supabase.rpc("reserve_token_withdrawal", {
+        p_discord_id: discordId,
+        p_token: token,
+        p_token_amount: (0, tokens_js_1.roundTokenAmount)(amount, token),
+        p_gas_sats: (0, format_js_1.roundSats)(gasSats),
+    });
+    if (error)
+        throw error;
+    if (data === "ok" || data === "insufficient_token" || data === "insufficient_sats")
+        return data;
+    throw new Error(`Unexpected withdrawal reservation result: ${String(data)}`);
 }
 async function subtractBalances(debits) {
     const payload = debits

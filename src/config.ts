@@ -94,6 +94,10 @@ export const config = {
   arcadeTokenSecret: process.env.ARCADE_TOKEN_SECRET ?? process.env.TREASURY_PRIVATE_KEY ?? "",
   depositAdminOnly: optionalBool("DEPOSIT_ADMIN_ONLY", true),
   deposits: {
+    allowedRoleIds: optional(
+      "DEPOSIT_ALLOWED_ROLE_IDS",
+      "1234604312689381488,1234604340208205896,1227314810853523526",
+    ).split(",").map((s) => s.trim()).filter(Boolean),
     pollMs: parseInt(optional("DEPOSIT_POLL_MS", "60000"), 10),
     addressRefreshMs: parseInt(optional("DEPOSIT_ADDRESS_REFRESH_MS", "900000"), 10),
     balanceConcurrency: parseInt(optional("DEPOSIT_BALANCE_CONCURRENCY", "8"), 10),

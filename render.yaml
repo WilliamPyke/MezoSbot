@@ -80,7 +80,9 @@ services:
       - key: SKIP_WITHDRAWAL_MIN
         value: "false"
       - key: DEPOSIT_ADMIN_ONLY
-        value: "true"
+        value: "false"
+      - key: DEPOSIT_ALLOWED_ROLE_IDS
+        value: "1234604312689381488,1234604340208205896,1227314810853523526"
       - key: DEPOSIT_POLL_MS
         value: "60000"
       - key: DEPOSIT_ADDRESS_REFRESH_MS

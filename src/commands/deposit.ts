@@ -3,19 +3,20 @@ import QRCode from "qrcode";
 import { getSweepGasSponsorAddress, registerDepositAddress } from "../evm.js";
 import { config } from "../config.js";
 import { TOKEN_CHOICES, assertTokenConfigured, parseToken, tokenLabel } from "../tokens.js";
+import { canInteractionUseDeposits } from "../depositAccess.js";
 
 export const data = {
   name: "deposit",
   description: "Get your personal token deposit address",
   options: [
     { name: "token", type: 3 as const, description: "Token to deposit", required: false, choices: TOKEN_CHOICES },
-    { name: "sponsor", type: 5 as const, description: "Admin: fund the ERC-20 sweep gas wallet", required: false },
+    { name: "sponsor", type: 5 as const, description: "Admin: fund the ERC-20 operations gas wallet", required: false },
   ],
 };
 
 export async function execute(interaction: ChatInputCommandInteraction) {
-  if (config.depositAdminOnly && !config.discord.adminIds.includes(interaction.user.id)) {
-    return interaction.reply({ content: "❌ Deposits are currently disabled.", flags: MessageFlags.Ephemeral });
+  if (!canInteractionUseDeposits(interaction)) {
+    return interaction.reply({ content: "❌ Deposits require the G4, G5, or G6 role.", flags: MessageFlags.Ephemeral });
   }
 
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
@@ -33,7 +34,9 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     return interaction.editReply({ content: `❌ ${(error as Error).message}` });
   }
 
-  const address = sponsor ? getSweepGasSponsorAddress() : await registerDepositAddress(interaction.user.id);
+  const address = sponsor
+    ? getSweepGasSponsorAddress()
+    : await registerDepositAddress(interaction.user.id, { enableDeposits: true });
   const explorer = config.evm.explorerUrl;
   const depositAsset = token === "SATS" ? "native BTC (credited as SATS)" : tokenLabel(token);
   const minimum = token === "SATS" || isAdmin ? null : config.deposits.minimums[token];
@@ -50,10 +53,10 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     .setColor(0x5865f2)
     .setTitle(`📍 Your ${tokenLabel(token)} Deposit Address`)
     .setDescription(`\`${address}\``)
-    .setTitle(sponsor ? "⛽ Sweep Gas Sponsor Address" : `📍 Your ${tokenLabel(token)} Deposit Address`)
+    .setTitle(sponsor ? "⛽ ERC-20 Gas Sponsor Address" : `📍 Your ${tokenLabel(token)} Deposit Address`)
     .addFields(
       { name: "How It Works", value: sponsor
-        ? "Send **native BTC** on Mezo to this dedicated operational wallet. It pays ERC-20 sweep gas and is not credited to a user balance."
+        ? "Send **native BTC** on Mezo to this dedicated operational wallet. It pays ERC-20 sweep and withdrawal gas and is not credited to a user balance."
         : `Send **${depositAsset}** on Mezo to this address. Your balance is credited automatically after polling.` },
       ...(minimum ? [{ name: "Minimum deposit", value: `Deposits accumulate until at least **${minimum} ${tokenLabel(token)}** is present.` }] : []),
       ...(token !== "SATS" ? [{ name: "Sweep timing", value: `ERC-20 funds are swept after roughly **${Math.ceil(config.deposits.erc20SweepDelayMs / 60000)} minutes**, allowing nearby deposits to be combined.` }] : []),

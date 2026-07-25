@@ -21,6 +21,8 @@ export type LedgerEntryType =
   | "deposit"
   | "withdrawal"
   | "withdrawal_refund"
+  | "withdrawal_network_fee"
+  | "withdrawal_network_fee_refund"
   | "tip"
   | "rain"
   | "distribute"
@@ -42,6 +44,8 @@ const TYPE_LABELS: Record<LedgerEntryType, string> = {
   deposit: "Deposit",
   withdrawal: "Withdrawal",
   withdrawal_refund: "Withdrawal Refund",
+  withdrawal_network_fee: "Withdrawal Network Fee",
+  withdrawal_network_fee_refund: "Withdrawal Network Fee Refund",
   tip: "Tip",
   rain: "Rain",
   distribute: "Distribute",

@@ -15,12 +15,22 @@ export function nextSweepTime(nowMs: number, delayMs: number): number {
   return nowMs + Math.max(0, delayMs);
 }
 
-export function pollableDepositRows<T extends { discord_id: string }>(
-  rows: T[],
-  adminOnly: boolean,
-  adminIds: readonly string[],
-): T[] {
-  if (!adminOnly) return rows;
-  const allowed = new Set(adminIds);
-  return rows.filter((row) => allowed.has(row.discord_id));
+export function hasAllowedDepositRole(
+  memberRoleIds: Iterable<string>,
+  allowedRoleIds: readonly string[],
+): boolean {
+  const allowed = new Set(allowedRoleIds);
+  for (const roleId of memberRoleIds) {
+    if (allowed.has(roleId)) return true;
+  }
+  return false;
+}
+
+export function withdrawalGasFundingShortfall(
+  treasuryBalanceWei: bigint,
+  gasCostWei: bigint,
+  protectedBackingWei: bigint,
+): bigint {
+  const required = gasCostWei + protectedBackingWei;
+  return required > treasuryBalanceWei ? required - treasuryBalanceWei : 0n;
 }

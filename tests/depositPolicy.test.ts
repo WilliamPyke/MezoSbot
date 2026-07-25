@@ -2,9 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   meetsPublicDepositMinimum,
+  hasAllowedDepositRole,
   nextSweepTime,
-  pollableDepositRows,
   preservesGasReserve,
+  withdrawalGasFundingShortfall,
 } from "../src/depositPolicy.js";
 
 test("public minimums accumulate while admins can test smaller deposits", () => {
@@ -23,11 +24,15 @@ test("sweep delay is deterministic and clamps negative configuration", () => {
   assert.equal(nextSweepTime(1_000, -1), 1_000);
 });
 
-test("admin-only polling ignores historical public deposit addresses", () => {
-  const rows = [
-    { discord_id: "admin", address: "0x1" },
-    { discord_id: "legacy-user", address: "0x2" },
-  ];
-  assert.deepEqual(pollableDepositRows(rows, true, ["admin"]), [rows[0]]);
-  assert.deepEqual(pollableDepositRows(rows, false, ["admin"]), rows);
+test("deposit access accepts any configured role and fails closed otherwise", () => {
+  const allowed = ["g4", "g5", "g6"];
+  assert.equal(hasAllowedDepositRole(["other", "g5"], allowed), true);
+  assert.equal(hasAllowedDepositRole(["other"], allowed), false);
+  assert.equal(hasAllowedDepositRole([], allowed), false);
+});
+
+test("withdrawal sponsor funds only the gas/backing shortfall", () => {
+  assert.equal(withdrawalGasFundingShortfall(1_100n, 100n, 1_000n), 0n);
+  assert.equal(withdrawalGasFundingShortfall(1_000n, 100n, 1_000n), 100n);
+  assert.equal(withdrawalGasFundingShortfall(950n, 100n, 1_000n), 150n);
 });

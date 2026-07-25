@@ -10,17 +10,18 @@ const qrcode_1 = __importDefault(require("qrcode"));
 const evm_js_1 = require("../evm.js");
 const config_js_1 = require("../config.js");
 const tokens_js_1 = require("../tokens.js");
+const depositAccess_js_1 = require("../depositAccess.js");
 exports.data = {
     name: "deposit",
     description: "Get your personal token deposit address",
     options: [
         { name: "token", type: 3, description: "Token to deposit", required: false, choices: tokens_js_1.TOKEN_CHOICES },
-        { name: "sponsor", type: 5, description: "Admin: fund the ERC-20 sweep gas wallet", required: false },
+        { name: "sponsor", type: 5, description: "Admin: fund the ERC-20 operations gas wallet", required: false },
     ],
 };
 async function execute(interaction) {
-    if (config_js_1.config.depositAdminOnly && !config_js_1.config.discord.adminIds.includes(interaction.user.id)) {
-        return interaction.reply({ content: "❌ Deposits are currently disabled.", flags: discord_js_1.MessageFlags.Ephemeral });
+    if (!(0, depositAccess_js_1.canInteractionUseDeposits)(interaction)) {
+        return interaction.reply({ content: "❌ Deposits require the G4, G5, or G6 role.", flags: discord_js_1.MessageFlags.Ephemeral });
     }
     await interaction.deferReply({ flags: discord_js_1.MessageFlags.Ephemeral });
     const sponsor = interaction.options.getBoolean("sponsor") ?? false;
@@ -38,7 +39,9 @@ async function execute(interaction) {
     catch (error) {
         return interaction.editReply({ content: `❌ ${error.message}` });
     }
-    const address = sponsor ? (0, evm_js_1.getSweepGasSponsorAddress)() : await (0, evm_js_1.registerDepositAddress)(interaction.user.id);
+    const address = sponsor
+        ? (0, evm_js_1.getSweepGasSponsorAddress)()
+        : await (0, evm_js_1.registerDepositAddress)(interaction.user.id, { enableDeposits: true });
     const explorer = config_js_1.config.evm.explorerUrl;
     const depositAsset = token === "SATS" ? "native BTC (credited as SATS)" : (0, tokens_js_1.tokenLabel)(token);
     const minimum = token === "SATS" || isAdmin ? null : config_js_1.config.deposits.minimums[token];
@@ -52,9 +55,9 @@ async function execute(interaction) {
         .setColor(0x5865f2)
         .setTitle(`📍 Your ${(0, tokens_js_1.tokenLabel)(token)} Deposit Address`)
         .setDescription(`\`${address}\``)
-        .setTitle(sponsor ? "⛽ Sweep Gas Sponsor Address" : `📍 Your ${(0, tokens_js_1.tokenLabel)(token)} Deposit Address`)
+        .setTitle(sponsor ? "⛽ ERC-20 Gas Sponsor Address" : `📍 Your ${(0, tokens_js_1.tokenLabel)(token)} Deposit Address`)
         .addFields({ name: "How It Works", value: sponsor
-            ? "Send **native BTC** on Mezo to this dedicated operational wallet. It pays ERC-20 sweep gas and is not credited to a user balance."
+            ? "Send **native BTC** on Mezo to this dedicated operational wallet. It pays ERC-20 sweep and withdrawal gas and is not credited to a user balance."
             : `Send **${depositAsset}** on Mezo to this address. Your balance is credited automatically after polling.` }, ...(minimum ? [{ name: "Minimum deposit", value: `Deposits accumulate until at least **${minimum} ${(0, tokens_js_1.tokenLabel)(token)}** is present.` }] : []), ...(token !== "SATS" ? [{ name: "Sweep timing", value: `ERC-20 funds are swept after roughly **${Math.ceil(config_js_1.config.deposits.erc20SweepDelayMs / 60000)} minutes**, allowing nearby deposits to be combined.` }] : []), { name: "Important", value: "Only send the selected token on the configured Mezo network." }, { name: "Explorer", value: `[View on Explorer](${explorer}/address/${address})` })
         .setThumbnail("attachment://deposit-qr.png")
         .setFooter({ text: sponsor ? "Dedicated protocol gas wallet" : "This address is unique to you" })

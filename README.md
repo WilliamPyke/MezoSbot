@@ -48,9 +48,10 @@ cp .env.example .env
 | `PUBLIC_BASE_URL` | Public URL of this bot's HTTP server (used for Slice Arcade browser-play links). E.g. `https://mezosbot.example.com` or `mezosbot.example.com`. Defaults to `http://localhost:<STREAM_PORT>` for local dev. |
 | `ARCADE_TOKEN_SECRET` | Optional HMAC secret for Slice Arcade browser tokens. Falls back to `TREASURY_PRIVATE_KEY` if unset. |
 | `DEPOSIT_POLL_MS` | Deposit wallet chain polling interval (default `60000`) |
+| `DEPOSIT_ALLOWED_ROLE_IDS` | Comma-separated Discord role IDs allowed to request/enable deposits; admins always bypass this check |
 | `DEPOSIT_ADDRESS_REFRESH_MS` | Supabase address/checkpoint cache refresh interval (default `900000`) |
 | `DEPOSIT_RPC_REQUESTS_PER_SECOND` | Maximum deposit balance reads per second across all poll workers (default `8`, below Mezo's public RPC limit) |
-| `SWEEP_GAS_SPONSOR_PRIVATE_KEY` | Optional dedicated hot key for ERC-20 sweep gas; otherwise a separate wallet is deterministically derived from the treasury key |
+| `SWEEP_GAS_SPONSOR_PRIVATE_KEY` | Optional dedicated hot key for ERC-20 sweep and withdrawal gas; otherwise a separate wallet is deterministically derived from the treasury key |
 | `PROTOCOL_GAS_RESERVE_MIN_SATS` | Protected operational SATS reserve; ERC-20 operations stop before crossing it (default `1000`) |
 | `ERC20_SWEEP_DELAY_MS` | Delay before sweeping an ERC-20 deposit so nearby deposits can be combined (default `300000`) |
 | `MUSD_MIN_DEPOSIT` | Public-user MUSD minimum; smaller deposits accumulate uncredited until the threshold (default `0.10`) |
