@@ -29,8 +29,6 @@ export function hasAllowedDepositRole(
 export function withdrawalGasFundingShortfall(
   treasuryBalanceWei: bigint,
   gasCostWei: bigint,
-  protectedBackingWei: bigint,
 ): bigint {
-  const required = gasCostWei + protectedBackingWei;
-  return required > treasuryBalanceWei ? required - treasuryBalanceWei : 0n;
+  return gasCostWei > treasuryBalanceWei ? gasCostWei - treasuryBalanceWei : 0n;
 }

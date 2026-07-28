@@ -31,8 +31,17 @@ test("deposit access accepts any configured role and fails closed otherwise", ()
   assert.equal(hasAllowedDepositRole([], allowed), false);
 });
 
-test("withdrawal sponsor funds only the gas/backing shortfall", () => {
-  assert.equal(withdrawalGasFundingShortfall(1_100n, 100n, 1_000n), 0n);
-  assert.equal(withdrawalGasFundingShortfall(1_000n, 100n, 1_000n), 100n);
-  assert.equal(withdrawalGasFundingShortfall(950n, 100n, 1_000n), 150n);
+test("withdrawal sponsor funds only a real spendable-gas shortfall", () => {
+  assert.equal(withdrawalGasFundingShortfall(1_100n, 100n), 0n);
+  assert.equal(withdrawalGasFundingShortfall(100n, 100n), 0n);
+  assert.equal(withdrawalGasFundingShortfall(60n, 100n), 40n);
+});
+
+test("withdrawal gas does not make the sponsor repair historical under-backing", () => {
+  const treasuryBalance = 227_597n;
+  const protectedBacking = 275_758n;
+  const gasCost = 17n;
+
+  assert.ok(treasuryBalance < protectedBacking);
+  assert.equal(withdrawalGasFundingShortfall(treasuryBalance, gasCost), 0n);
 });

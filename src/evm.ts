@@ -716,11 +716,15 @@ async function ensureErc20WithdrawalGas(
   gasCost: bigint,
   gasPrice: bigint,
 ): Promise<void> {
-  const liabilities = await getProtocolOperationalSnapshot();
-  const protectedBacking = satsToTokenUnits(liabilities.userSatsLiability + liabilities.poolSatsLiability);
   const treasuryNative = await getNativeBalance(wallet.address);
-  const requiredTreasuryBalance = protectedBacking + gasCost;
-  const funding = withdrawalGasFundingShortfall(treasuryNative, gasCost, protectedBacking);
+  // The caller has already reserved the quoted gas from the user's SATS
+  // balance, reducing protocol liabilities by at least gasCost. Paying that
+  // gas therefore cannot worsen an existing backing gap. Sponsorship is only
+  // needed when the treasury lacks enough native balance for this transaction;
+  // requiring it to repair historical under-backing blocks every ERC-20
+  // withdrawal and misreports the entire gap as a withdrawal gas requirement.
+  const requiredTreasuryBalance = gasCost;
+  const funding = withdrawalGasFundingShortfall(treasuryNative, gasCost);
   if (funding === 0n) return;
   const sponsorBalance = await getNativeBalance(sweepGasSponsorWallet.address);
   const sponsorTxGas = NATIVE_TRANSFER_GAS_LIMIT * gasPrice;
