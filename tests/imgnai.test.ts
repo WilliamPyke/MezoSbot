@@ -7,7 +7,7 @@ import {
   modelsForPage,
   type KatanaImageModel,
 } from "../src/imgnai/types.js";
-import { musdToDecimal, parseMusd } from "../src/imgnai/musd.js";
+import { hasSufficientMusdBacking, musdToDecimal, parseMusd } from "../src/imgnai/musd.js";
 import {
   IMGN_WORKER_IDLE_DELAY_MS,
   IMGN_WORKER_MIN_DELAY_MS,
@@ -49,6 +49,12 @@ test("MUSD decimal conversion is exact at 18 decimals", () => {
   const amount = parseMusd("123456789.000000000000000001");
   assert.equal(amount, 123456789000000000000000001n);
   assert.equal(musdToDecimal(amount), "123456789.000000000000000001");
+});
+
+test("MUSD solvency accepts legacy floating-point dust but rejects real deficits", () => {
+  const assets = parseMusd("19.5888162638");
+  assert.equal(hasSufficientMusdBacking(assets, assets + 2_831n), true);
+  assert.equal(hasSufficientMusdBacking(assets, assets + 1_000_001n), false);
 });
 
 test("generation worker sleeps when idle and wakes at persisted retry times", () => {

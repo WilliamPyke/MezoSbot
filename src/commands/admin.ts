@@ -36,6 +36,7 @@ import {
 import { formatSats } from "../format.js";
 import { getCatalogHealth, getDisabledModelKeys, refreshKatanaModels, setGuildModelEnabled } from "../imgnai/catalog.js";
 import { getImgnaiOperationalStatus } from "../imgnai/payments.js";
+import { hasSufficientMusdBacking } from "../imgnai/musd.js";
 import { formatMusd } from "../imgnai/types.js";
 
 const CUSTOM_ID_PREFIX = "admin";
@@ -152,7 +153,8 @@ async function renderImgnaiMenu(guildId: string, page: "current" | "legacy", sta
     operations.gasSponsorIsTreasury && operations.gasSponsorSats != null && operations.gasSponsorSats < operations.gasReserveMinimumSats
       ? "Treasury sweep sponsorship is below its protected reserve."
       : null,
-    musdAssets != null && musdObligations != null && musdAssets < musdObligations ? "MUSD assets are below user and pending-job obligations." : null,
+    musdAssets != null && musdObligations != null && !hasSufficientMusdBacking(musdAssets, musdObligations)
+      ? "MUSD assets are below user and pending-job obligations." : null,
     operations.sweepErrors ? `${operations.sweepErrors} ERC-20 sweep checkpoint(s) have errors.` : null,
     operations.lastSweepGasError,
   ].filter((item): item is string => !!item);

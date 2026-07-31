@@ -1,6 +1,15 @@
 export const MUSD_DECIMALS = 18;
 export const MUSD_SCALE = 10n ** BigInt(MUSD_DECIMALS);
 
+// Legacy DOUBLE PRECISION balance mirrors can leave a few atomic units of
+// rounding dust after an otherwise exact MUSD operation. This is small enough
+// to ignore for the operational backing check without hiding a real deficit.
+export const MUSD_SOLVENCY_DUST_TOLERANCE_ATOMIC = 1_000_000n; // 0.000000000001 MUSD
+
+export function hasSufficientMusdBacking(assetsAtomic: bigint, obligationsAtomic: bigint): boolean {
+  return assetsAtomic + MUSD_SOLVENCY_DUST_TOLERANCE_ATOMIC >= obligationsAtomic;
+}
+
 export function parseMusd(value: string | number): bigint {
   const raw = typeof value === "number" ? value.toString() : value.trim();
   const match = /^(\d+)(?:\.(\d+))?$/.exec(raw);

@@ -12,6 +12,7 @@
     "test:contracts": "hardhat test --config contracts/hardhat.config.ts",
     "test:imgnai": "node --import tsx --test tests/imgnai.test.ts",
     "test:operations": "node --import tsx --test tests/depositPolicy.test.ts",
+    "test:developer-relay": "node --import tsx --test tests/developerRelay.test.ts",
     "render:imgnai-logo": "node scripts/render-imgnai-logo.mjs",
     "deploy:contracts": "hardhat run --config contracts/hardhat.config.ts contracts/scripts/deployMallardEscrow.ts",
     "start": "node dist/index.js",

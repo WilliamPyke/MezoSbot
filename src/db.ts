@@ -37,3 +37,4 @@ export type QuestTaskCompletionRow = { id: number; quest_id: number; task_id: nu
 export type QuestUserRewardRow = { quest_id: number; user_id: string; completed_task_count: number; total_reward_sats: number; paid_sats: number; last_paid_at: string | null; updated_at: string };
 export type GameSaveRow = { rom_name: string; save_data: string; updated_at: string };
 export type RainBannedTermRow = { id: number; guild_id: string; term: string; created_by: string | null; created_at: string };
+export type DeveloperRelayRouteRow = { guild_id: string; discord_id: string; developer_channel_id: string; private_thread_id: string; enabled: boolean; created_by: string | null; created_at: string; updated_at: string };

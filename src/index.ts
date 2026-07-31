@@ -4,6 +4,7 @@ import {
   Events,
   GatewayIntentBits,
   MessageFlags,
+  Partials,
   REST,
   Routes,
   type ChatInputCommandInteraction,
@@ -72,6 +73,7 @@ import { expireStaleQueueEntries } from "./arcade/matchmaking.js";
 import { handleGenerationInteraction, isGenerationInteraction } from "./imgnai/interactions.js";
 import { startImgnaiWorker } from "./imgnai/service.js";
 import { refreshKatanaModels } from "./imgnai/catalog.js";
+import { handleDeveloperRelayMessage } from "./developerRelay.js";
 
 process.on("unhandledRejection", (err) => {
   console.error("Unhandled rejection:", (err as Error)?.message ?? err);
@@ -92,6 +94,7 @@ const intents = [
   // message.content additionally needs the privileged MessageContent intent
   // (added below); without it, the runtime falls back to embed URLs.
   GatewayIntentBits.GuildMessages,
+  GatewayIntentBits.DirectMessages,
 ];
 
 if (config.discord.guildMembersIntent) {
@@ -108,6 +111,7 @@ let discordState = "not_started";
 
 const client = new Client({
   intents,
+  partials: [Partials.Channel],
 });
 
 setHealthStatusProvider(() => ({
@@ -581,6 +585,12 @@ client.on(Events.GuildScheduledEventUserRemove, async (event) => {
 
 client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot) return;
+  if (message.channel.isDMBased()) {
+    await handleDeveloperRelayMessage(client, message).catch((err) =>
+      console.warn("[DeveloperRelay] DM handler failed:", (err as Error)?.message ?? err)
+    );
+    return;
+  }
   await handleMultiStepQuestMessage(client, message).catch((err) =>
     console.warn("[QuestEngine] Message handler failed:", (err as Error)?.message ?? err)
   );

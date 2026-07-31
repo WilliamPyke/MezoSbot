@@ -13,7 +13,7 @@ import {
   getTreasuryAddress,
   getTreasuryBalanceSats,
 } from "../evm.js";
-import { musdToDecimal, musdToNumber, parseMusd } from "./musd.js";
+import { hasSufficientMusdBacking, musdToDecimal, musdToNumber, parseMusd } from "./musd.js";
 
 const MEZO_NETWORK = "eip155:31612" as const;
 const account = privateKeyToAccount(config.evm.treasuryPrivateKey as `0x${string}`);
@@ -121,7 +121,7 @@ export async function ensureKatanaBalance(requiredMusdAtomic: bigint): Promise<b
     const snapshot = await getProtocolOperationalSnapshot();
     const totalAssets = treasuryUnits + balance + snapshot.unsweptMusdAtomic;
     const totalObligations = snapshot.userMusdAtomic + snapshot.pendingMusdAtomic;
-    if (totalAssets < totalObligations) {
+    if (!hasSufficientMusdBacking(totalAssets, totalObligations)) {
       throw new Error("Protocol MUSD assets are below user and pending-generation obligations");
     }
     if (balance >= requiredMusdAtomic) {

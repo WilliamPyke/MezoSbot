@@ -13,6 +13,7 @@ A Discord bot for depositing and using native SATS, MUSD, MEZO, and mUSDC on Mez
 - **Browser stream**: Built-in WebRTC viewer endpoint for low-latency cloud play
 - **Auto snapshot recovery**: Emulator saves full state snapshots plus SRAM fallback and resumes from the latest snapshot after restarts/redeploys
 - **imgnAI generation**: Generate SFW images with Katana and pay the exact model cost from your MUSD balance
+- **Developer link relay**: Authorized developers can DM links to Mezo SBOT for attributed forwarding to their private thread or developer channel
 
 ## Setup
 
@@ -104,6 +105,7 @@ npm run dev
 | `/distribute <amount> <@users> [token]` | Split a token among multiple users |
 | `/rain <amount> <count> [token] [role] [message]` | Rain a token on recently active users (optionally role-filtered) |
 | `/rainban` | Manage server-wide banned words and phrases excluded from rain recipient searches |
+| `/developer-relay set\|show\|disable` | Manage developer DM-to-channel link relay routes |
 | `/drop <total> <per_claim> <max_claims> [role]` | Create a claimable drop (optionally role-gated) |
 | `/claim <drop_id>` | Claim from an active drop |
 | `/arcade practice [minutes]` | Solo block-puzzle warm-up — no stake |
@@ -119,9 +121,23 @@ Recipients receive DMs when they are credited from tips, rains, distributions, a
 Token arguments are optional and default to native SATS, preserving the original command behavior.
 Rain banned-word filtering requires `DISCORD_MESSAGE_CONTENT_INTENT=true` and the Message Content privileged intent enabled in Discord Developer Portal.
 
+## Developer link relay
+
+Apply `migrations/2026-07-28_developer_relay.sql` before configuring relay routes. The bot requires **View Channel**, **Send Messages**, and **Embed Links** in the developer channel, plus **Send Messages in Threads** and access to each configured private thread.
+
+A server manager configures a developer with:
+
+```text
+/developer-relay set developer:@alice channel:#developers thread:#alice-private
+```
+
+The developer can then DM a message containing an `http://`, `https://`, or `www.` link to Mezo SBOT. A normal DM is forwarded to the configured private thread. Prefixing the DM with `channel:` sends it to the configured developer channel; `thread:` selects the private thread explicitly.
+
+Forwarded messages identify the original developer, suppress all Discord mentions, are limited to five per minute per developer, and are recorded by source and destination message ID for duplicate-delivery protection. If the server's link filter also scans bot messages, exempt the Mezo SBOT role or the configured relay destinations.
+
 ## imgnAI Katana Generation
 
-Apply `migrations/2026-07-13_imgnai_katana.sql`, then `migrations/2026-07-13_imgnai_atomic_musd.sql`, `migrations/2026-07-13_protocol_operations.sql`, and `migrations/2026-07-16_imgnai_reconciliation_safety.sql`, after the multi-token migration before enabling `/generate`. The atomic migration backfills exact 18-decimal MUSD units and keeps the legacy floating columns only as compatibility mirrors. The operations migrations add delayed sweeps, gas-funding audit records, solvency metrics, and terminal-state safeguards for refunded generations. The bot uses the existing Mezo mainnet treasury signer and MUSD contract; no imgnAI API key is required.
+Apply `migrations/2026-07-13_imgnai_katana.sql`, then `migrations/2026-07-13_imgnai_atomic_musd.sql`, `migrations/2026-07-13_protocol_operations.sql`, `migrations/2026-07-16_imgnai_reconciliation_safety.sql`, and `migrations/2026-07-31_imgnai_musd_atomic_writes.sql`, after the multi-token migration before enabling `/generate`. The atomic migration backfills exact 18-decimal MUSD units and keeps the legacy floating columns only as compatibility mirrors. The operations migrations add delayed sweeps, gas-funding audit records, solvency metrics, and terminal-state safeguards for refunded generations. The final migration keeps older token balance and withdrawal RPCs on the atomic MUSD column. The bot uses the existing Mezo mainnet treasury signer and MUSD contract; no imgnAI API key is required.
 
 - `/generate` opens a private setup with prompt, SFW model, aspect ratio, quality, live MUSD price, and balance.
 - The confirmed amount is atomically reserved from the user's internal MUSD balance. The public progress message is edited into the final downloadable image.
