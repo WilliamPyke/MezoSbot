@@ -148,6 +148,45 @@ export const config = {
     guildId: optional("LEDGER_GUILD_ID", ""),
     channelId: optional("LEDGER_CHANNEL_ID", ""),
   },
+  developerRelay: {
+    /** Developer link relay always forwards `channel:` messages to this text channel. */
+    developerChannelId: optional("DEVELOPER_CHANNEL_ID", "1229470180252119605"),
+  },
+  /**
+   * Hybrid /swap: internal inventory when possible, Mezo Pools on-chain otherwise.
+   * Gas for on-chain legs is reserved from the user's SATS balance.
+   */
+  swap: {
+    /** Default false until migration is applied and ops are ready. */
+    enabled: optionalBool("SWAP_ENABLED", false),
+    routerAddress: optional("MEZO_POOLS_ROUTER", "0x16A76d3cd3C1e3CE843C6680d6B37E9116b5C706"),
+    poolFactory: optional("MEZO_POOLS_FACTORY", "0x83FE469C636C4081b87bA5b3Ae9991c6Ed104248"),
+    /** Quote validity window (ms). */
+    quoteTtlMs: parseInt(optional("SWAP_QUOTE_TTL_MS", "45000"), 10),
+    /** Max slippage bps the user may request (hard cap). */
+    maxSlippageBps: parseInt(optional("SWAP_MAX_SLIPPAGE_BPS", "500"), 10),
+    /** Default slippage when user omits it (bps). */
+    defaultSlippageBps: parseInt(optional("SWAP_DEFAULT_SLIPPAGE_BPS", "100"), 10),
+    /** Internal fills use at most this fraction of free inventory. */
+    maxInternalFraction: parseFloat(optional("SWAP_MAX_INTERNAL_FRACTION", "0.5")),
+    /** Absolute cap on a single internal fill (token units of the *output*). */
+    maxInternalOutSats: parseFloat(optional("SWAP_MAX_INTERNAL_OUT_SATS", "5000000")),
+    maxInternalOutMusd: parseFloat(optional("SWAP_MAX_INTERNAL_OUT_MUSD", "500")),
+    maxInternalOutMusdc: parseFloat(optional("SWAP_MAX_INTERNAL_OUT_MUSDC", "500")),
+    /** Haircut on internal mid quotes so inventory is not arbed (bps). */
+    internalHaircutBps: parseInt(optional("SWAP_INTERNAL_HAIRCUT_BPS", "10"), 10),
+    maxSwapsPerDay: parseInt(optional("SWAP_MAX_PER_DAY", "25"), 10),
+    maxVolumeSatsPerDay: parseFloat(optional("SWAP_MAX_VOLUME_SATS_PER_DAY", "50000000")),
+    minFromSats: parseFloat(optional("SWAP_MIN_FROM_SATS", "100")),
+    minFromMusd: parseFloat(optional("SWAP_MIN_FROM_MUSD", "0.10")),
+    minFromMusdc: parseFloat(optional("SWAP_MIN_FROM_MUSDC", "0.10")),
+    /** Background rebalance when free inventory of a token drops below this. */
+    rebalanceMinFreeSats: parseFloat(optional("SWAP_REBALANCE_MIN_FREE_SATS", "250000")),
+    rebalanceMinFreeMusd: parseFloat(optional("SWAP_REBALANCE_MIN_FREE_MUSD", "50")),
+    rebalanceMinFreeMusdc: parseFloat(optional("SWAP_REBALANCE_MIN_FREE_MUSDC", "50")),
+    rebalanceIntervalMs: parseInt(optional("SWAP_REBALANCE_INTERVAL_MS", "300000"), 10),
+    rebalanceEnabled: optionalBool("SWAP_REBALANCE_ENABLED", true),
+  },
   streaming: {
     port: parseInt(optional("STREAM_PORT", optional("PORT", "8787")), 10),
     targetFps: parseInt(optional("STREAM_TARGET_FPS", "30"), 10),

@@ -90,8 +90,19 @@ export function getTreasuryAddress(): string {
   return wallet.address;
 }
 
+export function getTreasurySigner(): ethers.Wallet {
+  return wallet;
+}
+
 export function getSweepGasSponsorAddress(): string {
   return sweepGasSponsorWallet.address;
+}
+
+/** Exported for swap gas quotes and other protocol ops that share Mezo RPC helpers. */
+export { rawRpcCall, addGasLimitBuffer };
+
+export async function getGasPriceWei(): Promise<bigint> {
+  return getGasPrice();
 }
 
 export function initEVM() {

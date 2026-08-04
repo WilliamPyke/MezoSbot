@@ -13,6 +13,7 @@ const rainBans_js_1 = require("../rainBans.js");
 const format_js_1 = require("../format.js");
 const catalog_js_1 = require("../imgnai/catalog.js");
 const payments_js_1 = require("../imgnai/payments.js");
+const musd_js_1 = require("../imgnai/musd.js");
 const types_js_1 = require("../imgnai/types.js");
 const CUSTOM_ID_PREFIX = "admin";
 const COLOR_MAIN = 0x2ecc71; // Green
@@ -110,7 +111,8 @@ async function renderImgnaiMenu(guildId, page, statusText) {
         operations.gasSponsorIsTreasury && operations.gasSponsorSats != null && operations.gasSponsorSats < operations.gasReserveMinimumSats
             ? "Treasury sweep sponsorship is below its protected reserve."
             : null,
-        musdAssets != null && musdObligations != null && musdAssets < musdObligations ? "MUSD assets are below user and pending-job obligations." : null,
+        musdAssets != null && musdObligations != null && !(0, musd_js_1.hasSufficientMusdBacking)(musdAssets, musdObligations)
+            ? "MUSD assets are below user and pending-job obligations." : null,
         operations.sweepErrors ? `${operations.sweepErrors} ERC-20 sweep checkpoint(s) have errors.` : null,
         operations.lastSweepGasError,
     ].filter((item) => !!item);

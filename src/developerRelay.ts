@@ -5,6 +5,7 @@ import {
   type SendableChannels,
 } from "discord.js";
 import { supabase, type DeveloperRelayRouteRow } from "./db.js";
+import { config } from "./config.js";
 import {
   buildDeveloperRelayContent,
   parseDeveloperRelayMessage,
@@ -141,13 +142,15 @@ function validateDestination(
   if (!channel || !channel.isSendable() || channel.isDMBased()) return false;
   if (!("guildId" in channel) || channel.guildId !== route.guild_id) return false;
 
+  const developerChannelId = config.developerRelay.developerChannelId;
+
   if (destination === "channel") {
-    return channel.type === ChannelType.GuildText && channel.id === route.developer_channel_id;
+    return channel.type === ChannelType.GuildText && channel.id === developerChannelId;
   }
 
   return channel.type === ChannelType.PrivateThread &&
     channel.id === route.private_thread_id &&
-    channel.parentId === route.developer_channel_id;
+    channel.parentId === developerChannelId;
 }
 
 export async function handleDeveloperRelayMessage(client: Client, message: Message): Promise<void> {
@@ -186,7 +189,7 @@ export async function handleDeveloperRelayMessage(client: Client, message: Messa
 
   const route = routes[0];
   const destinationChannelId = parsed.destination === "channel"
-    ? route.developer_channel_id
+    ? config.developerRelay.developerChannelId
     : route.private_thread_id;
   const content = buildDeveloperRelayContent(
     message.author.globalName ?? message.author.username,

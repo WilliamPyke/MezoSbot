@@ -58,6 +58,8 @@ const wallet = __importStar(require("./wallet.js"));
 const satscape = __importStar(require("./satscape.js"));
 const multi = __importStar(require("./multi.js"));
 const generate = __importStar(require("./generate.js"));
+const developerRelay = __importStar(require("./developerRelay.js"));
+const swap = __importStar(require("./swap.js"));
 const gameboy_js_1 = require("./gameboy.js");
 const config_js_1 = require("../config.js");
 const baseCommands = [
@@ -65,6 +67,7 @@ const baseCommands = [
     deposit,
     balance,
     withdraw,
+    swap,
     tip,
     distribute,
     drop,
@@ -85,6 +88,7 @@ const baseCommands = [
     satscape,
     multi,
     generate,
+    developerRelay,
 ];
 // Merge base commands + gameboy button commands into a single list
 exports.commands = [

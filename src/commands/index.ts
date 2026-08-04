@@ -24,6 +24,7 @@ import * as satscape from "./satscape.js";
 import * as multi from "./multi.js";
 import * as generate from "./generate.js";
 import * as developerRelay from "./developerRelay.js";
+import * as swap from "./swap.js";
 import { gameboyCommands } from "./gameboy.js";
 import { config } from "../config.js";
 
@@ -32,6 +33,7 @@ const baseCommands = [
   deposit,
   balance,
   withdraw,
+  swap,
   tip,
   distribute,
   drop,

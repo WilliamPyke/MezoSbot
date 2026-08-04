@@ -17,6 +17,9 @@ import { config } from "./config.js";
 import { formatSats } from "./format.js";
 import { formatTokenAmount } from "./tokens.js";
 import { initEVM, getTreasuryAddress, startDepositPoller, registerDepositAddress, recoverPendingWithdrawals } from "./evm.js";
+import { recoverPendingSwaps, startSwapRecoveryWorker } from "./swap/service.js";
+import { startSwapRebalanceWorker } from "./swap/rebalance.js";
+import { handleSwapInteraction, isSwapInteraction } from "./commands/swap.js";
 import { bindLedgerClient, recordLedgerEntry } from "./ledger.js";
 import { commands, commandsData } from "./commands/index.js";
 import { handleQuestBuilderInteraction, isQuestBuilderInteraction, handleQuestEditInteraction, isQuestEditInteraction } from "./commands/quest.js";
@@ -477,6 +480,24 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return;
   }
 
+  if (isSwapInteraction(interaction)) {
+    const cid = ("customId" in interaction && interaction.customId) || "";
+    console.log(`[Discord] Swap interaction ${cid} from ${tag} (arrivalLag=${arrivalLagMs}ms)`);
+    try {
+      await handleSwapInteraction(interaction);
+    } catch (err) {
+      const message = (err as Error)?.message ?? String(err);
+      console.warn(`[Swap] Interaction ${cid} failed:`, message);
+      if ("followUp" in interaction && (interaction.deferred || interaction.replied)) {
+        await interaction.followUp({ content: `Could not complete swap: ${message}`, flags: MessageFlags.Ephemeral }).catch(() => {});
+      } else if ("reply" in interaction) {
+        await interaction.reply({ content: `Could not complete swap: ${message}`, flags: MessageFlags.Ephemeral }).catch(() => {});
+      }
+    }
+    console.log(`[Discord] Swap ${cid} done in ${Date.now() - startMs}ms`);
+    return;
+  }
+
   if (isRainBanInteraction(interaction)) {
     const cid = ("customId" in interaction && interaction.customId) || "";
     console.log(`[Discord] Rain ban interaction ${cid} from ${tag} (arrivalLag=${arrivalLagMs}ms)`);
@@ -860,6 +881,11 @@ async function main() {
   recoverPendingWithdrawals().catch((err) =>
     console.error("[Recovery] Failed:", (err as Error)?.message ?? err)
   );
+  recoverPendingSwaps().catch((err) =>
+    console.error("[Swap recovery] Failed:", (err as Error)?.message ?? err)
+  );
+  startSwapRecoveryWorker(60_000);
+  startSwapRebalanceWorker();
 
   await connectDiscordWithRetry();
 

@@ -6,6 +6,9 @@ const config_js_1 = require("./config.js");
 const format_js_1 = require("./format.js");
 const tokens_js_1 = require("./tokens.js");
 const evm_js_1 = require("./evm.js");
+const service_js_1 = require("./swap/service.js");
+const rebalance_js_1 = require("./swap/rebalance.js");
+const swap_js_1 = require("./commands/swap.js");
 const ledger_js_1 = require("./ledger.js");
 const index_js_1 = require("./commands/index.js");
 const quest_js_1 = require("./commands/quest.js");
@@ -28,8 +31,9 @@ const spectate_js_1 = require("./arcade/spectate.js");
 const db_js_2 = require("./arcade/db.js");
 const matchmaking_js_1 = require("./arcade/matchmaking.js");
 const interactions_js_3 = require("./imgnai/interactions.js");
-const service_js_1 = require("./imgnai/service.js");
+const service_js_2 = require("./imgnai/service.js");
 const catalog_js_1 = require("./imgnai/catalog.js");
+const developerRelay_js_1 = require("./developerRelay.js");
 process.on("unhandledRejection", (err) => {
     console.error("Unhandled rejection:", err?.message ?? err);
 });
@@ -46,6 +50,7 @@ const intents = [
     // message.content additionally needs the privileged MessageContent intent
     // (added below); without it, the runtime falls back to embed URLs.
     discord_js_1.GatewayIntentBits.GuildMessages,
+    discord_js_1.GatewayIntentBits.DirectMessages,
 ];
 if (config_js_1.config.discord.guildMembersIntent) {
     intents.push(discord_js_1.GatewayIntentBits.GuildMembers);
@@ -57,6 +62,7 @@ console.log(`[Discord] Gateway intents: ${intents.join(", ")}`);
 let discordState = "not_started";
 const client = new discord_js_1.Client({
     intents,
+    partials: [discord_js_1.Partials.Channel],
 });
 (0, stream_js_1.setHealthStatusProvider)(() => ({
     status: client.isReady() ? "ok" : "starting",
@@ -380,6 +386,25 @@ client.on(discord_js_1.Events.InteractionCreate, async (interaction) => {
         console.log(`[Discord] Admin interaction ${cid} done in ${Date.now() - startMs}ms`);
         return;
     }
+    if ((0, swap_js_1.isSwapInteraction)(interaction)) {
+        const cid = ("customId" in interaction && interaction.customId) || "";
+        console.log(`[Discord] Swap interaction ${cid} from ${tag} (arrivalLag=${arrivalLagMs}ms)`);
+        try {
+            await (0, swap_js_1.handleSwapInteraction)(interaction);
+        }
+        catch (err) {
+            const message = err?.message ?? String(err);
+            console.warn(`[Swap] Interaction ${cid} failed:`, message);
+            if ("followUp" in interaction && (interaction.deferred || interaction.replied)) {
+                await interaction.followUp({ content: `Could not complete swap: ${message}`, flags: discord_js_1.MessageFlags.Ephemeral }).catch(() => { });
+            }
+            else if ("reply" in interaction) {
+                await interaction.reply({ content: `Could not complete swap: ${message}`, flags: discord_js_1.MessageFlags.Ephemeral }).catch(() => { });
+            }
+        }
+        console.log(`[Discord] Swap ${cid} done in ${Date.now() - startMs}ms`);
+        return;
+    }
     if ((0, rainban_js_1.isRainBanInteraction)(interaction)) {
         const cid = ("customId" in interaction && interaction.customId) || "";
         console.log(`[Discord] Rain ban interaction ${cid} from ${tag} (arrivalLag=${arrivalLagMs}ms)`);
@@ -473,6 +498,10 @@ client.on(discord_js_1.Events.GuildScheduledEventUserRemove, async (event) => {
 client.on(discord_js_1.Events.MessageCreate, async (message) => {
     if (message.author.bot)
         return;
+    if (message.channel.isDMBased()) {
+        await (0, developerRelay_js_1.handleDeveloperRelayMessage)(client, message).catch((err) => console.warn("[DeveloperRelay] DM handler failed:", err?.message ?? err));
+        return;
+    }
     await (0, runtime_js_1.handleMultiStepQuestMessage)(client, message).catch((err) => console.warn("[QuestEngine] Message handler failed:", err?.message ?? err));
     if (!config_js_1.config.gameboy.enabled)
         return;
@@ -696,9 +725,12 @@ async function main() {
     console.log(`Treasury: ${(0, evm_js_1.getTreasuryAddress)()}`);
     // Resolve any withdrawals left pending from a previous session
     (0, evm_js_1.recoverPendingWithdrawals)().catch((err) => console.error("[Recovery] Failed:", err?.message ?? err));
+    (0, service_js_1.recoverPendingSwaps)().catch((err) => console.error("[Swap recovery] Failed:", err?.message ?? err));
+    (0, service_js_1.startSwapRecoveryWorker)(60_000);
+    (0, rebalance_js_1.startSwapRebalanceWorker)();
     await connectDiscordWithRetry();
     (0, catalog_js_1.refreshKatanaModels)(true).catch((err) => console.warn("[imgnAI] Initial model refresh failed:", err?.message ?? err));
-    (0, service_js_1.startImgnaiWorker)(client);
+    (0, service_js_2.startImgnaiWorker)(client);
     (0, evm_js_1.startDepositPoller)((discordId, amountSats, gasSats, txHash, token) => {
         console.log(`Auto-deposit: ${(0, tokens_js_1.formatTokenAmount)(amountSats, token)} for ${discordId}`);
         (0, ledger_js_1.recordLedgerEntry)(client, {

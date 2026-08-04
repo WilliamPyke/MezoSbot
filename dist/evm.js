@@ -2,7 +2,11 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.getProvider = getProvider;
 exports.getTreasuryAddress = getTreasuryAddress;
+exports.getTreasurySigner = getTreasurySigner;
 exports.getSweepGasSponsorAddress = getSweepGasSponsorAddress;
+exports.rawRpcCall = rawRpcCall;
+exports.addGasLimitBuffer = addGasLimitBuffer;
+exports.getGasPriceWei = getGasPriceWei;
 exports.initEVM = initEVM;
 exports.getUserDepositWallet = getUserDepositWallet;
 exports.getUserDepositAddress = getUserDepositAddress;
@@ -102,8 +106,14 @@ async function rawRpcCall(method, params, options = {}) {
 function getTreasuryAddress() {
     return wallet.address;
 }
+function getTreasurySigner() {
+    return wallet;
+}
 function getSweepGasSponsorAddress() {
     return sweepGasSponsorWallet.address;
+}
+async function getGasPriceWei() {
+    return getGasPrice();
 }
 function initEVM() {
     const network = { chainId: config_js_1.config.evm.chainId, name: "mezo" };

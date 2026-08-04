@@ -4,6 +4,7 @@ import {
   PermissionFlagsBits,
   type ChatInputCommandInteraction,
 } from "discord.js";
+import { config } from "../config.js";
 import {
   disableDeveloperRelayRoute,
   getDeveloperRelayRoute,
@@ -18,10 +19,9 @@ export const data = {
     {
       name: "set",
       type: 1 as const,
-      description: "Assign a developer channel and private thread",
+      description: "Assign a developer private thread",
       options: [
         { name: "developer", type: 6 as const, description: "Developer to authorize", required: true },
-        { name: "channel", type: 7 as const, description: "Developer text channel", required: true },
         { name: "thread", type: 7 as const, description: "Developer's private thread", required: true },
       ],
     },
@@ -70,11 +70,13 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
   }
 
   if (subcommand === "set") {
-    const channel = interaction.options.getChannel("channel", true);
     const thread = interaction.options.getChannel("thread", true);
 
-    if (channel.type !== ChannelType.GuildText || !("guildId" in channel) || channel.guildId !== interaction.guild.id) {
-      await interaction.editReply("The developer channel must be a text channel in this server.");
+    const channel = await interaction.guild.channels
+      .fetch(config.developerRelay.developerChannelId)
+      .catch(() => null);
+    if (!channel || channel.type !== ChannelType.GuildText || channel.guildId !== interaction.guild.id) {
+      await interaction.editReply("The configured developer channel is missing or is not a text channel in this server.");
       return;
     }
     if (
@@ -86,7 +88,7 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
       return;
     }
     if (thread.parentId !== channel.id) {
-      await interaction.editReply("The selected private thread must belong to the selected developer channel.");
+      await interaction.editReply("The selected private thread must belong to the developer channel.");
       return;
     }
 
@@ -137,7 +139,7 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
     await interaction.editReply({
       content:
         `Relay for <@${developer.id}> is **${route.enabled ? "enabled" : "disabled"}**.\n` +
-        `Developer channel: <#${route.developer_channel_id}>\n` +
+        `Developer channel: <#${config.developerRelay.developerChannelId}>\n` +
         `Private thread: <#${route.private_thread_id}>`,
       allowedMentions: { parse: [] },
     });

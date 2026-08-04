@@ -38,7 +38,11 @@ export type LedgerEntryType =
   | "arcade_rake"
   | "gameboy_bid"
   | "image_generation"
-  | "image_generation_refund";
+  | "image_generation_refund"
+  | "swap"
+  | "swap_refund"
+  | "swap_network_fee"
+  | "swap_network_fee_refund";
 
 const TYPE_LABELS: Record<LedgerEntryType, string> = {
   deposit: "Deposit",
@@ -62,6 +66,10 @@ const TYPE_LABELS: Record<LedgerEntryType, string> = {
   gameboy_bid: "Game Bid",
   image_generation: "Image Generation",
   image_generation_refund: "Image Generation Refund",
+  swap: "Swap",
+  swap_refund: "Swap Refund",
+  swap_network_fee: "Swap Network Fee",
+  swap_network_fee_refund: "Swap Network Fee Refund",
 };
 
 export type LedgerPartyId = string | "treasury" | "platform" | null;

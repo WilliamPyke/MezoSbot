@@ -101,6 +101,7 @@ npm run dev
 | `/balance` | Check all token balances |
 | `/generate` | Configure and generate one Katana image paid from your MUSD balance |
 | `/withdraw <amount> [address] [token]` | Withdraw a token to an address |
+| `/swap <amount> <from> <to> [slippage] [onchain]` | Swap SATS ↔ MUSD ↔ mUSDC (inventory or Mezo Pools; on-chain gas from sats) |
 | `/tip <user> <amount> [token] [message]` | Tip another user with an optional message |
 | `/distribute <amount> <@users> [token]` | Split a token among multiple users |
 | `/rain <amount> <count> [token] [role] [message]` | Rain a token on recently active users (optionally role-filtered) |
@@ -121,6 +122,29 @@ Recipients receive DMs when they are credited from tips, rains, distributions, a
 Token arguments are optional and default to native SATS, preserving the original command behavior.
 Rain banned-word filtering requires `DISCORD_MESSAGE_CONTENT_INTENT=true` and the Message Content privileged intent enabled in Discord Developer Portal.
 
+## Token swaps (`/swap`)
+
+Apply `migrations/2026-08-03_token_swaps.sql` before enabling swaps.
+
+Hybrid routing:
+
+1. **Internal** — when free treasury inventory of the *output* token covers the fill (after liabilities and the protected SATS gas reserve). Instant, no network fee. Serialized with a Postgres advisory lock so concurrent fills cannot over-promise inventory.
+2. **On-chain** — Mezo Pools router (`swapExactTokensForTokens`) when inventory is thin or the user passes `onchain:true`. Gas is reserved from the user's **SATS** balance (same pattern as ERC-20 withdrawals); unused gas is refunded after the receipt.
+
+Supported pairs: SATS ↔ MUSD, MUSD ↔ mUSDC, and multi-hop SATS ↔ mUSDC. MEZO is not swappable until a liquid pool exists.
+
+Safety controls: quote TTL, confirm button, slippage floor, daily per-user count/volume caps, SatQuest combat lock on SATS, crash recovery for `reserved`/`submitted` swaps, and optional background inventory rebalance (`SWAP_REBALANCE_ENABLED`).
+
+| Variable | Description |
+|----------|-------------|
+| `SWAP_ENABLED` | Master switch (default `false` — enable after applying the swap migration) |
+| `MEZO_POOLS_ROUTER` | Router address (default mainnet Mezo Pools router) |
+| `MEZO_POOLS_FACTORY` | Pool factory address |
+| `SWAP_QUOTE_TTL_MS` | Quote validity (default `45000`) |
+| `SWAP_MAX_INTERNAL_FRACTION` | Max fraction of free inventory usable per internal fill (default `0.5`) |
+| `SWAP_MAX_PER_DAY` / `SWAP_MAX_VOLUME_SATS_PER_DAY` | Per-user daily limits |
+| `PROTOCOL_GAS_RESERVE_MIN_SATS` | Protected SATS not available as internal inventory |
+
 ## Developer link relay
 
 Apply `migrations/2026-07-28_developer_relay.sql` before configuring relay routes. The bot requires **View Channel**, **Send Messages**, and **Embed Links** in the developer channel, plus **Send Messages in Threads** and access to each configured private thread.
@@ -128,10 +152,12 @@ Apply `migrations/2026-07-28_developer_relay.sql` before configuring relay route
 A server manager configures a developer with:
 
 ```text
-/developer-relay set developer:@alice channel:#developers thread:#alice-private
+/developer-relay set developer:@alice thread:#alice-private
 ```
 
-The developer can then DM a message containing an `http://`, `https://`, or `www.` link to Mezo SBOT. A normal DM is forwarded to the configured private thread. Prefixing the DM with `channel:` sends it to the configured developer channel; `thread:` selects the private thread explicitly.
+The `channel:` destination always posts to the configured developer channel (set via `DEVELOPER_CHANNEL_ID`, default `1229470180252119605`).
+
+The developer can then DM a message containing an `http://`, `https://`, or `www.` link to Mezo SBOT. A normal DM is forwarded to the configured private thread. Prefixing the DM with `channel:` sends it to the developer channel; `thread:` selects the private thread explicitly.
 
 Forwarded messages identify the original developer, suppress all Discord mentions, are limited to five per minute per developer, and are recorded by source and destination message ID for duplicate-delivery protection. If the server's link filter also scans bot messages, exempt the Mezo SBOT role or the configured relay destinations.
 
