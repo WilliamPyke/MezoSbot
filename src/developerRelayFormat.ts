@@ -4,6 +4,13 @@ export type ParsedDeveloperRelayMessage =
   | { ok: true; destination: DeveloperRelayDestination; body: string }
   | { ok: false; error: string };
 
+export function getDeveloperRelayDestinationChannelId(
+  route: { developer_channel_id: string; private_thread_id: string },
+  destination: DeveloperRelayDestination,
+): string {
+  return destination === "channel" ? route.developer_channel_id : route.private_thread_id;
+}
+
 const DESTINATION_PREFIX = /^(channel|thread)\s*:\s*/i;
 const LINK_PATTERN = /(?:https?:\/\/|www\.)[^\s<]+/i;
 

@@ -148,10 +148,6 @@ export const config = {
     guildId: optional("LEDGER_GUILD_ID", ""),
     channelId: optional("LEDGER_CHANNEL_ID", ""),
   },
-  developerRelay: {
-    /** Developer link relay always forwards `channel:` messages to this text channel. */
-    developerChannelId: optional("DEVELOPER_CHANNEL_ID", "1229470180252119605"),
-  },
   /**
    * Hybrid /swap: internal inventory when possible, Mezo Pools on-chain otherwise.
    * Gas for on-chain legs is reserved from the user's SATS balance.

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   buildDeveloperRelayContent,
+  getDeveloperRelayDestinationChannelId,
   parseDeveloperRelayMessage,
 } from "../src/developerRelayFormat.js";
 
@@ -33,6 +34,16 @@ test("recognizes explicit channel and thread destinations", () => {
       body: "https://example.com/private",
     },
   );
+});
+
+test("uses the channel saved with the route instead of a global channel", () => {
+  const route = {
+    developer_channel_id: "route-channel",
+    private_thread_id: "private-thread",
+  };
+
+  assert.equal(getDeveloperRelayDestinationChannelId(route, "channel"), "route-channel");
+  assert.equal(getDeveloperRelayDestinationChannelId(route, "thread"), "private-thread");
 });
 
 test("requires both content and a link", () => {

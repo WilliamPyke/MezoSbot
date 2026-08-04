@@ -4,7 +4,6 @@ import {
   PermissionFlagsBits,
   type ChatInputCommandInteraction,
 } from "discord.js";
-import { config } from "../config.js";
 import {
   disableDeveloperRelayRoute,
   getDeveloperRelayRoute,
@@ -72,23 +71,23 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
   if (subcommand === "set") {
     const thread = interaction.options.getChannel("thread", true);
 
-    const channel = await interaction.guild.channels
-      .fetch(config.developerRelay.developerChannelId)
-      .catch(() => null);
-    if (!channel || channel.type !== ChannelType.GuildText || channel.guildId !== interaction.guild.id) {
-      await interaction.editReply("The configured developer channel is missing or is not a text channel in this server.");
-      return;
-    }
     if (
       thread.type !== ChannelType.PrivateThread ||
       !("guildId" in thread) ||
-      thread.guildId !== interaction.guild.id
+      thread.guildId !== interaction.guild.id ||
+      thread.parentId === null
     ) {
       await interaction.editReply("The thread must be a private thread in this server.");
       return;
     }
-    if (thread.parentId !== channel.id) {
-      await interaction.editReply("The selected private thread must belong to the developer channel.");
+
+    const channel = thread.parent ?? await interaction.guild.channels
+      .fetch(thread.parentId)
+      .catch(() => null);
+    if (!channel || channel.type !== ChannelType.GuildText || channel.guildId !== interaction.guild.id) {
+      await interaction.editReply(
+        "I can't access the selected thread's parent text channel. Give me **View Channel** permission on it, then try again.",
+      );
       return;
     }
 
@@ -139,7 +138,7 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
     await interaction.editReply({
       content:
         `Relay for <@${developer.id}> is **${route.enabled ? "enabled" : "disabled"}**.\n` +
-        `Developer channel: <#${config.developerRelay.developerChannelId}>\n` +
+        `Developer channel: <#${route.developer_channel_id}>\n` +
         `Private thread: <#${route.private_thread_id}>`,
       allowedMentions: { parse: [] },
     });

@@ -155,7 +155,7 @@ A server manager configures a developer with:
 /developer-relay set developer:@alice thread:#alice-private
 ```
 
-The `channel:` destination always posts to the configured developer channel (set via `DEVELOPER_CHANNEL_ID`, default `1229470180252119605`).
+The `channel:` destination posts to the selected private thread's parent text channel. That channel is saved with the developer's relay route when `/developer-relay set` is run.
 
 The developer can then DM a message containing an `http://`, `https://`, or `www.` link to Mezo SBOT. A normal DM is forwarded to the configured private thread. Prefixing the DM with `channel:` sends it to the developer channel; `thread:` selects the private thread explicitly.
 
