@@ -20,6 +20,16 @@ export const data = {
 };
 
 export async function execute(interaction: ChatInputCommandInteraction) {
+  if (!config.withdrawals.enabled) {
+    return interaction.reply({
+      content:
+        "🛠️ **Withdrawals are temporarily disabled.**\n" +
+        `MezoSBOT is currently undergoing account upgrades. Estimated completion: **${config.withdrawals.eta}**.\n` +
+        "Your balance is safe — please try again after the upgrade is complete.",
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
   const addressOpt = interaction.options.getString("address");
   const token = parseToken(interaction.options.getString("token"));
   const amount = roundTokenAmount(interaction.options.getNumber("amount", true), token);

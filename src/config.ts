@@ -85,6 +85,11 @@ export const config = {
     settlementGraceSeconds: parseInt(optional("WEB_SETTLEMENT_GRACE_SECONDS", "30"), 10),
   },
   depositWebUrl: optional("DEPOSIT_WEB_URL", "https://deposit.mallard.sh/sbot"),
+  withdrawals: {
+    /** Default false while MezoSBOT account upgrades are in progress. */
+    enabled: optionalBool("WITHDRAWALS_ENABLED", false),
+    eta: optional("WITHDRAWALS_ETA", "Friday, September 25th"),
+  },
   /**
    * Public base URL of this bot's HTTP server (no trailing slash).
    * Used to build the Slice Arcade browser-play links posted in Discord.
