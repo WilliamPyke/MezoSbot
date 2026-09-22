@@ -149,13 +149,25 @@ Safety controls: quote TTL, confirm button, slippage floor, daily per-user count
 
 Apply `migrations/2026-07-28_developer_relay.sql` before configuring relay routes. The bot requires **View Channel**, **Send Messages**, and **Embed Links** in the developer channel, plus **Send Messages in Threads** and access to each configured private thread.
 
-A server manager configures a developer with:
+Apply `migrations/2026-09-21_developer_relay_channel_only.sql` before using channel-only routes. Restart the bot after deployment to refresh slash commands.
+
+A server manager can authorize posting through SBOT to #developers without a private thread:
+
+```text
+/developer-relay set developer:@alice channel:#developers
+```
+
+Alice then DMs SBOT `channel: My update https://example.com`. A link and the `channel:` prefix are required for channel-only routes; unprefixed or `thread:` messages will ask her to use `channel:`. This authorizes relay posting; it does not change Discord roles or channel permissions.
+
+To configure a private thread as well:
 
 ```text
 /developer-relay set developer:@alice thread:#alice-private
 ```
 
-The `channel:` destination posts to the selected private thread's parent text channel. That channel is saved with the developer's relay route when `/developer-relay set` is run.
+If both `channel` and `thread` are supplied, the thread must belong to that channel. Running `set` replaces the previous route; using only `channel` removes any previous private-thread destination.
+
+The `channel:` destination posts to the selected text channel, or the private thread's parent text channel when only `thread` is supplied. That channel is saved with the developer's relay route when `/developer-relay set` is run.
 
 The developer can then DM a message containing an `http://`, `https://`, or `www.` link to Mezo SBOT. A normal DM is forwarded to the configured private thread. Prefixing the DM with `channel:` sends it to the developer channel; `thread:` selects the private thread explicitly.
 

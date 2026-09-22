@@ -5,9 +5,9 @@ export type ParsedDeveloperRelayMessage =
   | { ok: false; error: string };
 
 export function getDeveloperRelayDestinationChannelId(
-  route: { developer_channel_id: string; private_thread_id: string },
+  route: { developer_channel_id: string; private_thread_id: string | null },
   destination: DeveloperRelayDestination,
-): string {
+): string | null {
   return destination === "channel" ? route.developer_channel_id : route.private_thread_id;
 }
 

@@ -18,10 +18,11 @@ export const data = {
     {
       name: "set",
       type: 1 as const,
-      description: "Assign a developer private thread",
+      description: "Authorize a developer channel or private thread",
       options: [
         { name: "developer", type: 6 as const, description: "Developer to authorize", required: true },
-        { name: "thread", type: 7 as const, description: "Developer's private thread", required: true },
+        { name: "channel", type: 7 as const, description: "Developer text channel", required: false, channel_types: [ChannelType.GuildText] },
+        { name: "thread", type: 7 as const, description: "Developer's private thread", required: false, channel_types: [ChannelType.PrivateThread] },
       ],
     },
     {
@@ -69,45 +70,50 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
   }
 
   if (subcommand === "set") {
-    const thread = interaction.options.getChannel("thread", true);
-
-    if (
+    const thread = interaction.options.getChannel("thread");
+    const selectedChannel = interaction.options.getChannel("channel");
+    if (!thread && !selectedChannel) {
+      await interaction.editReply("Select a developer channel or a private thread.");
+      return;
+    }
+    if (thread && (
       thread.type !== ChannelType.PrivateThread ||
-      !("guildId" in thread) ||
-      thread.guildId !== interaction.guild.id ||
+      !("guildId" in thread) || thread.guildId !== interaction.guild.id ||
       thread.parentId === null
-    ) {
+    )) {
       await interaction.editReply("The thread must be a private thread in this server.");
       return;
     }
-
-    const channel = thread.parent ?? await interaction.guild.channels
-      .fetch(thread.parentId)
-      .catch(() => null);
+    const channelId = selectedChannel?.id ?? (thread && "parentId" in thread ? thread.parentId : null);
+    const channel = channelId ? await interaction.guild.channels.fetch(channelId).catch(() => null) : null;
     if (!channel || channel.type !== ChannelType.GuildText || channel.guildId !== interaction.guild.id) {
-      await interaction.editReply(
-        "I can't access the selected thread's parent text channel. Give me **View Channel** permission on it, then try again.",
-      );
+      await interaction.editReply("Select a text channel in this server that I can access.");
+      return;
+    }
+    if (thread && (!("parentId" in thread) || thread.parentId !== channel.id)) {
+      await interaction.editReply("The private thread must belong to the selected developer channel.");
       return;
     }
 
     const botMember = interaction.guild.members.me;
     const channelPermissions = botMember ? channel.permissionsFor(botMember) : null;
-    const threadPermissions = botMember ? thread.permissionsFor(botMember) : null;
+    const threadPermissions = botMember && thread && "permissionsFor" in thread ? thread.permissionsFor(botMember) : null;
     if (
       !channelPermissions?.has([
         PermissionFlagsBits.ViewChannel,
         PermissionFlagsBits.SendMessages,
         PermissionFlagsBits.EmbedLinks,
       ]) ||
-      !threadPermissions?.has([
+      (thread && !threadPermissions?.has([
         PermissionFlagsBits.ViewChannel,
         PermissionFlagsBits.SendMessagesInThreads,
         PermissionFlagsBits.EmbedLinks,
-      ])
+      ]))
     ) {
       await interaction.editReply(
-        "I still need View Channel, Send Messages, Embed Links, and Send Messages in Threads for those destinations.",
+        thread
+          ? "I still need View Channel, Send Messages, Embed Links, and Send Messages in Threads for those destinations."
+          : "I still need View Channel, Send Messages, and Embed Links in the developer channel.",
       );
       return;
     }
@@ -116,13 +122,13 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
       guildId: interaction.guild.id,
       discordId: developer.id,
       developerChannelId: channel.id,
-      privateThreadId: thread.id,
+      privateThreadId: thread?.id ?? null,
       createdBy: interaction.user.id,
     });
     await interaction.editReply({
       content:
         `Relay enabled for <@${developer.id}>.\n` +
-        `Default: <#${thread.id}>\n` +
+        (thread ? `Default: <#${thread.id}>\n` : "No private thread. Use `channel:` when sending links.\n") +
         `Public with \`channel:\`: <#${channel.id}>`,
       allowedMentions: { parse: [] },
     });
@@ -139,7 +145,7 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
       content:
         `Relay for <@${developer.id}> is **${route.enabled ? "enabled" : "disabled"}**.\n` +
         `Developer channel: <#${route.developer_channel_id}>\n` +
-        `Private thread: <#${route.private_thread_id}>`,
+        `Private thread: ${route.private_thread_id ? `<#${route.private_thread_id}>` : "not configured (use channel:)"}`,
       allowedMentions: { parse: [] },
     });
     return;

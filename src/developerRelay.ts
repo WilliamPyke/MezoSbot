@@ -47,7 +47,7 @@ export async function setDeveloperRelayRoute(input: {
   guildId: string;
   discordId: string;
   developerChannelId: string;
-  privateThreadId: string;
+  privateThreadId: string | null;
   createdBy: string;
 }): Promise<void> {
   const { error } = await supabase
@@ -182,13 +182,17 @@ export async function handleDeveloperRelayMessage(client: Client, message: Messa
     await message.reply("You have relay routes in more than one server. Ask a server manager to disable the extra route.");
     return;
   }
+  const route = routes[0];
+  const destinationChannelId = getDeveloperRelayDestinationChannelId(route, parsed.destination);
+  if (!destinationChannelId) {
+    await message.reply("You do not have a private thread configured. Start your message with `channel:` to post in the developer channel.");
+    return;
+  }
   if (isRateLimited(message.author.id)) {
     await message.reply("You have reached the relay limit of 5 messages per minute. Please wait a moment.");
     return;
   }
 
-  const route = routes[0];
-  const destinationChannelId = getDeveloperRelayDestinationChannelId(route, parsed.destination);
   const content = buildDeveloperRelayContent(
     message.author.globalName ?? message.author.username,
     message.author.id,

@@ -1038,7 +1038,7 @@ CREATE TABLE IF NOT EXISTS developer_relay_routes (
   guild_id TEXT NOT NULL,
   discord_id TEXT NOT NULL,
   developer_channel_id TEXT NOT NULL,
-  private_thread_id TEXT NOT NULL,
+  private_thread_id TEXT,
   enabled BOOLEAN NOT NULL DEFAULT TRUE,
   created_by TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
