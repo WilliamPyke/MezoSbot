@@ -11,6 +11,9 @@ import { SAT, biomeAt } from "../satscape/engine.js";
 import { chargeBuyIn } from "../satscape/game.js";
 import { getPlayer, startRun } from "../satscape/db.js";
 import { buildSatscapePlayUrl } from "../satscape/web_tokens.js";
+import { config } from "../config.js";
+import { discordIdempotencyKey, sendSatscapeCommand, serviceErrorMessage } from "../serviceClient.js";
+import { metric } from "../telemetry.js";
 
 export const data = {
   name: "satscape",
@@ -42,7 +45,18 @@ export const data = {
 export async function execute(interaction: ChatInputCommandInteraction) {
   const sub = interaction.options.getSubcommand();
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  metric("discord_ack_ms", Date.now() - interaction.createdTimestamp, { command: "satscape", subcommand: sub });
   const discordId = interaction.user.id;
+
+  if (config.services.satscapeRemote) {
+    const action = sub === "join" ? "join" : sub === "shop" ? "open_shop" : sub === "quests" ? "open_quests" : "open_map";
+    const response = await sendSatscapeCommand(
+      { version: 1, domain: "satscape", action, actorId: discordId },
+      discordIdempotencyKey(interaction.id, `satscape.${action}`),
+    );
+    if (!response.ok) return interaction.editReply({ content: serviceErrorMessage(response.error) });
+    return interaction.editReply(buildRemotePlayReply(response.value.playUrl, sub as "join" | "map" | "shop" | "quests"));
+  }
 
   if (sub === "join") {
     const existing = await getPlayer(discordId);
@@ -70,6 +84,17 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   }
 
   return interaction.editReply(buildPlayReply(discordId, sub === "join" ? "join" : "map"));
+}
+
+function buildRemotePlayReply(url: string, target: "join" | "map" | "shop" | "quests") {
+  const embed = new EmbedBuilder()
+    .setColor(0x22c55e)
+    .setTitle(target === "join" ? "Welcome to SatScape" : "SatScape is ready")
+    .setDescription("SatScape now runs in its dedicated browser service. Your balance and game state remain authoritative in Supabase.");
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setStyle(ButtonStyle.Link).setURL(url).setLabel("Play SatScape in your browser"),
+  );
+  return { embeds: [embed], components: [row] };
 }
 
 function buildPlayReply(discordId: string, target: "join" | "map" | "shop" | "quests") {

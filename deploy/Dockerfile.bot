@@ -1,0 +1,48 @@
+# Northflank bot image. Built from the repo root:
+#   docker build -f deploy/Dockerfile.bot .
+#
+# This image is rollback-capable: it contains everything the legacy in-process
+# game server needs (web/dist, SatScape chunks, local emulator code), so any of
+# ARCADE_REMOTE_ENABLED / SATSCAPE_REMOTE_ENABLED / EMULATOR_REMOTE_ENABLED can
+# be set back to false with a plain redeploy of the same image.
+#
+# The ROM is never baked in. For a local-emulator rollback, mount it (Northflank
+# secret file / volume) and set ROM_PATH, e.g. ROM_PATH=/rom/pokeyellow.gbc.
+# Legacy emulator saves go to GB_SAVES_DIR (/app/saves, writable by `node`);
+# mount a volume there if saves must survive restarts.
+FROM node:22-bookworm-slim AS build
+WORKDIR /app
+COPY package.json package-lock.json ./
+COPY apps/bot/package.json apps/bot/package.json
+COPY apps/emulator/package.json apps/emulator/package.json
+COPY apps/games-worker/package.json apps/games-worker/package.json
+COPY packages/contracts/package.json packages/contracts/package.json
+COPY packages/game-core/package.json packages/game-core/package.json
+RUN npm ci
+COPY tsconfig.json tsconfig.base.json ./
+COPY packages ./packages
+COPY web ./web
+COPY src ./src
+# Root build = build:packages -> vite web build -> tsc -> SatScape chunk copy.
+RUN npm run build
+RUN npm prune --omit=dev
+
+FROM node:22-bookworm-slim
+ENV NODE_ENV=production \
+    MEZOSBOT_RUNTIME_ROLE=bot \
+    GB_SAVES_DIR=/app/saves
+WORKDIR /app
+COPY --from=build /app/package.json ./package.json
+COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/dist ./dist
+# stream.ts serves the legacy browser client from ./web/dist (cwd-relative).
+COPY --from=build /app/web/dist ./web/dist
+# imgnAI attaches ./src/assets/imgnai-logo.png (cwd-relative).
+COPY --from=build /app/src/assets ./src/assets
+COPY --from=build /app/packages/contracts/dist ./packages/contracts/dist
+COPY --from=build /app/packages/contracts/package.json ./packages/contracts/package.json
+COPY --from=build /app/packages/game-core/dist ./packages/game-core/dist
+COPY --from=build /app/packages/game-core/package.json ./packages/game-core/package.json
+RUN mkdir -p /app/saves && chown node:node /app/saves
+USER node
+CMD ["node", "dist/index.js"]

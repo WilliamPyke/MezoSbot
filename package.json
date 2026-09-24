@@ -1,15 +1,26 @@
 {
   "name": "mezosbot",
   "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
   "description": "Discord bot for depositing sats from EVM, tipping, distributing, and dropping",
   "main": "dist/index.js",
   "scripts": {
-    "build": "npm run build:web && tsc && npm run copy:satscape-assets",
-    "build:server": "tsc",
+    "build": "npm run build:packages && npm run build:web && tsc && npm run copy:satscape-assets",
+    "build:packages": "npm run build --workspace @mezosbot/contracts && npm run build --workspace @mezosbot/game-core",
+    "build:server": "npm run build:packages && tsc",
+    "build:bot": "npm run build --workspace @mezosbot/bot",
+    "build:emulator": "npm run build --workspace @mezosbot/emulator",
+    "build:games-worker": "npm run build --workspace @mezosbot/games-worker",
+    "build:all": "npm run build:packages && npm run build:bot && npm run build:emulator && npm run build:games-worker",
     "build:web": "vite build --config web/vite.config.ts",
     "copy:satscape-assets": "node -e \"const fs=require('fs'); if (fs.existsSync('src/satscape/world_gen/chunks')) fs.cpSync('src/satscape/world_gen/chunks','dist/satscape/world_gen/chunks',{recursive:true});\"",
     "dev:web": "vite dev --config web/vite.config.ts",
     "test:contracts": "hardhat test --config contracts/hardhat.config.ts",
+    "test:service-contracts": "npm run test --workspace @mezosbot/contracts",
     "test:imgnai": "node --import tsx --test tests/imgnai.test.ts",
     "test:operations": "node --import tsx --test tests/depositPolicy.test.ts",
     "test:swap": "node --import tsx --test tests/swap.test.ts",
@@ -17,8 +28,15 @@
     "render:imgnai-logo": "node scripts/render-imgnai-logo.mjs",
     "deploy:contracts": "hardhat run --config contracts/hardhat.config.ts contracts/scripts/deployMallardEscrow.ts",
     "start": "node dist/index.js",
+    "start:bot": "npm run start --workspace @mezosbot/bot",
+    "start:emulator": "npm run start --workspace @mezosbot/emulator",
     "dev": "tsx watch src/index.ts",
-    "satscape:smoke": "tsx src/satscape/smoke.ts"
+    "satscape:smoke": "tsx src/satscape/smoke.ts",
+    "test:game-core": "npm run test --workspace @mezosbot/game-core",
+    "test:worker": "npm run test --workspace @mezosbot/games-worker",
+    "test:emulator": "npm run test --workspace @mezosbot/emulator",
+    "test:modular": "npm run test:service-contracts && npm run test:game-core && npm run test:worker && npm run test:emulator",
+    "load:modular": "k6 run tests/load/modular.k6.js"
   },
   "keywords": [
     "discord",
@@ -32,6 +50,8 @@
   "license": "MIT",
   "dependencies": {
     "@koush/wrtc": "^0.5.3",
+    "@mezosbot/contracts": "*",
+    "@mezosbot/game-core": "*",
     "@napi-rs/canvas": "^1.0.0",
     "@rainbow-me/rainbowkit": "^2.2.8",
     "@roamhq/wrtc": "^0.9.1",
@@ -40,7 +60,7 @@
     "@x402/core": "^2.18.0",
     "@x402/evm": "^2.18.0",
     "@x402/fetch": "^2.18.0",
-    "discord.js": "^14.16.3",
+    "discord.js": "14.25.1",
     "dotenv": "^16.4.5",
     "ethers": "^6.13.4",
     "qrcode": "^1.5.4",
@@ -53,6 +73,8 @@
     "ws": "^8.18.0"
   },
   "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.21.2",
+    "@cloudflare/workers-types": "^5.20260812.1",
     "@nomicfoundation/hardhat-toolbox": "^6.1.0",
     "@openzeppelin/contracts": "^5.4.0",
     "@types/node": "^22.10.1",
@@ -61,11 +83,13 @@
     "@types/react-dom": "^18.3.7",
     "@types/ws": "^8.5.13",
     "@vitejs/plugin-react": "^4.7.0",
-    "hardhat": "^2.27.1",
+    "hardhat": "2.28.6",
     "tsx": "^4.19.2",
-    "typescript": "^5.7.2"
+    "typescript": "^5.7.2",
+    "vitest": "^4.1.10",
+    "wrangler": "^4.122.0"
   },
   "engines": {
-    "node": "20.x"
+    "node": ">=20 <25"
   }
 }

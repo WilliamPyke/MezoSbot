@@ -1,6 +1,7 @@
 import { EmbedBuilder, MessageFlags, type ChatInputCommandInteraction } from "discord.js";
 import { config } from "../config.js";
 import { addBalance, subtractBalance } from "../balance.js";
+import { canMintSats } from "../evm.js";
 import { formatSats } from "../format.js";
 import { recordLedgerEntry } from "../ledger.js";
 import { TOKEN_CHOICES, formatTokenAmount, parseToken, roundTokenAmount } from "../tokens.js";
@@ -32,6 +33,15 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   }
 
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  if (amount > 0 && token === "SATS") {
+    const mint = await canMintSats(amount);
+    if (!mint.ok) {
+      return interaction.editReply({
+        content: `❌ Cannot credit unbacked SATS. Treasury is short **${formatSats(mint.shortfallSats)}**. Send native BTC to the treasury address first.`,
+      });
+    }
+  }
 
   if (amount > 0) {
     await addBalance(target.id, amount, token);

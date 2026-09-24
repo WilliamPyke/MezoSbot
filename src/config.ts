@@ -16,6 +16,41 @@ function optionalBool(key: string, def: boolean): boolean {
   return val === "1" || val.toLowerCase() === "true";
 }
 
+/**
+ * Secret that must be present (and non-empty) when `enabled` is true. There is
+ * deliberately no shared fallback: the Worker and the emulator each verify
+ * with their own secret, so a leak of one cannot forge requests to the other.
+ */
+function requiredWhen(enabled: boolean, key: string, because: string): string {
+  const val = (process.env[key] ?? "").trim();
+  if (enabled && !val) throw new Error(`Missing required env: ${key} (required because ${because})`);
+  return val;
+}
+
+function runtimeRole(): "legacy" | "bot" {
+  const role = optional("MEZOSBOT_RUNTIME_ROLE", "legacy").trim().toLowerCase();
+  if (role !== "legacy" && role !== "bot") {
+    throw new Error(`Invalid MEZOSBOT_RUNTIME_ROLE "${role}" (expected "legacy" or "bot")`);
+  }
+  return role;
+}
+
+// Remote feature flags are read once at boot. Flipping one is a redeploy
+// (restart), never a live toggle, so a process only ever runs one path per
+// feature. See deploy/README.md "Feature flags".
+const arcadeRemote = optionalBool("ARCADE_REMOTE_ENABLED", false);
+const satscapeRemote = optionalBool("SATSCAPE_REMOTE_ENABLED", false);
+const emulatorRemote = optionalBool("EMULATOR_REMOTE_ENABLED", false);
+const gamesSigningSecret = requiredWhen(
+  arcadeRemote || satscapeRemote,
+  "GAMES_SIGNING_SECRET",
+  "ARCADE_REMOTE_ENABLED or SATSCAPE_REMOTE_ENABLED is on",
+);
+const emulatorSigningSecret = requiredWhen(emulatorRemote, "EMULATOR_SIGNING_SECRET", "EMULATOR_REMOTE_ENABLED is on");
+if (gamesSigningSecret && emulatorSigningSecret && gamesSigningSecret === emulatorSigningSecret) {
+  throw new Error("GAMES_SIGNING_SECRET and EMULATOR_SIGNING_SECRET must be different secrets");
+}
+
 function publicBaseUrl(): string {
   const fallback = `http://localhost:${process.env.STREAM_PORT ?? process.env.PORT ?? "8787"}`;
   const raw = (process.env.PUBLIC_BASE_URL ?? fallback).trim().replace(/\/+$/, "");
@@ -29,6 +64,19 @@ function publicBaseUrl(): string {
 }
 
 export const config = {
+  runtime: {
+    role: runtimeRole(),
+  },
+  services: {
+    arcadeRemote,
+    satscapeRemote,
+    emulatorRemote,
+    gamesBaseUrl: optional("GAMES_SERVICE_URL", "https://arcade.mallard.sh").replace(/\/+$/, ""),
+    emulatorBaseUrl: optional("EMULATOR_SERVICE_URL", "https://emulator.mallard.sh").replace(/\/+$/, ""),
+    gamesSigningSecret,
+    emulatorSigningSecret,
+    requestTimeoutMs: parseInt(optional("INTERNAL_REQUEST_TIMEOUT_MS", "5000"), 10),
+  },
   discord: {
     token: required("DISCORD_TOKEN"),
     clientId: required("DISCORD_CLIENT_ID"),
@@ -162,6 +210,8 @@ export const config = {
     enabled: optionalBool("SWAP_ENABLED", false),
     routerAddress: optional("MEZO_POOLS_ROUTER", "0x16A76d3cd3C1e3CE843C6680d6B37E9116b5C706"),
     poolFactory: optional("MEZO_POOLS_FACTORY", "0x83FE469C636C4081b87bA5b3Ae9991c6Ed104248"),
+    clRouterAddress: optional("MEZO_CL_ROUTER", "0x37cDd11919ec3860eaD9efB8673d7476E5326225"),
+    clFactory: optional("MEZO_CL_FACTORY", "0xBB24AF5c6fB88F1d191FA76055e30BF881BeEb79"),
     /** Quote validity window (ms). */
     quoteTtlMs: parseInt(optional("SWAP_QUOTE_TTL_MS", "45000"), 10),
     /** Max slippage bps the user may request (hard cap). */
@@ -174,6 +224,7 @@ export const config = {
     maxInternalOutSats: parseFloat(optional("SWAP_MAX_INTERNAL_OUT_SATS", "5000000")),
     maxInternalOutMusd: parseFloat(optional("SWAP_MAX_INTERNAL_OUT_MUSD", "500")),
     maxInternalOutMusdc: parseFloat(optional("SWAP_MAX_INTERNAL_OUT_MUSDC", "500")),
+    maxInternalOutMezo: parseFloat(optional("SWAP_MAX_INTERNAL_OUT_MEZO", "50000")),
     /** Haircut on internal mid quotes so inventory is not arbed (bps). */
     internalHaircutBps: parseInt(optional("SWAP_INTERNAL_HAIRCUT_BPS", "10"), 10),
     maxSwapsPerDay: parseInt(optional("SWAP_MAX_PER_DAY", "25"), 10),
@@ -181,10 +232,12 @@ export const config = {
     minFromSats: parseFloat(optional("SWAP_MIN_FROM_SATS", "100")),
     minFromMusd: parseFloat(optional("SWAP_MIN_FROM_MUSD", "0.10")),
     minFromMusdc: parseFloat(optional("SWAP_MIN_FROM_MUSDC", "0.10")),
+    minFromMezo: parseFloat(optional("SWAP_MIN_FROM_MEZO", "1")),
     /** Background rebalance when free inventory of a token drops below this. */
     rebalanceMinFreeSats: parseFloat(optional("SWAP_REBALANCE_MIN_FREE_SATS", "250000")),
     rebalanceMinFreeMusd: parseFloat(optional("SWAP_REBALANCE_MIN_FREE_MUSD", "50")),
     rebalanceMinFreeMusdc: parseFloat(optional("SWAP_REBALANCE_MIN_FREE_MUSDC", "50")),
+    rebalanceMinFreeMezo: parseFloat(optional("SWAP_REBALANCE_MIN_FREE_MEZO", "1000")),
     rebalanceIntervalMs: parseInt(optional("SWAP_REBALANCE_INTERVAL_MS", "300000"), 10),
     rebalanceEnabled: optionalBool("SWAP_REBALANCE_ENABLED", true),
   },

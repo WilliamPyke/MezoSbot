@@ -1,0 +1,18 @@
+{
+  "name": "@mezosbot/games-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:deps": "npm run build --workspace @mezosbot/game-core && npm run build --workspace @mezosbot/contracts",
+    "build": "npm run build:deps && node scripts/prepare-assets.mjs && wrangler deploy --dry-run --outdir dist",
+    "types": "wrangler types",
+    "dev": "npm run build:deps && node scripts/prepare-assets.mjs && wrangler dev",
+    "deploy": "npm run build:deps && node scripts/prepare-assets.mjs && wrangler deploy",
+    "test": "npm run build:deps && vitest run"
+  },
+  "dependencies": {
+    "@mezosbot/contracts": "*",
+    "@mezosbot/game-core": "*"
+  }
+}

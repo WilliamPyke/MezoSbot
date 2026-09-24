@@ -1,0 +1,14 @@
+{
+  "name": "@mezosbot/emulator",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node scripts/mark-shared-cjs.mjs",
+    "start": "node dist/apps/emulator/src/index.js",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@mezosbot/contracts": "*"
+  }
+}

@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>SatScape</title>
+  <style>body{font:16px system-ui;background:#10170f;color:#edf7e9;margin:0;display:grid;place-items:center;min-height:100vh}main{width:min(36rem,92vw)}pre{background:#172216;padding:1rem;border-radius:.6rem;overflow:auto}.controls{display:grid;grid-template-columns:repeat(3,4rem);gap:.5rem;justify-content:center}.controls button{font:inherit;padding:.8rem;background:#315c2e;color:white;border:1px solid #6ba864;border-radius:.5rem}.up{grid-column:2}.left{grid-column:1}.down{grid-column:2}.right{grid-column:3}</style>
+</head>
+<body><main><h1>SatScape</h1><p id="status">Loading authoritative state…</p><pre id="state"></pre><div class="controls"><button class="up" data-d="up">↑</button><button class="left" data-d="left">←</button><button class="down" data-d="down">↓</button><button class="right" data-d="right">→</button></div></main>
+<script>
+const token=new URLSearchParams(location.search).get('token');
+const status=document.querySelector('#status'),out=document.querySelector('#state');
+async function state(){const r=await fetch('/api/v1/satscape/state?token='+encodeURIComponent(token));const v=await r.json();if(!r.ok)throw Error(v.error?.message||'State failed');out.textContent=JSON.stringify({player:v.player,balance:v.balance,combat:v.combat,nearby:v.nearby},null,2);status.textContent='Connected';}
+async function move(direction){status.textContent='Moving…';const r=await fetch('/api/v1/satscape/action?token='+encodeURIComponent(token),{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({direction})});const v=await r.json();if(!r.ok)throw Error(v.error?.message||'Move failed');await state();}
+document.querySelectorAll('button').forEach(b=>b.onclick=()=>move(b.dataset.d).catch(e=>status.textContent=e.message));state().catch(e=>status.textContent=e.message);
+</script></body></html>

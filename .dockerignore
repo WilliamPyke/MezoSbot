@@ -1,0 +1,19 @@
+node_modules
+**/node_modules
+**/dist
+.git
+.github
+.env
+.env.*
+!.env.example
+.dev.vars
+**/.dev.vars
+.wrangler
+coverage
+saves
+web/node_modules
+scripts/_*
+tests/load
+# ROMs are mounted at runtime via ROM_PATH, never baked into an image.
+*.gbc
+*.gb

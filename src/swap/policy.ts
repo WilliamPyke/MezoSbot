@@ -133,7 +133,7 @@ export function volumeSatsProxy(fromToken: TokenSymbol, fromAmount: number, quot
   if (fromToken === "SATS") return fromAmount;
   if (quotedToSatsIfKnown != null && quotedToSatsIfKnown > 0) return quotedToSatsIfKnown;
   // Stablecoins ≈ $1; without BTC price use a conservative placeholder only for limits.
-  // Callers should pass quotedToSatsIfKnown when swapping into/out of SATS.
+  // Callers should pass quotedToSatsIfKnown (or quote a SATS leg) for MEZO and non-stables.
   return fromAmount * 100_000; // ~$1 → 100k sats proxy if BTC ~$100k
 }
 

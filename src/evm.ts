@@ -5,7 +5,7 @@ import { supabase } from "./db.js";
 import { addBalance } from "./balance.js";
 import { recordLedgerEntry } from "./ledger.js";
 import { verifyWalletFromDeposit } from "./walletVerification.js";
-import { meetsPublicDepositMinimum, nextSweepTime, preservesGasReserve, withdrawalGasFundingShortfall } from "./depositPolicy.js";
+import { meetsPublicDepositMinimum, nextSweepTime, preservesGasReserve, satsMintCovered, satsWithdrawalCovered, withdrawalGasFundingShortfall } from "./depositPolicy.js";
 import { TOKEN_SYMBOLS, assertTokenConfigured, tokenAmountToUnits, tokenDecimalToUnits, tokenUnitsToAmount, type TokenSymbol } from "./tokens.js";
 
 const ERC20_ABI = [
@@ -1341,6 +1341,11 @@ export async function withdraw(
   const value = satsToTokenUnits(amountSats);
   if (value <= 0n) return { error: "Amount too small" };
 
+  const treasuryNative = await getNativeBalance(wallet.address);
+  if (!satsWithdrawalCovered(treasuryNative, value)) {
+    return { error: "Treasury has insufficient SATS to cover this withdrawal" };
+  }
+
   const gasPrice = await getGasPrice();
   let gasLimit: bigint;
   try {
@@ -1390,8 +1395,7 @@ export async function withdraw(
       gasPrice,
     });
   } catch (e: unknown) {
-    const err = e as { message?: string; reason?: string };
-    return { error: err?.reason ?? err?.message ?? String(e) };
+    return { error: describeNativeWithdrawalError(e) };
   }
 
   // Poll for confirmation manually — tx.wait() is unreliable on Mezo RPC
@@ -1521,6 +1525,67 @@ export async function recoverPendingWithdrawals(): Promise<void> {
     } catch (err) {
       console.error(`[Recovery] Withdrawal ${w.id}: RPC error —`, (err as Error)?.message ?? err);
     }
+  }
+}
+
+function describeNativeWithdrawalError(error: unknown): string {
+  const err = error as { code?: string; message?: string; reason?: string };
+  const message = err.reason ?? err.message ?? String(error);
+  if (err.code === "INSUFFICIENT_FUNDS" || /insufficient funds/i.test(message)) {
+    return "Treasury has insufficient SATS to cover this withdrawal";
+  }
+  return message;
+}
+
+export type SatsBackingSnapshot = {
+  treasurySats: number;
+  userLiabilities: number;
+  poolLiabilities: number;
+  reserveSats: number;
+  excessSats: number;
+};
+
+export async function getSatsBackingSnapshot(): Promise<SatsBackingSnapshot> {
+  const [treasuryWei, snapshot] = await Promise.all([
+    getNativeBalance(wallet.address),
+    getProtocolOperationalSnapshot(),
+  ]);
+  const treasurySats = tokenUnitsToSats(treasuryWei);
+  const userLiabilities = snapshot.userSatsLiability;
+  const poolLiabilities = snapshot.poolSatsLiability;
+  return {
+    treasurySats,
+    userLiabilities,
+    poolLiabilities,
+    reserveSats: config.evm.protocolGasReserveMinSats,
+    excessSats: treasurySats - userLiabilities - poolLiabilities,
+  };
+}
+
+export async function canMintSats(amountSats: number): Promise<{ ok: true } | { ok: false; shortfallSats: number }> {
+  const [treasuryWei, snapshot] = await Promise.all([
+    getNativeBalance(wallet.address),
+    getProtocolOperationalSnapshot(),
+  ]);
+  const liabilityWei = satsToTokenUnits(snapshot.userSatsLiability + snapshot.poolSatsLiability);
+  const mintWei = satsToTokenUnits(amountSats);
+  const reserveWei = satsToTokenUnits(config.evm.protocolGasReserveMinSats);
+  if (satsMintCovered(treasuryWei, liabilityWei, mintWei, reserveWei)) return { ok: true };
+  return { ok: false, shortfallSats: tokenUnitsToSats(liabilityWei + mintWei + reserveWei - treasuryWei) };
+}
+
+export async function warnIfSatsUnderbacked(): Promise<void> {
+  try {
+    const backing = await getSatsBackingSnapshot();
+    if (backing.excessSats < backing.reserveSats) {
+      console.warn(
+        `[Solvency] SATS backing shortfall: treasury ${backing.treasurySats} sats, ` +
+        `liabilities ${backing.userLiabilities + backing.poolLiabilities} sats, ` +
+        `excess ${backing.excessSats} sats, reserve ${backing.reserveSats} sats`,
+      );
+    }
+  } catch (error) {
+    console.warn("[Solvency] Failed to check SATS backing:", (error as Error).message);
   }
 }
 

@@ -1,3 +1,4 @@
+# Legacy rollback deployment only. Retire after the seven-day modular cutover window.
 services:
   - type: web
     name: mezosbot

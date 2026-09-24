@@ -1,5 +1,22 @@
 # MezoSbot
 
+## Modular runtime
+
+The repository is an npm-workspace monorepo with three independently deployable
+runtime boundaries:
+
+- `apps/bot`: lean Discord/EVM service for Northflank.
+- `apps/emulator`: leased Node emulator/stream service for Northflank.
+- `apps/games-worker`: Cloudflare Worker for Arcade, SatScape, static world assets,
+  and hibernatable spectator rooms.
+- `packages/contracts` and `packages/game-core`: shared runtime-validated service
+  contracts and platform-neutral deterministic game rules.
+
+The migration is additive and all remote adapters are feature-flagged. See
+`deploy/README.md` for the staged rollout, environment variables, release gates,
+and independent rollback procedure. Production continues from
+`origin/TestingRender`; `main` is not a deployment branch.
+
 A Discord bot for depositing and using native SATS, MUSD, MEZO, and mUSDC on Mezo.
 
 ## Features
@@ -101,7 +118,7 @@ npm run dev
 | `/balance` | Check all token balances |
 | `/generate` | Configure and generate one Katana image paid from your MUSD balance |
 | `/withdraw <amount> [address] [token]` | Withdraw a token to an address |
-| `/swap <amount> <from> <to> [slippage] [onchain]` | Swap SATS ↔ MUSD ↔ mUSDC (inventory or Mezo Pools; on-chain gas from sats) |
+| `/swap <amount> <from> <to> [slippage] [onchain]` | Swap SATS ↔ MUSD ↔ MEZO ↔ mUSDC (inventory or Mezo Pools; on-chain gas from sats) |
 | `/tip <user> <amount> [token] [message]` | Tip another user with an optional message |
 | `/distribute <amount> <@users> [token]` | Split a token among multiple users |
 | `/rain <amount> <count> [token] [role] [message]` | Rain a token on recently active users (optionally role-filtered) |
@@ -131,15 +148,25 @@ Hybrid routing:
 1. **Internal** — when free treasury inventory of the *output* token covers the fill (after liabilities and the protected SATS gas reserve). Instant, no network fee. Serialized with a Postgres advisory lock so concurrent fills cannot over-promise inventory.
 2. **On-chain** — Mezo Pools router (`swapExactTokensForTokens`) when inventory is thin or the user passes `onchain:true`. Gas is reserved from the user's **SATS** balance (same pattern as ERC-20 withdrawals); unused gas is refunded after the receipt.
 
-Supported pairs: SATS ↔ MUSD, MUSD ↔ mUSDC, and multi-hop SATS ↔ mUSDC. MEZO is not swappable until a liquid pool exists.
+Supported pairs: every bot ledger asset — SATS, MUSD, MEZO, and mUSDC.
+
+Routing:
+
+1. **Basic Mezo Pools** — SATS ↔ MUSD (volatile), MUSD ↔ mUSDC (stable), SATS ↔ mUSDC (two hops via MUSD).
+2. **Concentrated liquidity** — MEZO ↔ SATS and MEZO ↔ MUSD on Slipstream CL pools.
+3. **Two-leg** — MEZO ↔ mUSDC runs as CL MEZO↔MUSD then basic MUSD↔mUSDC (two treasury txs, one user quote).
+
+Quotes walk live pool state (basic `getAmountsOut`, CL tick walk). Internal fills still use that mid price.
 
 Safety controls: quote TTL, confirm button, slippage floor, daily per-user count/volume caps, SatQuest combat lock on SATS, crash recovery for `reserved`/`submitted` swaps, and optional background inventory rebalance (`SWAP_REBALANCE_ENABLED`).
 
 | Variable | Description |
 |----------|-------------|
 | `SWAP_ENABLED` | Master switch (default `false` — enable after applying the swap migration) |
-| `MEZO_POOLS_ROUTER` | Router address (default mainnet Mezo Pools router) |
-| `MEZO_POOLS_FACTORY` | Pool factory address |
+| `MEZO_POOLS_ROUTER` | Basic pool router (default mainnet) |
+| `MEZO_POOLS_FACTORY` | Basic pool factory |
+| `MEZO_CL_ROUTER` | Concentrated-liquidity swap router |
+| `MEZO_CL_FACTORY` | Concentrated-liquidity factory |
 | `SWAP_QUOTE_TTL_MS` | Quote validity (default `45000`) |
 | `SWAP_MAX_INTERNAL_FRACTION` | Max fraction of free inventory usable per internal fill (default `0.5`) |
 | `SWAP_MAX_PER_DAY` / `SWAP_MAX_VOLUME_SATS_PER_DAY` | Per-user daily limits |

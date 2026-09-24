@@ -1,8 +1,9 @@
 import { config } from "../config.js";
-import { tokenAmountToUnits, tokenUnitsToAmount, type TokenSymbol } from "../tokens.js";
+import { TOKEN_SYMBOLS, tokenAmountToUnits, tokenUnitsToAmount, type TokenSymbol } from "../tokens.js";
 import { shouldRebalance } from "./policy.js";
-import { buildSwapRoutes } from "./routes.js";
 import {
+  buildBestSwapRoutes,
+  computeLegMinimums,
   executeTreasuryRouterSwap,
   quoteRouterAmountsOut,
   routerOutToTokenAmount,
@@ -13,16 +14,49 @@ let rebalanceTimer: ReturnType<typeof setInterval> | null = null;
 let rebalanceRunning = false;
 
 /**
- * Protocol-owned inventory rebalance: when free MUSD/mUSDC/SATS is short and
- * another swappable asset has excess free inventory, run a small on-chain swap
- * from the long asset into the short one. Never touches user balances.
+ * MEZO is excluded from protocol rebalancing (neither bought nor sold) until
+ * explicitly enabled. Planned config: SWAP_REBALANCE_MEZO_ENABLED (default false).
+ */
+export const REBALANCE_MEZO_ENABLED = false;
+/** Slippage applied to every rebalance leg (bps). */
+const REBALANCE_SLIPPAGE_BPS = 100;
+
+/** Tokens the rebalance worker may buy or sell (exported for tests). */
+export function rebalanceTokens(mezoEnabled: boolean = REBALANCE_MEZO_ENABLED): TokenSymbol[] {
+  return TOKEN_SYMBOLS.filter((t) => mezoEnabled || t !== "MEZO");
+}
+
+function minFreeFor(token: TokenSymbol): number {
+  if (token === "SATS") return config.swap.rebalanceMinFreeSats;
+  if (token === "MUSD") return config.swap.rebalanceMinFreeMusd;
+  if (token === "MUSDC") return config.swap.rebalanceMinFreeMusdc;
+  if (token === "MEZO") return REBALANCE_MEZO_ENABLED ? config.swap.rebalanceMinFreeMezo : 0;
+  const _exhaustive: never = token;
+  return _exhaustive;
+}
+
+function probeSize(token: TokenSymbol, free: number): number {
+  if (token === "SATS") return Math.min(free * 0.1, 50_000);
+  if (token === "MEZO") return Math.min(free * 0.1, 5_000);
+  return Math.min(free * 0.1, 25);
+}
+
+function minProbe(token: TokenSymbol): number {
+  if (token === "SATS") return 1_000;
+  if (token === "MEZO") return 10;
+  return 1;
+}
+
+/**
+ * Protocol-owned inventory rebalance: when free inventory of a swappable
+ * token is short and another has excess, run a small on-chain swap from the
+ * long asset into the short one. Never touches user balances.
  */
 export async function runInventoryRebalance(): Promise<void> {
   if (!config.swap.enabled || !config.swap.rebalanceEnabled) return;
   if (rebalanceRunning) return;
   rebalanceRunning = true;
   try {
-    // Skip while any user swap is in-flight so free inventory / nonce stay clean.
     const { supabase } = await import("../db.js");
     const { count } = await supabase
       .from("swaps")
@@ -33,17 +67,14 @@ export async function runInventoryRebalance(): Promise<void> {
       return;
     }
 
-    const tokens: TokenSymbol[] = ["SATS", "MUSD", "MUSDC"];
+    const tokens: TokenSymbol[] = rebalanceTokens();
     const free = Object.fromEntries(
       await Promise.all(tokens.map(async (t) => [t, await getFreeInventory(t)] as const)),
-    ) as Record<TokenSymbol, Awaited<ReturnType<typeof getFreeInventory>>>;
+    ) as Partial<Record<TokenSymbol, Awaited<ReturnType<typeof getFreeInventory>>>>;
 
-    const minFree: Record<TokenSymbol, number> = {
-      SATS: config.swap.rebalanceMinFreeSats,
-      MUSD: config.swap.rebalanceMinFreeMusd,
-      MEZO: Number.POSITIVE_INFINITY,
-      MUSDC: config.swap.rebalanceMinFreeMusdc,
-    };
+    const minFree = Object.fromEntries(
+      tokens.map((t) => [t, minFreeFor(t)] as const),
+    ) as Partial<Record<TokenSymbol, number>>;
 
     for (const short of tokens) {
       for (const long of tokens) {
@@ -60,20 +91,16 @@ export async function runInventoryRebalance(): Promise<void> {
           continue;
         }
 
-        // Size: up to 25% of long free, capped so we don't blow through shortfall.
         const shortfall = Math.max(0, minFree[short]! - free[short]!.free);
         if (shortfall <= 0) continue;
 
-        // Estimate long→short rate with a probe quote.
-        let probeFrom: number;
-        if (long === "SATS") probeFrom = Math.min(free[long]!.free * 0.1, 50_000);
-        else probeFrom = Math.min(free[long]!.free * 0.1, 25);
-        probeFrom = Math.max(probeFrom, long === "SATS" ? 1_000 : 1);
+        let probeFrom = probeSize(long, free[long]!.free);
+        probeFrom = Math.max(probeFrom, minProbe(long));
         if (probeFrom > free[long]!.free * 0.25) continue;
 
         let routes;
         try {
-          routes = buildSwapRoutes(long, short);
+          routes = await buildBestSwapRoutes(long, short, probeFrom);
         } catch {
           continue;
         }
@@ -88,7 +115,6 @@ export async function runInventoryRebalance(): Promise<void> {
         const probeOut = routerOutToTokenAmount(quote.amountOut, short);
         if (probeOut <= 0) continue;
 
-        // Scale probe toward shortfall (but stay within 25% of long free).
         const scale = Math.min(shortfall / probeOut, (free[long]!.free * 0.25) / probeFrom);
         if (scale <= 0) continue;
         const fromAmount = probeFrom * Math.min(scale, 1);
@@ -96,8 +122,8 @@ export async function runInventoryRebalance(): Promise<void> {
 
         const live = await quoteRouterAmountsOut(long, short, fromAmount, routes);
         const amountIn = tokenAmountToUnits(fromAmount, long);
-        // Tight minOut for protocol rebalance — 1% slippage.
-        const minOut = (live.amountOut * 99n) / 100n;
+        const legMinOuts = computeLegMinimums(live.legOuts, REBALANCE_SLIPPAGE_BPS);
+        const minOut = legMinOuts[legMinOuts.length - 1]!;
 
         console.log(
           `[Swap rebalance] ${fromAmount} ${long} → ${short} (short free=${free[short]!.free})`,
@@ -108,6 +134,7 @@ export async function runInventoryRebalance(): Promise<void> {
           amountIn,
           amountOutMin: minOut,
           routes,
+          legMinOuts,
         });
         if (!result.confirmed) {
           console.warn(`[Swap rebalance] failed: ${result.error}`);
@@ -116,7 +143,7 @@ export async function runInventoryRebalance(): Promise<void> {
         console.log(
           `[Swap rebalance] ok tx=${result.txHash} out≈${tokenUnitsToAmount(result.amountOut, short)} ${short}`,
         );
-        return; // one rebalance hop per tick
+        return;
       }
     }
   } finally {
@@ -133,7 +160,6 @@ export function startSwapRebalanceWorker(): void {
       console.warn("[Swap rebalance] tick failed:", (err as Error)?.message ?? err),
     );
   }, interval);
-  // First pass after boot settles.
   setTimeout(() => {
     runInventoryRebalance().catch(() => {});
   }, 60_000);

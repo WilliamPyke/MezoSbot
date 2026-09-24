@@ -394,6 +394,10 @@ export async function trySettleMatch(matchId: number): Promise<SettlementResult>
   if (match.status === "cancelled" || match.status === "settling") {
     return { status: "waiting", match };
   }
+  // Matches created by the games Worker are settled only by the v1 RPCs.
+  if ((match as ArcadeMatchRow & { runtime?: string }).runtime === "remote") {
+    return { status: "waiting", match };
+  }
 
   if (match.mode === "practice") {
     if (match.player_a_submitted) {

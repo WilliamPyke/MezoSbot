@@ -10,6 +10,7 @@ import {
   roundTokenAmount,
   tokenAmountToUnits,
   tokenUnitsToAmount,
+  TOKEN_SYMBOLS,
   type TokenSymbol,
 } from "../tokens.js";
 import {
@@ -21,18 +22,46 @@ import {
   volumeSatsProxy,
   withinDailyLimits,
 } from "./policy.js";
+import { checkInternalFillPrice, MEZO_MAX_INTERNAL_OUT } from "./priceGuard.js";
 import {
-  buildSwapRoutes,
+  assessMissingReceipt,
+  eligibleForRecovery,
+  ESCROWED_SWAP_STATUSES,
+  progressMeta,
+  RECOVERABLE_SWAP_STATUSES,
+  RECOVERY_LEASE_MS,
+  RECOVERY_MAX_ATTEMPTS,
+  RECOVERY_STALE_MS,
+  recoveryAttemptAllowed,
+  recoverySnapshotUnchanged,
+  sumInventoryHolds,
+  type SwapProgressMeta,
+} from "./recovery.js";
+import {
+  groupSwapLegs,
+  hopTokenOut,
   isSwappableToken,
-  MEZO_BTC_TOKEN,
+  parseRouteHops,
+  poolTokenAddress,
+  remainingHops,
   routeStableDefaultSlippageBps,
+  symbolForPoolToken,
 } from "./routes.js";
 import {
+  buildBestSwapRoutes,
+  computeLegMinimums,
   executeTreasuryRouterSwap,
+  executeTreasuryRouterSwapUnlocked,
+  getTransactionByHash,
+  getTreasuryNonce,
   inspectSwapReceipt,
+  quoteRouteUnits,
   quoteRouterAmountsOut,
   quoteSwapGasSats,
   routerOutToTokenAmount,
+  withTreasurySwapLock,
+  type ExecuteSwapOptions,
+  type RouterQuote,
 } from "./router.js";
 import type { ExecuteSwapResult, MezoRouteHop, SwapQuote, SwapRow } from "./types.js";
 
@@ -40,14 +69,19 @@ function maxInternalAbsolute(toToken: TokenSymbol): number {
   if (toToken === "SATS") return config.swap.maxInternalOutSats;
   if (toToken === "MUSD") return config.swap.maxInternalOutMusd;
   if (toToken === "MUSDC") return config.swap.maxInternalOutMusdc;
-  return 0;
+  // Safe default until config.swap.maxInternalOutMezo defaults to 0 (see priceGuard.ts).
+  if (toToken === "MEZO") return Math.min(config.swap.maxInternalOutMezo, MEZO_MAX_INTERNAL_OUT);
+  const _exhaustive: never = toToken;
+  return _exhaustive;
 }
 
 function minFromAmount(fromToken: TokenSymbol): number {
   if (fromToken === "SATS") return config.swap.minFromSats;
   if (fromToken === "MUSD") return config.swap.minFromMusd;
   if (fromToken === "MUSDC") return config.swap.minFromMusdc;
-  return Number.POSITIVE_INFINITY;
+  if (fromToken === "MEZO") return config.swap.minFromMezo;
+  const _exhaustive: never = fromToken;
+  return _exhaustive;
 }
 
 async function getLiabilities(): Promise<Record<TokenSymbol, number>> {
@@ -64,22 +98,58 @@ async function getLiabilities(): Promise<Record<TokenSymbol, number>> {
 }
 
 function tokenOutAddress(symbol: TokenSymbol): string {
-  if (symbol === "SATS") return MEZO_BTC_TOKEN;
-  if (symbol === "MUSD") {
-    return process.env.MUSD_TOKEN_CONTRACT?.trim() || "0xdD468A1DDc392dcdbEf6db6e34E89AA338F9F186";
-  }
-  if (symbol === "MUSDC") {
-    return process.env.MUSDC_TOKEN_CONTRACT?.trim() || "0x04671C72Aab5AC02A03c1098314b1BB6B560c197";
-  }
-  throw new Error(`No pool token for ${symbol}`);
+  return poolTokenAddress(symbol);
 }
 
+function readTxHashes(metadata: Record<string, unknown> | null | undefined, fallback: string | null): string[] {
+  const raw = metadata?.tx_hashes;
+  if (Array.isArray(raw)) {
+    return raw.filter((h): h is string => typeof h === "string" && h.length > 0);
+  }
+  if (fallback) return fallback.split(",").map((h) => h.trim()).filter(Boolean);
+  return [];
+}
+
+async function volumeSatsForQuote(input: {
+  fromToken: TokenSymbol;
+  toToken: TokenSymbol;
+  fromAmount: number;
+  marketOut: number;
+}): Promise<number> {
+  if (input.fromToken === "SATS") return input.fromAmount;
+  if (input.toToken === "SATS") return input.marketOut;
+  try {
+    const routes = await buildBestSwapRoutes(input.fromToken, "SATS", input.fromAmount);
+    const quote = await quoteRouterAmountsOut(input.fromToken, "SATS", input.fromAmount, routes);
+    const sats = routerOutToTokenAmount(quote.amountOut, "SATS");
+    if (sats > 0) return sats;
+  } catch {
+    // fall through
+  }
+  return volumeSatsProxy(input.fromToken, input.fromAmount);
+}
+
+/** Inventory held by in-flight swaps (intermediate leg outputs / uncredited outputs). */
+async function getInventoryHolds(token: TokenSymbol): Promise<number> {
+  const { data, error } = await supabase
+    .from("swaps")
+    .select("status, metadata")
+    .in("status", [...ESCROWED_SWAP_STATUSES]);
+  if (error) throw error;
+  return sumInventoryHolds((data ?? []) as Array<Pick<SwapRow, "status" | "metadata">>, token);
+}
+
+/**
+ * Free inventory. `onchain` in the snapshot is the treasury balance minus
+ * inventory held by in-flight multi-leg swaps, so internal fills (which pass
+ * it as p_onchain_to) can never consume another swap's intermediate tokens.
+ * Balance is read before holds: a hold is written before its leg broadcasts,
+ * so the ordering can only over-reserve, never under-reserve.
+ */
 export async function getFreeInventory(token: TokenSymbol): Promise<ReturnType<typeof computeFreeInventory>> {
-  const [onchainUnits, liabilities] = await Promise.all([
-    getTokenBalance(getTreasuryAddress(), token),
-    getLiabilities(),
-  ]);
-  const onchain = tokenUnitsToAmount(onchainUnits, token);
+  const onchainUnits = await getTokenBalance(getTreasuryAddress(), token);
+  const [liabilities, holds] = await Promise.all([getLiabilities(), getInventoryHolds(token)]);
+  const onchain = Math.max(0, tokenUnitsToAmount(onchainUnits, token) - holds);
   return computeFreeInventory(onchain, liabilities[token] ?? 0, {
     token,
     gasReserveSats: config.evm.protocolGasReserveMinSats,
@@ -111,9 +181,7 @@ export async function createSwapQuote(input: {
   const toToken = input.toToken;
   if (fromToken === toToken) throw new Error("Choose two different tokens.");
   if (!isSwappableToken(fromToken) || !isSwappableToken(toToken)) {
-    throw new Error(
-      "Only SATS, MUSD, and mUSDC can be swapped right now (Mezo Pools liquidity). MEZO inventory swaps are not enabled.",
-    );
+    throw new Error("Unsupported swap token.");
   }
 
   const fromAmount = roundTokenAmount(input.fromAmount, fromToken);
@@ -127,7 +195,7 @@ export async function createSwapQuote(input: {
     throw new Error(`Slippage cannot exceed ${config.swap.maxSlippageBps / 100}%.`);
   }
 
-  const routes = buildSwapRoutes(fromToken, toToken);
+  const routes = await buildBestSwapRoutes(fromToken, toToken, fromAmount);
   if (slippageBps === config.swap.defaultSlippageBps) {
     slippageBps = Math.max(slippageBps, routeStableDefaultSlippageBps(routes));
   }
@@ -144,27 +212,31 @@ export async function createSwapQuote(input: {
   if (minToAmount <= 0) throw new Error("Minimum output is zero after slippage — increase amount.");
 
   const free = await getFreeInventory(toToken);
+  const priceCheck = checkInternalFillPrice({
+    fromToken,
+    toToken,
+    routes,
+    liveRate: marketOut / fromAmount,
+  });
   const decision = decideHybridMode({
     requiredOut: internalOut,
     freeInventory: free.free,
-    hasOnchainRoute: true,
+    hasOnchainRoute: routes.length > 0,
     maxInternalFraction: config.swap.maxInternalFraction,
     maxInternalAbsolute: maxInternalAbsolute(toToken),
-    forceOnchain: input.forceOnchain,
+    forceOnchain: input.forceOnchain || !priceCheck.ok,
   });
 
   if (!decision.canInternal && !decision.canOnchain) {
     throw new Error("Cannot fill this swap: insufficient treasury inventory and no on-chain route.");
   }
 
-  // Volume proxy: if either side is SATS use that; else approximate via BTC leg when possible.
-  let volProxy = volumeSatsProxy(fromToken, fromAmount);
-  if (fromToken === "SATS") volProxy = fromAmount;
-  else if (toToken === "SATS") volProxy = marketOut;
-  else {
-    // Stable↔stable: convert via a 1-unit SATS proxy from MUSD pool when possible.
-    volProxy = volumeSatsProxy(fromToken, fromAmount);
-  }
+  const volProxy = await volumeSatsForQuote({
+    fromToken,
+    toToken,
+    fromAmount,
+    marketOut,
+  });
 
   const daily = await getDailyVolume(input.discordId);
   const limits = withinDailyLimits({
@@ -211,6 +283,7 @@ export async function createSwapQuote(input: {
       internal_out: internalOut,
       free_inventory_to: free.free,
       decision: decision.reason,
+      internal_price_check: priceCheck.ok ? "ok" : priceCheck.reason,
       slippage_bps: slippageBps,
       volume_sats_proxy: volProxy,
       force_onchain: !!input.forceOnchain,
@@ -336,8 +409,8 @@ export async function executeSwapQuote(
   if (!limits.ok) return { ok: false, error: limits.reason, code: "daily_limit" };
 
   // Re-decide mode at execution using fresh inventory + live quote.
-  let routes = (row.route_json ?? []) as MezoRouteHop[];
-  if (!routes.length) routes = buildSwapRoutes(row.from_token, row.to_token);
+  let routes = parseRouteHops(row.route_json);
+  if (!routes.length) routes = await buildBestSwapRoutes(row.from_token, row.to_token, row.from_amount);
 
   const live = await quoteRouterAmountsOut(row.from_token, row.to_token, row.from_amount, routes);
   const marketOut = routerOutToTokenAmount(live.amountOut, row.to_token);
@@ -347,13 +420,19 @@ export async function executeSwapQuote(
   );
   const free = await getFreeInventory(row.to_token);
   const forceOnchain = !!(row.metadata as { force_onchain?: boolean })?.force_onchain;
+  const priceCheck = checkInternalFillPrice({
+    fromToken: row.from_token,
+    toToken: row.to_token,
+    routes,
+    liveRate: marketOut / row.from_amount,
+  });
   const decision = decideHybridMode({
     requiredOut: internalOut,
     freeInventory: free.free,
-    hasOnchainRoute: true,
+    hasOnchainRoute: routes.length > 0,
     maxInternalFraction: config.swap.maxInternalFraction,
     maxInternalAbsolute: maxInternalAbsolute(row.to_token),
-    forceOnchain,
+    forceOnchain: forceOnchain || !priceCheck.ok,
   });
 
   if (!decision.canInternal && !decision.canOnchain) {
@@ -396,7 +475,75 @@ export async function executeSwapQuote(
 
   // If the quote was priced as internal (gas_reserved=0) but we fell back to
   // on-chain at confirm, still charge gas correctly.
-  return executeOnchain(row, routes, marketOut, volumeProxy, client);
+  return executeOnchain(row, routes, live, marketOut, volumeProxy, client);
+}
+
+function swapMetadata(row: SwapRow): Record<string, unknown> {
+  return row.metadata ?? {};
+}
+
+function rowSlippageBps(row: SwapRow): number {
+  const raw = Number(progressMeta(swapMetadata(row)).slippage_bps);
+  return Number.isFinite(raw) && raw >= 0 ? raw : config.swap.defaultSlippageBps;
+}
+
+/**
+ * Persists live-path / recovery progress onto the swap row: one tx hash per
+ * leg index (plus nonce + signed time), legs_completed, last_progress_at, and
+ * the inventory hold for the leg output. Every write also bumps updated_at so
+ * recovery staleness tracks real progress.
+ */
+function createProgressTracker(
+  row: SwapRow,
+  meta: SwapProgressMeta & Record<string, unknown>,
+  routes: MezoRouteHop[],
+  preHold?: { token: TokenSymbol; amount: number } | null,
+): { meta: SwapProgressMeta & Record<string, unknown>; hashes: () => string[]; options: ExecuteSwapOptions } {
+  const hashes: string[] = [...(meta.tx_hashes ?? [])];
+  meta.legs_total = groupSwapLegs(routes).length;
+
+  const onSigned: ExecuteSwapOptions["onSigned"] = async (txHash, info) => {
+    const nowIso = new Date().toISOString();
+    hashes[info.legIndex] = txHash;
+    hashes.length = info.legIndex + 1;
+    meta.tx_hashes = [...hashes];
+    meta.tx_nonces = { ...(meta.tx_nonces ?? {}), [txHash]: info.nonce };
+    meta.tx_signed_at = { ...(meta.tx_signed_at ?? {}), [txHash]: nowIso };
+    meta.legs_completed = info.legIndex;
+    meta.last_progress_at = nowIso;
+    if (info.legIndex === 0 && preHold && preHold.amount > 0) {
+      // Reserve the intermediate output before it exists on-chain.
+      meta.held_token = preHold.token;
+      meta.held_amount = preHold.amount;
+    }
+    const { data, error } = await supabase.from("swaps").update({
+      status: "submitted",
+      tx_hash: hashes[0],
+      route_json: routes,
+      metadata: meta,
+      updated_at: nowIso,
+    }).eq("quote_id", row.quote_id).in("status", [...RECOVERABLE_SWAP_STATUSES]).select("id");
+    if (error) throw new Error(`Failed to persist swap tx hash: ${error.message}`);
+    if (!data?.length) throw new Error("Failed to persist swap tx hash: row not in reserved/submitted");
+  };
+
+  const onLegComplete: ExecuteSwapOptions["onLegComplete"] = async (info) => {
+    const nowIso = new Date().toISOString();
+    meta.legs_completed = info.legIndex + 1;
+    meta.last_progress_at = nowIso;
+    const heldToken = info.isLast ? row.to_token : symbolForPoolToken(info.tokenOut);
+    if (heldToken) {
+      meta.held_token = heldToken;
+      meta.held_amount = tokenUnitsToAmount(info.amountOut, heldToken);
+    }
+    const { error } = await supabase.from("swaps").update({
+      metadata: meta,
+      updated_at: nowIso,
+    }).eq("quote_id", row.quote_id).in("status", [...RECOVERABLE_SWAP_STATUSES]);
+    if (error) console.error(`[Swap] ${row.quote_id}: failed to persist leg progress: ${error.message}`);
+  };
+
+  return { meta, hashes: () => [...hashes], options: { onSigned, onLegComplete } };
 }
 
 async function executeInternal(
@@ -487,6 +634,7 @@ async function executeInternal(
 async function executeOnchain(
   row: SwapRow,
   routes: MezoRouteHop[],
+  live: RouterQuote,
   marketOut: number,
   volumeProxy: number,
   client: Parameters<typeof recordLedgerEntry>[0],
@@ -495,6 +643,8 @@ async function executeOnchain(
   // Re-quote gas with current min out.
   const minOut = Math.min(row.min_to_amount, marketOut);
   const amountOutMin = tokenAmountToUnits(minOut, row.to_token);
+  // Intermediate legs: quoted leg output minus the user's slippage (never min=1).
+  const legMinOuts = computeLegMinimums(live.legOuts, rowSlippageBps(row), amountOutMin);
   let gasSats = row.gas_reserved_sats;
   try {
     const gasQuote = await quoteSwapGasSats(routes, amountIn, amountOutMin);
@@ -555,6 +705,24 @@ async function executeOnchain(
     });
   }
 
+  const legs = groupSwapLegs(routes);
+  const firstLegToken = legs.length > 1
+    ? symbolForPoolToken(hopTokenOut(legs[0]!.hops[legs[0]!.hops.length - 1]!))
+    : null;
+  const tracker = createProgressTracker(
+    row,
+    {
+      ...swapMetadata(row),
+      tx_hashes: [],
+      leg_min_outs: legMinOuts.map((v) => v.toString()),
+    },
+    routes,
+    firstLegToken
+      ? { token: firstLegToken, amount: tokenUnitsToAmount(live.legOuts[0]!, firstLegToken) }
+      : null,
+  );
+  // Persist hash before broadcast so crash recovery never refunds an in-flight tx;
+  // persist per-leg progress so recovery staleness tracks the live path.
   const result = await executeTreasuryRouterSwap(
     {
       fromToken: row.from_token,
@@ -562,23 +730,16 @@ async function executeOnchain(
       amountIn,
       amountOutMin,
       routes,
+      legMinOuts,
     },
-    {
-      // Persist hash before broadcast so crash recovery never refunds an in-flight tx.
-      onSigned: async (txHash) => {
-        const { data, error } = await supabase.from("swaps").update({
-          status: "submitted",
-          tx_hash: txHash,
-          updated_at: new Date().toISOString(),
-        }).eq("quote_id", row.quote_id).in("status", ["reserved", "submitted"]).select("id");
-        if (error) throw new Error(`Failed to persist swap tx hash: ${error.message}`);
-        if (!data?.length) throw new Error("Failed to persist swap tx hash: row not in reserved/submitted");
-      },
-    },
+    tracker.options,
   );
 
-  // Money-safety: only refund when we never broadcast OR chain explicitly reverted.
-  if (result.minedRevert || (!result.txHash && !result.confirmed)) {
+  const txHashes = tracker.hashes().length ? tracker.hashes() : result.txHashes;
+
+  // Refund only when no hop has mined successfully.
+  const neverBroadcast = !result.txHash && !result.confirmed && result.legsCompleted === 0;
+  if ((result.minedRevert && result.legsCompleted === 0) || neverBroadcast) {
     await refundSwap(row.quote_id, result.error ?? "onchain_failed", client, {
       gasActual: result.gasSats,
       txHash: result.txHash || null,
@@ -587,6 +748,16 @@ async function executeOnchain(
       ok: false,
       error: result.error ?? "On-chain swap failed.",
       code: "onchain_failed",
+    };
+  }
+
+  if (result.minedRevert && result.legsCompleted > 0) {
+    return {
+      ok: false,
+      error:
+        "A later hop reverted after the first hop mined. " +
+        "Your funds stay reserved until recovery finishes the route — do not retry.",
+      code: "leg_failed",
     };
   }
 
@@ -668,6 +839,7 @@ async function executeOnchain(
     gasActualSats: result.gasSats,
     gasRefundedSats: gasRefunded,
     txHash: result.txHash,
+    txHashes,
     quoteId: row.quote_id,
   };
 }
@@ -726,116 +898,389 @@ async function refundSwap(
 /**
  * Resolve swaps left in reserved/submitted after crashes.
  * Money rules:
- * - no tx_hash after age → safe full refund (never broadcast)
- * - mined revert → refund
- * - mined success → credit log-derived out (or min_to floor); never refund principal
- * - unknown / mempool → leave pending
+ * - no tx_hash after staleness → safe full refund (never broadcast)
+ * - mined revert / provably dropped first hop → refund
+ * - any hop mined success → never refund principal; finish remaining hops then credit
+ * - remaining hops are retried at most RECOVERY_MAX_ATTEMPTS times, never with a
+ *   lowered min-out; after that (or on ambiguity) the row goes to needs_review
+ * - unknown / mempool → leave pending (bounded by dropped/stuck timeouts)
+ *
+ * Concurrency: rows are claimed by compare-and-set on updated_at (plus a lease
+ * in metadata), then re-read under the in-process treasury swap lock; recovery
+ * skips the row if anything moved since the claim. Staleness uses updated_at /
+ * last_progress_at, which the live path bumps on every signed tx and mined leg.
  */
 export async function recoverPendingSwaps(): Promise<void> {
-  const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
-  const { data: stale } = await supabase
+  const cutoff = new Date(Date.now() - RECOVERY_STALE_MS).toISOString();
+  const { data: stale, error } = await supabase
     .from("swaps")
     .select("*")
-    .in("status", ["reserved", "submitted"])
-    .lt("created_at", fiveMinutesAgo);
+    .in("status", [...RECOVERABLE_SWAP_STATUSES])
+    .lt("updated_at", cutoff);
+  if (error) {
+    console.warn("[Swap recovery] select failed:", error.message);
+    return;
+  }
 
-  if (!stale?.length) return;
-  console.log(`[Swap recovery] ${stale.length} pending swap(s)`);
+  const now = Date.now();
+  const rows = ((stale ?? []) as SwapRow[]).filter((row) => eligibleForRecovery(row, now));
+  if (!rows.length) return;
+  console.log(`[Swap recovery] ${rows.length} pending swap(s)`);
 
-  for (const raw of stale) {
-    const row = raw as SwapRow;
+  for (const row of rows) {
     try {
-      if (!row.tx_hash) {
-        // Only refund if still no hash after age — never broadcast.
-        await refundSwap(row.quote_id, "recovery_no_tx_hash", null);
-        console.log(`[Swap recovery] ${row.quote_id}: no tx → refunded`);
-        continue;
-      }
-
-      const amountOutMin = tokenAmountToUnits(row.min_to_amount, row.to_token);
-      const inspected = await inspectSwapReceipt(
-        row.tx_hash,
-        tokenOutAddress(row.to_token),
-        amountOutMin,
-      );
-
-      if (inspected.status === "pending") {
-        const tx = await rawRpcTx(row.tx_hash);
-        if (tx === null) {
-          await new Promise((r) => setTimeout(r, 4000));
-          const retry = await rawRpcTx(row.tx_hash);
-          if (retry === null) {
-            // Only drop-refund after a second null lookup on a stale row.
-            const ageMs = Date.now() - new Date(row.created_at).getTime();
-            // Conservative: only auto-refund a known hash after 60m of repeated absence.
-            // Prefer ops review over free-riding if RPC was flaky.
-            if (ageMs > 60 * 60 * 1000) {
-              await refundSwap(row.quote_id, "recovery_tx_dropped", null, { txHash: row.tx_hash });
-              console.log(`[Swap recovery] ${row.quote_id}: dropped after 60m → refunded`);
-            } else {
-              console.log(`[Swap recovery] ${row.quote_id}: tx not found yet — leave pending`);
-            }
-          } else {
-            console.log(`[Swap recovery] ${row.quote_id}: still pending`);
-          }
-        } else {
-          console.log(`[Swap recovery] ${row.quote_id}: mempool/waiting receipt`);
-        }
-        continue;
-      }
-
-      if (inspected.status === "revert") {
-        await refundSwap(row.quote_id, "recovery_tx_reverted", null, {
-          txHash: row.tx_hash,
-          gasActual: inspected.gasSats,
-        });
-        console.log(`[Swap recovery] ${row.quote_id}: reverted → refunded`);
-        continue;
-      }
-
-      // Success: credit once. Never refund principal after minedSuccess.
-      if (!row.to_credited) {
-        const creditAmount = Math.max(
-          routerOutToTokenAmount(inspected.amountOut, row.to_token),
-          row.min_to_amount,
-        );
-        const { data: creditResult } = await supabase.rpc("credit_swap_output", {
-          p_quote_id: row.quote_id,
-          p_to_amount: creditAmount,
-          p_gas_actual_sats: inspected.gasSats || row.gas_reserved_sats,
-          p_tx_hash: row.tx_hash,
-          p_volume_sats_proxy: Number((row.metadata as { volume_sats_proxy?: number })?.volume_sats_proxy ?? 0),
-        });
-        console.log(`[Swap recovery] ${row.quote_id}: confirmed → credit ${creditResult}`);
-        if (creditResult === "ok" || creditResult === "ok_with_gas_refund") {
-          recordLedgerEntry(null, {
-            type: "swap",
-            amountSats: creditAmount,
-            token: row.to_token,
-            senderId: "treasury",
-            receiverId: row.discord_id,
-            referenceType: "swaps",
-            referenceId: row.quote_id,
-            metadata: { leg: "to", mode: "onchain", recovery: true, tx_hash: row.tx_hash },
-          });
-        }
-      } else {
-        await supabase.from("swaps").update({
-          status: "completed",
-          updated_at: new Date().toISOString(),
-        }).eq("quote_id", row.quote_id);
-      }
+      await recoverOneSwap(row);
     } catch (err) {
       console.error(`[Swap recovery] ${row.quote_id}:`, (err as Error)?.message ?? err);
     }
   }
 }
 
-async function rawRpcTx(txHash: string): Promise<{ blockNumber?: string | null } | null> {
-  const { rawRpcCall } = await import("../evm.js");
-  return await rawRpcCall("eth_getTransactionByHash", [txHash]) as {
-    blockNumber?: string | null;
-  } | null;
+/** Atomically claim a stale row (CAS on updated_at) and write a recovery lease. */
+async function claimSwapForRecovery(row: SwapRow): Promise<SwapRow | null> {
+  const now = Date.now();
+  const nowIso = new Date(now).toISOString();
+  const { data, error } = await supabase.from("swaps").update({
+    metadata: {
+      ...swapMetadata(row),
+      recovery_lease_until: new Date(now + RECOVERY_LEASE_MS).toISOString(),
+      last_recovery_at: nowIso,
+    },
+    updated_at: nowIso,
+  })
+    .eq("quote_id", row.quote_id)
+    .in("status", [...RECOVERABLE_SWAP_STATUSES])
+    .eq("updated_at", row.updated_at)
+    .select("*");
+  if (error) throw new Error(`recovery claim failed: ${error.message}`);
+  return (data?.[0] as SwapRow | undefined) ?? null;
+}
+
+async function recoverOneSwap(stale: SwapRow): Promise<void> {
+  const claimed = await claimSwapForRecovery(stale);
+  if (!claimed) {
+    console.log(`[Swap recovery] ${stale.quote_id}: row changed before claim — skip`);
+    return;
+  }
+  await withTreasurySwapLock(async () => {
+    // The live path in this process holds the same lock for its whole route, so
+    // after acquiring it the row reflects any progress it made.
+    const row = await loadSwap(stale.quote_id);
+    if (!row || !recoverySnapshotUnchanged(claimed, row)) {
+      console.log(`[Swap recovery] ${stale.quote_id}: row progressed after claim — skip`);
+      return;
+    }
+    await recoverClaimedSwap(row);
+  });
+}
+
+async function markSwapNeedsReview(
+  row: SwapRow,
+  meta: SwapProgressMeta & Record<string, unknown>,
+  reason: string,
+): Promise<void> {
+  const nowIso = new Date().toISOString();
+  meta.needs_review = true;
+  meta.needs_review_reason = reason;
+  meta.needs_review_at = nowIso;
+  console.error(
+    `[Swap recovery][ALERT] ${row.quote_id} needs operator review: ${reason} ` +
+    `(user=${row.discord_id} ${row.from_amount} ${row.from_token}→${row.to_token}, ` +
+    `legs=${meta.legs_completed ?? 0}/${meta.legs_total ?? "?"}, attempts=${meta.recovery_attempts ?? 0}, ` +
+    `hashes=${(meta.tx_hashes ?? []).join(",") || "none"}). Funds stay escrowed.`,
+  );
+  const { error } = await supabase.from("swaps").update({
+    status: "needs_review",
+    error_message: reason.slice(0, 500),
+    metadata: meta,
+    updated_at: nowIso,
+  }).eq("quote_id", row.quote_id).in("status", [...RECOVERABLE_SWAP_STATUSES]);
+  if (!error) return;
+  // Pre-migration the status CHECK rejects needs_review: keep status, flag metadata
+  // (recovery skips flagged rows, so automation still stops).
+  console.error(`[Swap recovery] ${row.quote_id}: needs_review status write failed (${error.message}); flagging metadata`);
+  await supabase.from("swaps").update({
+    error_message: reason.slice(0, 500),
+    metadata: meta,
+    updated_at: nowIso,
+  }).eq("quote_id", row.quote_id).in("status", [...RECOVERABLE_SWAP_STATUSES]);
+}
+
+async function persistRecoveryMeta(row: SwapRow, meta: SwapProgressMeta & Record<string, unknown>): Promise<void> {
+  const hashes = meta.tx_hashes ?? [];
+  const { error } = await supabase.from("swaps").update({
+    tx_hash: hashes[0] ?? row.tx_hash,
+    metadata: meta,
+    updated_at: new Date().toISOString(),
+  }).eq("quote_id", row.quote_id).in("status", [...RECOVERABLE_SWAP_STATUSES]);
+  if (error) throw new Error(`recovery metadata write failed: ${error.message}`);
+}
+
+/** Classify a hash with no receipt; waits briefly and re-checks the node first. */
+async function assessPendingHash(
+  row: SwapRow,
+  meta: SwapProgressMeta,
+  txHash: string,
+  firstHop: boolean,
+): Promise<ReturnType<typeof assessMissingReceipt>> {
+  let tx = await getTransactionByHash(txHash);
+  if (tx === null) {
+    await new Promise((r) => setTimeout(r, 4000));
+    tx = await getTransactionByHash(txHash);
+  }
+  let latestNonce: number | null = null;
+  try {
+    latestNonce = await getTreasuryNonce("latest");
+  } catch {
+    // unknown → nonce rule not applied
+  }
+  const storedNonce = meta.tx_nonces?.[txHash];
+  const txNonce = typeof storedNonce === "number"
+    ? storedNonce
+    : (tx?.nonce ? Number(BigInt(tx.nonce)) : null);
+  const signedAt = meta.tx_signed_at?.[txHash] ?? meta.last_progress_at ?? row.created_at;
+  const ageMs = Date.now() - new Date(signedAt).getTime();
+  return assessMissingReceipt({
+    txKnown: tx !== null,
+    txMined: !!tx?.blockNumber,
+    txNonce,
+    latestNonce,
+    ageMs,
+    firstHop,
+  });
+}
+
+async function recoverClaimedSwap(row: SwapRow): Promise<void> {
+  const meta: SwapProgressMeta & Record<string, unknown> = { ...swapMetadata(row) };
+  const hashes = readTxHashes(meta, row.tx_hash);
+  if (hashes.length === 0) {
+    await refundSwap(row.quote_id, "recovery_no_tx_hash", null);
+    console.log(`[Swap recovery] ${row.quote_id}: no tx → refunded`);
+    return;
+  }
+
+  const routes = parseRouteHops(row.route_json);
+  if (!routes.length) {
+    await recoverWithoutRoute(row, meta, hashes);
+    return;
+  }
+
+  const legs = groupSwapLegs(routes);
+  meta.legs_total = legs.length;
+  if (hashes.length > legs.length) {
+    await markSwapNeedsReview(row, meta, `more tx hashes (${hashes.length}) than route legs (${legs.length})`);
+    return;
+  }
+
+  const amountOutMin = tokenAmountToUnits(row.min_to_amount, row.to_token);
+  let completed = 0;
+  let lastOut = 0n;
+  let lastFromLogs = true;
+  let totalGas = 0;
+
+  for (let i = 0; i < hashes.length; i += 1) {
+    const hash = hashes[i]!;
+    const isFinalLeg = i === legs.length - 1;
+    const storedMin = meta.leg_min_outs?.[i];
+    const inspected = await inspectSwapReceipt(
+      hash,
+      tokenOutForLeg(legs, i, row.to_token),
+      isFinalLeg ? amountOutMin : (storedMin ? BigInt(storedMin) : 1n),
+    );
+
+    if (inspected.status === "pending") {
+      const outcome = await assessPendingHash(row, meta, hash, completed === 0);
+      if (outcome === "wait") {
+        console.log(`[Swap recovery] ${row.quote_id}: hop ${i + 1} pending — leave`);
+        return;
+      }
+      if (outcome === "needs_review") {
+        await markSwapNeedsReview(row, meta, `hop ${i + 1} tx ${hash} unconfirmed too long (not provably dropped)`);
+        return;
+      }
+      // Provably dropped.
+      if (completed === 0) {
+        await refundSwap(row.quote_id, "recovery_tx_dropped", null, { txHash: hash });
+        console.log(`[Swap recovery] ${row.quote_id}: first hop dropped → refunded`);
+        return;
+      }
+      console.log(`[Swap recovery] ${row.quote_id}: hop ${i + 1} dropped after prior success — retry remaining`);
+      break;
+    }
+
+    if (inspected.status === "revert") {
+      if (completed === 0) {
+        await refundSwap(row.quote_id, "recovery_tx_reverted", null, {
+          txHash: hash,
+          gasActual: inspected.gasSats,
+        });
+        console.log(`[Swap recovery] ${row.quote_id}: reverted → refunded`);
+        return;
+      }
+      totalGas += inspected.gasSats;
+      console.log(`[Swap recovery] ${row.quote_id}: hop ${i + 1} reverted after prior success — retry remaining`);
+      break;
+    }
+
+    completed += 1;
+    lastOut = inspected.amountOut;
+    lastFromLogs = inspected.fromLogs;
+    totalGas += inspected.gasSats;
+  }
+
+  if (completed < legs.length) {
+    // Keep tx_hashes[i] ↔ leg i: move reverted/dropped hashes aside.
+    const failed = hashes.slice(completed);
+    meta.tx_hashes = hashes.slice(0, completed);
+    meta.legs_completed = completed;
+    if (failed.length) meta.dropped_tx_hashes = [...(meta.dropped_tx_hashes ?? []), ...failed];
+
+    if (!lastFromLogs) {
+      await markSwapNeedsReview(row, meta, `hop ${completed} output unknown (no Transfer logs); cannot size remaining legs`);
+      return;
+    }
+    const attempts = Math.max(0, Math.floor(Number(meta.recovery_attempts ?? 0)));
+    if (!recoveryAttemptAllowed(attempts, RECOVERY_MAX_ATTEMPTS)) {
+      await markSwapNeedsReview(row, meta, `recovery attempts exhausted (${attempts}/${RECOVERY_MAX_ATTEMPTS})`);
+      return;
+    }
+    meta.recovery_attempts = attempts + 1;
+    const lastAttempt = !recoveryAttemptAllowed(attempts + 1, RECOVERY_MAX_ATTEMPTS);
+    await persistRecoveryMeta(row, meta);
+
+    const rest = remainingHops(routes, completed);
+    let quote: RouterQuote;
+    try {
+      quote = await quoteRouteUnits(lastOut, rest);
+    } catch (err) {
+      const reason = `remaining-leg quote failed: ${(err as Error)?.message ?? err}`;
+      if (lastAttempt) await markSwapNeedsReview(row, meta, reason);
+      else console.warn(`[Swap recovery] ${row.quote_id}: ${reason} (attempt ${attempts + 1}/${RECOVERY_MAX_ATTEMPTS})`);
+      return;
+    }
+    // Never broadcast a leg that cannot meet the user's min (it would revert and burn gas),
+    // and never lower the min silently.
+    if (quote.amountOut < amountOutMin) {
+      const reason =
+        `remaining route quotes ${quote.amountOut} < min_to ${amountOutMin} ` +
+        `(attempt ${attempts + 1}/${RECOVERY_MAX_ATTEMPTS})`;
+      if (lastAttempt) await markSwapNeedsReview(row, meta, reason);
+      else console.warn(`[Swap recovery] ${row.quote_id}: ${reason} — not broadcasting`);
+      return;
+    }
+
+    const legMinOuts = computeLegMinimums(quote.legOuts, rowSlippageBps(row), amountOutMin);
+    const tracker = createProgressTracker(row, meta, routes);
+    const follow = await executeTreasuryRouterSwapUnlocked(
+      {
+        fromToken: row.from_token,
+        toToken: row.to_token,
+        amountIn: lastOut,
+        amountOutMin,
+        routes: rest,
+        legMinOuts,
+        legOffset: completed,
+      },
+      tracker.options,
+    );
+    totalGas += follow.gasSats;
+
+    if (!follow.confirmed) {
+      const reason = `remaining hops not confirmed (${follow.error ?? "pending"})`;
+      if (follow.minedRevert && lastAttempt) await markSwapNeedsReview(row, meta, reason);
+      else console.log(`[Swap recovery] ${row.quote_id}: ${reason}`);
+      return;
+    }
+    lastOut = follow.amountOut;
+    lastFromLogs = follow.fromLogs !== false;
+  }
+
+  await creditRecoveredSwap(row, meta.tx_hashes ?? hashes, lastOut, totalGas);
+}
+
+/** Legacy / malformed rows with hashes but no route_json. */
+async function recoverWithoutRoute(
+  row: SwapRow,
+  meta: SwapProgressMeta & Record<string, unknown>,
+  hashes: string[],
+): Promise<void> {
+  if (hashes.length !== 1) {
+    await markSwapNeedsReview(row, meta, `empty route_json with ${hashes.length} tx hashes`);
+    return;
+  }
+  const hash = hashes[0]!;
+  const amountOutMin = tokenAmountToUnits(row.min_to_amount, row.to_token);
+  const inspected = await inspectSwapReceipt(hash, tokenOutAddress(row.to_token), amountOutMin);
+  if (inspected.status === "pending") {
+    const outcome = await assessPendingHash(row, meta, hash, true);
+    if (outcome === "dropped") {
+      await refundSwap(row.quote_id, "recovery_tx_dropped", null, { txHash: hash });
+    } else if (outcome === "needs_review") {
+      await markSwapNeedsReview(row, meta, `tx ${hash} unconfirmed too long (empty route_json)`);
+    }
+    return;
+  }
+  if (inspected.status === "revert") {
+    await refundSwap(row.quote_id, "recovery_tx_reverted", null, { txHash: hash, gasActual: inspected.gasSats });
+    return;
+  }
+  if (!inspected.fromLogs) {
+    // Without a route we cannot tell whether this tx delivered the final token.
+    await markSwapNeedsReview(row, meta, "empty route_json and no to_token Transfer log in receipt");
+    return;
+  }
+  await creditRecoveredSwap(row, hashes, inspected.amountOut, inspected.gasSats);
+}
+
+async function creditRecoveredSwap(
+  row: SwapRow,
+  hashes: string[],
+  lastOut: bigint,
+  totalGas: number,
+): Promise<void> {
+  if (row.to_credited) {
+    await supabase.from("swaps").update({
+      status: "completed",
+      updated_at: new Date().toISOString(),
+    }).eq("quote_id", row.quote_id);
+    return;
+  }
+
+  const creditAmount = Math.max(
+    routerOutToTokenAmount(lastOut, row.to_token),
+    row.min_to_amount,
+  );
+  const { data: creditResult } = await supabase.rpc("credit_swap_output", {
+    p_quote_id: row.quote_id,
+    p_to_amount: creditAmount,
+    p_gas_actual_sats: totalGas || row.gas_reserved_sats,
+    p_tx_hash: hashes[0],
+    p_volume_sats_proxy: Number((row.metadata as { volume_sats_proxy?: number })?.volume_sats_proxy ?? 0),
+  });
+  console.log(`[Swap recovery] ${row.quote_id}: confirmed → credit ${creditResult}`);
+  if (creditResult === "ok" || creditResult === "ok_with_gas_refund") {
+    recordLedgerEntry(null, {
+      type: "swap",
+      amountSats: creditAmount,
+      token: row.to_token,
+      senderId: "treasury",
+      receiverId: row.discord_id,
+      referenceType: "swaps",
+      referenceId: row.quote_id,
+      metadata: { leg: "to", mode: "onchain", recovery: true, tx_hash: hashes[0] },
+    });
+  }
+}
+
+function tokenOutForLeg(
+  legs: ReturnType<typeof groupSwapLegs>,
+  index: number,
+  fallback: TokenSymbol,
+): string {
+  const leg = legs[index];
+  if (!leg) return tokenOutAddress(fallback);
+  const hop = leg.hops[leg.hops.length - 1]!;
+  return hopTokenOut(hop);
 }
 
 /** Periodic recovery for long-lived bot processes. */
@@ -851,24 +1296,26 @@ export async function getSwapOperationalSummary(): Promise<{
   free: Record<string, number>;
   treasury: Record<string, number>;
   pending: number;
+  needsReview: number;
 }> {
-  const [treasury, freeSats, freeMusd, freeMusdc, pendingRes] = await Promise.all([
+  const [treasury, freeSnaps, pendingRes, reviewRes] = await Promise.all([
     getTreasuryBalances(),
-    getFreeInventory("SATS"),
-    getFreeInventory("MUSD"),
-    getFreeInventory("MUSDC"),
+    Promise.all(TOKEN_SYMBOLS.map(async (token) => [token, await getFreeInventory(token)] as const)),
     supabase
       .from("swaps")
       .select("id", { count: "exact", head: true })
-      .in("status", ["reserved", "submitted"]),
+      .in("status", [...RECOVERABLE_SWAP_STATUSES]),
+    supabase
+      .from("swaps")
+      .select("id", { count: "exact", head: true })
+      .eq("status", "needs_review"),
   ]);
+  const free: Record<string, number> = {};
+  for (const [token, snap] of freeSnaps) free[token] = snap.free;
   return {
     treasury,
-    free: {
-      SATS: freeSats.free,
-      MUSD: freeMusd.free,
-      MUSDC: freeMusdc.free,
-    },
+    free,
     pending: pendingRes.count ?? 0,
+    needsReview: reviewRes.count ?? 0,
   };
 }

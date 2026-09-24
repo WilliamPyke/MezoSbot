@@ -1,4 +1,7 @@
 import {
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
   Client,
   EmbedBuilder,
   Events,
@@ -9,6 +12,7 @@ import {
   Routes,
   type ChatInputCommandInteraction,
   type ButtonInteraction,
+  type Interaction,
   type TextChannel,
   type Message,
 } from "discord.js";
@@ -16,7 +20,7 @@ import { setDefaultResultOrder } from "node:dns";
 import { config } from "./config.js";
 import { formatSats } from "./format.js";
 import { formatTokenAmount } from "./tokens.js";
-import { initEVM, getTreasuryAddress, startDepositPoller, registerDepositAddress, recoverPendingWithdrawals } from "./evm.js";
+import { initEVM, getTreasuryAddress, startDepositPoller, registerDepositAddress, recoverPendingWithdrawals, warnIfSatsUnderbacked } from "./evm.js";
 import { recoverPendingSwaps, startSwapRecoveryWorker } from "./swap/service.js";
 import { startSwapRebalanceWorker } from "./swap/rebalance.js";
 import { handleSwapInteraction, isSwapInteraction } from "./commands/swap.js";
@@ -25,17 +29,7 @@ import { commands, commandsData } from "./commands/index.js";
 import { handleQuestBuilderInteraction, isQuestBuilderInteraction, handleQuestEditInteraction, isQuestEditInteraction } from "./commands/quest.js";
 import { handleRainBanInteraction, isRainBanInteraction } from "./commands/rainban.js";
 import { handleAdminInteraction, isAdminInteraction, handleAdminModalTriggers } from "./commands/admin.js";
-import {
-  startEmulator,
-  stopEmulator,
-  submitBid,
-  onRound,
-  getButtonEmoji,
-  BUTTONS,
-  type GBButton,
-  type RoundResult,
-} from "./emulator.js";
-import { setHealthStatusProvider, startStream } from "./stream.js";
+import type { GBButton, RoundResult } from "./emulator.js";
 import { getBalance, subtractBalances } from "./balance.js";
 import {
   processClaim,
@@ -53,10 +47,6 @@ import {
   isArcadeInteraction,
   updateMatchFeed,
 } from "./arcade/interactions.js";
-import {
-  handleSatscapeInteraction,
-  isSatscapeInteraction,
-} from "./satscape/interactions.js";
 import {
   handleEventQuestScheduledEventUpdate,
   handleEventQuestScheduledEventUserChange,
@@ -77,6 +67,17 @@ import { handleGenerationInteraction, isGenerationInteraction } from "./imgnai/i
 import { startImgnaiWorker } from "./imgnai/service.js";
 import { refreshKatanaModels } from "./imgnai/catalog.js";
 import { handleDeveloperRelayMessage } from "./developerRelay.js";
+import { startBotHealth } from "./health.js";
+import { discordIdempotencyKey, isRemoteArcadeMatch, sendEmulatorVote, sendSatscapeCommand, serviceErrorMessage } from "./serviceClient.js";
+import type { SatscapeCommand } from "@mezosbot/contracts";
+import { startIntegrationEventConsumer } from "./integrationEvents.js";
+import { metric, telemetrySnapshot } from "./telemetry.js";
+
+const BUTTONS = ["A", "B", "UP", "DOWN", "LEFT", "RIGHT", "START", "SELECT"] as const;
+const BUTTON_EMOJI: Record<GBButton, string> = {
+  A: "🅰️", B: "🅱️", UP: "⬆️", DOWN: "⬇️", LEFT: "⬅️", RIGHT: "➡️", START: "▶️", SELECT: "⏸️",
+};
+function getButtonEmoji(button: GBButton): string { return BUTTON_EMOJI[button]; }
 
 process.on("unhandledRejection", (err) => {
   console.error("Unhandled rejection:", (err as Error)?.message ?? err);
@@ -116,12 +117,6 @@ const client = new Client({
   intents,
   partials: [Partials.Channel],
 });
-
-setHealthStatusProvider(() => ({
-  status: client.isReady() ? "ok" : "starting",
-  discordReady: client.isReady(),
-  discordState,
-}));
 
 const commandMap = new Map(commands.map((c) => [c.data.name, c.execute]));
 const autocompleteMap = new Map(
@@ -371,6 +366,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
   const arrivalLagMs = Date.now() - interaction.createdTimestamp;
   const startMs = Date.now();
   const tag = interaction.user.tag;
+  metric("discord_arrival_ms", arrivalLagMs, { interactionType: interaction.type });
 
   if (arrivalLagMs >= STALE_INTERACTION_SKIP_MS) {
     const name =
@@ -393,11 +389,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return;
   }
 
-  if (isSatscapeInteraction(interaction)) {
+  const isSatscapeInteraction = "customId" in interaction && interaction.customId.startsWith("satscape:");
+  if (isSatscapeInteraction) {
     const cid = ("customId" in interaction && interaction.customId) || "";
     console.log(`[Discord] SatScape interaction ${cid} from ${tag} (arrivalLag=${arrivalLagMs}ms)`);
     try {
-      await handleSatscapeInteraction(interaction);
+      if (config.services.satscapeRemote) {
+        await handleRemoteSatscapeInteraction(interaction, cid);
+      } else {
+        const { handleSatscapeInteraction } = await import("./satscape/interactions.js");
+        await handleSatscapeInteraction(interaction);
+      }
     } catch (err) {
       console.warn(`[SatScape] Interaction ${cid} failed:`, (err as Error)?.message ?? err);
     }
@@ -554,6 +556,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
   updateUserProfile(interaction.user.id, username, displayName, avatarUrl).catch(() => {});
   try {
     await handler(interaction as ChatInputCommandInteraction);
+    metric("discord_completion_ms", Date.now() - startMs, { command: interaction.commandName });
     console.log(`[Discord] /${interaction.commandName} done in ${Date.now() - startMs}ms (arrivalLag=${arrivalLagMs}ms)`);
   } catch (err) {
     if ((err as { code?: number })?.code === 10062) {
@@ -649,12 +652,60 @@ client.on(Events.MessageCreate, async (message) => {
   }
 
   // Submit bid
-  const result = submitBid(message.author.id, button, amount);
+  const result = config.services.emulatorRemote
+    ? await sendEmulatorVote(
+      { version: 1, domain: "emulator", actorId: message.author.id, button, amountSats: amount },
+      discordIdempotencyKey(message.id, "emulator.vote"),
+    )
+    : await import("./emulator.js").then((module) => module.submitBid(message.author.id, button, amount));
   if (!result.ok) return;
 
   // Ensure user has a deposit address (fire-and-forget, first time only)
   registerDepositAddress(message.author.id).catch(() => {});
 });
+
+/* ────────────────────────────────────────────────────────────────── */
+/*  Remote SatScape buttons                                           */
+/*  With SATSCAPE_REMOTE_ENABLED the bot no longer mutates SatScape   */
+/*  state. Old in-Discord buttons map to the matching browser view    */
+/*  (the Worker supports open_map / open_shop / open_quests); every   */
+/*  mutating action (buy, equip, accept/claim quest, travel, ...) is  */
+/*  explicitly reported as web-only instead of silently executing.    */
+/* ────────────────────────────────────────────────────────────────── */
+
+const SATSCAPE_SHOP_ACTIONS = new Set(["shop", "shopclose", "buy", "equip", "invequip", "inventory"]);
+const SATSCAPE_QUEST_ACTIONS = new Set(["quests", "qaccept", "qclaim", "qtribute"]);
+const SATSCAPE_VIEW_ACTIONS = new Set(["map", "refresh", "open", "shop", "quests"]);
+
+async function handleRemoteSatscapeInteraction(interaction: Interaction, cid: string) {
+  if (!interaction.isButton() && !interaction.isStringSelectMenu() && !interaction.isModalSubmit()) return;
+  const action = cid.split(":")[1] ?? "";
+  if (!interaction.deferred && !interaction.replied) {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  }
+  const remoteAction: SatscapeCommand["action"] = SATSCAPE_SHOP_ACTIONS.has(action)
+    ? "open_shop"
+    : SATSCAPE_QUEST_ACTIONS.has(action) ? "open_quests" : "open_map";
+  const result = await sendSatscapeCommand(
+    { version: 1, domain: "satscape", action: remoteAction, actorId: interaction.user.id },
+    discordIdempotencyKey(interaction.id, `satscape.${remoteAction}`),
+  );
+  if (!result.ok) {
+    await interaction.editReply({ content: serviceErrorMessage(result.error), components: [] });
+    return;
+  }
+  const note = SATSCAPE_VIEW_ACTIONS.has(action)
+    ? "SatScape now runs in the browser."
+    : "That SatScape action is web-only now — nothing was changed from Discord. Finish it in the browser:";
+  await interaction.editReply({
+    content: note,
+    components: [
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder().setStyle(ButtonStyle.Link).setURL(result.value.playUrl).setLabel("Open SatScape"),
+      ),
+    ],
+  });
+}
 
 /* ────────────────────────────────────────────────────────────────── */
 /*  Democracy round resolution                                        */
@@ -668,7 +719,7 @@ let feedBusy = false;
 let lastFeedTime = 0;
 const FEED_THROTTLE_MS = 1000; // max 1 Discord message edit per second
 
-function setupGameBoyCallbacks() {
+function setupGameBoyCallbacks(onRound: (callback: (result: RoundResult) => void) => void) {
   if (!config.gameboy.enabled) return;
   if (!config.gameboy.textInputEnabled) return;
   if (!config.discord.messageContentIntent) return;
@@ -736,6 +787,24 @@ async function updateFeed(
     }
   } catch {
     // Message was deleted or errored — will create a new one next update
+    feedMsg = null;
+  }
+}
+
+async function updateRemoteFeed(button: GBButton, sats: number, winnerCount: number) {
+  if (!cachedGameChannel && config.gameboy.gameChannelId) {
+    const ch = await client.channels.fetch(config.gameboy.gameChannelId).catch(() => null);
+    if (ch && "send" in ch) cachedGameChannel = ch as TextChannel;
+  }
+  if (!cachedGameChannel) return;
+  const content = `${getButtonEmoji(button)} **${button}** — **${formatSats(sats)}** from ${winnerCount} winning vote${winnerCount === 1 ? "" : "s"}`;
+  try {
+    if (feedMsg) {
+      await feedMsg.edit({ content, allowedMentions: { parse: [] } });
+    } else {
+      feedMsg = await cachedGameChannel.send({ content, allowedMentions: { parse: [] } });
+    }
+  } catch {
     feedMsg = null;
   }
 }
@@ -826,7 +895,23 @@ async function main() {
   bindLedgerClient(client);
 
   // ── Web canvas server (start first — Render needs an open port quickly) ──
-  await startStream();
+  const fullyRemote = config.services.arcadeRemote && config.services.satscapeRemote && config.services.emulatorRemote;
+  if (config.runtime.role === "bot" && fullyRemote) {
+    await startBotHealth(config.streaming.port, () => ({
+      status: client.isReady() ? "ok" : "starting",
+      discordReady: client.isReady(),
+      discordState,
+      ...telemetrySnapshot(),
+    }));
+  } else {
+    const stream = await import("./stream.js");
+    stream.setHealthStatusProvider(() => ({
+      status: client.isReady() ? "ok" : "starting",
+      discordReady: client.isReady(),
+      discordState,
+    }));
+    await stream.startStream();
+  }
 
   // Slice Arcade browser flow needs a public HTTPS URL to put in Discord
   // Link buttons. Surface a loud warning on startup if the operator hasn't
@@ -876,6 +961,9 @@ async function main() {
 
   initEVM();
   console.log(`Treasury: ${getTreasuryAddress()}`);
+  warnIfSatsUnderbacked().catch((err) =>
+    console.warn("[Solvency] Startup backing check failed:", (err as Error)?.message ?? err)
+  );
 
   // Resolve any withdrawals left pending from a previous session
   recoverPendingWithdrawals().catch((err) =>
@@ -888,6 +976,35 @@ async function main() {
   startSwapRebalanceWorker();
 
   await connectDiscordWithRetry();
+
+  // The bot role keeps consuming after a flag is rolled back so remote matches
+  // that outlive the flip still get their final feed update.
+  if (config.runtime.role === "bot" || config.services.arcadeRemote || config.services.emulatorRemote) {
+    // Events are display-only (settlement already happened in the RPC that
+    // emitted them). Only react to events the remote runtime owns: arcade
+    // events for runtime='remote' matches (which can outlive a flag flip),
+    // emulator events only while the emulator is remote so the legacy local
+    // feed never gets a second writer. Ignored events are acked, not retried.
+    startIntegrationEventConsumer(async (event) => {
+      if (event.type === "arcade.match_settled") {
+        const match = await getArcadeMatch(event.matchId);
+        if (match && isRemoteArcadeMatch(match)) await updateMatchFeed(client, match);
+        return;
+      }
+      if (!config.services.emulatorRemote) return;
+      // Remote emulator rounds resolve ~2/s. Mirror the legacy feed: edit a
+      // single status message at most once per FEED_THROTTLE_MS and drop the
+      // rest (the event is still acked — the feed is best-effort display).
+      if (!config.gameboy.gameChannelId) return;
+      const now = Date.now();
+      if (feedBusy || now - lastFeedTime < FEED_THROTTLE_MS) return;
+      feedBusy = true;
+      lastFeedTime = now;
+      void updateRemoteFeed(event.winningButton, event.winningSats, event.winnerIds.length)
+        .catch(() => {})
+        .finally(() => { feedBusy = false; });
+    });
+  }
 
   refreshKatanaModels(true).catch((err) =>
     console.warn("[imgnAI] Initial model refresh failed:", (err as Error)?.message ?? err)
@@ -927,8 +1044,8 @@ async function main() {
     }).catch(() => {});
   });
 
-  if (!config.gameboy.enabled) {
-    console.log("[Pokemon] POKEMON_ENABLED=false - emulator and controls disabled");
+  if (!config.gameboy.enabled || config.services.emulatorRemote) {
+    console.log(`[Pokemon] emulator disabled (${!config.gameboy.enabled ? "POKEMON_ENABLED=false" : "remote service enabled"})`);
     return;
   }
 
@@ -936,8 +1053,9 @@ async function main() {
   const { romPath } = config.gameboy;
   if (romPath) {
     try {
-      await startEmulator(romPath);
-      setupGameBoyCallbacks();
+      const emulator = await import("./emulator.js");
+      await emulator.startEmulator(romPath);
+      setupGameBoyCallbacks(emulator.onRound);
     } catch (err) {
       console.error("[GameBoy] Failed to start:", (err as Error)?.message ?? err);
     }
@@ -949,13 +1067,17 @@ async function main() {
 // Graceful shutdown: save game state before exit
 process.on("SIGINT", async () => {
   console.log("\n[Shutdown] Received SIGINT, saving game state...");
-  await stopEmulator();
+  if (!config.services.emulatorRemote) {
+    await import("./emulator.js").then((module) => module.stopEmulator());
+  }
   process.exit(0);
 });
 
 process.on("SIGTERM", async () => {
   console.log("\n[Shutdown] Received SIGTERM, saving game state...");
-  await stopEmulator();
+  if (!config.services.emulatorRemote) {
+    await import("./emulator.js").then((module) => module.stopEmulator());
+  }
   process.exit(0);
 });
 

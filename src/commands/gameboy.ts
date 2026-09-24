@@ -4,10 +4,18 @@
  */
 import { MessageFlags, SlashCommandBuilder, type ChatInputCommandInteraction } from "discord.js";
 import { getBalance } from "../balance.js";
-import { submitBid, getButtonEmoji, type GBButton } from "../emulator.js";
+import type { EmulatorButton as GBButton } from "@mezosbot/contracts";
 import { config } from "../config.js";
 import { registerDepositAddress } from "../evm.js";
 import { formatSats } from "../format.js";
+import { discordIdempotencyKey, sendEmulatorVote, serviceErrorMessage } from "../serviceClient.js";
+import { metric } from "../telemetry.js";
+
+const BUTTON_EMOJI: Record<GBButton, string> = {
+  A: "🅰️", B: "🅱️", UP: "⬆️", DOWN: "⬇️", LEFT: "⬅️", RIGHT: "➡️", START: "▶️", SELECT: "⏸️",
+};
+
+function getButtonEmoji(button: GBButton): string { return BUTTON_EMOJI[button]; }
 
 /** Shared handler for all button commands */
 async function handlePress(interaction: ChatInputCommandInteraction, button: GBButton) {
@@ -20,6 +28,7 @@ async function handlePress(interaction: ChatInputCommandInteraction, button: GBB
   }
 
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  metric("discord_ack_ms", Date.now() - interaction.createdTimestamp, { command: button.toLowerCase() });
 
   // Check balance
   const balance = await getBalance(interaction.user.id);
@@ -28,9 +37,16 @@ async function handlePress(interaction: ChatInputCommandInteraction, button: GBB
   }
 
   // Submit bid
-  const result = submitBid(interaction.user.id, button, amount);
+  const result = config.services.emulatorRemote
+    ? await sendEmulatorVote(
+      { version: 1, domain: "emulator", actorId: interaction.user.id, button, amountSats: amount },
+      discordIdempotencyKey(interaction.id, "emulator.vote"),
+    )
+    : await import("../emulator.js").then((module) => module.submitBid(interaction.user.id, button, amount));
   if (!result.ok) {
-    return interaction.editReply({ content: `❌ ${result.reason}` });
+    return interaction.editReply({
+      content: "error" in result ? serviceErrorMessage(result.error) : `❌ ${result.reason}`,
+    });
   }
 
   await registerDepositAddress(interaction.user.id);

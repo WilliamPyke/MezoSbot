@@ -1,0 +1,38 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "mezosbot-games",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-12",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": ["/api/*", "/internal/*", "/healthz", "/metrics"]
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "ARCADE_ROOMS",
+        "class_name": "ArcadeRoom"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["ArcadeRoom"]
+    }
+  ],
+  "triggers": {
+    // Expires abandoned Arcade matches (expire_stale_arcade_matches_v1).
+    "crons": ["*/5 * * * *"]
+  },
+  "vars": {
+    "ARCADE_ORIGIN": "https://arcade.mallard.sh",
+    "SATSCAPE_ORIGIN": "https://satscape.mallard.sh"
+  }
+}

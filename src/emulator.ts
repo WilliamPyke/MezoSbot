@@ -9,9 +9,9 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { gunzipSync, gzipSync } from "node:zlib";
-import { config } from "./config.js";
-import { supabase } from "./db.js";
+import { gunzipSync, gzip } from "node:zlib";
+import { promisify } from "node:util";
+import { emulatorRuntime, emulatorSupabase } from "./emulatorRuntime.js";
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const Gameboy = require("serverboy");
@@ -27,11 +27,13 @@ const TICK_MS = 1000 / STREAM_FPS;
 const FRAMES_PER_TICK = BASE_SPEED;
 const HOLD_FRAMES = parseInt(process.env.GB_HOLD_FRAMES ?? "16", 10);
 const FRAME_BYTES = GB_WIDTH * GB_HEIGHT * 4;
-const SAVE_INTERVAL_MS = config.gameboy.snapshotIntervalMs;
-const SAVES_DIR = path.join(process.cwd(), "saves");
+const SAVE_INTERVAL_MS = emulatorRuntime.snapshotIntervalMs;
+const SAVES_DIR = process.env.GB_SAVES_DIR ? path.resolve(process.env.GB_SAVES_DIR) : path.join(process.cwd(), "saves");
 const PERSISTED_STATE_VERSION = 2;
 const PERSISTED_STATE_FORMAT = "serverboy-fullstate-gzip-base64";
 const MAX_SNAPSHOT_HISTORY = 2;
+const gzipAsync = promisify(gzip);
+const DEFER_ROUND_APPLY = process.env.GB_DEFER_ROUND_APPLY === "1" || process.env.GB_DEFER_ROUND_APPLY === "true";
 
 export interface FrameMeta {
   width: number;
@@ -70,12 +72,17 @@ let bidSeq = 0;
 
 export function submitBid(userId: string, button: GBButton, amount: number): { ok: boolean; reason?: string } {
   if (!running) return { ok: false, reason: "Emulator is not running." };
-  if (amount < config.gameboy.minBid) return { ok: false, reason: `Minimum bid is ${config.gameboy.minBid} sats.` };
+  if (amount < emulatorRuntime.minBid) return { ok: false, reason: `Minimum bid is ${emulatorRuntime.minBid} sats.` };
   bidPool.set(userId, { userId, button, amount, seq: bidSeq++ });
   return { ok: true };
 }
 
 export function getCurrentBidCount(): number { return bidPool.size; }
+
+export function applyWinningButton(button: GBButton): void {
+  activeButton = button;
+  activeHoldRemaining = HOLD_FRAMES;
+}
 
 /* ── State ─────────────────────────────────────────────────────────── */
 
@@ -206,9 +213,9 @@ function getGameboyCore(instance: unknown): GameboyCoreLike | null {
   return gameboy as unknown as GameboyCoreLike;
 }
 
-function encodeSnapshot(state: unknown[]): string {
+async function encodeSnapshot(state: unknown[]): Promise<string> {
   const json = JSON.stringify(state);
-  return gzipSync(Buffer.from(json, "utf-8")).toString("base64");
+  return (await gzipAsync(Buffer.from(json, "utf-8"))).toString("base64");
 }
 
 function decodeSnapshot(encoded: string): unknown[] {
@@ -242,7 +249,7 @@ function parsePersistedState(raw: string): { sram: number[] | null; snapshots: S
 
 async function loadRawStateFromSupabase(romName: string): Promise<string | null> {
   try {
-    const { data, error } = await supabase
+    const { data, error } = await emulatorSupabase
       .from("game_saves")
       .select("save_data")
       .eq("rom_name", romName)
@@ -326,7 +333,21 @@ async function loadSaveState(romPath: string): Promise<LoadedSaveState> {
   return emptyState;
 }
 
-function saveSaveState(awaitSupabase?: boolean): Promise<void> | void {
+let saveInFlight: Promise<void> | null = null;
+let persistGuard: () => boolean = () => true;
+
+/** Gate for remote/local save writes (e.g. only while holding the emulator lease). */
+export function setPersistGuard(guard: () => boolean): void {
+  persistGuard = guard;
+}
+
+function saveSaveState(): Promise<void> {
+  if (saveInFlight) return saveInFlight;
+  saveInFlight = persistSaveState().finally(() => { saveInFlight = null; });
+  return saveInFlight;
+}
+
+async function persistSaveState(): Promise<void> {
   if (!gb || !running || !currentRomPath) return;
 
   try {
@@ -344,7 +365,7 @@ function saveSaveState(awaitSupabase?: boolean): Promise<void> | void {
         const snapshot = core.saveState();
         if (Array.isArray(snapshot)) {
           const capturedAt = new Date().toISOString();
-          const encoded = encodeSnapshot(snapshot);
+          const encoded = await encodeSnapshot(snapshot);
           snapshots = [{ capturedAt, state: encoded }, ...snapshots].slice(0, MAX_SNAPSHOT_HISTORY);
           console.log(`[Emulator] Captured full snapshot at ${capturedAt}`);
         } else {
@@ -365,33 +386,43 @@ function saveSaveState(awaitSupabase?: boolean): Promise<void> | void {
     };
     const json = JSON.stringify(payload);
     const romName = getRomName(currentRomPath);
-
-    // Local write (synchronous, fast)
-    if (!fs.existsSync(SAVES_DIR)) {
-      fs.mkdirSync(SAVES_DIR, { recursive: true });
-    }
     const savePath = getSaveFilePath(currentRomPath);
-    fs.writeFileSync(savePath, json, "utf-8");
     snapshotHistory = snapshots;
-    console.log(`[Emulator] Saved game state payload locally to ${savePath}`);
 
-    // Supabase upsert
-    const upsertPromise = (async () => {
-      const { error } = await supabase
+    if (!persistGuard()) {
+      console.warn("[Emulator] Save skipped: persistence guard denied (lease not held)");
+      return;
+    }
+
+    // Supabase is the source of truth: upsert first, independently of the
+    // local filesystem (which may be read-only in the container).
+    let remoteSaved = false;
+    try {
+      const { error } = await emulatorSupabase
         .from("game_saves")
         .upsert({ rom_name: romName, save_data: json, updated_at: new Date().toISOString() });
       if (error) {
         console.error(`[Emulator] Supabase save failed:`, error.message);
       } else {
+        remoteSaved = true;
         console.log(`[Emulator] Saved game state payload to Supabase for "${romName}"`);
-        // Remove local file now that Supabase has the authoritative copy
-        try { fs.unlinkSync(savePath); } catch { /* already gone */ }
       }
-    })();
+    } catch (err) {
+      console.error(`[Emulator] Supabase save failed:`, (err as Error)?.message ?? err);
+    }
 
-    if (awaitSupabase) return upsertPromise;
-    // Fire-and-forget during normal operation
-    upsertPromise.catch(() => {});
+    // Local file is only a fallback for when Supabase is unreachable.
+    try {
+      if (remoteSaved) {
+        await fs.promises.unlink(savePath).catch(() => { /* no stale fallback */ });
+      } else {
+        await fs.promises.mkdir(SAVES_DIR, { recursive: true });
+        await fs.promises.writeFile(savePath, json, "utf-8");
+        console.log(`[Emulator] Saved game state payload locally to ${savePath}`);
+      }
+    } catch (err) {
+      console.error(`[Emulator] Local save fallback failed:`, (err as Error)?.message ?? err);
+    }
   } catch (err) {
     console.error(`[Emulator] Failed to save state:`, (err as Error)?.message ?? err);
   }
@@ -430,14 +461,14 @@ export async function startEmulator(romPath: string): Promise<void> {
   }
 
   running = true;
-  roundMs = config.gameboy.roundMs;
+  roundMs = emulatorRuntime.roundMs;
   msSinceLastRound = 0;
 
   // Start emulation loop
   loopHandle = setInterval(tick, TICK_MS);
 
   // Start auto-save loop
-  saveHandle = setInterval(saveSaveState, SAVE_INTERVAL_MS);
+  saveHandle = setInterval(() => void saveSaveState(), SAVE_INTERVAL_MS);
 
   console.log(`[Emulator] Started | ${BASE_SPEED}× | ${FRAMES_PER_TICK}f/tick @ ${STREAM_FPS}fps | hold=${HOLD_FRAMES}f | ${roundMs}ms rounds`);
   if (restoreSource === "latest") {
@@ -455,7 +486,7 @@ export async function stopEmulator(): Promise<void> {
   if (!running) return;
 
   // Save state before shutdown — await Supabase so it completes before exit
-  await saveSaveState(true);
+  await saveSaveState();
 
   running = false;
   if (loopHandle) clearInterval(loopHandle);
@@ -540,7 +571,6 @@ function resolveRound(): void {
   const winner = tally[0];
   if (!winner) return;
 
-  activeButton = winner.button;
-  activeHoldRemaining = HOLD_FRAMES;
+  if (!DEFER_ROUND_APPLY) applyWinningButton(winner.button);
   onRoundResolved?.({ winningButton: winner.button, winners: winner.voters, winningSats: winner.totalSats, tally, totalBids });
 }

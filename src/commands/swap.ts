@@ -19,7 +19,7 @@ const COLOR = 0x00cc6a;
 
 export const data = {
   name: "swap",
-  description: "Swap between SATS, MUSD, and mUSDC (gas for on-chain legs paid in sats)",
+  description: "Swap between SATS, MUSD, MEZO, and mUSDC (gas for on-chain legs paid in sats)",
   options: [
     {
       name: "amount",
@@ -33,14 +33,14 @@ export const data = {
       type: 3 as const,
       description: "Token to sell",
       required: true,
-      choices: TOKEN_CHOICES.filter((c) => c.value !== "MEZO"),
+      choices: TOKEN_CHOICES,
     },
     {
       name: "to",
       type: 3 as const,
       description: "Token to buy",
       required: true,
-      choices: TOKEN_CHOICES.filter((c) => c.value !== "MEZO"),
+      choices: TOKEN_CHOICES,
     },
     {
       name: "slippage",
@@ -60,10 +60,16 @@ export const data = {
 };
 
 function buildQuoteEmbed(quote: SwapQuote): EmbedBuilder {
+  const hasCl = quote.routes.some((hop) => hop.kind === "cl");
+  const hasBasic = quote.routes.some((hop) => hop.kind === "basic");
   const modeLabel =
     quote.mode === "internal"
       ? "Instant · treasury inventory"
-      : "On-chain · Mezo Pools";
+      : hasCl && hasBasic
+        ? "On-chain · Mezo Pools (two hops)"
+        : hasCl
+          ? "On-chain · Mezo Pools CL"
+          : "On-chain · Mezo Pools";
   const embed = new EmbedBuilder()
     .setColor(COLOR)
     .setTitle("Confirm swap")
@@ -204,7 +210,7 @@ export async function handleSwapInteraction(interaction: Interaction): Promise<v
       .setDescription(
         result.mode === "internal"
           ? "Filled from treasury inventory (no network fee)."
-          : "Filled via Mezo Pools on-chain.",
+          : "Filled on-chain via Mezo Pools.",
       )
       .addFields(
         {
@@ -219,7 +225,9 @@ export async function handleSwapInteraction(interaction: Interaction): Promise<v
         },
         {
           name: "Path",
-          value: result.mode === "internal" ? "Instant inventory" : "Mezo Pools",
+          value: result.mode === "internal"
+            ? "Instant inventory"
+            : (result.txHashes && result.txHashes.length > 1 ? "Mezo Pools · two hops" : "Mezo Pools"),
           inline: true,
         },
       )
@@ -235,10 +243,16 @@ export async function handleSwapInteraction(interaction: Interaction): Promise<v
         inline: true,
       });
     }
-    if (result.txHash) {
+    const hashes = result.txHashes?.length ? result.txHashes : (result.txHash ? [result.txHash] : []);
+    if (hashes.length === 1) {
       embed.addFields({
         name: "Transaction",
-        value: `[View on Explorer](${explorer}/tx/${result.txHash})`,
+        value: `[View on Explorer](${explorer}/tx/${hashes[0]})`,
+      });
+    } else if (hashes.length > 1) {
+      embed.addFields({
+        name: "Transactions",
+        value: hashes.map((hash, i) => `[Hop ${i + 1}](${explorer}/tx/${hash})`).join(" · "),
       });
     }
 

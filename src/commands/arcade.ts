@@ -32,6 +32,8 @@ import {
   DEFAULT_PLATFORM_RAKE_BPS,
 } from "../arcade/economics.js";
 import { replyInsufficientBalance } from "./responses.js";
+import { discordIdempotencyKey, isRemoteArcadeMatch, sendArcadeCommand, serviceErrorMessage } from "../serviceClient.js";
+import { metric } from "../telemetry.js";
 
 const DEFAULT_ARCADE_DURATION_MINUTES = 3;
 const MAX_ARCADE_DURATION_MINUTES = 5;
@@ -197,6 +199,16 @@ export const data = {
 
 export async function execute(interaction: ChatInputCommandInteraction) {
   const sub = interaction.options.getSubcommand();
+  // New matches go to whichever runtime the boot-time flag selects. Existing
+  // matches (watch) are always served by the runtime that created them, so a
+  // flag flip never hands a live match to the other settlement path.
+  if (config.services.arcadeRemote && ["practice", "challenge", "offer", "tipfight"].includes(sub)) {
+    return runRemote(interaction, sub);
+  }
+  if (sub === "watch") {
+    const existing = await getMatch(interaction.options.getInteger("match-id", true));
+    if (existing && isRemoteArcadeMatch(existing)) return runRemote(interaction, sub);
+  }
   switch (sub) {
     case "practice":
       return runPractice(interaction);
@@ -225,6 +237,47 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     default:
       return interaction.reply({ content: "Unknown subcommand.", flags: MessageFlags.Ephemeral });
   }
+}
+
+async function runRemote(interaction: ChatInputCommandInteraction, sub: string) {
+  await interaction.deferReply(sub === "practice" || sub === "watch" ? { flags: MessageFlags.Ephemeral } : {});
+  metric("discord_ack_ms", Date.now() - interaction.createdTimestamp, { command: "arcade", subcommand: sub });
+  const action = sub === "practice" ? "create_practice" : sub === "challenge" ? "create_challenge" : sub === "offer" ? "create_offer" : sub === "tipfight" ? "create_tipfight" : "status";
+  const response = await sendArcadeCommand({
+    version: 1,
+    domain: "arcade",
+    action,
+    actorId: interaction.user.id,
+    guildId: interaction.guildId ?? undefined,
+    channelId: interaction.channelId ?? undefined,
+    matchId: sub === "watch" ? interaction.options.getInteger("match-id", true) : undefined,
+    opponentId: sub === "challenge" ? interaction.options.getUser("user", true).id : sub === "tipfight" ? interaction.options.getUser("user")?.id : undefined,
+    stakeSats: sub === "challenge" || sub === "offer" ? interaction.options.getNumber("stake") ?? 0 : sub === "tipfight" ? interaction.options.getNumber("stake", true) : undefined,
+    durationMinutes: sub === "practice" || sub === "challenge" || sub === "offer" || sub === "tipfight" ? interaction.options.getNumber("minutes") ?? 3 : undefined,
+  }, discordIdempotencyKey(interaction.id, `arcade.${action}`));
+  if (!response.ok) return interaction.editReply({ content: serviceErrorMessage(response.error) });
+  const match = response.value.match;
+  const url = response.value.playUrl;
+  if (!url) return interaction.editReply({ content: "The game service did not return a play link." });
+  if ((sub === "challenge" || sub === "offer" || sub === "tipfight") && match?.id) {
+    const stored = await getMatch(match.id);
+    if (!stored) return interaction.editReply({ content: "The match was created, but its public card could not be loaded." });
+    const target = sub === "challenge" ? interaction.options.getUser("user", true) : sub === "tipfight" ? interaction.options.getUser("user") : null;
+    const reply = await interaction.editReply({
+      content: target ? `<@${target.id}> — you've been challenged! Click **Accept** to start.` : "Open Slice Arcade offer posted. First player to accept gets matched.",
+      embeds: [buildMatchFeedEmbed(stored)],
+      components: buildMatchFeedComponents(stored),
+      allowedMentions: target ? { users: [target.id] } : { parse: [] },
+    });
+    const messageId = (reply as { id?: string }).id;
+    if (messageId && interaction.channelId) await setMatchMessage(stored.id, interaction.channelId, messageId);
+    return;
+  }
+  const embed = new EmbedBuilder()
+    .setColor(0x00cc6a)
+    .setTitle(sub === "watch" ? `Watch match #${match?.id ?? ""}` : `Arcade match #${match?.id ?? ""} ready`)
+    .setDescription("This match runs in the dedicated Arcade service; settlement remains transactional in Supabase.");
+  return interaction.editReply({ embeds: [embed], components: [playLinkRow(url, sub === "watch" ? "Watch match" : "Play in browser")] });
 }
 
 /* ────────────────────────────────────────────────────────────────── */

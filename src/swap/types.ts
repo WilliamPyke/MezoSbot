@@ -8,15 +8,34 @@ export type SwapStatus =
   | "submitted"
   | "completed"
   | "failed"
-  | "cancelled";
+  | "cancelled"
+  /** Terminal for automation: funds stay escrowed until an operator resolves it. */
+  | "needs_review";
 
-/** Aerodrome-style Mezo Pools route hop. */
-export type MezoRouteHop = {
+/** Aerodrome-style basic Mezo pool hop. */
+export type BasicRouteHop = {
+  kind: "basic";
   from: string;
   to: string;
   stable: boolean;
   factory: string;
 };
+
+/** Slipstream concentrated-liquidity hop. */
+export type ClRouteHop = {
+  kind: "cl";
+  tokenIn: string;
+  tokenOut: string;
+  tickSpacing: number;
+  factory: string;
+  pool: string;
+};
+
+export type MezoRouteHop = BasicRouteHop | ClRouteHop;
+
+export type SwapLeg =
+  | { venue: "basic"; hops: BasicRouteHop[] }
+  | { venue: "cl"; hops: ClRouteHop[] };
 
 export type SwapQuote = {
   quoteId: string;
@@ -78,6 +97,7 @@ export type ExecuteSwapResult =
       gasActualSats: number;
       gasRefundedSats: number;
       txHash?: string;
+      txHashes?: string[];
       quoteId: string;
     }
   | {

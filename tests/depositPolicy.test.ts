@@ -6,6 +6,9 @@ import {
   nextSweepTime,
   preservesGasReserve,
   withdrawalGasFundingShortfall,
+  satsWithdrawalCovered,
+  satsMintCovered,
+  satsBackingShortfallWei,
 } from "../src/depositPolicy.js";
 
 test("public minimums accumulate while admins can test smaller deposits", () => {
@@ -44,4 +47,26 @@ test("withdrawal gas does not make the sponsor repair historical under-backing",
 
   assert.ok(treasuryBalance < protectedBacking);
   assert.equal(withdrawalGasFundingShortfall(treasuryBalance, gasCost), 0n);
+});
+
+test("SATS withdrawals require the hot wallet to hold the full send amount", () => {
+  assert.equal(satsWithdrawalCovered(1_000n, 1_000n), true);
+  assert.equal(satsWithdrawalCovered(999n, 1_000n), false);
+  assert.equal(satsWithdrawalCovered(0n, 1n), false);
+});
+
+test("SATS minting is blocked while the hot wallet is under-backed", () => {
+  const liabilities = 467_000n;
+  const reserve = 1_000n;
+  const mint = 1n;
+  const required = liabilities + mint + reserve;
+  assert.equal(satsMintCovered(1_000n, liabilities, mint, reserve), false);
+  assert.equal(satsMintCovered(required, liabilities, mint, reserve), true);
+  assert.equal(satsMintCovered(required - 1n, liabilities, mint, reserve), false);
+});
+
+test("SATS backing shortfall is the unpaid liability plus reserve", () => {
+  assert.equal(satsBackingShortfallWei(0n, 467_532n, 1_000n), 468_532n);
+  assert.equal(satsBackingShortfallWei(468_532n, 467_532n, 1_000n), 0n);
+  assert.equal(satsBackingShortfallWei(500_000n, 467_532n, 1_000n), 0n);
 });

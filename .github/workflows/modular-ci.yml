@@ -1,0 +1,136 @@
+name: modular-ci
+
+on:
+  pull_request:
+    branches: [TestingRender]
+  push:
+    branches: [TestingRender]
+
+jobs:
+  node:
+    runs-on: ubuntu-latest
+    env:
+      # src/config.ts throws at import time for every required(...) key. These
+      # are inert placeholders so unit tests can load config; no test talks to
+      # Discord, Supabase or an RPC. DOTENV_CONFIG_PATH points dotenv at a file
+      # that does not exist so a stray .env can never leak into CI.
+      DOTENV_CONFIG_PATH: /nonexistent/.env
+      DISCORD_TOKEN: ci-placeholder
+      DISCORD_CLIENT_ID: "000000000000000000"
+      SUPABASE_URL: http://127.0.0.1:54321
+      SUPABASE_SERVICE_ROLE_KEY: ci-placeholder
+      RPC_URL: http://127.0.0.1:8545
+      TOKEN_CONTRACT: "0x0000000000000000000000000000000000000001"
+      TREASURY_PRIVATE_KEY: "0x0000000000000000000000000000000000000000000000000000000000000001"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # wrangler 4.x requires Node >= 22; the bot image also runs Node 22.
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # build:all = build:packages + full bot build (web, tsc, SatScape assets) + emulator + worker bundle.
+      - run: npm run build:all
+      - run: npx tsc --noEmit -p .
+      - run: npm run test:modular
+      - run: npm run test:operations
+      - run: npm run test:swap
+
+  bot-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build rollback-capable bot image (not pushed)
+        run: docker build -f deploy/Dockerfile.bot -t mezosbot-bot:ci .
+
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PGHOST: localhost
+      PGPORT: 5432
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: postgres
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bootstrap Supabase-compatible roles
+        # The migration guards anon/authenticated with existence checks; CI
+        # creates them so the REVOKE path is actually exercised and asserted.
+        run: |
+          psql -v ON_ERROR_STOP=1 -c "CREATE ROLE service_role NOLOGIN;"
+          psql -v ON_ERROR_STOP=1 -c "CREATE ROLE anon NOLOGIN;"
+          psql -v ON_ERROR_STOP=1 -c "CREATE ROLE authenticated NOLOGIN;"
+          psql -v ON_ERROR_STOP=1 -c "CREATE PUBLICATION supabase_realtime;"
+          # Mimic Supabase default privileges: new functions/tables in public
+          # are granted to anon and authenticated automatically.
+          psql -v ON_ERROR_STOP=1 -c "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO anon, authenticated;"
+          psql -v ON_ERROR_STOP=1 -c "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO anon, authenticated;"
+      - name: Apply fresh schema and SatScape history
+        run: |
+          psql -v ON_ERROR_STOP=1 -f supabase-schema.sql
+          for file in \
+            migrations/2026-05-27_satquest.sql \
+            migrations/2026-05-28_satscape_gear.sql \
+            migrations/2026-05-29_satscape_hp.sql \
+            migrations/2026-05-29_satscape_world.sql \
+            migrations/2026-05-30_satscape_quests.sql \
+            migrations/2026-05-31_satscape_boots.sql \
+            migrations/2026-06-01_satscape_shared_fog.sql \
+            migrations/2026-06-02_satscape_tactical_combat.sql \
+            migrations/2026-06-03_satscape_battle_controls.sql \
+            migrations/2026-06-04_satscape_battle_plan.sql \
+            migrations/2026-06-05_satscape_multi_monster.sql \
+            migrations/2026-06-06_satscape_terrain.sql; do
+            psql -v ON_ERROR_STOP=1 -f "$file"
+          done
+          psql -v ON_ERROR_STOP=1 -f migrations/2026-08-12_modular_runtime.sql
+      - name: Migration is re-runnable
+        run: psql -v ON_ERROR_STOP=1 -f migrations/2026-08-12_modular_runtime.sql
+      - name: Privilege and RLS assertions
+        run: |
+          psql -v ON_ERROR_STOP=1 <<'SQL'
+          DO $$
+          DECLARE v_fn RECORD; v_tbl TEXT;
+          BEGIN
+            FOR v_fn IN
+              SELECT p.oid::regprocedure AS sig FROM pg_proc p
+                JOIN pg_namespace n ON n.oid = p.pronamespace
+               WHERE n.nspname = 'public' AND p.proname LIKE '%\_v1' ESCAPE '\'
+            LOOP
+              IF has_function_privilege('anon', v_fn.sig, 'EXECUTE')
+                 OR has_function_privilege('authenticated', v_fn.sig, 'EXECUTE') THEN
+                RAISE EXCEPTION 'function % is executable by anon/authenticated', v_fn.sig;
+              END IF;
+              IF NOT has_function_privilege('service_role', v_fn.sig, 'EXECUTE') THEN
+                RAISE EXCEPTION 'function % is not executable by service_role', v_fn.sig;
+              END IF;
+            END LOOP;
+            FOREACH v_tbl IN ARRAY ARRAY['integration_events', 'integration_idempotency', 'integration_request_nonces', 'service_leases'] LOOP
+              IF NOT (SELECT relrowsecurity FROM pg_class WHERE oid = ('public.' || v_tbl)::regclass) THEN
+                RAISE EXCEPTION 'RLS is not enabled on %', v_tbl;
+              END IF;
+              IF has_table_privilege('anon', 'public.' || v_tbl, 'SELECT') THEN
+                RAISE EXCEPTION 'anon can read %', v_tbl;
+              END IF;
+            END LOOP;
+            IF EXISTS (SELECT 1 FROM pg_publication_tables WHERE pubname = 'supabase_realtime' AND tablename = 'integration_events') THEN
+              RAISE EXCEPTION 'integration_events must not be in supabase_realtime';
+            END IF;
+          END;
+          $$;
+          SQL
+      - name: Retry and settlement invariants
+        run: psql -v ON_ERROR_STOP=1 -f tests/modular-db.sql

@@ -1,0 +1,4 @@
+SUPABASE_URL=https://example.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=replace-me
+INTERNAL_SIGNING_SECRET=replace-with-games-only-32-random-bytes
+PLAY_TOKEN_SECRET=replace-with-another-32-random-bytes

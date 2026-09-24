@@ -1091,3 +1091,7 @@ CREATE INDEX IF NOT EXISTS idx_ledger_entries_sender ON ledger_entries(sender_id
 CREATE INDEX IF NOT EXISTS idx_ledger_entries_receiver ON ledger_entries(receiver_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_ledger_entries_guild ON ledger_entries(guild_id, created_at DESC);
 
+-- Modular service state, transactional game RPCs, leases, replay protection,
+-- and the integration outbox are maintained by:
+-- migrations/2026-08-12_modular_runtime.sql
+

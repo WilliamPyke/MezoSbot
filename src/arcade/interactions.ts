@@ -26,6 +26,7 @@ import {
 import { issueMatchToken } from "./tokens.js";
 import { config } from "../config.js";
 import { supabase } from "../db.js";
+import { discordIdempotencyKey, isRemoteArcadeMatch, sendArcadeCommand, serviceErrorMessage } from "../serviceClient.js";
 
 type ArcadeInteraction = ButtonInteraction;
 
@@ -60,6 +61,15 @@ export async function handleArcadeInteraction(interaction: Interaction): Promise
   }
 
   try {
+    // Route by the match's owning runtime, not the current flag: a match
+    // created by the legacy path is finished by legacy and vice versa, so
+    // flipping ARCADE_REMOTE_ENABLED can never settle one match twice.
+    if (["accept", "cancel", "play"].includes(action)) {
+      const owner = await getMatch(+parts[0]);
+      if (owner && isRemoteArcadeMatch(owner)) {
+        return await handleRemoteInteraction(interaction, action, owner.id);
+      }
+    }
     switch (action) {
       case "accept":
         return await handleAccept(interaction, +parts[0]);
@@ -88,6 +98,49 @@ export async function handleArcadeInteraction(interaction: Interaction): Promise
       .followUp({ content: `❌ ${message}`, flags: MessageFlags.Ephemeral })
       .catch(() => {});
   }
+}
+
+async function handleRemoteInteraction(interaction: ButtonInteraction, action: string, matchId: number): Promise<void> {
+  if (action === "play") {
+    const match = await getMatch(matchId);
+    if (!match || ![match.player_a_id, match.player_b_id].includes(interaction.user.id)) {
+      return reply(interaction, "You're not a player in this match.");
+    }
+  }
+  const response = await sendArcadeCommand({
+    version: 1,
+    domain: "arcade",
+    action: action === "play" ? "status" : action as "accept" | "cancel",
+    actorId: interaction.user.id,
+    guildId: interaction.guildId ?? undefined,
+    channelId: interaction.channelId,
+    matchId,
+  }, discordIdempotencyKey(interaction.id, `arcade.${action}:${matchId}`));
+  if (!response.ok) {
+    await interaction
+      .followUp({ content: serviceErrorMessage(response.error), flags: MessageFlags.Ephemeral })
+      .catch(() => {});
+    return;
+  }
+  if (action === "play") {
+    if (!response.value.playUrl) return reply(interaction, "The game service did not return a play link.");
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setLabel("Open browser playfield").setStyle(ButtonStyle.Link).setURL(response.value.playUrl),
+    );
+    await interaction.editReply({
+      embeds: [new EmbedBuilder().setColor(0x00cc6a).setTitle("Your private playfield link").setDescription(`Open the link below to play match #${matchId}.`) ],
+      components: [row],
+    });
+    return;
+  }
+  const match = await getMatch(matchId);
+  if (!match) return reply(interaction, "Match changed but could not be reloaded.");
+  await interaction.editReply({
+    content: action === "accept" ? `<@${match.player_a_id}> vs <@${match.player_b_id}> — match is live.` : undefined,
+    embeds: [buildMatchFeedEmbed(match)],
+    components: buildMatchFeedComponents(match),
+    allowedMentions: { users: [match.player_a_id, match.player_b_id].filter(Boolean) as string[] },
+  });
 }
 
 /* ─────────── Lobby ─────────── */

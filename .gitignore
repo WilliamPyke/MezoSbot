@@ -1,5 +1,11 @@
 node_modules/
 dist/
+dist-bot/
+dist-emulator/
+.wrangler/
+.dev.vars
+coverage/
+apps/games-worker/public/assets/satscape/chunks/
 .env
 mezosbot.db
 *.log
@@ -9,3 +15,13 @@ contracts/artifacts/
 contracts/cache/
 contracts/typechain-types/
 contracts/contracts/cache/
+
+# Local one-off scripts/reports (kept on disk, never committed)
+scripts/_*
+
+# tsc output accidentally emitted next to package sources
+packages/*/src/**/*.js
+
+# Game ROMs are copyrighted; mount at runtime via ROM_PATH
+*.gbc
+*.gb
