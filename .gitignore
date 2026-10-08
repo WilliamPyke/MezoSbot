@@ -22,6 +22,8 @@ scripts/_*
 # tsc output accidentally emitted next to package sources
 packages/*/src/**/*.js
 
-# Game ROMs are copyrighted; mount at runtime via ROM_PATH
+# Game ROMs are copyrighted; mount at runtime via ROM_PATH.
+# pokeyellow.gbc is still force-tracked because the Northflank build reads it
+# from the checkout; untrack it once ROM_PATH points at a mounted file.
 *.gbc
 *.gb

@@ -5,9 +5,14 @@ Never deploy `main`.
 
 ## 1. Database
 
-Apply `migrations/2026-08-12_modular_runtime.sql` to staging, then production,
-in the Supabase SQL editor. The migration is additive, re-runnable, and keeps the
-legacy code operational. Validate the four hot indexes with the queries in
+Apply these in order, to staging and then production, in the Supabase SQL editor:
+
+1. `migrations/2026-09-21_developer_relay_channel_only.sql`
+2. `migrations/2026-08-12_modular_runtime.sql`
+3. `migrations/2026-09-24_swap_recovery.sql` (lets swap recovery park rows in
+   `needs_review`; without it those rows are only flagged in metadata)
+
+All three are additive, re-runnable, and keep the legacy code operational. Validate the four hot indexes with the queries in
 `explain-hot-paths.sql` against production-like data before enabling remote
 traffic.
 

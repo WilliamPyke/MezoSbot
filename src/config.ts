@@ -136,7 +136,7 @@ export const config = {
   withdrawals: {
     /** Default false while MezoSBOT account upgrades are in progress. */
     enabled: optionalBool("WITHDRAWALS_ENABLED", false),
-    eta: optional("WITHDRAWALS_ETA", "Friday, September 25th"),
+    eta: optional("WITHDRAWALS_ETA", "soon"),
   },
   /**
    * Public base URL of this bot's HTTP server (no trailing slash).
@@ -224,7 +224,7 @@ export const config = {
     maxInternalOutSats: parseFloat(optional("SWAP_MAX_INTERNAL_OUT_SATS", "5000000")),
     maxInternalOutMusd: parseFloat(optional("SWAP_MAX_INTERNAL_OUT_MUSD", "500")),
     maxInternalOutMusdc: parseFloat(optional("SWAP_MAX_INTERNAL_OUT_MUSDC", "500")),
-    maxInternalOutMezo: parseFloat(optional("SWAP_MAX_INTERNAL_OUT_MEZO", "50000")),
+    maxInternalOutMezo: parseFloat(optional("SWAP_MAX_INTERNAL_OUT_MEZO", "0")),
     /** Haircut on internal mid quotes so inventory is not arbed (bps). */
     internalHaircutBps: parseInt(optional("SWAP_INTERNAL_HAIRCUT_BPS", "10"), 10),
     maxSwapsPerDay: parseInt(optional("SWAP_MAX_PER_DAY", "25"), 10),
