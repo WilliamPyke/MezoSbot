@@ -1,13 +1,22 @@
 import { EmbedBuilder, MessageFlags, type ChatInputCommandInteraction } from "discord.js";
-import { subtractBalance, addBalance, getBalance } from "../balance.js";
-import { getSweepGasSponsorAddress, registerDepositAddress, withdraw } from "../evm.js";
+import { creditRecipients, getBalance, refundUndeliveredCredits, subtractBalance } from "../balance.js";
+import { settledState } from "../depositPolicy.js";
+import {
+  executeWithdrawal,
+  finalizeWithdrawal,
+  getSweepGasSponsorAddress,
+  preflightWithdrawal,
+  registerDepositAddress,
+  reserveWithdrawal,
+} from "../evm.js";
 import { formatSats } from "../format.js";
 import { sendTransferReceivedDm } from "../notifications.js";
 import { supabase } from "../db.js";
 import { updateUserBadges } from "../badges.js";
 import { recordLedgerEntry } from "../ledger.js";
 import { replyInsufficientBalance } from "./responses.js";
-import { TOKEN_CHOICES, formatTokenAmount, parseToken, roundTokenAmount } from "../tokens.js";
+import { reservationFailureMessage, withdrawalPreflightMessage, withdrawalsPausedMessage } from "./withdraw.js";
+import { TOKEN_CHOICES, formatTokenAmount, parseToken, roundTokenAmount, type TokenSymbol } from "../tokens.js";
 import { config } from "../config.js";
 
 
@@ -41,7 +50,10 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   if (sponsor && token !== "SATS") {
     return interaction.reply({ content: "❌ The gas sponsor accepts SATS only.", flags: MessageFlags.Ephemeral });
   }
-
+  // A sponsor tip sends custodial SATS on-chain, so it obeys the withdrawal switch.
+  if (sponsor && !config.withdrawals.enabled) {
+    return interaction.reply({ content: withdrawalsPausedMessage(), flags: MessageFlags.Ephemeral });
+  }
 
   if (customMessage && customMessage.length > 200) {
     return interaction.reply({ content: "❌ Message must be 200 characters or fewer.", flags: MessageFlags.Ephemeral });
@@ -60,45 +72,20 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     return replyInsufficientBalance(interaction);
   }
 
+  if (sponsor) return tipGasSponsor(interaction, amount);
+
   if (!(await subtractBalance(interaction.user.id, amount, token))) {
     return replyInsufficientBalance(interaction);
   }
 
   await interaction.deferReply();
 
-  if (sponsor) {
-    const result = await withdraw(getSweepGasSponsorAddress(), amount, "SATS");
-    if (result.error || !result.confirmed) {
-      await addBalance(interaction.user.id, amount, "SATS");
-      return interaction.editReply({ content: `❌ Sponsor tip failed and was refunded: ${result.error ?? "transaction was not confirmed"}` });
-    }
-    recordLedgerEntry(interaction.client, {
-      type: "tip",
-      amountSats: amount,
-      token: "SATS",
-      senderId: interaction.user.id,
-      receiverId: "platform",
-      guildId: interaction.guildId,
-      referenceType: "gas_sponsor_tip",
-      referenceId: result.txHash ?? null,
-      metadata: { destination: "sweep_gas_sponsor", sent_sats: result.sentSats, gas_sats: result.gasSats },
-    });
-    return interaction.editReply({
-      embeds: [new EmbedBuilder()
-        .setColor(0x00cc6a)
-        .setTitle("⛽ Gas Sponsor Funded")
-        .addFields(
-          { name: "Contributed", value: `**${formatSats(amount)}**`, inline: true },
-          { name: "Received", value: `**${formatSats(result.sentSats ?? 0)}**`, inline: true },
-          { name: "Network gas", value: `~${formatSats(result.gasSats ?? 0)}`, inline: true },
-        )
-        .setTimestamp()],
-    });
-  }
-
   if (!target) throw new Error("Tip destination was not resolved");
 
-  await addBalance(target.id, amount, token);
+  const credit = await creditTipOrRefund(interaction.user.id, target.id, amount, token);
+  if (credit !== "credited") {
+    return interaction.editReply({ content: TIP_FAILURE_MESSAGES[credit] });
+  }
   await registerDepositAddress(target.id);
   await sendTransferReceivedDm({
     client: interaction.client,
@@ -151,4 +138,110 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   }
 
   await interaction.editReply({ embeds: [embed], allowedMentions: { parse: [] } });
+}
+
+const TIP_FAILURE_MESSAGES = {
+  refunded: "❌ The tip could not be delivered and was refunded. Please try again.",
+  unconfirmed: "⚠️ The tip's delivery could not be confirmed. An admin has been alerted to reconcile it — please don't resend.",
+  stranded: "❌ The tip could not be delivered and the refund did not go through. An admin has been alerted to restore your balance.",
+} as const;
+
+/**
+ * Credit the recipient. Only a credit that provably did not apply is handed
+ * back to the sender; an unconfirmed credit may have landed, so refunding it
+ * could pay twice and it is logged for manual repair instead.
+ */
+async function creditTipOrRefund(
+  senderId: string,
+  recipientId: string,
+  amount: number,
+  token: TokenSymbol,
+): Promise<"credited" | keyof typeof TIP_FAILURE_MESSAGES> {
+  const [credit] = await creditRecipients([{ discordId: recipientId, amount }], token);
+  if (credit.outcome === "credited") return "credited";
+  if (credit.outcome === "unconfirmed") {
+    console.error(
+      `[Tip] MANUAL REPAIR: credit of ${amount} ${token} from ${senderId} to ${recipientId} is unconfirmed ` +
+      `(${credit.error}); the sender was debited — check the recipient's balance`,
+    );
+    return "unconfirmed";
+  }
+  console.error(`[Tip] Credit of ${amount} ${token} to ${recipientId} failed: ${credit.error}`);
+  const { refundConfirmed } = await refundUndeliveredCredits(senderId, [credit], token, "Tip");
+  return refundConfirmed ? "refunded" : "stranded";
+}
+
+/**
+ * Admin SATS contribution to the sweep gas sponsor. It sends custodial SATS
+ * on-chain, so it runs the full withdrawal pipeline: pre-debit solvency and
+ * coverage checks, a durable withdrawals row, the hash persisted before
+ * broadcast, and a refund only when the tx provably cannot land.
+ */
+async function tipGasSponsor(interaction: ChatInputCommandInteraction, amount: number) {
+  await interaction.deferReply();
+
+  const sponsorAddress = getSweepGasSponsorAddress();
+  const preflight = await preflightWithdrawal(sponsorAddress, amount, "SATS");
+  if (!preflight.ok) {
+    return interaction.editReply({ content: withdrawalPreflightMessage(preflight) });
+  }
+
+  const reservation = await reserveWithdrawal({
+    discordId: interaction.user.id,
+    toAddress: sponsorAddress,
+    amount,
+    token: "SATS",
+  });
+  if (!reservation.ok) {
+    if (reservation.reason === "insufficient_token" || reservation.reason === "insufficient_sats") {
+      return replyInsufficientBalance(interaction);
+    }
+    return interaction.editReply({ content: reservationFailureMessage(reservation.reason) });
+  }
+
+  recordLedgerEntry(interaction.client, {
+    type: "withdrawal",
+    amountSats: amount,
+    token: "SATS",
+    senderId: interaction.user.id,
+    receiverId: "treasury",
+    guildId: interaction.guildId,
+    referenceType: "withdrawals",
+    referenceId: String(reservation.record.id),
+    metadata: { destination: "sweep_gas_sponsor" },
+  });
+
+  const result = await executeWithdrawal(reservation.record);
+  const final = await finalizeWithdrawal(reservation.record, result, {
+    client: interaction.client,
+    guildId: interaction.guildId,
+  });
+
+  const state = settledState(final);
+  if (state === "refunded") {
+    return interaction.editReply({ content: `❌ Sponsor tip failed and was refunded: ${result.error ?? "transaction did not go through"}` });
+  }
+  if (state === "refund_pending") {
+    return interaction.editReply({
+      content: `❌ Sponsor tip failed: ${result.error ?? "transaction did not go through"}. The refund is being processed and should land within a few minutes.`,
+    });
+  }
+  if (state === "pending") {
+    const link = result.txHash ? ` [View on Explorer](${config.evm.explorerUrl}/tx/${result.txHash})` : "";
+    return interaction.editReply({
+      content: `⏳ Sponsor tip submitted and still confirming; it will be finalized automatically.${link}`,
+    });
+  }
+
+  return interaction.editReply({
+    embeds: [new EmbedBuilder()
+      .setColor(0x00cc6a)
+      .setTitle("⛽ Gas Sponsor Funded")
+      .addFields(
+        { name: "Contributed", value: `**${formatSats(amount)}**`, inline: true },
+        { name: "Received", value: `**${formatSats(result.sentSats ?? 0)}**`, inline: true },
+        { name: "Network gas", value: `~${formatSats(result.gasSats ?? 0)}`, inline: true },
+      )
+      .setTimestamp()],
+  });
 }

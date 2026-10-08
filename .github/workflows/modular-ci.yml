@@ -35,6 +35,7 @@ jobs:
       - run: npx tsc --noEmit -p .
       - run: npm run test:modular
       - run: npm run test:operations
+      - run: npm run test:withdrawals
       - run: npm run test:swap
 
   bot-image:
@@ -134,3 +135,10 @@ jobs:
           SQL
       - name: Retry and settlement invariants
         run: psql -v ON_ERROR_STOP=1 -f tests/modular-db.sql
+      - name: Withdrawal reserve/refund invariants
+        run: |
+          psql -v ON_ERROR_STOP=1 -f migrations/2026-07-12_multi_token_support.sql
+          psql -v ON_ERROR_STOP=1 -f migrations/2026-07-25_token_withdrawal_gas.sql
+          psql -v ON_ERROR_STOP=1 -f migrations/2026-10-08_withdrawal_safety.sql
+          psql -v ON_ERROR_STOP=1 -f migrations/2026-10-08_withdrawal_safety.sql
+          psql -v ON_ERROR_STOP=1 -f tests/withdrawal-db.sql

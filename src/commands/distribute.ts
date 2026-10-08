@@ -1,5 +1,12 @@
 import { EmbedBuilder, MessageFlags, type ChatInputCommandInteraction } from "discord.js";
-import { subtractBalance, addBalance, getBalance } from "../balance.js";
+import {
+  creditRecipients,
+  describeUndeliveredCredits,
+  getBalance,
+  refundUndeliveredCredits,
+  subtractBalance,
+} from "../balance.js";
+import { summarizeCredits } from "../depositPolicy.js";
 import { registerDepositAddress } from "../evm.js";
 import { formatSats, roundSats } from "../format.js";
 import { sendTransferReceivedDm } from "../notifications.js";
@@ -54,10 +61,17 @@ export async function execute(interaction: ChatInputCommandInteraction) {
 
   await interaction.deferReply();
 
-  // Parallelize balance additions, address registrations, and recipient DMs.
-  await Promise.all(
-    validUsers.map(async (uid) => {
-      await addBalance(uid, perUser, token);
+  // Credit each recipient independently. Only shares that provably failed go
+  // back to the sender; unconfirmed ones may have landed and are logged.
+  const results = await creditRecipients(validUsers.map((uid) => ({ discordId: uid, amount: perUser })), token);
+  const { credited, creditedTotal } = summarizeCredits(results);
+  const settlement = await refundUndeliveredCredits(interaction.user.id, results, token, "Distribute");
+  const undelivered = describeUndeliveredCredits(results, settlement, token);
+  const creditedIds = credited.map((result) => result.discordId);
+
+  // Address registrations and recipient DMs are best-effort.
+  await Promise.allSettled(
+    creditedIds.map(async (uid) => {
       await registerDepositAddress(uid).catch(() => {});
       await sendTransferReceivedDm({
         client: interaction.client,
@@ -70,28 +84,39 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     })
   );
 
+  if (creditedIds.length === 0) {
+    return interaction.editReply({ content: `❌ The distribution could not be delivered.\n${undelivered ?? ""}` });
+  }
+
+  const deliveredTotal = roundTokenAmount(creditedTotal, token);
   recordLedgerEntry(interaction.client, {
     type: "distribute",
-    amountSats: totalNeeded,
+    amountSats: deliveredTotal,
     token,
     senderId: interaction.user.id,
     receiverId: null,
     guildId: interaction.guildId,
-    metadata: { recipient_count: validUsers.length, per_user_sats: perUser, recipient_ids: validUsers },
+    metadata: {
+      recipient_count: creditedIds.length,
+      per_user_sats: perUser,
+      recipient_ids: creditedIds,
+      ...(undelivered ? { undelivered_recipient_ids: results.filter((r) => r.outcome !== "credited").map((r) => r.discordId) } : {}),
+    },
   });
 
-  const recipients = validUsers.map((id) => `<@${id}>`).join("\n");
+  const recipients = creditedIds.map((id) => `<@${id}>`).join("\n");
 
   const embed = new EmbedBuilder()
     .setColor(0x9b59b6)
     .setTitle(`📤 ${tokenLabel(token)} Distributed!`)
-    .setDescription(`<@${interaction.user.id}> split ${tokenLabel(token)} across ${validUsers.length} user${validUsers.length === 1 ? "" : "s"}.`)
+    .setDescription(`<@${interaction.user.id}> split ${tokenLabel(token)} across ${creditedIds.length} user${creditedIds.length === 1 ? "" : "s"}.`)
     .addFields(
       { name: "Per User", value: `**${formatTokenAmount(perUser, token)}**`, inline: true },
-      { name: "Total", value: `**${formatTokenAmount(totalNeeded, token)}**`, inline: true },
+      { name: "Total", value: `**${formatTokenAmount(deliveredTotal, token)}**`, inline: true },
       { name: "Recipients", value: recipients },
     )
     .setTimestamp();
+  if (undelivered) embed.addFields({ name: "⚠️ Not delivered", value: undelivered });
 
   await interaction.editReply({ embeds: [embed], allowedMentions: { parse: [] } });
 }

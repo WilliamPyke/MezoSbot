@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { config } from "../config.js";
 import { supabase } from "../db.js";
-import { getTokenBalance, getTreasuryAddress, getTreasuryBalances } from "../evm.js";
+import { checkSatsExitSolvency, getTokenBalance, getTreasuryAddress, getTreasuryBalances } from "../evm.js";
 import { roundSats } from "../format.js";
 import { recordLedgerEntry } from "../ledger.js";
 import {
@@ -471,6 +471,21 @@ export async function executeSwapQuote(
         `Wait for deposit sweeps or try a smaller amount.`,
       code: "treasury_short_from",
     };
+  }
+
+  // Native SATS leaving the treasury follows the withdrawal solvency rule:
+  // while under-backed, swapping out would let one user exit at full value.
+  if (row.from_token === "SATS") {
+    const solvency = await checkSatsExitSolvency();
+    if (!solvency.ok) {
+      return {
+        ok: false,
+        error: solvency.reason === "underbacked"
+          ? "On-chain SATS swaps are paused while the treasury's backing is topped up. Nothing was debited."
+          : "Could not verify treasury backing right now. Nothing was debited — try again shortly.",
+        code: "sats_backing",
+      };
+    }
   }
 
   // If the quote was priced as internal (gas_reserved=0) but we fell back to

@@ -1,5 +1,12 @@
 import { EmbedBuilder, MessageFlags, type ChatInputCommandInteraction, type TextChannel } from "discord.js";
-import { subtractBalance, addBalance, getBalance } from "../balance.js";
+import {
+  creditRecipients,
+  describeUndeliveredCredits,
+  getBalance,
+  refundUndeliveredCredits,
+  subtractBalance,
+} from "../balance.js";
+import { summarizeCredits } from "../depositPolicy.js";
 import { registerDepositAddress } from "../evm.js";
 import { formatSats, roundSats } from "../format.js";
 import { sendTransferReceivedDm } from "../notifications.js";
@@ -141,10 +148,21 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     return replyInsufficientBalance(interaction);
   }
 
-  // Parallelize balance additions, address registrations, and recipient DMs.
-  await Promise.all(
-    recipientPayouts.map(async (recipient) => {
-      await addBalance(recipient.uid, recipient.amount, token);
+  // Credit each recipient independently. Only shares that provably failed go
+  // back to the sender; unconfirmed ones may have landed and are logged.
+  const results = await creditRecipients(
+    recipientPayouts.map((recipient) => ({ discordId: recipient.uid, amount: recipient.amount })),
+    token,
+  );
+  const { creditedTotal } = summarizeCredits(results);
+  const settlement = await refundUndeliveredCredits(interaction.user.id, results, token, "Rain");
+  const undelivered = describeUndeliveredCredits(results, settlement, token);
+  const creditedIds = new Set(results.filter((r) => r.outcome === "credited").map((r) => r.discordId));
+  const delivered = recipientPayouts.filter((recipient) => creditedIds.has(recipient.uid));
+
+  // Address registrations and recipient DMs are best-effort.
+  await Promise.allSettled(
+    delivered.map(async (recipient) => {
       await registerDepositAddress(recipient.uid).catch(() => {});
       await sendTransferReceivedDm({
         client: interaction.client,
@@ -158,23 +176,33 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     })
   );
 
+  if (delivered.length === 0) {
+    return interaction.editReply({ content: `❌ The rain could not be delivered.\n${undelivered ?? ""}` });
+  }
+
+  const deliveredTotal = roundTokenAmount(creditedTotal, token);
   const { data: rainRow } = await supabase.from("rains").insert({
     sender_id: interaction.user.id,
-    amount_sats: totalNeeded,
-    recipient_count: activeUserIds.length,
+    amount_sats: deliveredTotal,
+    recipient_count: delivered.length,
     token,
   }).select("id").single();
 
   recordLedgerEntry(interaction.client, {
     type: "rain",
-    amountSats: totalNeeded,
+    amountSats: deliveredTotal,
     token,
     senderId: interaction.user.id,
     receiverId: null,
     guildId: interaction.guildId,
     referenceType: "rains",
     referenceId: rainRow?.id != null ? String(rainRow.id) : null,
-    metadata: { recipient_count: activeUserIds.length, per_unit_sats: perUnit, multi_recipient_count: recipientPayouts.filter((recipient) => recipient.multiplier === 2).length },
+    metadata: {
+      recipient_count: delivered.length,
+      per_unit_sats: perUnit,
+      multi_recipient_count: delivered.filter((recipient) => recipient.multiplier === 2).length,
+      ...(undelivered ? { undelivered_recipient_ids: results.filter((r) => r.outcome !== "credited").map((r) => r.discordId) } : {}),
+    },
   });
 
   // Update rainer badge roles in Discord
@@ -185,7 +213,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   }
 
 
-  const recipients = activeUserIds.map((id) => `<@${id}>`).join("\n");
+  const recipients = delivered.map((recipient) => `<@${recipient.uid}>`).join("\n");
 
   const embed = new EmbedBuilder()
     .setColor(0x3498db)
@@ -193,11 +221,12 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     .setDescription(`<@${interaction.user.id}> made it rain!`)
     .addFields(
       { name: "Base Share", value: `**${formatTokenAmount(perUnit, token)}**`, inline: true },
-      { name: "Total", value: `**${formatTokenAmount(totalNeeded, token)}**`, inline: true },
-      { name: "Recipients", value: `**${activeUserIds.length}**`, inline: true },
+      { name: "Total", value: `**${formatTokenAmount(deliveredTotal, token)}**`, inline: true },
+      { name: "Recipients", value: `**${delivered.length}**`, inline: true },
       { name: "Rained On", value: recipients, inline: false },
     )
     .setTimestamp();
+  if (undelivered) embed.addFields({ name: "⚠️ Not delivered", value: undelivered });
 
   if (role) {
     embed.addFields({ name: "Eligible Role", value: `<@&${role.id}>`, inline: true });

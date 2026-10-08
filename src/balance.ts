@@ -1,7 +1,13 @@
 import { supabase } from "./db.js";
 import { roundSats } from "./format.js";
-import { TOKEN_SYMBOLS, roundTokenAmount, type TokenSymbol } from "./tokens.js";
+import { TOKEN_SYMBOLS, formatTokenAmount, roundTokenAmount, type TokenSymbol } from "./tokens.js";
 import { parseMusd } from "./imgnai/musd.js";
+import {
+  CREDIT_NOT_ATTEMPTED_CODE,
+  isDefiniteDbFailure,
+  summarizeCredits,
+  type CreditOutcome,
+} from "./depositPolicy.js";
 
 export async function getOrCreateUser(discordId: string) {
   // Use upsert with onConflict to avoid duplicate inserts, select to return the row
@@ -71,17 +77,92 @@ export async function getBalances(discordId: string): Promise<Record<TokenSymbol
   return balances;
 }
 
+/**
+ * Credit a balance. Throws when the RPC fails so callers never assume a credit
+ * landed; use isDefiniteDbFailure(error) to tell "did not apply" from "may have".
+ */
 export async function addBalance(discordId: string, amountSats: number, token: TokenSymbol = "SATS"): Promise<void> {
-  await getOrCreateUser(discordId);
-  const rounded = token === "SATS" ? roundSats(amountSats) : roundTokenAmount(amountSats, token);
-  if (token === "SATS") {
-    await supabase.rpc("add_balance", { p_discord_id: discordId, p_amount: rounded });
-    return;
+  // add_balance silently updates zero rows for a missing user, so the row must exist first.
+  if (!(await getOrCreateUser(discordId))) {
+    throw Object.assign(new Error(`User ${discordId} could not be loaded for a balance credit`), {
+      code: CREDIT_NOT_ATTEMPTED_CODE,
+    });
   }
-  const { error } = await supabase.rpc("add_token_balance", {
-    p_discord_id: discordId, p_token: token, p_amount: rounded,
-  });
+  const rounded = token === "SATS" ? roundSats(amountSats) : roundTokenAmount(amountSats, token);
+  const { error } = token === "SATS"
+    ? await supabase.rpc("add_balance", { p_discord_id: discordId, p_amount: rounded })
+    : await supabase.rpc("add_token_balance", { p_discord_id: discordId, p_token: token, p_amount: rounded });
   if (error) throw error;
+}
+
+export type CreditResult = { discordId: string; amount: number; outcome: CreditOutcome; error?: string };
+
+/** Credit each recipient independently. Never throws; see CreditOutcome. */
+export async function creditRecipients(
+  credits: ReadonlyArray<{ discordId: string; amount: number }>,
+  token: TokenSymbol,
+): Promise<CreditResult[]> {
+  return Promise.all(credits.map(async ({ discordId, amount }): Promise<CreditResult> => {
+    try {
+      await addBalance(discordId, amount, token);
+      return { discordId, amount, outcome: "credited" };
+    } catch (error) {
+      const message = (error as Error)?.message ?? String(error);
+      return { discordId, amount, outcome: isDefiniteDbFailure(error) ? "failed" : "unconfirmed", error: message };
+    }
+  }));
+}
+
+/**
+ * After one upfront debit paid for several credits, give the sender back the
+ * shares that provably failed. Unconfirmed shares may have landed, so they are
+ * logged for manual repair rather than refunded. Returns the amount refunded.
+ */
+export async function refundUndeliveredCredits(
+  senderId: string,
+  results: readonly CreditResult[],
+  token: TokenSymbol,
+  context: string,
+): Promise<{ refunded: number; refundConfirmed: boolean }> {
+  const { failed, unconfirmed, failedTotal } = summarizeCredits(results);
+  for (const result of unconfirmed) {
+    console.error(
+      `[${context}] MANUAL REPAIR: credit of ${result.amount} ${token} from ${senderId} to ${result.discordId} ` +
+      `is unconfirmed (${result.error}); check the recipient's balance before refunding the sender`,
+    );
+  }
+  const refund = token === "SATS" ? roundSats(failedTotal) : roundTokenAmount(failedTotal, token);
+  if (refund <= 0) return { refunded: 0, refundConfirmed: true };
+  try {
+    await addBalance(senderId, refund, token);
+    return { refunded: refund, refundConfirmed: true };
+  } catch (error) {
+    console.error(
+      `[${context}] MANUAL REPAIR: refund of ${refund} ${token} to ${senderId} for undelivered credits to ` +
+      `${failed.map((result) => result.discordId).join(", ")} ${isDefiniteDbFailure(error) ? "failed" : "is unconfirmed"}: ` +
+      `${(error as Error)?.message ?? error}`,
+    );
+    return { refunded: 0, refundConfirmed: false };
+  }
+}
+
+/** User-facing note about shares that did not land, or null when every credit did. */
+export function describeUndeliveredCredits(
+  results: readonly CreditResult[],
+  settlement: { refunded: number; refundConfirmed: boolean },
+  token: TokenSymbol,
+): string | null {
+  const { failed, unconfirmed } = summarizeCredits(results);
+  const lines: string[] = [];
+  if (failed.length > 0) {
+    lines.push(settlement.refundConfirmed
+      ? `${failed.length} recipient(s) could not be credited; ${formatTokenAmount(settlement.refunded, token)} was refunded to you.`
+      : `${failed.length} recipient(s) could not be credited and the refund did not go through; an admin has been alerted.`);
+  }
+  if (unconfirmed.length > 0) {
+    lines.push(`${unconfirmed.length} credit(s) could not be confirmed; an admin has been alerted to reconcile them. Please don't resend.`);
+  }
+  return lines.length > 0 ? lines.join("\n") : null;
 }
 
 export async function subtractBalance(discordId: string, amountSats: number, token: TokenSymbol = "SATS"): Promise<boolean> {

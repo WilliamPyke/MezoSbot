@@ -2,10 +2,28 @@ import { randomUUID } from "node:crypto";
 import { ethers } from "ethers";
 import { config, satsToTokenUnits, tokenUnitsToSats } from "./config.js";
 import { supabase } from "./db.js";
-import { addBalance } from "./balance.js";
+import { roundSats } from "./format.js";
 import { recordLedgerEntry } from "./ledger.js";
 import { verifyWalletFromDeposit } from "./walletVerification.js";
-import { meetsPublicDepositMinimum, nextSweepTime, preservesGasReserve, satsMintCovered, satsWithdrawalCovered, withdrawalGasFundingShortfall } from "./depositPolicy.js";
+import {
+  explainWithdrawalOutcome,
+  isDefiniteDbFailure,
+  meetsPublicDepositMinimum,
+  nextSweepTime,
+  pollWithdrawalOutcome,
+  preservesGasReserve,
+  satsBackingShortfallWei,
+  satsExitAllowed,
+  satsMintCovered,
+  satsWithdrawalCovered,
+  sumInFlightSatsLiabilities,
+  withdrawalGasFundingShortfall,
+  type InFlightSatsLiabilities,
+  type WithdrawalObservation,
+  type WithdrawalOutcome,
+  type WithdrawalOutcomeReason,
+  type WithdrawalReceiptLike,
+} from "./depositPolicy.js";
 import { TOKEN_SYMBOLS, assertTokenConfigured, tokenAmountToUnits, tokenDecimalToUnits, tokenUnitsToAmount, type TokenSymbol } from "./tokens.js";
 
 const ERC20_ABI = [
@@ -1239,12 +1257,16 @@ export function startDepositPoller(
 }
 
 export interface WithdrawResult {
+  /** completed | refund | pending — see classifyWithdrawalOutcome. */
+  outcome: WithdrawalOutcome;
+  reason: WithdrawalOutcomeReason;
   txHash?: string;
   error?: string;
+  /** Native: gas charged against the amount (incl. buffer). ERC-20: gas paid, when known. */
   gasSats?: number;
   sentSats?: number;
-  /** true if tx was mined and succeeded on-chain */
-  confirmed?: boolean;
+  /** Gas actually paid according to the receipt. */
+  actualGasSats?: number;
 }
 
 export interface Erc20WithdrawalGasQuote {
@@ -1273,86 +1295,198 @@ export async function quoteErc20WithdrawalGas(
   return { gasLimit, gasPrice, gasSats: tokenUnitsToSats(gasLimit * gasPrice) };
 }
 
-/** Withdraw sats from treasury to an address (native send).
- *  Gas fee is deducted from the send amount so the treasury stays solvent.
- *  Waits for on-chain confirmation before returning success. */
-export async function withdraw(
-  toAddress: string,
-  amountSats: number,
-  token: TokenSymbol = "SATS",
-  gasQuote?: Erc20WithdrawalGasQuote,
-): Promise<WithdrawResult> {
-  const normalized = toAddress.toLowerCase().trim();
-  if (!/^0x[a-fA-F0-9]{40}$/.test(normalized)) return { error: "Invalid address" };
+/**
+ * withdrawals row lifecycle (migrations/2026-10-08_withdrawal_safety.sql):
+ *   reserve_withdrawal_v2: debit + insert 'pending' (one transaction)
+ *   → hash, nonce, raw tx, signed_at persisted → broadcast
+ *   → complete_withdrawal_v2 ('completed') | refund_withdrawal_v2 ('failed')
+ * Every step is idempotent by status, so a lost database response is settled
+ * by retrying (recovery) rather than by guessing.
+ */
+export type WithdrawalRecord = {
+  id: number;
+  discord_id: string;
+  amount_sats: number;
+  token: TokenSymbol;
+  to_address: string;
+  tx_hash: string | null;
+  created_at: string;
+  nonce: number | null;
+  raw_tx: string | null;
+  gas_reserved_sats: number | null;
+  /** 2 = persist-before-broadcast pipeline; null = legacy row. */
+  pipeline_version: number | null;
+  signed_at: string | null;
+};
 
-  if (token !== "SATS") {
-    const cfg = assertTokenConfigured(token);
-    const units = tokenAmountToUnits(amountSats, token);
-    if (units <= 0n) return { error: "Amount too small" };
-    try {
-      const treasuryBalance = await getTokenBalance(wallet.address, token);
-      if (treasuryBalance < units) return { error: `Treasury has insufficient ${token}` };
-      const gasPrice = gasQuote?.gasPrice ?? await getGasPrice();
-      const transferData = ERC20_INTERFACE.encodeFunctionData("transfer", [normalized, units]);
-      const gasLimit = gasQuote?.gasLimit ?? (await quoteErc20WithdrawalGas(normalized, amountSats, token)).gasLimit;
-      const gasCost = gasLimit * gasPrice;
-      await ensureErc20WithdrawalGas(token, gasCost, gasPrice);
+function toWithdrawalRecord(row: Record<string, unknown>): WithdrawalRecord {
+  const token = (row.token ?? "SATS") as TokenSymbol;
+  if (!TOKEN_SYMBOLS.includes(token)) throw new Error(`unknown withdrawal token ${String(row.token)}`);
+  const nonce = row.nonce == null ? null : Number(row.nonce);
+  const gasReserved = row.gas_reserved_sats == null ? null : Number(row.gas_reserved_sats);
+  const pipeline = row.pipeline_version == null ? null : Number(row.pipeline_version);
+  return {
+    id: Number(row.id),
+    discord_id: String(row.discord_id),
+    amount_sats: Number(row.amount_sats),
+    token,
+    to_address: String(row.to_address).toLowerCase(),
+    tx_hash: (row.tx_hash as string | null) ?? null,
+    created_at: String(row.created_at),
+    nonce: nonce != null && Number.isSafeInteger(nonce) ? nonce : null,
+    raw_tx: (row.raw_tx as string | null) ?? null,
+    gas_reserved_sats: gasReserved != null && Number.isFinite(gasReserved) ? gasReserved : null,
+    pipeline_version: pipeline != null && Number.isFinite(pipeline) ? pipeline : null,
+    signed_at: (row.signed_at as string | null) ?? null,
+  };
+}
 
-      const nonceRaw = await rawRpcCall("eth_getTransactionCount", [wallet.address, "pending"]) as string;
-      const signed = await wallet.signTransaction({
-        to: cfg.contractAddress!,
-        data: transferData,
-        gasLimit,
-        gasPrice,
-        nonce: Number(BigInt(nonceRaw ?? "0x0")),
-        chainId: config.evm.chainId,
-        type: 0,
-      });
-      const expectedHash = ethers.keccak256(signed);
-      let txHash = expectedHash;
-      try {
-        txHash = (await rawRpcCall("eth_sendRawTransaction", [signed]) as string | null) ?? expectedHash;
-      } catch (error) {
-        const message = String((error as Error)?.message ?? error).toLowerCase();
-        if (!message.includes("already known") && !message.includes("known transaction")) throw error;
-      }
-      for (let i = 0; i < 40; i++) {
-        await new Promise((resolve) => setTimeout(resolve, 3000));
-        const receipt = await rawRpcCall("eth_getTransactionReceipt", [txHash]) as {
-          status: string;
-          gasUsed?: string;
-          effectiveGasPrice?: string;
-        } | null;
-        if (!receipt) continue;
-        if (parseInt(receipt.status, 16) !== 1) {
-          return { txHash, confirmed: false, error: "Transaction reverted on-chain" };
-        }
-        const actualGasCost = receipt.gasUsed
-          ? BigInt(receipt.gasUsed) * BigInt(receipt.effectiveGasPrice ?? gasPrice)
-          : gasCost;
-        return { txHash, sentSats: amountSats, gasSats: tokenUnitsToSats(actualGasCost), confirmed: true };
-      }
-      return { txHash, confirmed: false, error: "Receipt timeout: transaction not confirmed after 2 minutes" };
-    } catch (error) {
-      return { error: (error as Error).message };
-    }
+async function readWithdrawalStatus(id: number): Promise<string | null> {
+  const { data } = await supabase.from("withdrawals").select("status").eq("id", id).maybeSingle();
+  return (data?.status as string | undefined) ?? null;
+}
+
+/** Write the signed tx identity onto the row while it is still pending and hashless. */
+async function persistWithdrawalBroadcast(
+  id: number,
+  txHash: string,
+  nonce: number,
+  rawTx: string,
+  signedAt: number,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const { data, error } = await supabase
+    .from("withdrawals")
+    .update({ tx_hash: txHash, nonce, raw_tx: rawTx, signed_at: new Date(signedAt).toISOString() })
+    .eq("id", id)
+    .eq("status", "pending")
+    .is("tx_hash", null)
+    .select("id");
+  if (error) return { ok: false, error: error.message };
+  if (!data?.length) return { ok: false, error: "withdrawal is no longer pending" };
+  return { ok: true };
+}
+
+export type WithdrawalReservation =
+  | { ok: true; record: WithdrawalRecord }
+  | { ok: false; reason: "insufficient_token" | "insufficient_sats" | "unavailable" | "unconfirmed"; error?: string };
+
+/**
+ * Debit the user and create the pending row in one transaction. If the
+ * response is lost ("unconfirmed") the reservation either never happened or
+ * left a hashless pipeline-2 pending row, which recovery refunds as never
+ * broadcast. All solvency/coverage checks belong before this call.
+ */
+export async function reserveWithdrawal(input: {
+  discordId: string;
+  toAddress: string;
+  amount: number;
+  token: TokenSymbol;
+  /** SATS network fee reserved alongside an ERC-20 withdrawal. */
+  gasSats?: number;
+}): Promise<WithdrawalReservation> {
+  const toAddress = input.toAddress.toLowerCase().trim();
+  const gasReservedSats = input.token === "SATS" ? null : roundSats(input.gasSats ?? 0);
+  const { data, error } = await supabase.rpc("reserve_withdrawal_v2", {
+    p_discord_id: input.discordId,
+    p_to_address: toAddress,
+    p_token: input.token,
+    p_amount: input.amount,
+    p_gas_sats: gasReservedSats ?? 0,
+  });
+  if (error) {
+    if (isDefiniteDbFailure(error)) return { ok: false, reason: "unavailable", error: error.message };
+    console.error(
+      `[Withdraw] Reservation for ${input.discordId} (${input.amount} ${input.token} → ${toAddress}) is unconfirmed ` +
+      `(${error.message}); if it committed, recovery refunds the hashless row`,
+    );
+    return { ok: false, reason: "unconfirmed", error: error.message };
   }
 
+  const result = (data ?? {}) as { status?: string; id?: unknown; created_at?: unknown };
+  if (result.status === "insufficient_token" || result.status === "insufficient_sats") {
+    return { ok: false, reason: result.status };
+  }
+  if (result.status !== "ok" || result.id == null) {
+    return { ok: false, reason: "unavailable", error: `unexpected reservation result ${JSON.stringify(data)}` };
+  }
+  return {
+    ok: true,
+    record: {
+      id: Number(result.id),
+      discord_id: input.discordId,
+      amount_sats: input.amount,
+      token: input.token,
+      to_address: toAddress,
+      tx_hash: null,
+      created_at: String(result.created_at),
+      nonce: null,
+      raw_tx: null,
+      gas_reserved_sats: gasReservedSats,
+      pipeline_version: 2,
+      signed_at: null,
+    },
+  };
+}
+
+export type WithdrawalPreflight =
+  | { ok: true }
+  | { ok: false; code: "underbacked" | "backing_unavailable" | "treasury_short" | "invalid"; error: string };
+
+/**
+ * Checks that must pass before any debit. Native SATS: the treasury must be
+ * solvent overall, hold the full amount, and the amount must cover gas.
+ * ERC-20: the treasury must hold the token amount (gas is quoted separately).
+ */
+export async function preflightWithdrawal(
+  toAddress: string,
+  amount: number,
+  token: TokenSymbol,
+): Promise<WithdrawalPreflight> {
+  const normalized = toAddress.toLowerCase().trim();
+  if (!/^0x[a-f0-9]{40}$/.test(normalized)) return { ok: false, code: "invalid", error: "Invalid address" };
+  try {
+    if (token === "SATS") {
+      const solvency = await checkSatsExitSolvency();
+      if (!solvency.ok) {
+        return solvency.reason === "underbacked"
+          ? { ok: false, code: "underbacked", error: "Treasury SATS backing is below liabilities plus reserve" }
+          : { ok: false, code: "backing_unavailable", error: solvency.error };
+      }
+      const plan = await planNativeWithdrawal(normalized, amount);
+      return plan.ok ? { ok: true } : { ok: false, code: plan.code, error: plan.error };
+    }
+    const units = tokenAmountToUnits(amount, token);
+    if (units <= 0n) return { ok: false, code: "invalid", error: "Amount too small" };
+    if (await getTokenBalance(wallet.address, token) < units) {
+      return { ok: false, code: "treasury_short", error: `Treasury has insufficient ${token}` };
+    }
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, code: "backing_unavailable", error: describeNativeWithdrawalError(error) };
+  }
+}
+
+type NativeWithdrawalPlan =
+  | { ok: true; sendValue: bigint; gasLimit: bigint; gasPrice: bigint; gasSats: number; sentSats: number }
+  | { ok: false; code: "treasury_short" | "invalid"; error: string };
+
+/** Gas is deducted from the send amount (with a 50% buffer the treasury keeps). */
+async function planNativeWithdrawal(toAddress: string, amountSats: number): Promise<NativeWithdrawalPlan> {
   const value = satsToTokenUnits(amountSats);
-  if (value <= 0n) return { error: "Amount too small" };
+  if (value <= 0n) return { ok: false, code: "invalid", error: "Amount too small" };
 
   const treasuryNative = await getNativeBalance(wallet.address);
   if (!satsWithdrawalCovered(treasuryNative, value)) {
-    return { error: "Treasury has insufficient SATS to cover this withdrawal" };
+    return { ok: false, code: "treasury_short", error: "Treasury has insufficient SATS to cover this withdrawal" };
   }
 
   const gasPrice = await getGasPrice();
   let gasLimit: bigint;
   try {
-    gasLimit = await estimateNativeTransferGas(normalized, value);
+    gasLimit = await estimateNativeTransferGas(toAddress, value);
   } catch (e: unknown) {
     const err = e as { message?: string; reason?: string };
-    return { error: `Unable to estimate withdrawal gas: ${err?.reason ?? err?.message ?? String(e)}` };
+    return { ok: false, code: "invalid", error: `Unable to estimate withdrawal gas: ${err?.reason ?? err?.message ?? String(e)}` };
   }
 
   let gasCost = gasLimit * gasPrice;
@@ -1362,11 +1496,11 @@ export async function withdraw(
 
   let sendValue = value - chargedGas;
   if (sendValue <= 0n) {
-    return { error: `Amount too small to cover network gas (~${gasSats} sats)` };
+    return { ok: false, code: "invalid", error: `Amount too small to cover network gas (~${gasSats} sats)` };
   }
 
   try {
-    const refinedGasLimit = await estimateNativeTransferGas(normalized, sendValue);
+    const refinedGasLimit = await estimateNativeTransferGas(toAddress, sendValue);
     if (refinedGasLimit > gasLimit) {
       gasLimit = refinedGasLimit;
       gasCost = gasLimit * gasPrice;
@@ -1375,155 +1509,496 @@ export async function withdraw(
       sendValue = value - chargedGas;
 
       if (sendValue <= 0n) {
-        return { error: `Amount too small to cover network gas (~${gasSats} sats)` };
+        return { ok: false, code: "invalid", error: `Amount too small to cover network gas (~${gasSats} sats)` };
       }
     }
   } catch (e: unknown) {
     const err = e as { message?: string; reason?: string };
-    return { error: `Unable to estimate withdrawal gas: ${err?.reason ?? err?.message ?? String(e)}` };
+    return { ok: false, code: "invalid", error: `Unable to estimate withdrawal gas: ${err?.reason ?? err?.message ?? String(e)}` };
   }
 
-  const sentSats = tokenUnitsToSats(sendValue);
+  return { ok: true, sendValue, gasLimit, gasPrice, gasSats, sentSats: tokenUnitsToSats(sendValue) };
+}
 
-  // Send the transaction
-  let tx;
+/** Serializes treasury withdrawal nonce assignment → persist → broadcast in this process. */
+let withdrawalSendQueue: Promise<void> = Promise.resolve();
+
+async function withWithdrawalSendLock<T>(fn: () => Promise<T>): Promise<T> {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const prev = withdrawalSendQueue;
+  withdrawalSendQueue = prev.then(() => gate);
+  await prev;
   try {
-    tx = await wallet.sendTransaction({
-      to: normalized,
-      value: sendValue,
-      gasLimit,
-      gasPrice,
+    return await fn();
+  } finally {
+    release();
+  }
+}
+
+type WithdrawalTxRequest = { to: string; value?: bigint; data?: string; gasLimit: bigint; gasPrice: bigint };
+type WithdrawalBroadcast =
+  | { broadcast: true; txHash: string; nonce: number; signedAt: number }
+  | { broadcast: false; error: string };
+
+/**
+ * Assign a nonce, sign locally, persist hash + nonce (+ raw tx) on the
+ * still-pending row, then broadcast. Nothing is sent unless the persist
+ * landed; once it has, every outcome counts as possibly broadcast.
+ */
+async function signPersistAndBroadcast(
+  record: WithdrawalRecord,
+  request: WithdrawalTxRequest,
+): Promise<WithdrawalBroadcast> {
+  return withWithdrawalSendLock(async () => {
+    const nonceRaw = await rawRpcCall("eth_getTransactionCount", [wallet.address, "pending"]) as string;
+    const nonce = Number(BigInt(nonceRaw ?? "0x0"));
+    const signedTx = await wallet.signTransaction({
+      ...request,
+      nonce,
+      chainId: config.evm.chainId,
+      type: 0,
     });
-  } catch (e: unknown) {
-    return { error: describeNativeWithdrawalError(e) };
-  }
-
-  // Poll for confirmation manually — tx.wait() is unreliable on Mezo RPC
-  // (same pattern used in fundGasAndSweep above)
-  const POLL_INTERVAL_MS = 3_000;
-  const POLL_ATTEMPTS = 40; // ~2 minutes total
-
-  for (let i = 0; i < POLL_ATTEMPTS; i++) {
-    await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
-    try {
-      const receipt = await rawRpcCall("eth_getTransactionReceipt", [tx.hash]) as { status: string } | null;
-      if (receipt !== null) {
-        const status = parseInt(receipt.status, 16);
-        if (status === 0) {
-          return { txHash: tx.hash, gasSats, sentSats, confirmed: false, error: "Transaction reverted on-chain" };
-        }
-        return { txHash: tx.hash, gasSats, sentSats, confirmed: true };
-      }
-    } catch (err: unknown) {
-      // Log first error per tx so we can diagnose RPC issues in Render logs
-      if (i === 0) console.warn(`[Withdraw] Poll error for ${tx.hash}:`, (err as Error)?.message ?? err);
+    const txHash = ethers.keccak256(signedTx);
+    const signedAt = Date.now();
+    // If this write's response is lost after it committed, nothing is sent
+    // now; the refund then sees the hash and recovery rebroadcasts raw_tx.
+    const persisted = await persistWithdrawalBroadcast(record.id, txHash, nonce, signedTx, signedAt);
+    if (!persisted.ok) {
+      return { broadcast: false, error: `Could not record the transaction before sending it: ${persisted.error}` };
     }
-  }
 
-  console.warn(`[Withdraw] Receipt timeout for ${tx.hash} after ${POLL_ATTEMPTS} attempts`);
-  return { txHash: tx.hash, gasSats, sentSats, confirmed: false, error: "Receipt timeout: transaction not confirmed after 2 minutes" };
+    try {
+      await rawRpcCall("eth_sendRawTransaction", [signedTx]);
+    } catch (error) {
+      const message = String((error as Error)?.message ?? error);
+      if (!/already known|known transaction/i.test(message)) {
+        // Ambiguous: the node may have accepted the tx before the error
+        // surfaced. The persisted hash/nonce settle it from chain state.
+        console.warn(`[Withdraw] ${record.id}: broadcast of ${txHash} errored; resolving on-chain: ${message.slice(0, 300)}`);
+      }
+    }
+    return { broadcast: true, txHash, nonce, signedAt };
+  });
 }
 
 /**
- * On startup, resolve any withdrawals left in "pending" state from a
- * previous session (e.g. bot killed mid-poll, or before the BAD_DATA fix).
- * Records older than 5 minutes are considered stuck — Mezo confirms in seconds.
+ * One read of a withdrawal tx. The mined nonce is read BEFORE the receipt: if
+ * the tx mines between the two reads the receipt shows it, whereas the
+ * reverse order could mistake a just-mined tx for a dropped one.
+ */
+async function observeWithdrawalTx(
+  txHash: string,
+  knownNonce: number | null,
+  signedAtMs: number,
+): Promise<WithdrawalObservation> {
+  let minedNonce: number | null = null;
+  try {
+    const raw = await rawRpcCall("eth_getTransactionCount", [wallet.address, "latest"]) as string | null;
+    if (raw != null) minedNonce = Number(BigInt(raw));
+  } catch {
+    // Unknown mined nonce → no drop verdict this round.
+  }
+
+  let receipt: WithdrawalReceiptLike | null | undefined;
+  try {
+    receipt = await rawRpcCall("eth_getTransactionReceipt", [txHash]) as WithdrawalReceiptLike | null;
+  } catch {
+    receipt = undefined;
+  }
+
+  let txNonce = knownNonce;
+  let txMined = false;
+  // Only a possible drop needs the tx lookup (is it mined? which nonce?).
+  const nonceMayBeConsumed = txNonce == null || (minedNonce != null && minedNonce > txNonce);
+  if (receipt === null && nonceMayBeConsumed) {
+    try {
+      const tx = await rawRpcCall("eth_getTransactionByHash", [txHash]) as {
+        blockNumber?: string | null;
+        nonce?: string | null;
+      } | null;
+      txMined = tx?.blockNumber != null;
+      if (txNonce == null && tx?.nonce != null) txNonce = Number(BigInt(tx.nonce));
+    } catch {
+      receipt = undefined;
+    }
+  }
+
+  return { broadcast: true, receipt, txMined, txNonce, minedNonce, signedAgeMs: Date.now() - signedAtMs };
+}
+
+function receiptGasSats(
+  receipt: WithdrawalReceiptLike | null | undefined,
+  fallbackGasPrice: bigint | null,
+): number | undefined {
+  if (!receipt?.gasUsed) return undefined;
+  try {
+    const price = receipt.effectiveGasPrice != null ? BigInt(receipt.effectiveGasPrice) : fallbackGasPrice;
+    return price == null ? undefined : tokenUnitsToSats(BigInt(receipt.gasUsed) * price);
+  } catch {
+    return undefined;
+  }
+}
+
+const WITHDRAWAL_POLL_INTERVAL_MS = 3_000;
+const WITHDRAWAL_POLL_ATTEMPTS = 40; // ~2 minutes
+
+/**
+ * Send a reserved withdrawal and wait up to ~2 minutes for a verdict. Errors
+ * before signing mean nothing was sent (refund). After the hash is persisted
+ * only a receipt or a consumed nonce can decide it; otherwise it stays
+ * pending for recovery.
+ */
+export async function executeWithdrawal(
+  record: WithdrawalRecord,
+  gasQuote?: Erc20WithdrawalGasQuote,
+): Promise<WithdrawResult> {
+  const token = record.token;
+  let sent: WithdrawalBroadcast;
+  let gasPrice: bigint;
+  let gasSats: number | undefined;
+  let sentSats: number | undefined;
+  try {
+    if (token === "SATS") {
+      const plan = await planNativeWithdrawal(record.to_address, record.amount_sats);
+      if (!plan.ok) return { outcome: "refund", reason: "never_broadcast", error: plan.error };
+      gasPrice = plan.gasPrice;
+      gasSats = plan.gasSats;
+      sentSats = plan.sentSats;
+      sent = await signPersistAndBroadcast(record, {
+        to: record.to_address,
+        value: plan.sendValue,
+        gasLimit: plan.gasLimit,
+        gasPrice: plan.gasPrice,
+      });
+    } else {
+      const cfg = assertTokenConfigured(token);
+      const units = tokenAmountToUnits(record.amount_sats, token);
+      if (units <= 0n) return { outcome: "refund", reason: "never_broadcast", error: "Amount too small" };
+      const treasuryBalance = await getTokenBalance(wallet.address, token);
+      if (treasuryBalance < units) {
+        return { outcome: "refund", reason: "never_broadcast", error: `Treasury has insufficient ${token}` };
+      }
+      gasPrice = gasQuote?.gasPrice ?? await getGasPrice();
+      const gasLimit = gasQuote?.gasLimit
+        ?? (await quoteErc20WithdrawalGas(record.to_address, record.amount_sats, token)).gasLimit;
+      await ensureErc20WithdrawalGas(token, gasLimit * gasPrice, gasPrice);
+      sentSats = record.amount_sats;
+      sent = await signPersistAndBroadcast(record, {
+        to: cfg.contractAddress!,
+        data: ERC20_INTERFACE.encodeFunctionData("transfer", [record.to_address, units]),
+        gasLimit,
+        gasPrice,
+      });
+    }
+  } catch (error) {
+    // Thrown before the hash was persisted, so nothing was broadcast. (If the
+    // persist itself landed despite an error, finalize sees the hash and
+    // leaves the row pending.)
+    return { outcome: "refund", reason: "never_broadcast", error: describeNativeWithdrawalError(error) };
+  }
+
+  if (!sent.broadcast) {
+    return { outcome: "refund", reason: "never_broadcast", error: sent.error, gasSats, sentSats };
+  }
+
+  const { txHash, nonce, signedAt } = sent;
+  const poll = await pollWithdrawalOutcome({
+    attempts: WITHDRAWAL_POLL_ATTEMPTS,
+    intervalMs: WITHDRAWAL_POLL_INTERVAL_MS,
+    observe: () => observeWithdrawalTx(txHash, nonce, signedAt),
+  });
+  const actualGasSats = receiptGasSats(poll.observation?.receipt, gasPrice);
+  const result: WithdrawResult = {
+    outcome: poll.outcome,
+    reason: poll.reason,
+    txHash,
+    gasSats: token === "SATS" ? gasSats : actualGasSats ?? gasQuote?.gasSats,
+    sentSats,
+    actualGasSats,
+  };
+  if (poll.outcome === "refund") {
+    result.error = poll.reason === "reverted" ? "Transaction reverted on-chain" : "Transaction was dropped by the network";
+  } else if (poll.outcome === "pending") {
+    console.warn(`[Withdraw] ${record.id}: ${txHash} unresolved after ~2 minutes (${poll.reason}); recovery will finalize it`);
+  }
+  return result;
+}
+
+/** ERC-20 gas reservation of a row that predates gas_reserved_sats (it lives in the ledger). */
+async function legacyGasReservation(record: WithdrawalRecord): Promise<number | null> {
+  if (record.token === "SATS" || record.gas_reserved_sats != null) return null;
+  const { data } = await supabase
+    .from("ledger_entries")
+    .select("amount_sats")
+    .eq("type", "withdrawal_network_fee")
+    .eq("reference_type", "withdrawals")
+    .eq("reference_id", String(record.id))
+    .limit(1)
+    .maybeSingle();
+  const amount = Number(data?.amount_sats ?? 0);
+  if (amount > 0) return amount;
+  console.error(`[Withdraw] MANUAL REVIEW: withdrawal ${record.id} has no recorded gas reservation; none will be returned`);
+  return null;
+}
+
+export type WithdrawalFinalState =
+  /** Confirmed on-chain (see `recorded`). */
+  | "completed"
+  /** This call refunded the user. */
+  | "refunded"
+  /** Outcome unknown; the row stays pending for recovery. */
+  | "pending"
+  /** Proven failed, but the refund call failed or its response was lost; recovery retries it (idempotent). */
+  | "refund_pending"
+  /** Another worker settled the row first; see currentStatus. */
+  | "already_final";
+
+export type WithdrawalFinalization = {
+  state: WithdrawalFinalState;
+  /** completed only: false when the row update did not confirm (recovery retries it). */
+  recorded?: boolean;
+  unusedGasRefundSats?: number;
+  currentStatus?: string | null;
+};
+
+type LedgerClient = Parameters<typeof recordLedgerEntry>[0];
+
+/**
+ * Apply a verdict through the atomic SQL functions, shared by the live
+ * command and recovery. Each function locks the row and acts only while it is
+ * 'pending', so a failed or lost call is simply retried by recovery's next
+ * pass and can never credit twice.
+ */
+export async function finalizeWithdrawal(
+  record: WithdrawalRecord,
+  result: Pick<WithdrawResult, "outcome" | "reason" | "txHash" | "actualGasSats">,
+  context: { client?: LedgerClient; guildId?: string | null } = {},
+): Promise<WithdrawalFinalization> {
+  if (result.outcome === "pending") return { state: "pending" };
+
+  const client = context.client ?? null;
+  const ledgerBase = {
+    senderId: "treasury",
+    receiverId: record.discord_id,
+    guildId: context.guildId ?? null,
+    referenceType: "withdrawals",
+    referenceId: String(record.id),
+  } as const;
+  const details =
+    `withdrawal ${record.id} (${record.discord_id}, ${record.amount_sats} ${record.token} → ${record.to_address}, ` +
+    `tx ${result.txHash ?? record.tx_hash ?? "none"}, ${result.reason})`;
+  const fallbackGasSats = await legacyGasReservation(record);
+
+  if (result.outcome === "completed") {
+    const { data, error } = await supabase.rpc("complete_withdrawal_v2", {
+      p_withdrawal_id: record.id,
+      p_actual_gas_sats: result.actualGasSats ?? null,
+      p_fallback_gas_sats: fallbackGasSats,
+    });
+    if (error) {
+      console.error(`[Withdraw] ${details}: confirmed on-chain but not recorded (${error.message}); recovery will retry`);
+      return { state: "completed", recorded: false };
+    }
+    const response = (data ?? {}) as { status?: string; unused_gas_sats?: unknown; current?: unknown };
+    if (response.status !== "completed") return settledElsewhere(response, details);
+    const unused = Number(response.unused_gas_sats ?? 0);
+    if (unused > 0) {
+      recordLedgerEntry(client, {
+        ...ledgerBase,
+        type: "withdrawal_network_fee_refund",
+        amountSats: unused,
+        token: "SATS",
+        metadata: { reason: "unused_gas_reservation" },
+      });
+    }
+    return { state: "completed", recorded: true, unusedGasRefundSats: unused > 0 ? unused : undefined };
+  }
+
+  // A never-broadcast refund also requires the row to be hashless and from
+  // the persist-before-broadcast pipeline (checked under the row lock).
+  const { data, error } = await supabase.rpc("refund_withdrawal_v2", {
+    p_withdrawal_id: record.id,
+    p_require_no_hash: result.reason === "never_broadcast",
+    p_fallback_gas_sats: fallbackGasSats,
+  });
+  if (error) {
+    console.error(
+      `[Withdraw] ${details}: refund ${isDefiniteDbFailure(error) ? "failed" : "unconfirmed (if it committed, its ledger entry is missing)"}: ` +
+      `${error.message}; recovery retries it`,
+    );
+    return { state: "refund_pending" };
+  }
+  const response = (data ?? {}) as { status?: string; gas_sats?: unknown; current?: unknown };
+  if (response.status === "has_hash") return { state: "pending" };
+  if (response.status === "legacy_row") {
+    console.error(`[Withdraw] MANUAL REVIEW: ${details}: legacy hashless row is not refunded automatically`);
+    return { state: "pending" };
+  }
+  if (response.status !== "refunded") return settledElsewhere(response, details);
+
+  recordLedgerEntry(client, {
+    ...ledgerBase,
+    type: "withdrawal_refund",
+    amountSats: record.amount_sats,
+    token: record.token,
+    metadata: { reason: result.reason },
+  });
+  const gasSats = Number(response.gas_sats ?? 0);
+  if (gasSats > 0) {
+    recordLedgerEntry(client, {
+      ...ledgerBase,
+      type: "withdrawal_network_fee_refund",
+      amountSats: gasSats,
+      token: "SATS",
+      metadata: { reason: result.reason },
+    });
+  }
+  return { state: "refunded" };
+}
+
+function settledElsewhere(
+  response: { status?: string; current?: unknown },
+  details: string,
+): WithdrawalFinalization {
+  if (response.status === "not_pending") {
+    return { state: "already_final", currentStatus: response.current == null ? null : String(response.current) };
+  }
+  console.error(`[Withdraw] ${details}: unexpected settlement result ${JSON.stringify(response)}`);
+  return { state: "pending" };
+}
+
+/** Current status of a row, for replies after another worker settled it. */
+export async function getWithdrawalStatus(id: number): Promise<string | null> {
+  return readWithdrawalStatus(id);
+}
+
+const WITHDRAWAL_RECOVERY_INTERVAL_MS = 60_000;
+/** Live commands poll ~2 minutes; recovery leaves younger rows to them. */
+const WITHDRAWAL_RECOVERY_MIN_AGE_MS = 5 * 60_000;
+const WITHDRAWAL_REVIEW_AFTER_MS = 30 * 60_000;
+const WITHDRAWAL_REVIEW_LOG_INTERVAL_MS = 60 * 60_000;
+let withdrawalRecoveryTimer: ReturnType<typeof setInterval> | null = null;
+let withdrawalRecoveryRunning = false;
+const withdrawalReviewLoggedAt = new Map<number, number>();
+
+function logWithdrawalForReview(id: number, message: string): void {
+  const last = withdrawalReviewLoggedAt.get(id) ?? 0;
+  if (Date.now() - last < WITHDRAWAL_REVIEW_LOG_INTERVAL_MS) return;
+  withdrawalReviewLoggedAt.set(id, Date.now());
+  console.error(`[Recovery] MANUAL REVIEW withdrawal ${id}: ${message}`);
+}
+
+/**
+ * Resolve withdrawals the live command could not finish (restart mid-poll,
+ * receipt timeout, lost database responses) with the same rules as the live
+ * path. Called at startup; it then re-runs itself every minute.
  */
 export async function recoverPendingWithdrawals(): Promise<void> {
-  const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
-  const { data: stale } = await supabase
+  if (!withdrawalRecoveryTimer) {
+    withdrawalRecoveryTimer = setInterval(() => {
+      recoverPendingWithdrawals().catch((err) =>
+        console.error("[Recovery] Withdrawal pass failed:", (err as Error)?.message ?? err),
+      );
+    }, WITHDRAWAL_RECOVERY_INTERVAL_MS);
+    withdrawalRecoveryTimer.unref?.();
+  }
+  if (withdrawalRecoveryRunning) return;
+  withdrawalRecoveryRunning = true;
+  try {
+    await recoverPendingWithdrawalsOnce();
+  } finally {
+    withdrawalRecoveryRunning = false;
+  }
+}
+
+async function recoverPendingWithdrawalsOnce(): Promise<void> {
+  const cutoff = new Date(Date.now() - WITHDRAWAL_RECOVERY_MIN_AGE_MS).toISOString();
+  const { data: stale, error } = await supabase
     .from("withdrawals")
     .select("*")
     .eq("status", "pending")
-    .lt("created_at", fiveMinutesAgo);
+    .lt("created_at", cutoff)
+    .order("id")
+    .limit(100);
+  if (error) throw new Error(error.message);
 
-  if (!stale || stale.length === 0) return;
-  console.log(`[Recovery] Found ${stale.length} stale pending withdrawal(s) to resolve`);
-
-  for (const w of stale) {
-    const withdrawalToken = (w.token ?? "SATS") as TokenSymbol;
-    if (!w.tx_hash) {
-      // sendTransaction never got a hash — safe to refund
-      await addBalance(w.discord_id, w.amount_sats, withdrawalToken);
-      recordLedgerEntry(null, {
-        type: "withdrawal_refund",
-        amountSats: w.amount_sats,
-        token: withdrawalToken,
-        senderId: "treasury",
-        receiverId: w.discord_id,
-        referenceType: "withdrawals",
-        referenceId: String(w.id),
-        metadata: { reason: "recovery_no_tx_hash" },
-      });
-      await supabase.from("withdrawals").update({ status: "failed" }).eq("id", w.id);
-      console.log(`[Recovery] Withdrawal ${w.id}: no tx_hash → refunded ${w.amount_sats} sats`);
-      continue;
-    }
-
+  for (const row of stale ?? []) {
     try {
-      const receipt = await rawRpcCall("eth_getTransactionReceipt", [w.tx_hash]) as { status: string } | null;
-      if (receipt !== null) {
-        const status = parseInt(receipt.status, 16);
-        if (status === 1) {
-          await supabase.from("withdrawals").update({ status: "completed" }).eq("id", w.id);
-          console.log(`[Recovery] Withdrawal ${w.id}: tx confirmed on-chain → marked completed (no refund)`);
-        } else {
-          await addBalance(w.discord_id, w.amount_sats, withdrawalToken);
-          recordLedgerEntry(null, {
-            type: "withdrawal_refund",
-            amountSats: w.amount_sats,
-            token: withdrawalToken,
-            senderId: "treasury",
-            receiverId: w.discord_id,
-            referenceType: "withdrawals",
-            referenceId: String(w.id),
-            metadata: { reason: "recovery_tx_reverted" },
-          });
-          await supabase.from("withdrawals").update({ status: "failed" }).eq("id", w.id);
-          console.log(`[Recovery] Withdrawal ${w.id}: tx reverted → refunded ${w.amount_sats} sats`);
-        }
-      } else {
-        // No receipt — check if tx is mined without a receipt
-        const tx = await rawRpcCall("eth_getTransactionByHash", [w.tx_hash]) as { blockNumber?: string | null } | null;
-        if (tx?.blockNumber != null) {
-          // Tx is in a block but receipt unavailable — treat as confirmed
-          await supabase.from("withdrawals").update({ status: "completed" }).eq("id", w.id);
-          console.log(`[Recovery] Withdrawal ${w.id}: tx in block (no receipt) → marked completed`);
-        } else if (tx !== null) {
-          // Tx exists on-chain but blockNumber is null = still in mempool.
-          // Mezo confirms in seconds so this is unusual, but don't refund —
-          // leave pending and let the next recovery pass resolve it.
-          console.log(`[Recovery] Withdrawal ${w.id}: tx ${w.tx_hash} still in mempool — leaving pending`);
-        } else {
-          // tx === null: this node has no record of it.
-          // Could be RPC lag at startup, so retry once before refunding.
-          await new Promise((r) => setTimeout(r, 4000));
-          const txRetry = await rawRpcCall("eth_getTransactionByHash", [w.tx_hash]) as { blockNumber?: string | null } | null;
-          if (txRetry?.blockNumber != null) {
-            await supabase.from("withdrawals").update({ status: "completed" }).eq("id", w.id);
-            console.log(`[Recovery] Withdrawal ${w.id}: tx found in block on retry → marked completed`);
-          } else if (txRetry !== null) {
-            console.log(`[Recovery] Withdrawal ${w.id}: tx in mempool on retry — leaving pending`);
-          } else {
-            // Still null after retry — tx genuinely dropped
-            await addBalance(w.discord_id, w.amount_sats, withdrawalToken);
-            recordLedgerEntry(null, {
-              type: "withdrawal_refund",
-              amountSats: w.amount_sats,
-              token: withdrawalToken,
-              senderId: "treasury",
-              receiverId: w.discord_id,
-              referenceType: "withdrawals",
-              referenceId: String(w.id),
-              metadata: { reason: "recovery_tx_dropped" },
-            });
-            await supabase.from("withdrawals").update({ status: "failed" }).eq("id", w.id);
-            console.log(`[Recovery] Withdrawal ${w.id}: tx not found after retry → refunded ${w.amount_sats} sats`);
-          }
-        }
-      }
+      await recoverOneWithdrawal(toWithdrawalRecord(row));
     } catch (err) {
-      console.error(`[Recovery] Withdrawal ${w.id}: RPC error —`, (err as Error)?.message ?? err);
+      console.error(`[Recovery] Withdrawal ${row.id}:`, (err as Error)?.message ?? err);
+    }
+  }
+}
+
+async function recoverOneWithdrawal(record: WithdrawalRecord): Promise<void> {
+  if (!record.tx_hash) {
+    // Older code wrote tx_hash only after ~2 minutes of polling (and an old
+    // replica can still do so during a deploy overlap), so only pipeline-2
+    // rows prove "never broadcast".
+    if ((record.pipeline_version ?? 0) < 2) {
+      logWithdrawalForReview(
+        record.id,
+        `legacy pending row without tx_hash (${record.discord_id}, ${record.amount_sats} ${record.token} → ` +
+        `${record.to_address}); check the treasury's txs to that address before refunding`,
+      );
+      return;
+    }
+    const final = await finalizeWithdrawal(record, { outcome: "refund", reason: "never_broadcast" });
+    console.log(`[Recovery] Withdrawal ${record.id}: no tx hash (never broadcast) → ${final.state}`);
+    return;
+  }
+
+  const signedAt = Date.parse(record.signed_at ?? record.created_at);
+  let observation = await observeWithdrawalTx(record.tx_hash, record.nonce, signedAt);
+  let verdict = explainWithdrawalOutcome(observation);
+  if (verdict.reason === "dropped") {
+    // Same re-check the live poller does before trusting a drop.
+    await new Promise((resolve) => setTimeout(resolve, 4_000));
+    observation = await observeWithdrawalTx(record.tx_hash, record.nonce, signedAt);
+    verdict = explainWithdrawalOutcome(observation);
+  }
+
+  if (verdict.outcome === "pending") {
+    await rebroadcastIfLost(record, observation);
+    const ageMs = Date.now() - signedAt;
+    if (ageMs >= WITHDRAWAL_REVIEW_AFTER_MS) {
+      logWithdrawalForReview(
+        record.id,
+        `pending ${Math.round(ageMs / 60_000)} min (${verdict.reason}); tx ${record.tx_hash}, ` +
+        `nonce ${observation.txNonce ?? "unknown"}, treasury mined nonce ${observation.minedNonce ?? "unknown"}`,
+      );
+    }
+    return;
+  }
+
+  const final = await finalizeWithdrawal(record, {
+    outcome: verdict.outcome,
+    reason: verdict.reason,
+    txHash: record.tx_hash,
+    actualGasSats: receiptGasSats(observation.receipt, null),
+  });
+  console.log(`[Recovery] Withdrawal ${record.id}: ${verdict.reason} → ${final.state}${final.recorded === false ? " (not recorded yet)" : ""}`);
+}
+
+/** Re-send the exact stored signed tx (same hash, so idempotent) when the node has lost it. */
+async function rebroadcastIfLost(record: WithdrawalRecord, observation: WithdrawalObservation): Promise<void> {
+  if (!record.raw_tx || !record.tx_hash || observation.receipt !== null || observation.txMined) return;
+  if (ethers.keccak256(record.raw_tx).toLowerCase() !== record.tx_hash.toLowerCase()) {
+    logWithdrawalForReview(record.id, "stored raw_tx does not hash to tx_hash; not rebroadcasting");
+    return;
+  }
+  try {
+    if (await rawRpcCall("eth_getTransactionByHash", [record.tx_hash]) != null) return;
+    await rawRpcCall("eth_sendRawTransaction", [record.raw_tx]);
+    console.log(`[Recovery] Withdrawal ${record.id}: node had lost ${record.tx_hash}; rebroadcast the signed tx`);
+  } catch (error) {
+    const message = String((error as Error)?.message ?? error);
+    if (!/already known|known transaction|nonce too low/i.test(message)) {
+      console.warn(`[Recovery] Withdrawal ${record.id}: rebroadcast failed: ${message.slice(0, 300)}`);
     }
   }
 }
@@ -1539,48 +2014,136 @@ function describeNativeWithdrawalError(error: unknown): string {
 
 export type SatsBackingSnapshot = {
   treasurySats: number;
+  /** User balances plus user SATS held in flight (see inFlight). */
   userLiabilities: number;
   poolLiabilities: number;
+  /** Debited from users but in no balance: pending withdrawals, drop remainders, arcade escrow, swap escrow. */
+  inFlight: InFlightSatsLiabilities;
   reserveSats: number;
   excessSats: number;
 };
 
-export async function getSatsBackingSnapshot(): Promise<SatsBackingSnapshot> {
-  const [treasuryWei, snapshot] = await Promise.all([
+const LIABILITY_PAGE_SIZE = 1000;
+
+/** Read a whole (normally tiny) in-flight set; PostgREST caps responses at 1000 rows. */
+async function selectAllPages<T>(
+  page: (from: number, to: number) => PromiseLike<{ data: T[] | null; error: { message: string } | null }>,
+): Promise<T[]> {
+  const rows: T[] = [];
+  for (let from = 0; ; from += LIABILITY_PAGE_SIZE) {
+    const { data, error } = await page(from, from + LIABILITY_PAGE_SIZE - 1);
+    if (error) throw new Error(error.message);
+    rows.push(...(data ?? []));
+    if ((data?.length ?? 0) < LIABILITY_PAGE_SIZE) return rows;
+  }
+}
+
+async function getInFlightSatsLiabilities(): Promise<InFlightSatsLiabilities> {
+  const [withdrawals, drops, arcadeEscrow, swaps] = await Promise.all([
+    selectAllPages((from, to) => supabase
+      .from("withdrawals")
+      .select("amount_sats, token, gas_reserved_sats")
+      .eq("status", "pending")
+      .order("id")
+      .range(from, to)),
+    selectAllPages((from, to) => supabase
+      .from("drops")
+      .select("per_claim_sats, max_claims, claims_count, token")
+      .eq("status", "active")
+      .eq("token", "SATS")
+      .order("id")
+      .range(from, to)),
+    selectAllPages((from, to) => supabase
+      .from("arcade_escrow")
+      .select("amount_sats")
+      .eq("status", "funded")
+      .order("id")
+      .range(from, to)),
+    selectAllPages((from, to) => supabase
+      .from("swaps")
+      .select("from_token, from_amount, gas_reserved_sats, gas_refunded_sats, gas_settled")
+      .in("status", ["reserved", "submitted", "needs_review"])
+      .order("id")
+      .range(from, to)),
+  ]);
+  return sumInFlightSatsLiabilities({ withdrawals, drops, arcadeEscrow, swaps });
+}
+
+async function loadSatsBacking(): Promise<SatsBackingSnapshot & { treasuryWei: bigint }> {
+  const [treasuryWei, snapshot, inFlight] = await Promise.all([
     getNativeBalance(wallet.address),
     getProtocolOperationalSnapshot(),
+    getInFlightSatsLiabilities(),
   ]);
   const treasurySats = tokenUnitsToSats(treasuryWei);
-  const userLiabilities = snapshot.userSatsLiability;
+  const userLiabilities = snapshot.userSatsLiability + inFlight.total;
   const poolLiabilities = snapshot.poolSatsLiability;
   return {
+    treasuryWei,
     treasurySats,
     userLiabilities,
     poolLiabilities,
+    inFlight,
     reserveSats: config.evm.protocolGasReserveMinSats,
     excessSats: treasurySats - userLiabilities - poolLiabilities,
   };
 }
 
+export async function getSatsBackingSnapshot(): Promise<SatsBackingSnapshot> {
+  const { treasuryWei: _treasuryWei, ...snapshot } = await loadSatsBacking();
+  return snapshot;
+}
+
+export type SatsExitCheck =
+  | { ok: true; backing: SatsBackingSnapshot }
+  | { ok: false; reason: "underbacked"; shortfallSats: number; backing: SatsBackingSnapshot }
+  | { ok: false; reason: "unavailable"; error: string };
+
+/**
+ * Gate for native SATS leaving the treasury (withdrawals, on-chain SATS
+ * swaps): the treasury must cover all liabilities plus the reserve. Fails
+ * closed when backing cannot be measured.
+ */
+export async function checkSatsExitSolvency(): Promise<SatsExitCheck> {
+  let backing: Awaited<ReturnType<typeof loadSatsBacking>>;
+  try {
+    backing = await loadSatsBacking();
+  } catch (error) {
+    const message = (error as Error)?.message ?? String(error);
+    console.warn("[Solvency] Could not measure SATS backing; blocking SATS exits:", message);
+    return { ok: false, reason: "unavailable", error: message };
+  }
+  const liabilityWei = satsToTokenUnits(backing.userLiabilities + backing.poolLiabilities);
+  const reserveWei = satsToTokenUnits(backing.reserveSats);
+  if (satsExitAllowed(backing.treasuryWei, liabilityWei, reserveWei)) return { ok: true, backing };
+  const shortfallSats = tokenUnitsToSats(satsBackingShortfallWei(backing.treasuryWei, liabilityWei, reserveWei));
+  console.warn(
+    `[Solvency] Blocking SATS exit: treasury ${backing.treasurySats} sats, liabilities ` +
+    `${backing.userLiabilities + backing.poolLiabilities} sats (in flight ${backing.inFlight.total}), ` +
+    `reserve ${backing.reserveSats} sats, short ${shortfallSats} sats`,
+  );
+  return { ok: false, reason: "underbacked", shortfallSats, backing };
+}
+
 export async function canMintSats(amountSats: number): Promise<{ ok: true } | { ok: false; shortfallSats: number }> {
-  const [treasuryWei, snapshot] = await Promise.all([
-    getNativeBalance(wallet.address),
-    getProtocolOperationalSnapshot(),
-  ]);
-  const liabilityWei = satsToTokenUnits(snapshot.userSatsLiability + snapshot.poolSatsLiability);
+  const backing = await loadSatsBacking();
+  const liabilityWei = satsToTokenUnits(backing.userLiabilities + backing.poolLiabilities);
   const mintWei = satsToTokenUnits(amountSats);
   const reserveWei = satsToTokenUnits(config.evm.protocolGasReserveMinSats);
-  if (satsMintCovered(treasuryWei, liabilityWei, mintWei, reserveWei)) return { ok: true };
-  return { ok: false, shortfallSats: tokenUnitsToSats(liabilityWei + mintWei + reserveWei - treasuryWei) };
+  if (satsMintCovered(backing.treasuryWei, liabilityWei, mintWei, reserveWei)) return { ok: true };
+  return { ok: false, shortfallSats: tokenUnitsToSats(liabilityWei + mintWei + reserveWei - backing.treasuryWei) };
 }
 
 export async function warnIfSatsUnderbacked(): Promise<void> {
   try {
     const backing = await getSatsBackingSnapshot();
     if (backing.excessSats < backing.reserveSats) {
+      const inFlight = backing.inFlight;
       console.warn(
         `[Solvency] SATS backing shortfall: treasury ${backing.treasurySats} sats, ` +
-        `liabilities ${backing.userLiabilities + backing.poolLiabilities} sats, ` +
+        `liabilities ${backing.userLiabilities + backing.poolLiabilities} sats ` +
+        `(in flight: withdrawals ${inFlight.pendingWithdrawals}, drops ${inFlight.dropRemainders}, ` +
+        `arcade ${inFlight.arcadeEscrow}, swaps ${inFlight.swapEscrow}), ` +
         `excess ${backing.excessSats} sats, reserve ${backing.reserveSats} sats`,
       );
     }

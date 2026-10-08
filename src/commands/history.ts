@@ -53,7 +53,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     const lines = withdrawals.map((w) => {
       const ts = Math.floor(new Date(w.created_at).getTime() / 1000);
       const addr = `\`${w.to_address.slice(0, 10)}...\``;
-      const icon = w.status === "pending" ? "⏳" : "✅";
+      const icon = w.status === "completed" ? "✅" : w.status === "failed" ? "↩️" : "⏳";
       return `📤 ${icon} **${formatTokenAmount(w.amount_sats, parseToken(w.token))}** → ${addr} <t:${ts}:R>`;
     });
     embed.addFields({ name: "Withdrawals", value: lines.join("\n") });

@@ -1,25 +1,25 @@
 import { EmbedBuilder, MessageFlags, type ChatInputCommandInteraction } from "discord.js";
 import { config, tokenUnitsToSats } from "../config.js";
-import {
-  getProvider,
-  getUserDepositAddress,
-  registerDepositAddress,
-  sweepToTreasury,
-} from "../evm.js";
-import { addBalance } from "../balance.js";
+import { getNativeBalance, getUserDepositAddress } from "../evm.js";
 import { supabase } from "../db.js";
 import { formatSats } from "../format.js";
-import { recordLedgerEntry } from "../ledger.js";
 
 export const data = {
   name: "backfill",
-  description: "Admin: manually check and credit a user's uncredited deposit",
+  description: "Admin: inspect a user's deposit address against the credited checkpoint",
   default_member_permissions: "0",
   options: [
     { name: "user", type: 6 as const, description: "User to check", required: true },
   ],
 };
 
+/**
+ * Read-only. This command used to mint `balance − last_checked_balance`
+ * directly, outside the atomic credit_native_deposit path: it ignored sweep
+ * markers, wallet-verification deposits and gas, and raced the poller (a
+ * double-credit path). The deposit poller is the only crediting path; this
+ * shows what it sees so an admin can tell whether anything is uncredited.
+ */
 export async function execute(interaction: ChatInputCommandInteraction) {
   if (!config.discord.adminIds.includes(interaction.user.id)) {
     return interaction.reply({ content: "❌ Admin only.", flags: MessageFlags.Ephemeral });
@@ -28,87 +28,45 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   const target = interaction.options.getUser("user", true);
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
-  await registerDepositAddress(target.id);
-
   const address = getUserDepositAddress(target.id);
-  const provider = getProvider();
 
   try {
-    const bal = await provider.getBalance(address);
-    if (bal === 0n) {
-      const embed = new EmbedBuilder()
-        .setColor(0x95a5a6)
-        .setTitle("🔍 Backfill Check")
-        .addFields(
-          { name: "User", value: `<@${target.id}>`, inline: true },
-          { name: "Address", value: `\`${address.slice(0, 12)}...\``, inline: true },
-          { name: "Result", value: "No funds found at deposit address." },
-        );
-      return interaction.editReply({ embeds: [embed], allowedMentions: { parse: [] } });
+    const [bal, { data: row, error }] = await Promise.all([
+      getNativeBalance(address),
+      supabase
+        .from("deposit_addresses")
+        .select("last_checked_balance, deposits_enabled, native_sweep_tx_hash, native_sweep_started_at")
+        .eq("discord_id", target.id)
+        .maybeSingle(),
+    ]);
+    if (error) throw error;
+
+    const tracked = BigInt(row?.last_checked_balance || "0");
+    let result: string;
+    if (!row) {
+      result = "No deposit address is registered for this user, so nothing is polled or credited.";
+    } else if (!row.deposits_enabled) {
+      result = "Deposits are not enabled for this address; the poller does not credit it.";
+    } else if (row.native_sweep_tx_hash) {
+      result = `A sweep (\`${String(row.native_sweep_tx_hash).slice(0, 12)}...\`) is in flight; the poller reconciles it before crediting again.`;
+    } else if (bal > tracked) {
+      result = "On-chain balance is above the checkpoint; the deposit poller will credit the difference (net of sweep gas) on its next pass.";
+    } else {
+      result = "Nothing uncredited. Use `/sweep` to move funds or `/credit` for manual adjustments.";
     }
-
-    const { data: row } = await supabase
-      .from("deposit_addresses")
-      .select("last_checked_balance")
-      .eq("discord_id", target.id)
-      .single();
-
-    const alreadyTracked = BigInt(row?.last_checked_balance || "0");
-
-    if (bal <= alreadyTracked) {
-      const embed = new EmbedBuilder()
-        .setColor(0x95a5a6)
-        .setTitle("🔍 Backfill Check")
-        .addFields(
-          { name: "User", value: `<@${target.id}>`, inline: true },
-          { name: "On-Chain", value: `**${formatSats(tokenUnitsToSats(bal))}**`, inline: true },
-          { name: "Already Tracked", value: `**${formatSats(tokenUnitsToSats(alreadyTracked))}**`, inline: true },
-          { name: "Result", value: "Nothing to backfill. Use `/sweep` to move funds or `/credit` for manual adjustments." },
-        );
-      return interaction.editReply({ embeds: [embed], allowedMentions: { parse: [] } });
-    }
-
-    const diff = bal - alreadyTracked;
-    const diffSats = tokenUnitsToSats(diff);
-    const txId = `backfill-${Date.now()}-${target.id}`;
-
-    await supabase.from("deposits").insert({
-      discord_id: target.id,
-      tx_hash: txId,
-      amount_sats: diffSats,
-      block_number: 0,
-    });
-
-    await addBalance(target.id, diffSats);
-
-    recordLedgerEntry(interaction.client, {
-      type: "deposit",
-      amountSats: diffSats,
-      senderId: "treasury",
-      receiverId: target.id,
-      guildId: interaction.guildId,
-      referenceType: "deposits",
-      referenceId: txId,
-      metadata: { source: "backfill" },
-    });
-
-    await supabase
-      .from("deposit_addresses")
-      .update({ last_checked_balance: bal.toString() })
-      .eq("discord_id", target.id);
-
-    sweepToTreasury(target.id).catch(() => {});
 
     const embed = new EmbedBuilder()
-      .setColor(0x00cc6a)
-      .setTitle("✅ Backfill Complete")
+      .setColor(0x95a5a6)
+      .setTitle("🔍 Deposit Check")
       .addFields(
         { name: "User", value: `<@${target.id}>`, inline: true },
-        { name: "Credited", value: `**${formatSats(diffSats)}**`, inline: true },
+        { name: "Address", value: `\`${address.slice(0, 12)}...\``, inline: true },
+        { name: "On-Chain", value: `**${formatSats(tokenUnitsToSats(bal))}**`, inline: true },
+        { name: "Credited Checkpoint", value: `**${formatSats(tokenUnitsToSats(tracked))}**`, inline: true },
+        { name: "Result", value: result },
       )
-      .setFooter({ text: "Sweep to treasury attempted" })
+      .setFooter({ text: "Read-only: deposits are credited only by the atomic deposit poller" })
       .setTimestamp();
-
     await interaction.editReply({ embeds: [embed], allowedMentions: { parse: [] } });
   } catch (err) {
     await interaction.editReply({

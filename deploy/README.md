@@ -11,8 +11,13 @@ Apply these in order, to staging and then production, in the Supabase SQL editor
 2. `migrations/2026-08-12_modular_runtime.sql`
 3. `migrations/2026-09-24_swap_recovery.sql` (lets swap recovery park rows in
    `needs_review`; without it those rows are only flagged in metadata)
+4. `migrations/2026-10-08_withdrawal_safety.sql` (must land before the bot
+   build that uses it: withdrawals refuse to start until `reserve_withdrawal_v2`
+   exists)
 
-All three are additive, re-runnable, and keep the legacy code operational. Validate the four hot indexes with the queries in
+All four are additive, re-runnable, and keep the legacy code operational.
+Run `deploy/preflight.sql` first and `deploy/verify.sql` afterwards (both are
+read-only); prefix each migration with `SET lock_timeout = '5s';`. Validate the four hot indexes with the queries in
 `explain-hot-paths.sql` against production-like data before enabling remote
 traffic.
 

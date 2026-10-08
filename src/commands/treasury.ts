@@ -30,7 +30,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
           name: "SATS backing",
           value: [
             `On-chain: **${formatSats(backing.treasurySats)}**`,
-            `User balances: **${formatSats(liabilities)}**`,
+            `Owed to users: **${formatSats(liabilities)}** (balances + funds in flight)`,
             underbacked
               ? `Shortfall: **${formatSats(shortfall)}** (includes ${formatSats(backing.reserveSats)} gas reserve)`
               : `Excess: **${formatSats(backing.excessSats)}** · reserve ${formatSats(backing.reserveSats)}`,

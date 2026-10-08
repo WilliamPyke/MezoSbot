@@ -1,6 +1,15 @@
 import { EmbedBuilder, MessageFlags, type ChatInputCommandInteraction } from "discord.js";
-import { quoteErc20WithdrawalGas, withdraw, type Erc20WithdrawalGasQuote } from "../evm.js";
-import { subtractBalance, addBalance, getWalletForUser, reserveWithdrawalBalances } from "../balance.js";
+import {
+  executeWithdrawal,
+  finalizeWithdrawal,
+  preflightWithdrawal,
+  quoteErc20WithdrawalGas,
+  reserveWithdrawal,
+  type Erc20WithdrawalGasQuote,
+  type WithdrawalPreflight,
+} from "../evm.js";
+import { getWalletForUser } from "../balance.js";
+import { settledState } from "../depositPolicy.js";
 import { supabase } from "../db.js";
 import { config } from "../config.js";
 import { recordLedgerEntry } from "../ledger.js";
@@ -19,15 +28,32 @@ export const data = {
   ],
 };
 
+/** Maintenance reply shared by every command that sends user funds on-chain. */
+export function withdrawalsPausedMessage(): string {
+  return (
+    "🛠️ **Withdrawals are temporarily disabled.**\n" +
+    `MezoSBOT is currently undergoing account upgrades. Estimated completion: **${config.withdrawals.eta}**.\n` +
+    "Your balance is safe — please try again after the upgrade is complete."
+  );
+}
+
+/** User-facing text for a failed pre-debit check. Nothing has been debited at this point. */
+export function withdrawalPreflightMessage(preflight: Exclude<WithdrawalPreflight, { ok: true }>): string {
+  if (preflight.code === "underbacked") {
+    return (
+      "⚠️ **SATS withdrawals are paused** while the treasury's on-chain backing is topped up.\n" +
+      "Your balance is safe and has not been debited — please try again later."
+    );
+  }
+  if (preflight.code === "backing_unavailable") {
+    return "⚠️ Could not verify treasury backing right now. Nothing was debited — please try again shortly.";
+  }
+  return `❌ ${preflight.error}`;
+}
+
 export async function execute(interaction: ChatInputCommandInteraction) {
   if (!config.withdrawals.enabled) {
-    return interaction.reply({
-      content:
-        "🛠️ **Withdrawals are temporarily disabled.**\n" +
-        `MezoSBOT is currently undergoing account upgrades. Estimated completion: **${config.withdrawals.eta}**.\n` +
-        "Your balance is safe — please try again after the upgrade is complete.",
-      flags: MessageFlags.Ephemeral,
-    });
+    return interaction.reply({ content: withdrawalsPausedMessage(), flags: MessageFlags.Ephemeral });
   }
 
   const addressOpt = interaction.options.getString("address");
@@ -64,7 +90,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     });
   }
 
-  // 1. Block concurrent withdrawals (only consider pending records < 10 min old)
+  // 1. Block concurrent withdrawals (only consider in-flight records < 10 min old)
   const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000).toISOString();
   const { data: pending } = await supabase
     .from("withdrawals")
@@ -73,7 +99,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     .eq("status", "pending")
     .gte("created_at", tenMinutesAgo)
     .limit(1)
-    .single();
+    .maybeSingle();
 
   if (pending) {
     return interaction.editReply({
@@ -81,45 +107,44 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     });
   }
 
-  // 2. Reserve the asset and, for ERC-20s, the sats required for network gas.
+  // 2. Every check runs before the user is debited: SATS needs a solvent
+  //    treasury that holds the amount and an amount that covers gas; ERC-20s
+  //    need a gas quote and treasury token coverage.
   let gasQuote: Erc20WithdrawalGasQuote | undefined;
-  if (token === "SATS") {
-    if (!(await subtractBalance(interaction.user.id, amount, token))) {
-      return interaction.editReply({ content: "❌ Insufficient balance." });
-    }
-  } else {
+  if (token !== "SATS") {
     try {
       gasQuote = await quoteErc20WithdrawalGas(address, amount, token);
     } catch (error) {
       return interaction.editReply({ content: `❌ Unable to estimate withdrawal gas: ${(error as Error).message}` });
     }
-    const reserved = await reserveWithdrawalBalances(interaction.user.id, amount, token, gasQuote.gasSats);
-    if (reserved === "insufficient_token") {
-      return interaction.editReply({ content: `❌ Insufficient ${token} balance.` });
+  }
+  const preflight = await preflightWithdrawal(address, amount, token);
+  if (!preflight.ok) {
+    return interaction.editReply({ content: withdrawalPreflightMessage(preflight) });
+  }
+
+  // 3. Debit + pending row in one transaction (reserve_withdrawal_v2).
+  const reservation = await reserveWithdrawal({
+    discordId: interaction.user.id,
+    toAddress: address,
+    amount,
+    token,
+    gasSats: gasQuote?.gasSats,
+  });
+  if (!reservation.ok) {
+    if (reservation.reason === "insufficient_token") {
+      return interaction.editReply({ content: token === "SATS" ? "❌ Insufficient balance." : `❌ Insufficient ${token} balance.` });
     }
-    if (reserved === "insufficient_sats") {
+    if (reservation.reason === "insufficient_sats") {
       return interaction.editReply({
-        content: `❌ Insufficient sats balance to fund the network fee (~${formatSats(gasQuote.gasSats)}).`,
+        content: `❌ Insufficient sats balance to fund the network fee (~${formatSats(gasQuote?.gasSats ?? 0)}).`,
       });
     }
+    return interaction.editReply({ content: reservationFailureMessage(reservation.reason) });
   }
 
-  // 3. Insert withdrawal as PENDING
-  const { data: row, error: insertError } = await supabase.from("withdrawals").insert({
-    discord_id: interaction.user.id,
-    amount_sats: amount,
-    to_address: address.toLowerCase(),
-    status: "pending",
-    token,
-  }).select("id").single();
-
-  if (insertError) {
-    await addBalance(interaction.user.id, amount, token);
-    if (gasQuote) await addBalance(interaction.user.id, gasQuote.gasSats, "SATS");
-    return interaction.editReply({ content: "❌ Could not create the withdrawal. Your balance was refunded." });
-  }
-
-  const withdrawalId = row?.id;
+  const record = reservation.record;
+  const withdrawalId = record.id;
 
   recordLedgerEntry(interaction.client, {
     type: "withdrawal",
@@ -129,7 +154,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     receiverId: "treasury",
     guildId: interaction.guildId,
     referenceType: "withdrawals",
-    referenceId: withdrawalId != null ? String(withdrawalId) : null,
+    referenceId: String(withdrawalId),
   });
   if (gasQuote) {
     recordLedgerEntry(interaction.client, {
@@ -140,89 +165,49 @@ export async function execute(interaction: ChatInputCommandInteraction) {
       receiverId: "treasury",
       guildId: interaction.guildId,
       referenceType: "withdrawals",
-      referenceId: withdrawalId != null ? String(withdrawalId) : null,
+      referenceId: String(withdrawalId),
       metadata: { withdrawal_token: token },
     });
   }
 
-  // 4. Send the transaction and wait for receipt
-  const result = await withdraw(address, amount, token, gasQuote);
+  // 4. Sign → persist hash/nonce on the row → broadcast → poll (~2 min).
+  const result = await executeWithdrawal(record, gasQuote);
 
-  // 5. Handle failure — refund both the asset and reserved gas
-  if (result.error && !result.confirmed) {
-    await addBalance(interaction.user.id, amount, token);
-    if (gasQuote) await addBalance(interaction.user.id, gasQuote.gasSats, "SATS");
-
-    recordLedgerEntry(interaction.client, {
-      type: "withdrawal_refund",
-      amountSats: amount,
-      token,
-      senderId: "treasury",
-      receiverId: interaction.user.id,
-      guildId: interaction.guildId,
-      referenceType: "withdrawals",
-      referenceId: withdrawalId != null ? String(withdrawalId) : null,
-      metadata: { reason: "withdrawal_failed", refunded_gas_sats: gasQuote?.gasSats ?? 0 },
-    });
-    if (gasQuote) {
-      recordLedgerEntry(interaction.client, {
-        type: "withdrawal_network_fee_refund",
-        amountSats: gasQuote.gasSats,
-        token: "SATS",
-        senderId: "treasury",
-        receiverId: interaction.user.id,
-        guildId: interaction.guildId,
-        referenceType: "withdrawals",
-        referenceId: withdrawalId != null ? String(withdrawalId) : null,
-      });
-    }
-
-    if (withdrawalId) {
-      await supabase.from("withdrawals").update({
-        status: "failed",
-        tx_hash: result.txHash ?? null,
-      }).eq("id", withdrawalId);
-    }
-
-    const failMsg = { content: `❌ Withdrawal failed: ${result.error}` };
-    try {
-      return await interaction.editReply(failMsg);
-    } catch {
-      // Interaction expired (e.g. bot restarted mid-poll) — fall back to DM
-      interaction.user.send(failMsg).catch(() => {});
-      return;
-    }
-  }
-
-  // The quote reserves the gas-limit maximum; return any unused portion after
-  // the receipt reports the actual gas consumed.
-  if (gasQuote && result.confirmed && result.gasSats != null) {
-    const unusedGasSats = Math.max(0, gasQuote.gasSats - result.gasSats);
-    if (unusedGasSats > 0) {
-      await addBalance(interaction.user.id, unusedGasSats, "SATS");
-      recordLedgerEntry(interaction.client, {
-        type: "withdrawal_network_fee_refund",
-        amountSats: unusedGasSats,
-        token: "SATS",
-        senderId: "treasury",
-        receiverId: interaction.user.id,
-        guildId: interaction.guildId,
-        referenceType: "withdrawals",
-        referenceId: withdrawalId != null ? String(withdrawalId) : null,
-        metadata: { reason: "unused_gas_reservation" },
-      });
-    }
-  }
-
-  // 6. Transaction confirmed on-chain — mark completed
-  if (withdrawalId) {
-    await supabase.from("withdrawals").update({
-      status: "completed",
-      tx_hash: result.txHash ?? null,
-    }).eq("id", withdrawalId);
-  }
+  // 5. Apply the verdict once. Refunds happen only when the tx provably can
+  //    never land; anything uncertain stays pending for recovery.
+  const final = await finalizeWithdrawal(record, result, {
+    client: interaction.client,
+    guildId: interaction.guildId,
+  });
 
   const explorer = config.evm.explorerUrl;
+  const txLink = result.txHash ? `[View on Explorer](${explorer}/tx/${result.txHash})` : null;
+  const state = settledState(final);
+
+  if (state === "refunded") {
+    return deliver(interaction, {
+      content: `❌ Withdrawal failed: ${result.error ?? "transaction did not go through"}. Your balance was refunded.`,
+    });
+  }
+  if (state === "refund_pending") {
+    // The row is still 'pending' (or already refunded by a lost-response
+    // call); recovery re-runs the idempotent refund every minute.
+    return deliver(interaction, {
+      content:
+        `❌ Withdrawal failed: ${result.error ?? "transaction did not go through"}. ` +
+        "Your refund is being processed and should appear in your balance within a few minutes.",
+    });
+  }
+  if (state === "pending") {
+    return deliver(interaction, {
+      content:
+        `⏳ **Withdrawal submitted — still confirming.** ${formatTokenAmount(amount, token)} to ` +
+        `\`${address.slice(0, 10)}...${address.slice(-8)}\`.\n` +
+        (txLink ? `${txLink}\n` : "") +
+        "Please don't retry. It will be finalized automatically; you are refunded only if the network " +
+        "rejects the transaction. Check `/history` for status.",
+    });
+  }
 
   const embed = new EmbedBuilder()
     .setColor(0x00cc6a)
@@ -234,21 +219,42 @@ export async function execute(interaction: ChatInputCommandInteraction) {
 
   if (result.gasSats) {
     embed.addFields({ name: "Network Fee", value: `~${formatSats(result.gasSats)}`, inline: true });
-    if (token === "SATS") {
-      embed.addFields({ name: "Received", value: `~${formatSats(result.sentSats!)}`, inline: true });
+    if (token === "SATS" && result.sentSats != null) {
+      embed.addFields({ name: "Received", value: `~${formatSats(result.sentSats)}`, inline: true });
     }
   }
+  if (final.unusedGasRefundSats) {
+    embed.addFields({ name: "Unused Fee Returned", value: `~${formatSats(final.unusedGasRefundSats)}`, inline: true });
+  }
 
-  if (result.txHash) {
-    embed.addFields({ name: "Transaction", value: `[View on Explorer](${explorer}/tx/${result.txHash})` });
+  if (txLink) {
+    embed.addFields({ name: "Transaction", value: txLink });
   }
 
   embed.setTimestamp();
 
+  return deliver(interaction, { embeds: [embed] });
+}
+
+/** Reply for a reservation that did not produce a row we can use. */
+export function reservationFailureMessage(reason: "unavailable" | "unconfirmed"): string {
+  if (reason === "unconfirmed") {
+    return (
+      "⚠️ Could not confirm the withdrawal was created. If your balance was debited, it is refunded " +
+      "automatically within about 10 minutes — please check `/balance` before retrying."
+    );
+  }
+  return "❌ Could not create the withdrawal. Nothing was debited — please try again later.";
+}
+
+async function deliver(
+  interaction: ChatInputCommandInteraction,
+  payload: { content?: string; embeds?: EmbedBuilder[] },
+): Promise<void> {
   try {
-    await interaction.editReply({ embeds: [embed] });
+    await interaction.editReply(payload);
   } catch {
-    // Interaction expired (e.g. bot restarted mid-poll) — fall back to DM
-    interaction.user.send({ embeds: [embed] }).catch(() => {});
+    // Interaction expired (polling outlived the token) — fall back to DM
+    interaction.user.send(payload).catch(() => {});
   }
 }
