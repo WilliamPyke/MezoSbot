@@ -1,6 +1,7 @@
 import { EmbedBuilder, MessageFlags, type ChatInputCommandInteraction } from "discord.js";
 import { config } from "../config.js";
-import { registerDepositAddress } from "../evm.js";
+import { isTreasuryCompromised, registerDepositAddress } from "../evm.js";
+import { CUSTODY_PAUSED_MESSAGE } from "../custody/compromised.js";
 import { formatSats } from "../format.js";
 import {
   createWalletVerificationChallenge,
@@ -41,6 +42,10 @@ async function verify(interaction: ChatInputCommandInteraction) {
       content: "❌ Wallet verification requires the G4, G5, or G6 role.",
       flags: MessageFlags.Ephemeral,
     });
+  }
+  // Verification asks the user to send funds to their deposit address.
+  if (isTreasuryCompromised()) {
+    return interaction.reply({ content: `⏸️ ${CUSTODY_PAUSED_MESSAGE}`, flags: MessageFlags.Ephemeral });
   }
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 

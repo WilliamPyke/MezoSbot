@@ -2,6 +2,7 @@ import { EmbedBuilder, MessageFlags, type ChatInputCommandInteraction } from "di
 import {
   executeWithdrawal,
   finalizeWithdrawal,
+  isTreasuryCompromised,
   preflightWithdrawal,
   quoteErc20WithdrawalGas,
   reserveWithdrawal,
@@ -10,6 +11,7 @@ import {
 } from "../evm.js";
 import { getWalletForUser } from "../balance.js";
 import { settledState } from "../depositPolicy.js";
+import { CUSTODY_PAUSED_MESSAGE } from "../custody/compromised.js";
 import { supabase } from "../db.js";
 import { config } from "../config.js";
 import { recordLedgerEntry } from "../ledger.js";
@@ -54,6 +56,9 @@ export function withdrawalPreflightMessage(preflight: Exclude<WithdrawalPrefligh
 export async function execute(interaction: ChatInputCommandInteraction) {
   if (!config.withdrawals.enabled) {
     return interaction.reply({ content: withdrawalsPausedMessage(), flags: MessageFlags.Ephemeral });
+  }
+  if (isTreasuryCompromised()) {
+    return interaction.reply({ content: `⏸️ ${CUSTODY_PAUSED_MESSAGE}`, flags: MessageFlags.Ephemeral });
   }
 
   const addressOpt = interaction.options.getString("address");

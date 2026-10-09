@@ -127,7 +127,8 @@ export const config = {
     escrowTreasuryAddress: optional("ESCROW_TREASURY_ADDRESS", ""),
     escrowPlatformFeeBps: parseInt(optional("ESCROW_PLATFORM_FEE_BPS", "1000"), 10),
     walletConnectProjectId: optional("WALLETCONNECT_PROJECT_ID", ""),
-    sessionSecret: optional("WEB_SESSION_SECRET", process.env.ARCADE_TOKEN_SECRET ?? process.env.TREASURY_PRIVATE_KEY ?? ""),
+    /** Read through hmacSecret(): never falls back to a wallet key. */
+    sessionSecret: optional("WEB_SESSION_SECRET", ""),
     joinWindowSeconds: parseInt(optional("WEB_JOIN_WINDOW_SECONDS", "900"), 10),
     playWindowSeconds: parseInt(optional("WEB_PLAY_WINDOW_SECONDS", "180"), 10),
     settlementGraceSeconds: parseInt(optional("WEB_SETTLEMENT_GRACE_SECONDS", "30"), 10),
@@ -144,7 +145,8 @@ export const config = {
    * Falls back to local dev address if unset.
    */
   publicBaseUrl: publicBaseUrl(),
-  arcadeTokenSecret: process.env.ARCADE_TOKEN_SECRET ?? process.env.TREASURY_PRIVATE_KEY ?? "",
+  /** Read through hmacSecret(): never falls back to a wallet key. */
+  arcadeTokenSecret: process.env.ARCADE_TOKEN_SECRET ?? "",
   depositAdminOnly: optionalBool("DEPOSIT_ADMIN_ONLY", true),
   deposits: {
     allowedRoleIds: optional(
@@ -167,6 +169,8 @@ export const config = {
   imgnai: {
     baseUrl: optional("IMGNAI_BASE_URL", "https://kat.imgnai.com").replace(/\/+$/, ""),
     x402TargetMusd: optional("IMGNAI_X402_TARGET_MUSD", "1.00"),
+    /** Dedicated x402 payer wallet holding a small MUSD float. Falls back to the treasury key (top-ups refused while it is compromised). */
+    payerPrivateKey: optional("IMGNAI_PAYER_PRIVATE_KEY", ""),
     modelCacheMs: parseInt(optional("IMGNAI_MODEL_CACHE_MS", "300000"), 10),
     imageTimeoutMs: parseInt(optional("IMGNAI_IMAGE_TIMEOUT_MS", "600000"), 10),
     promptMaxLength: parseInt(optional("IMGNAI_PROMPT_MAX_LENGTH", "2000"), 10),

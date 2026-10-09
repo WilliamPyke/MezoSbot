@@ -12,8 +12,7 @@ import {
 import { config } from "../config.js";
 import { supabase } from "../db.js";
 import { recordLedgerEntry } from "../ledger.js";
-import { getTreasuryAddress } from "../evm.js";
-import { ensureKatanaBalance, getKatanaWalletBalance, katanaWalletFetch, createSignInWithXHeader } from "./payments.js";
+import { ensureKatanaBalance, getImgnaiPayerAddress, getKatanaWalletBalance, katanaWalletFetch, createSignInWithXHeader } from "./payments.js";
 import { musdToNumber, parseMusd } from "./musd.js";
 import {
   IMGN_PROMPT_CLEANUP_INTERVAL_MS,
@@ -404,7 +403,7 @@ async function reconcileRefund(client: Client, job: GenerationJob): Promise<void
   if (!job.katana_request_id) return refundUnpaidJob(client, job, job.error_message ?? "Generation failed.");
   try {
     const proof = await createSignInWithXHeader();
-    const response = await fetch(`${config.imgnai.baseUrl}/v1/x402/transactions/${getTreasuryAddress()}`, {
+    const response = await fetch(`${config.imgnai.baseUrl}/v1/x402/transactions/${getImgnaiPayerAddress()}`, {
       headers: { "X-Sign-In-With-X": proof, Accept: "application/json" },
       signal: AbortSignal.timeout(15_000),
     });

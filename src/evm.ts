@@ -5,6 +5,7 @@ import { supabase } from "./db.js";
 import { roundSats } from "./format.js";
 import { recordLedgerEntry } from "./ledger.js";
 import { verifyWalletFromDeposit } from "./walletVerification.js";
+import { CUSTODY_PAUSED_MESSAGE, isCompromisedAddress } from "./custody/compromised.js";
 import {
   explainWithdrawalOutcome,
   isDefiniteDbFailure,
@@ -108,6 +109,28 @@ export function getTreasuryAddress(): string {
   return wallet.address;
 }
 
+let treasuryCompromised = false;
+
+/** True when TREASURY_PRIVATE_KEY belongs to a known-compromised address. */
+export function isTreasuryCompromised(): boolean {
+  return treasuryCompromised;
+}
+
+export class CustodyPausedError extends Error {
+  constructor() {
+    super(CUSTODY_PAUSED_MESSAGE);
+    this.name = "CustodyPausedError";
+  }
+}
+
+/**
+ * Refuses any action that would sign with, derive from, or send funds to the
+ * compromised treasury key: deposits, sweeps, withdrawals, on-chain swaps.
+ */
+export function assertCustodyAvailable(): void {
+  if (treasuryCompromised) throw new CustodyPausedError();
+}
+
 export function getTreasurySigner(): ethers.Wallet {
   return wallet;
 }
@@ -139,6 +162,16 @@ export function initEVM() {
   );
   if (!config.evm.sweepGasSponsorPrivateKey) {
     console.log(`[Deposits] Using derived sweep gas sponsor ${sweepGasSponsorWallet.address}`);
+  }
+  treasuryCompromised = isCompromisedAddress(wallet.address);
+  if (treasuryCompromised) {
+    console.error(
+      `[Custody] TREASURY_PRIVATE_KEY belongs to compromised address ${wallet.address}. ` +
+      "Deposits, sweeps, withdrawals and on-chain swaps are disabled; this key is not used to move funds.",
+    );
+  }
+  if (isCompromisedAddress(config.web.escrowTreasuryAddress)) {
+    console.error("[Custody] ESCROW_TREASURY_ADDRESS is the compromised treasury address; point it at the vault.");
   }
 
   provider.on("error", () => {});
@@ -365,6 +398,11 @@ export async function registerDepositAddress(
   discordId: string,
   options: { enableDeposits?: boolean } = {},
 ): Promise<string> {
+  // v1 deposit keys derive from the compromised treasury key: issue none.
+  if (treasuryCompromised) {
+    if (options.enableDeposits) throw new CustodyPausedError();
+    return "";
+  }
   const address = getUserDepositAddress(discordId);
   const normalizedAddress = address.toLowerCase();
   const cached = depositAddressCache.get(discordId);
@@ -652,6 +690,7 @@ export async function sweepDepositTokenToTreasury(
   token: Exclude<TokenSymbol, "SATS">,
   allowGasSponsorship = true,
 ): Promise<{ txHash: string | null; amountAtomic: bigint }> {
+  assertCustodyAvailable();
   const userWallet = getUserDepositWallet(discordId);
   const amountAtomic = await getTokenBalance(userWallet.address, token);
   if (amountAtomic <= 0n) return { txHash: null, amountAtomic: 0n };
@@ -814,6 +853,7 @@ export async function sweepToTreasury(
   maximumBalance?: bigint,
   expectedCheckpoint?: bigint,
 ): Promise<string | null> {
+  assertCustodyAvailable();
   const pending = sweepPromises.get(discordId);
   if (pending) return pending;
 
@@ -894,6 +934,7 @@ async function sweepToTreasuryUnlocked(
  * Used by the admin /sweep command for wallets where balance < gas cost.
  */
 export async function fundGasAndSweep(discordId: string): Promise<string | null> {
+  assertCustodyAvailable();
   const userWallet = getUserDepositWallet(discordId);
   const balance = await getNativeBalance(userWallet.address);
   if (balance === 0n) return null;
@@ -985,6 +1026,11 @@ async function reconcileNativeDepositSweep(row: DepositAddressRow): Promise<"rea
 export function startDepositPoller(
   onDeposit?: (discordId: string, amount: number, gasSats: number, txHash: string, token: TokenSymbol) => void
 ) {
+  if (treasuryCompromised) {
+    // Crediting v1 deposits the bot cannot secure would mint unbacked balance.
+    console.error("[Deposits] Poller not started: v1 deposit keys are compromised.");
+    return;
+  }
   let isPolling = false;
   const balanceConcurrency = clampPositiveInt(config.deposits.balanceConcurrency, 8);
   const balanceBatchSize = Math.max(
@@ -1384,6 +1430,7 @@ export async function reserveWithdrawal(input: {
   /** SATS network fee reserved alongside an ERC-20 withdrawal. */
   gasSats?: number;
 }): Promise<WithdrawalReservation> {
+  assertCustodyAvailable();
   const toAddress = input.toAddress.toLowerCase().trim();
   const gasReservedSats = input.token === "SATS" ? null : roundSats(input.gasSats ?? 0);
   const { data, error } = await supabase.rpc("reserve_withdrawal_v2", {
@@ -1552,6 +1599,7 @@ async function signPersistAndBroadcast(
   record: WithdrawalRecord,
   request: WithdrawalTxRequest,
 ): Promise<WithdrawalBroadcast> {
+  assertCustodyAvailable();
   return withWithdrawalSendLock(async () => {
     const nonceRaw = await rawRpcCall("eth_getTransactionCount", [wallet.address, "pending"]) as string;
     const nonce = Number(BigInt(nonceRaw ?? "0x0"));

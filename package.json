@@ -24,6 +24,7 @@
     "test:imgnai": "node --import tsx --test tests/imgnai.test.ts",
     "test:operations": "node --import tsx --test tests/depositPolicy.test.ts",
     "test:withdrawals": "node --import tsx --test tests/withdrawalSafety.test.ts",
+    "test:custody": "node --import tsx --test tests/custody.test.ts",
     "test:swap": "node --import tsx --test tests/swap.test.ts",
     "test:developer-relay": "node --import tsx --test tests/developerRelay.test.ts",
     "render:imgnai-logo": "node scripts/render-imgnai-logo.mjs",

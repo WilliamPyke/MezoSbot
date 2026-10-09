@@ -25,6 +25,7 @@ DECLARE
   v_def TEXT;
   v_count INTEGER;
   v_exists INTEGER;
+  v_obj RECORD;
   -- Every *_v1 function created by 2026-08-12_modular_runtime.sql.
   v_expected TEXT[] := ARRAY[
     'acquire_service_lease_v1(text,text,integer)',
@@ -237,6 +238,35 @@ BEGIN
     v_errors := v_errors || 'developer_relay_routes.private_thread_id does not exist'::TEXT;
   ELSIF v_count > 0 THEN
     v_errors := v_errors || 'developer_relay_routes.private_thread_id is still NOT NULL'::TEXT;
+  END IF;
+
+  -- 2026-10-09 lockdown: no anon/authenticated access beyond the deposit page --
+  FOR v_obj IN
+    SELECT c.oid::regclass AS rel, c.relkind, c.relrowsecurity
+      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p', 'v', 'm')
+  LOOP
+    IF v_obj.relkind IN ('r', 'p') AND NOT v_obj.relrowsecurity THEN
+      v_errors := v_errors || format('RLS is off on %s', v_obj.rel);
+    END IF;
+    IF has_table_privilege('anon', v_obj.rel, 'INSERT') OR has_table_privilege('anon', v_obj.rel, 'UPDATE')
+       OR has_table_privilege('anon', v_obj.rel, 'DELETE') OR has_table_privilege('anon', v_obj.rel, 'SELECT')
+       OR has_table_privilege('authenticated', v_obj.rel, 'INSERT') OR has_table_privilege('authenticated', v_obj.rel, 'UPDATE')
+       OR has_table_privilege('authenticated', v_obj.rel, 'DELETE') THEN
+      v_errors := v_errors || format('anon/authenticated have table privileges on %s', v_obj.rel);
+    END IF;
+  END LOOP;
+  SELECT COUNT(*) INTO v_count
+    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+   WHERE n.nspname = 'public'
+     AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid = p.oid AND d.deptype = 'e')
+     AND (has_function_privilege('anon', p.oid, 'EXECUTE') OR has_function_privilege('authenticated', p.oid, 'EXECUTE'));
+  IF v_count > 0 THEN
+    v_errors := v_errors || format('%s public functions are executable by anon/authenticated', v_count);
+  END IF;
+  IF NOT has_column_privilege('anon', 'public.users', 'balance_sats', 'SELECT')
+     OR NOT has_column_privilege('anon', 'public.deposit_addresses', 'address', 'SELECT') THEN
+    v_errors := v_errors || 'deposit page reads (users, deposit_addresses) are not granted to anon'::TEXT;
   END IF;
 
   IF cardinality(v_errors) > 0 THEN

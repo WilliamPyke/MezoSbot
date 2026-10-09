@@ -1,6 +1,7 @@
 import { ActionRowBuilder, AttachmentBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder, MessageFlags, type ChatInputCommandInteraction } from "discord.js";
 import QRCode from "qrcode";
-import { getSweepGasSponsorAddress, registerDepositAddress } from "../evm.js";
+import { getSweepGasSponsorAddress, isTreasuryCompromised, registerDepositAddress } from "../evm.js";
+import { CUSTODY_PAUSED_MESSAGE } from "../custody/compromised.js";
 import { config } from "../config.js";
 import { TOKEN_CHOICES, assertTokenConfigured, parseToken, tokenLabel } from "../tokens.js";
 import { canInteractionUseDeposits } from "../depositAccess.js";
@@ -17,6 +18,10 @@ export const data = {
 export async function execute(interaction: ChatInputCommandInteraction) {
   if (!canInteractionUseDeposits(interaction)) {
     return interaction.reply({ content: "❌ Deposits require the G4, G5, or G6 role.", flags: MessageFlags.Ephemeral });
+  }
+
+  if (isTreasuryCompromised()) {
+    return interaction.reply({ content: `⏸️ ${CUSTODY_PAUSED_MESSAGE}`, flags: MessageFlags.Ephemeral });
   }
 
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });

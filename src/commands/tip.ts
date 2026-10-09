@@ -1,10 +1,12 @@
 import { EmbedBuilder, MessageFlags, type ChatInputCommandInteraction } from "discord.js";
 import { creditRecipients, getBalance, refundUndeliveredCredits, subtractBalance } from "../balance.js";
 import { settledState } from "../depositPolicy.js";
+import { CUSTODY_PAUSED_MESSAGE } from "../custody/compromised.js";
 import {
   executeWithdrawal,
   finalizeWithdrawal,
   getSweepGasSponsorAddress,
+  isTreasuryCompromised,
   preflightWithdrawal,
   registerDepositAddress,
   reserveWithdrawal,
@@ -53,6 +55,9 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   // A sponsor tip sends custodial SATS on-chain, so it obeys the withdrawal switch.
   if (sponsor && !config.withdrawals.enabled) {
     return interaction.reply({ content: withdrawalsPausedMessage(), flags: MessageFlags.Ephemeral });
+  }
+  if (sponsor && isTreasuryCompromised()) {
+    return interaction.reply({ content: `⏸️ ${CUSTODY_PAUSED_MESSAGE}`, flags: MessageFlags.Ephemeral });
   }
 
   if (customMessage && customMessage.length > 200) {

@@ -14,9 +14,20 @@ import {
   getTreasuryBalanceSats,
 } from "../evm.js";
 import { hasSufficientMusdBacking, musdToDecimal, musdToNumber, parseMusd } from "./musd.js";
+import { isCompromisedAddress } from "../custody/compromised.js";
 
 const MEZO_NETWORK = "eip155:31612" as const;
-const account = privateKeyToAccount(config.evm.treasuryPrivateKey as `0x${string}`);
+const account = privateKeyToAccount(
+  (config.imgnai.payerPrivateKey || config.evm.treasuryPrivateKey) as `0x${string}`,
+);
+if (isCompromisedAddress(account.address)) {
+  console.error("[imgnAI] x402 payer is the compromised treasury key; top-ups are disabled until IMGNAI_PAYER_PRIVATE_KEY is set.");
+}
+
+/** Wallet that signs x402 payments and owns the Katana balance. */
+export function getImgnaiPayerAddress(): string {
+  return account.address;
+}
 const paymentClient = new x402Client();
 registerExactEvmScheme(paymentClient, {
   signer: account,
@@ -66,6 +77,9 @@ export async function getKatanaWalletBalance(): Promise<bigint> {
 
 async function topUpKatanaBalance(amountAtomic: bigint): Promise<void> {
   if (amountAtomic <= 0n) return;
+  if (isCompromisedAddress(account.address)) {
+    throw new Error("imgnAI top-ups are paused: set IMGNAI_PAYER_PRIVATE_KEY to a new wallet funded with MUSD");
+  }
   const amountDecimal = musdToDecimal(amountAtomic);
   const operationId = randomUUID();
   const idempotencyKey = `katana-topup-${operationId}`;
@@ -118,8 +132,10 @@ export async function ensureKatanaBalance(requiredMusdAtomic: bigint): Promise<b
     if (config.evm.chainId !== 31612) throw new Error("imgnAI payments require Mezo mainnet chain 31612");
     const balance = await getKatanaWalletBalance();
     const treasuryUnits = await getTokenBalance(getTreasuryAddress(), "MUSD");
+    const payerIsTreasury = account.address.toLowerCase() === getTreasuryAddress().toLowerCase();
+    const payerUnits = payerIsTreasury ? treasuryUnits : await getTokenBalance(account.address, "MUSD");
     const snapshot = await getProtocolOperationalSnapshot();
-    const totalAssets = treasuryUnits + balance + snapshot.unsweptMusdAtomic;
+    const totalAssets = treasuryUnits + (payerIsTreasury ? 0n : payerUnits) + balance + snapshot.unsweptMusdAtomic;
     const totalObligations = snapshot.userMusdAtomic + snapshot.pendingMusdAtomic;
     if (!hasSufficientMusdBacking(totalAssets, totalObligations)) {
       throw new Error("Protocol MUSD assets are below user and pending-generation obligations");
@@ -132,8 +148,8 @@ export async function ensureKatanaBalance(requiredMusdAtomic: bigint): Promise<b
     const configuredTarget = parseMusd(config.imgnai.x402TargetMusd);
     const target = configuredTarget > requiredMusdAtomic ? configuredTarget : requiredMusdAtomic;
     const amount = target - balance;
-    if (treasuryUnits < amount) {
-      throw new Error(`Treasury needs ${musdToDecimal(amount)} MUSD to fund imgnAI`);
+    if (payerUnits < amount) {
+      throw new Error(`imgnAI payer wallet needs ${musdToDecimal(amount)} MUSD to fund imgnAI`);
     }
     await topUpKatanaBalance(amount);
     resolvedBalance = await getKatanaWalletBalance();

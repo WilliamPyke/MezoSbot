@@ -2,6 +2,7 @@ import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { ethers } from "ethers";
 import { config } from "../config.js";
+import { hmacSecret } from "../secrets.js";
 import { supabase } from "../db.js";
 
 const COOKIE_NAME = "mallard_session";
@@ -129,7 +130,7 @@ function verifySessionToken(token: string): WalletSession | null {
 }
 
 function hmac(payload: string): string {
-  const secret = config.web.sessionSecret || "mallard-dev-session-secret";
+  const secret = hmacSecret("WEB_SESSION_SECRET", config.web.sessionSecret);
   return createHmac("sha256", secret).update(payload).digest("base64url");
 }
 

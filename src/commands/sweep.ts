@@ -2,6 +2,7 @@ import { EmbedBuilder, MessageFlags, type ChatInputCommandInteraction } from "di
 import { config, tokenUnitsToSats } from "../config.js";
 import {
   fundGasAndSweep,
+  isTreasuryCompromised,
   getNativeBalance,
   getTokenBalance,
   registerDepositAddress,
@@ -36,6 +37,9 @@ type Row = { discord_id: string; address: string };
 export async function execute(interaction: ChatInputCommandInteraction) {
   if (!config.discord.adminIds.includes(interaction.user.id)) {
     return interaction.reply({ content: "❌ Admin only.", flags: MessageFlags.Ephemeral });
+  }
+  if (isTreasuryCompromised()) {
+    return interaction.reply({ content: "⏸️ v1 deposit sweeps are disabled: those keys derive from the compromised treasury key.", flags: MessageFlags.Ephemeral });
   }
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 

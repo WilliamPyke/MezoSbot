@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { config } from "../config.js";
+import { hmacSecret } from "../secrets.js";
 
 /**
  * HMAC-signed match-access token.
@@ -15,7 +16,7 @@ const SIG_LEN = 24;
 const DEFAULT_TTL_MS = 30 * 24 * 60 * 60 * 1000; // Keeps browser rematch chains alive without returning to Discord.
 
 function secret(): string {
-  return config.arcadeTokenSecret || "mezosbot-arcade-default-secret-change-me";
+  return hmacSecret("ARCADE_TOKEN_SECRET", config.arcadeTokenSecret);
 }
 
 function sign(payload: string): string {

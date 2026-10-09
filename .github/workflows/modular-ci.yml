@@ -36,6 +36,7 @@ jobs:
       - run: npm run test:modular
       - run: npm run test:operations
       - run: npm run test:withdrawals
+      - run: npm run test:custody
       - run: npm run test:swap
 
   bot-image:
@@ -142,3 +143,51 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f migrations/2026-10-08_withdrawal_safety.sql
           psql -v ON_ERROR_STOP=1 -f migrations/2026-10-08_withdrawal_safety.sql
           psql -v ON_ERROR_STOP=1 -f tests/withdrawal-db.sql
+      - name: Public schema lockdown
+        run: |
+          psql -v ON_ERROR_STOP=1 -f migrations/2026-10-09_lockdown_public_access.sql
+          psql -v ON_ERROR_STOP=1 -f migrations/2026-10-09_lockdown_public_access.sql
+          psql -v ON_ERROR_STOP=1 <<'SQL'
+          DO $$
+          DECLARE v_rel RECORD; v_fn RECORD;
+          BEGIN
+            FOR v_rel IN
+              SELECT c.oid::regclass AS rel, c.relkind, c.relrowsecurity FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+               WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p', 'v', 'm')
+            LOOP
+              IF v_rel.relkind IN ('r', 'p') AND NOT v_rel.relrowsecurity THEN
+                RAISE EXCEPTION 'RLS is off on %', v_rel.rel;
+              END IF;
+              IF has_table_privilege('anon', v_rel.rel, 'INSERT') OR has_table_privilege('anon', v_rel.rel, 'UPDATE')
+                 OR has_table_privilege('anon', v_rel.rel, 'DELETE') OR has_table_privilege('anon', v_rel.rel, 'SELECT')
+                 OR has_table_privilege('authenticated', v_rel.rel, 'INSERT') OR has_table_privilege('authenticated', v_rel.rel, 'UPDATE')
+                 OR has_table_privilege('authenticated', v_rel.rel, 'DELETE') THEN
+                RAISE EXCEPTION 'anon/authenticated still have table privileges on %', v_rel.rel;
+              END IF;
+            END LOOP;
+            FOR v_fn IN
+              SELECT p.oid::regprocedure AS sig FROM pg_proc p
+                JOIN pg_namespace n ON n.oid = p.pronamespace
+               WHERE n.nspname = 'public'
+                 AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid = p.oid AND d.deptype = 'e')
+            LOOP
+              IF has_function_privilege('anon', v_fn.sig, 'EXECUTE') OR has_function_privilege('authenticated', v_fn.sig, 'EXECUTE') THEN
+                RAISE EXCEPTION 'function % is executable by anon/authenticated', v_fn.sig;
+              END IF;
+            END LOOP;
+            IF NOT has_function_privilege('service_role', 'add_balance(text,double precision)', 'EXECUTE')
+               OR NOT has_function_privilege('service_role', 'reserve_withdrawal_v2(text,text,text,double precision,double precision)', 'EXECUTE')
+               OR has_function_privilege('service_role', 'arcade_settle_internal(bigint)', 'EXECUTE') THEN
+              RAISE EXCEPTION 'service_role function access changed';
+            END IF;
+            IF NOT has_column_privilege('anon', 'users', 'balance_sats', 'SELECT')
+               OR NOT has_column_privilege('anon', 'deposit_addresses', 'address', 'SELECT') THEN
+              RAISE EXCEPTION 'deposit page reads were removed';
+            END IF;
+            IF has_column_privilege('anon', 'users', 'wallet_address', 'SELECT') THEN
+              RAISE EXCEPTION 'anon can read users.wallet_address';
+            END IF;
+          END;
+          $$;
+          SQL

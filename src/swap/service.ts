@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { config } from "../config.js";
 import { supabase } from "../db.js";
-import { checkSatsExitSolvency, getTokenBalance, getTreasuryAddress, getTreasuryBalances } from "../evm.js";
+import { checkSatsExitSolvency, getTokenBalance, getTreasuryAddress, getTreasuryBalances, isTreasuryCompromised } from "../evm.js";
 import { roundSats } from "../format.js";
 import { recordLedgerEntry } from "../ledger.js";
 import {
@@ -455,6 +455,15 @@ export async function executeSwapQuote(
 
   if (decision.preferredMode === "internal") {
     return executeInternal(row, internalOut, free.onchain, volumeProxy, client);
+  }
+
+  // On-chain legs sign with the treasury key; never with a compromised one.
+  if (isTreasuryCompromised()) {
+    return {
+      ok: false,
+      error: "On-chain swap routes are paused during a wallet security upgrade. Nothing was debited.",
+      code: "custody_paused",
+    };
   }
 
   // On-chain path spends treasury hot-wallet inventory (not unswept deposit wallets).
