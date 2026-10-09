@@ -29,6 +29,7 @@
     "test:developer-relay": "node --import tsx --test tests/developerRelay.test.ts",
     "render:imgnai-logo": "node scripts/render-imgnai-logo.mjs",
     "deploy:contracts": "hardhat run --config contracts/hardhat.config.ts contracts/scripts/deployMallardEscrow.ts",
+    "deploy:custody": "hardhat run --config contracts/hardhat.config.ts contracts/scripts/deployCustody.ts",
     "start": "node dist/index.js",
     "start:bot": "npm run start --workspace @mezosbot/bot",
     "start:emulator": "npm run start --workspace @mezosbot/emulator",

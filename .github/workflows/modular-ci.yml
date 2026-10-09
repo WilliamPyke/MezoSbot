@@ -30,6 +30,7 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - run: npm run test:contracts
       # build:all = build:packages + full bot build (web, tsc, SatScape assets) + emulator + worker bundle.
       - run: npm run build:all
       - run: npx tsc --noEmit -p .

@@ -9,6 +9,10 @@ const config: HardhatUserConfig = {
   solidity: {
     version: "0.8.24",
     settings: {
+      // Mezo mainnet and testnet (mezod 13, geth 1.16 fork) run Shanghai through Osaka, so
+      // PUSH0/MCOPY/TSTORE all work there. "paris" is what Hardhat already picked by default for
+      // 0.8.24; pinning it keeps MallardGameEscrow's bytecode identical and needs no newer opcodes.
+      evmVersion: "paris",
       optimizer: {
         enabled: true,
         runs: 200,
