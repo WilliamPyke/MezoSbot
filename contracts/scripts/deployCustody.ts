@@ -182,6 +182,7 @@ async function main() {
   console.log(`DEPOSIT_FACTORY_ADDRESS=${factoryAddress}`);
   console.log(`DEPOSIT_FORWARDER_IMPLEMENTATION=${implementation}`);
   console.log(`HOT_PAYOUT_ADDRESS=${payoutAddress}`);
+  // Log scanners (Swept, and the watchdog's Paid) start here; the factory is deployed first.
   console.log(`DEPOSIT_FACTORY_START_BLOCK=${factoryReceipt!.blockNumber}`);
   console.log("\nNext: fund HotPayout from the vault with a small float only. The deployer key holds no role.");
 }

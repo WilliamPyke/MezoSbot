@@ -1,4 +1,5 @@
 import { expect } from "chai";
+import type { ErrorFragment } from "ethers";
 import { ethers } from "hardhat";
 import { loadFixture, time } from "@nomicfoundation/hardhat-network-helpers";
 import { DEPOSIT_FACTORY_ABI, HOT_PAYOUT_ABI, NATIVE_TOKEN } from "../../src/custody/abi";
@@ -655,7 +656,7 @@ describe("Custody ABI the bot depends on", () => {
       });
       for (const fragment of expected.fragments) {
         if (fragment.type !== "error") continue;
-        const err = fragment as ethers.ErrorFragment;
+        const err = fragment as ErrorFragment;
         const actual = compiled.getError(err.selector);
         expect(actual, `missing ${err.format("sighash")}`).to.not.equal(null);
         checked++;
