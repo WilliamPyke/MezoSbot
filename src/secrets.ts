@@ -14,7 +14,15 @@ function normalizeKey(value: string): string {
  */
 export function hmacSecret(name: string, configured: string | undefined): string {
   const value = (configured ?? "").trim();
-  const keys = [process.env.TREASURY_PRIVATE_KEY, process.env.SWEEP_GAS_SPONSOR_PRIVATE_KEY]
+  const keys = [
+    process.env.TREASURY_PRIVATE_KEY,
+    process.env.SWEEP_GAS_SPONSOR_PRIVATE_KEY,
+    process.env.PAYOUT_OPERATOR_PRIVATE_KEY,
+    process.env.PAYOUT_GUARDIAN_PRIVATE_KEY,
+    process.env.SWEEP_GAS_PRIVATE_KEY,
+    process.env.IMGNAI_PAYER_PRIVATE_KEY,
+    process.env.ESCROW_SETTLER_PRIVATE_KEY,
+  ]
     .filter((key): key is string => !!key && key.trim().length > 0)
     .map(normalizeKey);
   if (value && !keys.includes(normalizeKey(value))) return value;

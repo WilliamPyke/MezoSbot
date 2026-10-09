@@ -1,8 +1,8 @@
 import { EmbedBuilder, MessageFlags, type ChatInputCommandInteraction } from "discord.js";
 import {
+  checkUserWithdrawalCap,
   executeWithdrawal,
   finalizeWithdrawal,
-  isTreasuryCompromised,
   preflightWithdrawal,
   quoteErc20WithdrawalGas,
   reserveWithdrawal,
@@ -11,12 +11,12 @@ import {
 } from "../evm.js";
 import { getWalletForUser } from "../balance.js";
 import { settledState } from "../depositPolicy.js";
-import { CUSTODY_PAUSED_MESSAGE } from "../custody/compromised.js";
+import { withdrawalsBlockedMessage } from "../custody/state.js";
 import { supabase } from "../db.js";
 import { config } from "../config.js";
 import { recordLedgerEntry } from "../ledger.js";
 import { formatSats } from "../format.js";
-import { TOKEN_CHOICES, formatTokenAmount, parseToken, roundTokenAmount } from "../tokens.js";
+import { TOKEN_CHOICES, formatTokenAmount, parseToken, roundTokenAmount, type TokenSymbol } from "../tokens.js";
 
 const MIN_WITHDRAWAL_SATS = parseFloat(process.env.MIN_WITHDRAWAL_SATS ?? "50");
 
@@ -50,15 +50,39 @@ export function withdrawalPreflightMessage(preflight: Exclude<WithdrawalPrefligh
   if (preflight.code === "backing_unavailable") {
     return "⚠️ Could not verify treasury backing right now. Nothing was debited — please try again shortly.";
   }
+  if (preflight.code === "payout_limit") {
+    return `⏳ ${preflight.error}\nNothing was debited.`;
+  }
+  if (preflight.code === "unavailable") {
+    return `⚠️ ${preflight.error} Nothing was debited — please try again later.`;
+  }
   return `❌ ${preflight.error}`;
+}
+
+/**
+ * Per-user rolling 24h cap (WITHDRAWAL_USER_DAILY_MAX_SATS), checked before
+ * any debit. Returns the refusal text, or null when the withdrawal fits.
+ */
+export async function userWithdrawalCapMessage(discordId: string, token: TokenSymbol, amount: number): Promise<string | null> {
+  try {
+    const cap = await checkUserWithdrawalCap(discordId, token, amount);
+    if (cap.ok) return null;
+    return (
+      `⏳ Withdrawals are limited to **${formatSats(cap.capSats)}** per user per 24 hours. ` +
+      `You can withdraw up to **${formatSats(cap.remainingSats)}** right now. Nothing was debited.`
+    );
+  } catch {
+    return "⚠️ Could not check your daily withdrawal limit. Nothing was debited — please try again shortly.";
+  }
 }
 
 export async function execute(interaction: ChatInputCommandInteraction) {
   if (!config.withdrawals.enabled) {
     return interaction.reply({ content: withdrawalsPausedMessage(), flags: MessageFlags.Ephemeral });
   }
-  if (isTreasuryCompromised()) {
-    return interaction.reply({ content: `⏸️ ${CUSTODY_PAUSED_MESSAGE}`, flags: MessageFlags.Ephemeral });
+  const blocked = withdrawalsBlockedMessage();
+  if (blocked) {
+    return interaction.reply({ content: `⏸️ ${blocked}`, flags: MessageFlags.Ephemeral });
   }
 
   const addressOpt = interaction.options.getString("address");
@@ -112,9 +136,18 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     });
   }
 
-  // 2. Every check runs before the user is debited: SATS needs a solvent
-  //    treasury that holds the amount and an amount that covers gas; ERC-20s
-  //    need a gas quote and treasury token coverage.
+  // 2. Every check runs before the user is debited: the per-user daily cap;
+  //    SATS needs solvent holdings and an amount that covers gas; custody v2
+  //    simulates the HotPayout call (pause, caps, float, recipient); ERC-20s
+  //    then need a gas quote.
+  const capMessage = await userWithdrawalCapMessage(interaction.user.id, token, amount);
+  if (capMessage) {
+    return interaction.editReply({ content: capMessage });
+  }
+  const preflight = await preflightWithdrawal(address, amount, token);
+  if (!preflight.ok) {
+    return interaction.editReply({ content: withdrawalPreflightMessage(preflight) });
+  }
   let gasQuote: Erc20WithdrawalGasQuote | undefined;
   if (token !== "SATS") {
     try {
@@ -122,10 +155,6 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     } catch (error) {
       return interaction.editReply({ content: `❌ Unable to estimate withdrawal gas: ${(error as Error).message}` });
     }
-  }
-  const preflight = await preflightWithdrawal(address, amount, token);
-  if (!preflight.ok) {
-    return interaction.editReply({ content: withdrawalPreflightMessage(preflight) });
   }
 
   // 3. Debit + pending row in one transaction (reserve_withdrawal_v2).

@@ -10,6 +10,12 @@ function optional(key: string, def: string): string {
   return process.env[key] ?? def;
 }
 
+/** A number from env; an unparseable value falls back to the default instead of becoming NaN. */
+function optionalNumber(key: string, def: number): number {
+  const parsed = parseFloat(process.env[key] ?? "");
+  return Number.isFinite(parsed) ? parsed : def;
+}
+
 function optionalBool(key: string, def: boolean): boolean {
   const val = process.env[key];
   if (val === undefined) return def;
@@ -93,7 +99,8 @@ export const config = {
     chainId: parseInt(optional("CHAIN_ID", "31612"), 10),
     tokenContract: required("TOKEN_CONTRACT"),
     tokenDecimals: parseInt(optional("TOKEN_DECIMALS", "18"), 10),
-    treasuryPrivateKey: required("TREASURY_PRIVATE_KEY"),
+    /** Legacy (v1) treasury hot key. Optional: custody v2 never signs with it. */
+    treasuryPrivateKey: optional("TREASURY_PRIVATE_KEY", "").trim(),
     sweepGasSponsorPrivateKey: optional("SWEEP_GAS_SPONSOR_PRIVATE_KEY", ""),
     protocolGasReserveMinSats: parseFloat(optional("PROTOCOL_GAS_RESERVE_MIN_SATS", "1000")),
     explorerUrl: optional("EXPLORER_URL", "https://explorer.mezo.org"),
@@ -133,11 +140,41 @@ export const config = {
     playWindowSeconds: parseInt(optional("WEB_PLAY_WINDOW_SECONDS", "180"), 10),
     settlementGraceSeconds: parseInt(optional("WEB_SETTLEMENT_GRACE_SECONDS", "30"), 10),
   },
+  /**
+   * Custody v2 (deploy/CUSTODY.md). Deposits go to keyless CREATE2 forwarders
+   * that can only sweep to the vault; withdrawals are paid from a capped
+   * HotPayout float by the operator key. src/custody/policy.ts decides the mode.
+   */
+  custody: {
+    vaultAddress: optional("VAULT_ADDRESS", "").trim(),
+    depositFactoryAddress: optional("DEPOSIT_FACTORY_ADDRESS", "").trim(),
+    forwarderImplementation: optional("DEPOSIT_FORWARDER_IMPLEMENTATION", "").trim(),
+    /** First block the Swept and Paid log scanners read (the factory deploy block). */
+    depositFactoryStartBlock: optional("DEPOSIT_FACTORY_START_BLOCK", "").trim(),
+    hotPayoutAddress: optional("HOT_PAYOUT_ADDRESS", "").trim(),
+    payoutOperatorPrivateKey: optional("PAYOUT_OPERATOR_PRIVATE_KEY", "").trim(),
+    /** Optional: lets the watchdog pause HotPayout on an anomaly. */
+    payoutGuardianPrivateKey: optional("PAYOUT_GUARDIAN_PRIVATE_KEY", "").trim(),
+    sweepGasPrivateKey: optional("SWEEP_GAS_PRIVATE_KEY", "").trim(),
+    depositConfirmations: parseInt(optional("DEPOSIT_CONFIRMATIONS", "2"), 10),
+    /** Native forwarder balance (sats) at which a non-admin deposit is swept. */
+    minNativeDepositSats: parseFloat(optional("DEPOSIT_V2_MIN_NATIVE_SATS", "1000")),
+    watchdogMs: parseInt(optional("CUSTODY_WATCHDOG_MS", "60000"), 10),
+    /** Operator / sweep-gas native balance (sats) below which admins are alerted. */
+    lowGasSats: parseFloat(optional("CUSTODY_LOW_GAS_SATS", "1000")),
+    /** Block span of one eth_getLogs request. */
+    logChunkBlocks: parseInt(optional("CUSTODY_LOG_CHUNK_BLOCKS", "2000"), 10),
+    /** Every N scanner passes, re-read the last CUSTODY_DEEP_RESCAN_BLOCKS blocks (idempotent). */
+    deepRescanPasses: optionalNumber("CUSTODY_DEEP_RESCAN_PASSES", 60),
+    deepRescanBlocks: optionalNumber("CUSTODY_DEEP_RESCAN_BLOCKS", 5000),
+  },
   depositWebUrl: optional("DEPOSIT_WEB_URL", "https://deposit.mallard.sh/sbot"),
   withdrawals: {
     /** Default false while MezoSBOT account upgrades are in progress. */
     enabled: optionalBool("WITHDRAWALS_ENABLED", false),
     eta: optional("WITHDRAWALS_ETA", "soon"),
+    /** Per-user rolling 24h cap on SATS withdrawals (0 = no cap). HotPayout caps apply on top. */
+    userDailyMaxSats: optionalNumber("WITHDRAWAL_USER_DAILY_MAX_SATS", 200_000),
   },
   /**
    * Public base URL of this bot's HTTP server (no trailing slash).
@@ -170,7 +207,13 @@ export const config = {
     baseUrl: optional("IMGNAI_BASE_URL", "https://kat.imgnai.com").replace(/\/+$/, ""),
     x402TargetMusd: optional("IMGNAI_X402_TARGET_MUSD", "1.00"),
     /** Dedicated x402 payer wallet holding a small MUSD float. Falls back to the treasury key (top-ups refused while it is compromised). */
-    payerPrivateKey: optional("IMGNAI_PAYER_PRIVATE_KEY", ""),
+    payerPrivateKey: optional("IMGNAI_PAYER_PRIVATE_KEY", "").trim(),
+    /** Largest single x402 top-up, in MUSD. */
+    x402MaxTopupMusd: optional("IMGNAI_X402_MAX_TOPUP_MUSD", "5"),
+    /** Most MUSD the payer may top up per rolling 24h. */
+    x402DailyMaxMusd: optional("IMGNAI_X402_DAILY_MAX_MUSD", "20"),
+    /** Optional: the only address an x402 top-up may pay. Unset pins to the last completed top-up's payTo. */
+    x402PayTo: optional("IMGNAI_X402_PAY_TO", "").trim(),
     modelCacheMs: parseInt(optional("IMGNAI_MODEL_CACHE_MS", "300000"), 10),
     imageTimeoutMs: parseInt(optional("IMGNAI_IMAGE_TIMEOUT_MS", "600000"), 10),
     promptMaxLength: parseInt(optional("IMGNAI_PROMPT_MAX_LENGTH", "2000"), 10),

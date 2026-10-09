@@ -1,6 +1,8 @@
 import { EmbedBuilder, MessageFlags, type ChatInputCommandInteraction } from "discord.js";
 import { config, tokenUnitsToSats } from "../config.js";
-import { getNativeBalance, getUserDepositAddress } from "../evm.js";
+import { getNativeBalance, getUserDepositAddress, treasurySignerAvailable } from "../evm.js";
+import { forwarderAddress } from "../custody/deposits.js";
+import { getCustodyMode, getV2Settings } from "../custody/state.js";
 import { supabase } from "../db.js";
 import { formatSats } from "../format.js";
 
@@ -28,7 +30,11 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   const target = interaction.options.getUser("user", true);
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
-  const address = getUserDepositAddress(target.id);
+  const v2 = getCustodyMode() === "v2" ? getV2Settings() : null;
+  if (!v2 && !treasurySignerAvailable()) {
+    return interaction.editReply({ content: "⏸️ Custody is paused: no deposit address is polled or credited." });
+  }
+  const address = v2 ? forwarderAddress(v2, target.id) : getUserDepositAddress(target.id);
 
   try {
     const [bal, { data: row, error }] = await Promise.all([
@@ -43,7 +49,14 @@ export async function execute(interaction: ChatInputCommandInteraction) {
 
     const tracked = BigInt(row?.last_checked_balance || "0");
     let result: string;
-    if (!row) {
+    if (v2) {
+      result = !row
+        ? "No deposit address is registered for this user."
+        : bal > 0n
+          ? "The forwarder holds funds that are not credited yet. They are credited only after a sweep to the vault " +
+            `(the poller sweeps at ${formatSats(config.custody.minNativeDepositSats)} or more; \`/sweep\` sweeps now).`
+          : "Nothing waiting. v2 deposits are credited from confirmed Swept events only.";
+    } else if (!row) {
       result = "No deposit address is registered for this user, so nothing is polled or credited.";
     } else if (!row.deposits_enabled) {
       result = "Deposits are not enabled for this address; the poller does not credit it.";
@@ -62,7 +75,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
         { name: "User", value: `<@${target.id}>`, inline: true },
         { name: "Address", value: `\`${address.slice(0, 12)}...\``, inline: true },
         { name: "On-Chain", value: `**${formatSats(tokenUnitsToSats(bal))}**`, inline: true },
-        { name: "Credited Checkpoint", value: `**${formatSats(tokenUnitsToSats(tracked))}**`, inline: true },
+        { name: v2 ? "Last Observed" : "Credited Checkpoint", value: `**${formatSats(tokenUnitsToSats(tracked))}**`, inline: true },
         { name: "Result", value: result },
       )
       .setFooter({ text: "Read-only: deposits are credited only by the atomic deposit poller" })

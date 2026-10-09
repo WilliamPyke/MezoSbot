@@ -1,3 +1,5 @@
+import { applyPayoutProof, type PayoutProof } from "./custody/policy.js";
+
 export function meetsPublicDepositMinimum(amountAtomic: bigint, minimumAtomic: bigint, isAdmin: boolean): boolean {
   return isAdmin || amountAtomic >= minimumAtomic;
 }
@@ -201,7 +203,11 @@ export type WithdrawalOutcomeReason =
   | "unknown_status"
   | "lookup_failed"
   | "mined_without_receipt"
-  | "awaiting_receipt";
+  | "awaiting_receipt"
+  /** HotPayout: a receipt or paid(ref) without a matching Paid log. Manual review. */
+  | "payout_unproven"
+  /** HotPayout: paid(ref) is true and a matching Paid log was found. */
+  | "paid_on_chain";
 
 /**
  * A consumed nonce only proves a drop once the tx is at least this old;
@@ -213,6 +219,7 @@ export type WithdrawalReceiptLike = {
   status?: unknown;
   gasUsed?: string | null;
   effectiveGasPrice?: string | null;
+  logs?: unknown[];
 };
 
 export type WithdrawalObservation = {
@@ -228,6 +235,8 @@ export type WithdrawalObservation = {
   minedNonce: number | null;
   /** Time since the tx was signed (row creation time for legacy rows). */
   signedAgeMs: number;
+  /** Custody v2 HotPayout evidence; when present it gates completion and refunds. */
+  payout?: PayoutProof;
 };
 
 /** JSON-RPC receipt status. Anything other than an explicit 0 or 1 is unknown. */
@@ -246,6 +255,13 @@ export function parseReceiptStatus(status: unknown): 0 | 1 | null {
  * state (timeouts, RPC errors, malformed receipts) stays pending.
  */
 export function explainWithdrawalOutcome(
+  input: WithdrawalObservation,
+): { outcome: WithdrawalOutcome; reason: WithdrawalOutcomeReason } {
+  const verdict = explainReceiptAndNonce(input);
+  return input.payout ? applyPayoutProof(verdict, input.payout) : verdict;
+}
+
+function explainReceiptAndNonce(
   input: WithdrawalObservation,
 ): { outcome: WithdrawalOutcome; reason: WithdrawalOutcomeReason } {
   if (!input.broadcast) return { outcome: "refund", reason: "never_broadcast" };

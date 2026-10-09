@@ -19,8 +19,13 @@ Apply these in order, to staging and then production, in the Supabase SQL editor
    page's read of `users(discord_id, username, display_name, avatar_url,
    balance_sats)`. service_role keeps exactly the privileges it had. The
    deposit page cannot show addresses again until the custody v2 migration)
+6. `migrations/2026-10-10_custody_v2.sql` (custody v2: retires every v1
+   deposit address, adds the forwarder/credit/watchdog tables and functions,
+   and restores the deposit page's read of `deposit_addresses(discord_id,
+   address)`. Apply before the bot build that runs custody v2; the full
+   procedure is in `deploy/CUSTODY.md`)
 
-All five are additive, re-runnable, and keep the legacy code operational.
+All six are additive, re-runnable, and keep the legacy code operational.
 Run `deploy/preflight.sql` first and `deploy/verify.sql` afterwards (both are
 read-only); prefix each migration with `SET lock_timeout = '5s';`. Validate the four hot indexes with the queries in
 `explain-hot-paths.sql` against production-like data before enabling remote

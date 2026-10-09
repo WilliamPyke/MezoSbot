@@ -20,7 +20,9 @@ import { setDefaultResultOrder } from "node:dns";
 import { config } from "./config.js";
 import { formatSats } from "./format.js";
 import { formatTokenAmount } from "./tokens.js";
-import { initEVM, getTreasuryAddress, startDepositPoller, registerDepositAddress, recoverPendingWithdrawals, warnIfSatsUnderbacked } from "./evm.js";
+import { initEVM, startDepositPoller, registerDepositAddress, recoverPendingWithdrawals, warnIfSatsUnderbacked } from "./evm.js";
+import { initCustody } from "./custody/state.js";
+import { startCustodyWatchdog } from "./custody/watchdog.js";
 import { recoverPendingSwaps, startSwapRecoveryWorker } from "./swap/service.js";
 import { startSwapRebalanceWorker } from "./swap/rebalance.js";
 import { handleSwapInteraction, isSwapInteraction } from "./commands/swap.js";
@@ -960,10 +962,12 @@ async function main() {
   startMultiStepQuestSweeper(client);
 
   initEVM();
-  console.log(`Treasury: ${getTreasuryAddress()}`);
-  warnIfSatsUnderbacked().catch((err) =>
-    console.warn("[Solvency] Startup backing check failed:", (err as Error)?.message ?? err)
-  );
+  // Decides custody v2 / legacy / paused (deploy/CUSTODY.md) in the
+  // background, so Discord connects without waiting on the chain. Never
+  // throws; custody stays paused (deposits and withdrawals off) until decided.
+  initCustody()
+    .then(() => warnIfSatsUnderbacked())
+    .catch((err) => console.warn("[Custody] Startup check failed:", (err as Error)?.message ?? err));
 
   // Resolve any withdrawals left pending from a previous session
   recoverPendingWithdrawals().catch((err) =>
@@ -1005,6 +1009,16 @@ async function main() {
         .finally(() => { feedBusy = false; });
     });
   }
+
+  // Custody v2 watchdog: DMs every ADMIN_IDS user when it freezes custody or
+  // a custody gas wallet runs low.
+  startCustodyWatchdog(async (message) => {
+    for (const adminId of config.discord.adminIds) {
+      await client.users.fetch(adminId).then((user) => user.send(message)).catch((err) =>
+        console.warn(`[Watchdog] Could not DM admin ${adminId}:`, (err as Error)?.message ?? err)
+      );
+    }
+  });
 
   refreshKatanaModels(true).catch((err) =>
     console.warn("[imgnAI] Initial model refresh failed:", (err as Error)?.message ?? err)

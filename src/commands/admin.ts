@@ -38,6 +38,8 @@ import { getCatalogHealth, getDisabledModelKeys, refreshKatanaModels, setGuildMo
 import { getImgnaiOperationalStatus } from "../imgnai/payments.js";
 import { hasSufficientMusdBacking } from "../imgnai/musd.js";
 import { formatMusd } from "../imgnai/types.js";
+import { getCustodyMode, getCustodyReasons, getFreezeState } from "../custody/state.js";
+import { noBackingReason } from "../custody/holdings.js";
 
 const CUSTOM_ID_PREFIX = "admin";
 const COLOR_MAIN = 0x2ecc71; // Green
@@ -122,19 +124,22 @@ async function renderImgnaiMenu(guildId: string, page: "current" | "legacy", sta
   const satsExcess = operations.treasurySats == null || satsLiability == null
     ? null
     : operations.treasurySats - satsLiability;
-  const musdAssets = operations.treasuryMusd == null || operations.katanaMusd == null || operations.unsweptMusdAtomic == null
+  const countedUnswept = operations.unsweptCounted ? operations.unsweptMusdAtomic : 0n;
+  const musdAssets = operations.treasuryMusd == null || operations.katanaMusd == null || countedUnswept == null
     ? null
-    : operations.treasuryMusd + operations.katanaMusd + operations.unsweptMusdAtomic;
+    : operations.treasuryMusd + operations.katanaMusd + countedUnswept;
   const musdObligations = operations.userMusdAtomic == null || operations.pendingMusdAtomic == null
     ? null
     : operations.userMusdAtomic + operations.pendingMusdAtomic;
+  const custodyFrozen = getFreezeState();
   const operational = [
-    `Treasury: **${operations.treasuryMusd == null ? "Unavailable" : formatMusd(operations.treasuryMusd)}**`,
+    `Custody: **${getCustodyMode()}**${custodyFrozen ? " · 🧊 frozen" : ""}`,
+    `Holdings: **${operations.treasuryMusd == null ? "Unavailable" : formatMusd(operations.treasuryMusd)}**`,
     `Katana wallet: **${operations.katanaMusd == null ? "Unavailable" : formatMusd(operations.katanaMusd)}**`,
-    `Unswept MUSD: **${operations.unsweptMusdAtomic == null ? "Unavailable" : formatMusd(operations.unsweptMusdAtomic)}**`,
+    `Unswept MUSD: **${operations.unsweptMusdAtomic == null ? "Unavailable" : formatMusd(operations.unsweptMusdAtomic)}**${operations.unsweptCounted ? "" : " · not counted (v1 addresses)"}`,
     `MUSD coverage: **${musdAssets == null || musdObligations == null ? "Unavailable" : `${formatMusd(musdAssets)} assets / ${formatMusd(musdObligations)} obligations`}**`,
     `SATS backing: **${operations.treasurySats == null || satsLiability == null ? "Unavailable" : `${formatSats(operations.treasurySats)} / ${formatSats(satsLiability)} liabilities`}**`,
-    `Treasury excess: **${satsExcess == null ? "Unavailable" : formatSats(satsExcess)}** · required reserve ${formatSats(operations.gasReserveMinimumSats)}`,
+    `SATS excess: **${satsExcess == null ? "Unavailable" : formatSats(satsExcess)}** · required reserve ${formatSats(operations.gasReserveMinimumSats)}`,
     `Sweep gas sponsor: **${operations.gasSponsorSats == null ? "Unavailable" : formatSats(operations.gasSponsorSats)}**${operations.gasSponsorIsTreasury ? " · ⚠ treasury fallback" : " · dedicated"}`,
     `Sweeps: **${operations.pendingSweeps ?? "Unavailable"} pending** · **${operations.sweepErrors ?? "Unavailable"} errors**`,
     `Pending jobs: **${operations.pendingJobs}**`,
@@ -149,6 +154,9 @@ async function renderImgnaiMenu(guildId: string, page: "current" | "legacy", sta
     .setTimestamp();
   if (health.lastError) embed.addFields({ name: "Catalog warning", value: health.lastError.slice(0, 1024) });
   const warnings = [
+    noBackingReason(),
+    ...getCustodyReasons().map((reason) => `Custody: ${reason}`),
+    custodyFrozen ? `Custody frozen: ${custodyFrozen.reason}` : null,
     satsExcess != null && satsExcess < operations.gasReserveMinimumSats ? "Treasury SATS excess is below the protected gas reserve." : null,
     operations.gasSponsorIsTreasury && operations.gasSponsorSats != null && operations.gasSponsorSats < operations.gasReserveMinimumSats
       ? "Treasury sweep sponsorship is below its protected reserve."

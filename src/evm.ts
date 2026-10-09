@@ -6,6 +6,39 @@ import { roundSats } from "./format.js";
 import { recordLedgerEntry } from "./ledger.js";
 import { verifyWalletFromDeposit } from "./walletVerification.js";
 import { CUSTODY_PAUSED_MESSAGE, isCompromisedAddress } from "./custody/compromised.js";
+import { registerForwarderAddress, startForwarderDeposits } from "./custody/deposits.js";
+import { getHoldingsUnits } from "./custody/holdings.js";
+import {
+  expectedPayoutForRow,
+  explainRevertedPayout,
+  gatherPayoutProof,
+  isRefPaid,
+  payoutRef,
+  planPayout,
+} from "./custody/payout.js";
+import {
+  DAY_MS,
+  checkUserDailyCap,
+  encodePayoutCall,
+  isPayoutAnomaly,
+  sumRecentSatsWithdrawals,
+  withdrawalDestinationProblem,
+  type V2Settings,
+} from "./custody/policy.js";
+import { freezeCustody } from "./custody/watchdog.js";
+import { withdrawalKey } from "./custody/watchdogCore.js";
+import { recordSignedTx } from "./custody/signing.js";
+import {
+  assertCanSign,
+  getConfiguredV2Settings,
+  isRuntimeCompromised,
+  getCustodyMode,
+  getOperatorWallet,
+  getSweepGasWallet,
+  getV2Settings,
+  isCustodyFrozen,
+  withdrawalsBlockedMessage,
+} from "./custody/state.js";
 import {
   explainWithdrawalOutcome,
   isDefiniteDbFailure,
@@ -34,8 +67,10 @@ const ERC20_ABI = [
 const ERC20_INTERFACE = new ethers.Interface(ERC20_ABI);
 
 let provider: ethers.JsonRpcProvider;
-let wallet: ethers.Wallet;
-let sweepGasSponsorWallet: ethers.Wallet;
+/** Legacy treasury hot wallet; null when TREASURY_PRIVATE_KEY is unset (custody v2). */
+let wallet: ethers.Wallet | null = null;
+/** Legacy (v1) ERC-20 sweep/withdrawal gas sponsor; null without a treasury or sponsor key. */
+let sweepGasSponsorWallet: ethers.Wallet | null = null;
 let lastSweepGasError: string | null = null;
 
 export function getProvider() {
@@ -78,6 +113,7 @@ async function rawRpcCall(
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ jsonrpc: "2.0", method, params, id: 1 }),
+        signal: AbortSignal.timeout(RPC_TIMEOUT_MS),
       });
 
       const text = await res.text();
@@ -87,10 +123,12 @@ async function rawRpcCall(
 
       const data: unknown = text ? JSON.parse(text) : null;
       const item = Array.isArray(data) ? data[0] : data;
-      const rpc = item as { error?: { message?: string }; result?: unknown };
+      const rpc = item as { error?: { message?: string; code?: unknown; data?: unknown }; result?: unknown };
       if (rpc.error) {
         const rpcError = new Error(rpc.error.message ?? JSON.stringify(rpc.error)) as RpcError;
         rpcError.rpcError = true;
+        rpcError.code = rpc.error.code;
+        rpcError.data = rpc.error.data;
         throw rpcError;
       }
       return rpc.result ?? null;
@@ -105,8 +143,19 @@ async function rawRpcCall(
   throw lastError;
 }
 
+/** The legacy treasury signer. Only legacy-mode code paths call this. */
+function treasury(): ethers.Wallet {
+  if (!wallet) throw new Error("No legacy treasury key is configured (TREASURY_PRIVATE_KEY)");
+  return wallet;
+}
+
 export function getTreasuryAddress(): string {
-  return wallet.address;
+  return treasury().address;
+}
+
+/** Legacy treasury address, or null without TREASURY_PRIVATE_KEY. Read-only uses only. */
+export function getLegacyTreasuryAddress(): string | null {
+  return wallet?.address ?? null;
 }
 
 let treasuryCompromised = false;
@@ -116,27 +165,50 @@ export function isTreasuryCompromised(): boolean {
   return treasuryCompromised;
 }
 
+/**
+ * The treasury hot wallet may sign (on-chain swaps, rebalancing, v1 sweeps)
+ * only in legacy mode. Custody v2 has no treasury signer at all.
+ */
+export function treasurySignerAvailable(): boolean {
+  return getCustodyMode() === "legacy" && !!wallet && !treasuryCompromised;
+}
+
 export class CustodyPausedError extends Error {
-  constructor() {
-    super(CUSTODY_PAUSED_MESSAGE);
+  constructor(message: string = CUSTODY_PAUSED_MESSAGE) {
+    super(message);
     this.name = "CustodyPausedError";
   }
 }
 
 /**
- * Refuses any action that would sign with, derive from, or send funds to the
- * compromised treasury key: deposits, sweeps, withdrawals, on-chain swaps.
+ * Refuses any v1 action that signs with or derives from the treasury key:
+ * v1 deposit addresses and sweeps. Allowed only in legacy mode.
  */
 export function assertCustodyAvailable(): void {
-  if (treasuryCompromised) throw new CustodyPausedError();
+  if (!treasurySignerAvailable()) throw new CustodyPausedError();
 }
 
 export function getTreasurySigner(): ethers.Wallet {
-  return wallet;
+  if (!treasurySignerAvailable()) throw new CustodyPausedError();
+  return treasury();
 }
 
+/**
+ * Wallet that pays deposit-sweep gas: SWEEP_GAS_PRIVATE_KEY in v2, the v1
+ * sponsor in legacy mode. Never surfaced while custody is paused (the v1
+ * sponsor then derives from a retired key).
+ */
 export function getSweepGasSponsorAddress(): string {
+  const mode = getCustodyMode();
+  const v2 = mode === "v2" ? getSweepGasWallet() : null;
+  if (v2) return v2.address;
+  if (mode !== "legacy" || !sweepGasSponsorWallet) throw new Error("No sweep gas wallet is available while custody is paused");
   return sweepGasSponsorWallet.address;
+}
+
+function sweepSponsor(): ethers.Wallet {
+  if (!sweepGasSponsorWallet) throw new Error("No v1 sweep gas sponsor is configured");
+  return sweepGasSponsorWallet;
 }
 
 /** Exported for swap gas quotes and other protocol ops that share Mezo RPC helpers. */
@@ -152,22 +224,35 @@ export function initEVM() {
     staticNetwork: true,
     batchMaxCount: 1,
   });
-  wallet = new ethers.Wallet(config.evm.treasuryPrivateKey, provider);
-  const derivedSweepSponsorKey = ethers.keccak256(ethers.toUtf8Bytes(
-    `mezosbot-sweep-gas-sponsor-v1:${config.evm.treasuryPrivateKey}`,
-  ));
-  sweepGasSponsorWallet = new ethers.Wallet(
-    config.evm.sweepGasSponsorPrivateKey || derivedSweepSponsorKey,
-    provider,
-  );
-  if (!config.evm.sweepGasSponsorPrivateKey) {
-    console.log(`[Deposits] Using derived sweep gas sponsor ${sweepGasSponsorWallet.address}`);
+  // A malformed key is ignored (custody stays paused), never a crash.
+  try {
+    wallet = config.evm.treasuryPrivateKey ? new ethers.Wallet(config.evm.treasuryPrivateKey, provider) : null;
+  } catch {
+    console.error("[Custody] TREASURY_PRIVATE_KEY is not a valid private key; it is ignored.");
+    wallet = null;
   }
-  treasuryCompromised = isCompromisedAddress(wallet.address);
-  if (treasuryCompromised) {
+  let sponsorKeyWallet: ethers.Wallet | null = null;
+  try {
+    sponsorKeyWallet = config.evm.sweepGasSponsorPrivateKey ? new ethers.Wallet(config.evm.sweepGasSponsorPrivateKey, provider) : null;
+  } catch {
+    console.error("[Custody] SWEEP_GAS_SPONSOR_PRIVATE_KEY is not a valid private key; it is ignored.");
+  }
+  if (sponsorKeyWallet) {
+    sweepGasSponsorWallet = sponsorKeyWallet;
+  } else if (wallet) {
+    const derivedSweepSponsorKey = ethers.keccak256(ethers.toUtf8Bytes(
+      `mezosbot-sweep-gas-sponsor-v1:${config.evm.treasuryPrivateKey}`,
+    ));
+    sweepGasSponsorWallet = new ethers.Wallet(derivedSweepSponsorKey, provider);
+    if (getCustodyMode() === "legacy") {
+      console.log(`[Deposits] Using derived sweep gas sponsor ${sweepGasSponsorWallet.address}`);
+    }
+  }
+  treasuryCompromised = !!wallet && isCompromisedAddress(wallet.address);
+  if (treasuryCompromised && wallet) {
     console.error(
       `[Custody] TREASURY_PRIVATE_KEY belongs to compromised address ${wallet.address}. ` +
-      "Deposits, sweeps, withdrawals and on-chain swaps are disabled; this key is not used to move funds.",
+      "It is never used to move funds; remove it from the environment once custody v2 runs.",
     );
   }
   if (isCompromisedAddress(config.web.escrowTreasuryAddress)) {
@@ -184,6 +269,7 @@ export function initEVM() {
  * Deterministic: same user always gets the same address.
  */
 export function getUserDepositWallet(discordId: string): ethers.Wallet {
+  if (!config.evm.treasuryPrivateKey) throw new Error("v1 deposit addresses need TREASURY_PRIVATE_KEY");
   const seed = `mezosbot-deposit-v1:${config.evm.treasuryPrivateKey}:${discordId}`;
   const derivedKey = ethers.keccak256(ethers.toUtf8Bytes(seed));
   return new ethers.Wallet(derivedKey, provider);
@@ -204,7 +290,10 @@ type DepositAddressRow = {
   native_sweep_started_at: string | null;
 };
 
-type RpcError = Error & { rpcError?: boolean };
+type RpcError = Error & { rpcError?: boolean; code?: unknown; data?: unknown };
+
+/** Per-attempt timeout for a JSON-RPC request; rawRpcCall retries transport failures. */
+const RPC_TIMEOUT_MS = 15_000;
 
 const depositAddressCache = new Map<string, DepositAddressRow>();
 const depositRegistrationPromises = new Map<string, Promise<string>>();
@@ -242,7 +331,7 @@ function warnDepositOnce(key: string, message: string): void {
   console.warn(`${message}${suppressed > 0 ? ` (${suppressed} similar warnings suppressed)` : ""}`);
 }
 
-async function mapWithConcurrency<T, R>(
+export async function mapWithConcurrency<T, R>(
   items: T[],
   concurrency: number,
   mapper: (item: T) => Promise<R>,
@@ -270,7 +359,8 @@ async function mapWithConcurrency<T, R>(
 function normalizeDepositRow(row: DepositAddressRow): DepositAddressRow {
   return {
     discord_id: row.discord_id,
-    address: row.address.toLowerCase(),
+    // Null once the custody v2 migration retired the address.
+    address: (row.address ?? "").toLowerCase(),
     last_checked_balance: row.last_checked_balance ?? "0",
     deposits_enabled: row.deposits_enabled ?? false,
     native_sweep_tx_hash: row.native_sweep_tx_hash ?? null,
@@ -306,6 +396,8 @@ async function refreshDepositAddressCache(force = false): Promise<void> {
     depositAddressCache.clear();
     for (const row of (data ?? []) as DepositAddressRow[]) {
       const normalized = normalizeDepositRow(row);
+      // Only v1 addresses this key derives are polled by the v1 poller.
+      if (normalized.address !== getUserDepositAddress(normalized.discord_id).toLowerCase()) continue;
       depositAddressCache.set(normalized.discord_id, normalized);
     }
     depositAddressCacheLoadedAt = Date.now();
@@ -393,13 +485,19 @@ async function updateDepositAddressBalances(
   }
 }
 
-/** Register a user's deposit address for polling */
+/**
+ * Register a user's deposit address for polling: a keyless forwarder in
+ * custody v2, a key derived from the treasury key in legacy mode, nothing
+ * while custody is paused.
+ */
 export async function registerDepositAddress(
   discordId: string,
   options: { enableDeposits?: boolean } = {},
 ): Promise<string> {
-  // v1 deposit keys derive from the compromised treasury key: issue none.
-  if (treasuryCompromised) {
+  const v2 = getCustodyMode() === "v2" ? getV2Settings() : null;
+  if (v2) return registerForwarderAddress(v2, discordId, options.enableDeposits === true);
+  // v1 deposit keys derive from the treasury key: issue none outside legacy mode.
+  if (!treasurySignerAvailable()) {
     if (options.enableDeposits) throw new CustodyPausedError();
     return "";
   }
@@ -419,6 +517,20 @@ export async function registerDepositAddress(
   }
 
   const registration = (async () => {
+    // Never overwrite an address from another custody version, and never
+    // reissue one the custody v2 migration retired (address NULL): legacy
+    // code only serves rows that still hold this key's v1 address.
+    const { data: current, error: currentError } = await supabase
+      .from("deposit_addresses")
+      .select("address")
+      .eq("discord_id", discordId)
+      .maybeSingle();
+    if (currentError) throw currentError;
+    const currentAddress = (current?.address as string | null | undefined)?.toLowerCase() ?? null;
+    if (current && currentAddress !== normalizedAddress) {
+      if (options.enableDeposits) throw new CustodyPausedError();
+      return "";
+    }
     if (options.enableDeposits) {
       const { error: enableError } = await supabase
         .from("deposit_addresses")
@@ -513,7 +625,7 @@ async function estimateNativeTransferGas(to: string, value: bigint): Promise<big
   if (code === "0x") return NATIVE_TRANSFER_GAS_LIMIT;
 
   const estimatedGas = await provider.estimateGas({
-    from: wallet.address,
+    from: treasury().address,
     to,
     value,
   });
@@ -534,7 +646,8 @@ export async function getTokenBalance(address: string, token: TokenSymbol): Prom
   return BigInt(raw ?? "0x0");
 }
 
-async function getDepositNativeBalance(address: string): Promise<bigint> {
+/** Rate-limited balance read for deposit polling (DEPOSIT_RPC_REQUESTS_PER_SECOND). */
+export async function getDepositNativeBalance(address: string): Promise<bigint> {
   const raw = await rawRpcCall(
     "eth_getBalance",
     [address, "latest"],
@@ -543,7 +656,7 @@ async function getDepositNativeBalance(address: string): Promise<bigint> {
   return BigInt(raw ?? "0x0");
 }
 
-async function getDepositTokenBalance(
+export async function getDepositTokenBalance(
   address: string,
   token: Exclude<TokenSymbol, "SATS">,
 ): Promise<bigint> {
@@ -586,7 +699,7 @@ async function sweepErc20ToTreasuryUnlocked(
   if (tokenBalance <= 0n) return null;
 
   const gasPrice = await getGasPrice();
-  const transferData = ERC20_INTERFACE.encodeFunctionData("transfer", [wallet.address, tokenBalance]);
+  const transferData = ERC20_INTERFACE.encodeFunctionData("transfer", [treasury().address, tokenBalance]);
   const estimatedRaw = await rawRpcCall("eth_estimateGas", [{
     from: userWallet.address,
     to: cfg.contractAddress,
@@ -599,8 +712,8 @@ async function sweepErc20ToTreasuryUnlocked(
   if (nativeBalance < requiredGas) {
     if (!allowGasSponsorship) throw new Error(`${token} deposit wallet does not have enough gas`);
     const funding = requiredGas - nativeBalance;
-    const sponsorBalance = await getNativeBalance(sweepGasSponsorWallet.address);
-    const sponsorIsTreasury = sweepGasSponsorWallet.address.toLowerCase() === wallet.address.toLowerCase();
+    const sponsorBalance = await getNativeBalance(sweepSponsor().address);
+    const sponsorIsTreasury = sweepSponsor().address.toLowerCase() === treasury().address.toLowerCase();
     // A dedicated hot wallet contains no user backing, so every sat deposited
     // into it is explicitly available for sweep gas. The configured reserve is
     // only meaningful when sponsorship falls back to the treasury.
@@ -628,14 +741,14 @@ async function sweepErc20ToTreasuryUnlocked(
       operation_type: "erc20_sweep_funding",
       discord_id: discordId,
       token,
-      sponsor_address: sweepGasSponsorWallet.address,
+      sponsor_address: sweepSponsor().address,
       recipient_address: userWallet.address,
       amount_wei: funding.toString(),
       status: "pending",
     });
     if (gasOperationError) throw gasOperationError;
     try {
-      const hash = await sendRawNativeTransfer(sweepGasSponsorWallet, userWallet.address, funding, NATIVE_TRANSFER_GAS_LIMIT, gasPrice);
+      const hash = await sendRawNativeTransfer(sweepSponsor(), userWallet.address, funding, NATIVE_TRANSFER_GAS_LIMIT, gasPrice);
       for (let i = 0; i < 20; i++) {
         await new Promise((resolve) => setTimeout(resolve, 3000));
         if (await getNativeBalance(userWallet.address) >= requiredGas) {
@@ -772,7 +885,7 @@ export async function getProtocolOperationalSnapshot(): Promise<ProtocolOperatio
 }
 
 export async function getSweepGasSponsorBalanceSats(): Promise<number> {
-  return tokenUnitsToSats(await provider.getBalance(sweepGasSponsorWallet.address));
+  return tokenUnitsToSats(await getNativeBalance(getSweepGasSponsorAddress()));
 }
 
 export function getLastSweepGasError(): string | null {
@@ -784,7 +897,7 @@ async function ensureErc20WithdrawalGas(
   gasCost: bigint,
   gasPrice: bigint,
 ): Promise<void> {
-  const treasuryNative = await getNativeBalance(wallet.address);
+  const treasuryNative = await getNativeBalance(treasury().address);
   // The caller has already reserved the quoted gas from the user's SATS
   // balance, reducing protocol liabilities by at least gasCost. Paying that
   // gas therefore cannot worsen an existing backing gap. Sponsorship is only
@@ -794,7 +907,7 @@ async function ensureErc20WithdrawalGas(
   const requiredTreasuryBalance = gasCost;
   const funding = withdrawalGasFundingShortfall(treasuryNative, gasCost);
   if (funding === 0n) return;
-  const sponsorBalance = await getNativeBalance(sweepGasSponsorWallet.address);
+  const sponsorBalance = await getNativeBalance(sweepSponsor().address);
   const sponsorTxGas = NATIVE_TRANSFER_GAS_LIMIT * gasPrice;
   if (sponsorBalance < funding + sponsorTxGas) {
     throw new Error(
@@ -808,8 +921,8 @@ async function ensureErc20WithdrawalGas(
     id: operationId,
     operation_type: "erc20_withdrawal_funding",
     token,
-    sponsor_address: sweepGasSponsorWallet.address,
-    recipient_address: wallet.address,
+    sponsor_address: sweepSponsor().address,
+    recipient_address: treasury().address,
     amount_wei: funding.toString(),
     status: "pending",
   });
@@ -817,15 +930,15 @@ async function ensureErc20WithdrawalGas(
 
   try {
     const hash = await sendRawNativeTransfer(
-      sweepGasSponsorWallet,
-      wallet.address,
+      sweepSponsor(),
+      treasury().address,
       funding,
       NATIVE_TRANSFER_GAS_LIMIT,
       gasPrice,
     );
     for (let i = 0; i < 20; i++) {
       await new Promise((resolve) => setTimeout(resolve, 3000));
-      if (await getNativeBalance(wallet.address) >= requiredTreasuryBalance) {
+      if (await getNativeBalance(treasury().address) >= requiredTreasuryBalance) {
         await supabase.from("protocol_gas_operations").update({
           status: "completed", tx_hash: hash, updated_at: new Date().toISOString(),
         }).eq("id", operationId);
@@ -892,7 +1005,7 @@ async function sweepToTreasuryUnlocked(
 
   const nonceRaw = await rawRpcCall("eth_getTransactionCount", [userWallet.address, "pending"]) as string;
   const signed = await userWallet.signTransaction({
-    to: wallet.address,
+    to: treasury().address,
     value: sendAmount,
     gasLimit,
     gasPrice,
@@ -947,7 +1060,7 @@ export async function fundGasAndSweep(discordId: string): Promise<string | null>
   const gasFunding = gasCost;
 
   console.log(`Funding gas for ${discordId}: sending ${gasFunding} wei from treasury`);
-  const fundHash = await sendRawNativeTransfer(wallet, userWallet.address, gasFunding, gasLimit, gasPrice);
+  const fundHash = await sendRawNativeTransfer(treasury(), userWallet.address, gasFunding, gasLimit, gasPrice);
   console.log(`Gas funding tx: ${fundHash}`);
 
   // Wait for the funding tx to be mined (poll manually since tx.wait() is broken)
@@ -1026,9 +1139,15 @@ async function reconcileNativeDepositSweep(row: DepositAddressRow): Promise<"rea
 export function startDepositPoller(
   onDeposit?: (discordId: string, amount: number, gasSats: number, txHash: string, token: TokenSymbol) => void
 ) {
-  if (treasuryCompromised) {
+  if (getConfiguredV2Settings()) {
+    // v1 addresses are never polled under custody v2. If the boot check has
+    // not passed yet the v2 poller starts once it does.
+    startForwarderDeposits(onDeposit);
+    return;
+  }
+  if (!treasurySignerAvailable()) {
     // Crediting v1 deposits the bot cannot secure would mint unbacked balance.
-    console.error("[Deposits] Poller not started: v1 deposit keys are compromised.");
+    console.error("[Deposits] Poller not started: custody is paused.");
     return;
   }
   let isPolling = false;
@@ -1329,12 +1448,19 @@ export async function quoteErc20WithdrawalGas(
 ): Promise<Erc20WithdrawalGasQuote> {
   const normalized = toAddress.toLowerCase().trim();
   if (!/^0x[a-fA-F0-9]{40}$/.test(normalized)) throw new Error("Invalid address");
+  const v2 = getCustodyMode() === "v2" ? getV2Settings() : null;
+  if (v2) {
+    // HotPayout.payToken from the operator, simulated.
+    const plan = await planPayout(v2, { withdrawalId: null, to: normalized, token, amount });
+    if (!plan.ok) throw new Error(plan.error);
+    return { gasLimit: plan.gasLimit, gasPrice: plan.gasPrice, gasSats: plan.gasSats };
+  }
   const cfg = assertTokenConfigured(token);
   const units = tokenAmountToUnits(amount, token);
   if (units <= 0n) throw new Error("Amount too small");
   const data = ERC20_INTERFACE.encodeFunctionData("transfer", [normalized, units]);
   const estimated = BigInt(await rawRpcCall("eth_estimateGas", [{
-    from: wallet.address, to: cfg.contractAddress, data,
+    from: treasury().address, to: cfg.contractAddress, data,
   }]) as string);
   const gasLimit = addGasLimitBuffer(estimated);
   const gasPrice = await getGasPrice();
@@ -1363,6 +1489,10 @@ export type WithdrawalRecord = {
   /** 2 = persist-before-broadcast pipeline; null = legacy row. */
   pipeline_version: number | null;
   signed_at: string | null;
+  /** Custody v2: the operator that signed the HotPayout call; null for treasury rows. */
+  signer_address: string | null;
+  /** Custody v2: HotPayout ref (withdrawalRef(id)), written with tx_hash before broadcast. */
+  payout_ref: string | null;
 };
 
 function toWithdrawalRecord(row: Record<string, unknown>): WithdrawalRecord {
@@ -1384,6 +1514,8 @@ function toWithdrawalRecord(row: Record<string, unknown>): WithdrawalRecord {
     gas_reserved_sats: gasReserved != null && Number.isFinite(gasReserved) ? gasReserved : null,
     pipeline_version: pipeline != null && Number.isFinite(pipeline) ? pipeline : null,
     signed_at: (row.signed_at as string | null) ?? null,
+    signer_address: row.signer_address ? String(row.signer_address).toLowerCase() : null,
+    payout_ref: row.payout_ref ? String(row.payout_ref).toLowerCase() : null,
   };
 }
 
@@ -1399,10 +1531,11 @@ async function persistWithdrawalBroadcast(
   nonce: number,
   rawTx: string,
   signedAt: number,
+  payout?: { signer_address: string; payout_ref: string },
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   const { data, error } = await supabase
     .from("withdrawals")
-    .update({ tx_hash: txHash, nonce, raw_tx: rawTx, signed_at: new Date(signedAt).toISOString() })
+    .update({ tx_hash: txHash, nonce, raw_tx: rawTx, signed_at: new Date(signedAt).toISOString(), ...(payout ?? {}) })
     .eq("id", id)
     .eq("status", "pending")
     .is("tx_hash", null)
@@ -1430,7 +1563,8 @@ export async function reserveWithdrawal(input: {
   /** SATS network fee reserved alongside an ERC-20 withdrawal. */
   gasSats?: number;
 }): Promise<WithdrawalReservation> {
-  assertCustodyAvailable();
+  const blocked = withdrawalsBlockedMessage();
+  if (blocked) throw new CustodyPausedError(blocked);
   const toAddress = input.toAddress.toLowerCase().trim();
   const gasReservedSats = input.token === "SATS" ? null : roundSats(input.gasSats ?? 0);
   const { data, error } = await supabase.rpc("reserve_withdrawal_v2", {
@@ -1471,13 +1605,41 @@ export async function reserveWithdrawal(input: {
       gas_reserved_sats: gasReservedSats,
       pipeline_version: 2,
       signed_at: null,
+      signer_address: null,
+      payout_ref: null,
     },
   };
 }
 
+/**
+ * Per-user rolling 24h soft cap on SATS withdrawals (pending and completed
+ * rows count; refunded ones do not). Checked before reserving.
+ */
+export async function checkUserWithdrawalCap(
+  discordId: string,
+  token: TokenSymbol,
+  amount: number,
+): Promise<{ ok: boolean; remainingSats: number; capSats: number }> {
+  const capSats = config.withdrawals.userDailyMaxSats;
+  if (token !== "SATS" || !(capSats > 0)) return { ok: true, remainingSats: Number.POSITIVE_INFINITY, capSats };
+  const now = Date.now();
+  const { data, error } = await supabase
+    .from("withdrawals")
+    .select("amount_sats, token, status, created_at")
+    .eq("discord_id", discordId)
+    .gte("created_at", new Date(now - DAY_MS).toISOString());
+  if (error) throw new Error(`Could not check the daily withdrawal limit: ${error.message}`);
+  return { ...checkUserDailyCap(sumRecentSatsWithdrawals(data ?? [], now), amount, capSats), capSats };
+}
+
 export type WithdrawalPreflight =
   | { ok: true }
-  | { ok: false; code: "underbacked" | "backing_unavailable" | "treasury_short" | "invalid"; error: string };
+  | {
+    ok: false;
+    /** payout_limit: HotPayout paused, a cap reached or the float low (custody v2). */
+    code: "underbacked" | "backing_unavailable" | "treasury_short" | "invalid" | "payout_limit" | "unavailable";
+    error: string;
+  };
 
 /**
  * Checks that must pass before any debit. Native SATS: the treasury must be
@@ -1492,6 +1654,12 @@ export async function preflightWithdrawal(
   const normalized = toAddress.toLowerCase().trim();
   if (!/^0x[a-f0-9]{40}$/.test(normalized)) return { ok: false, code: "invalid", error: "Invalid address" };
   try {
+    const refusal = await withdrawalDestinationRefusal(normalized);
+    if (refusal) return { ok: false, code: "invalid", error: refusal };
+  } catch (error) {
+    return { ok: false, code: "unavailable", error: (error as Error).message };
+  }
+  try {
     if (token === "SATS") {
       const solvency = await checkSatsExitSolvency();
       if (!solvency.ok) {
@@ -1499,18 +1667,54 @@ export async function preflightWithdrawal(
           ? { ok: false, code: "underbacked", error: "Treasury SATS backing is below liabilities plus reserve" }
           : { ok: false, code: "backing_unavailable", error: solvency.error };
       }
+    }
+    const v2 = getCustodyMode() === "v2" ? getV2Settings() : null;
+    if (v2) {
+      // Caps, pause, float and recipient, by simulating the HotPayout call.
+      const plan = await planPayout(v2, { withdrawalId: null, to: normalized, token, amount });
+      if (plan.ok) return { ok: true };
+      const code = plan.code === "already_paid" || plan.code === "paid_unknown" ? "unavailable" : plan.code;
+      return { ok: false, code, error: plan.error };
+    }
+    if (token === "SATS") {
       const plan = await planNativeWithdrawal(normalized, amount);
       return plan.ok ? { ok: true } : { ok: false, code: plan.code, error: plan.error };
     }
     const units = tokenAmountToUnits(amount, token);
     if (units <= 0n) return { ok: false, code: "invalid", error: "Amount too small" };
-    if (await getTokenBalance(wallet.address, token) < units) {
+    if (await getTokenBalance(treasury().address, token) < units) {
       return { ok: false, code: "treasury_short", error: `Treasury has insufficient ${token}` };
     }
     return { ok: true };
   } catch (error) {
     return { ok: false, code: "backing_unavailable", error: describeNativeWithdrawalError(error) };
   }
+}
+
+/**
+ * Destinations that never receive withdrawals: any deposit address (current
+ * forwarders and retired v1 addresses), the custody contracts and role
+ * wallets, and known-compromised addresses.
+ */
+async function withdrawalDestinationRefusal(normalized: string): Promise<string | null> {
+  const v2 = getConfiguredV2Settings();
+  const blocked = v2
+    ? [
+      { label: "vault", address: v2.vault },
+      { label: "deposit factory", address: v2.factory },
+      { label: "deposit forwarder implementation", address: v2.implementation },
+      { label: "withdrawal contract", address: v2.payout },
+      { label: "payout operator wallet", address: v2.operator },
+      { label: "payout guardian wallet", address: v2.guardian },
+    ]
+    : [];
+  // legacy_address exists once the custody v2 migration is applied, which v2 requires.
+  const query = supabase.from("deposit_addresses").select("discord_id").limit(1);
+  const { data, error } = v2
+    ? await query.or(`address.eq.${normalized},legacy_address.eq.${normalized}`)
+    : await query.eq("address", normalized);
+  if (error) throw new Error(`Could not check the destination address: ${error.message}`);
+  return withdrawalDestinationProblem(normalized, blocked, (data?.length ?? 0) > 0, isRuntimeCompromised);
 }
 
 type NativeWithdrawalPlan =
@@ -1522,7 +1726,7 @@ async function planNativeWithdrawal(toAddress: string, amountSats: number): Prom
   const value = satsToTokenUnits(amountSats);
   if (value <= 0n) return { ok: false, code: "invalid", error: "Amount too small" };
 
-  const treasuryNative = await getNativeBalance(wallet.address);
+  const treasuryNative = await getNativeBalance(treasury().address);
   if (!satsWithdrawalCovered(treasuryNative, value)) {
     return { ok: false, code: "treasury_short", error: "Treasury has insufficient SATS to cover this withdrawal" };
   }
@@ -1598,12 +1802,15 @@ type WithdrawalBroadcast =
 async function signPersistAndBroadcast(
   record: WithdrawalRecord,
   request: WithdrawalTxRequest,
+  payout?: { signer: ethers.Wallet; payoutRef: string },
 ): Promise<WithdrawalBroadcast> {
-  assertCustodyAvailable();
+  if (!payout) assertCustodyAvailable();
+  const signer = payout?.signer ?? treasury();
   return withWithdrawalSendLock(async () => {
-    const nonceRaw = await rawRpcCall("eth_getTransactionCount", [wallet.address, "pending"]) as string;
+    if (payout) assertCanSign();
+    const nonceRaw = await rawRpcCall("eth_getTransactionCount", [signer.address, "pending"]) as string;
     const nonce = Number(BigInt(nonceRaw ?? "0x0"));
-    const signedTx = await wallet.signTransaction({
+    const signedTx = await signer.signTransaction({
       ...request,
       nonce,
       chainId: config.evm.chainId,
@@ -1611,9 +1818,24 @@ async function signPersistAndBroadcast(
     });
     const txHash = ethers.keccak256(signedTx);
     const signedAt = Date.now();
+    if (payout) {
+      // The watchdog freezes custody on any operator nonce without a record.
+      try {
+        await recordSignedTx({ signer: signer.address, nonce, txHash, purpose: "withdrawal", ref: payout.payoutRef });
+      } catch (error) {
+        return { broadcast: false, error: (error as Error).message };
+      }
+    }
     // If this write's response is lost after it committed, nothing is sent
     // now; the refund then sees the hash and recovery rebroadcasts raw_tx.
-    const persisted = await persistWithdrawalBroadcast(record.id, txHash, nonce, signedTx, signedAt);
+    const persisted = await persistWithdrawalBroadcast(
+      record.id,
+      txHash,
+      nonce,
+      signedTx,
+      signedAt,
+      payout ? { signer_address: signer.address.toLowerCase(), payout_ref: payout.payoutRef } : undefined,
+    );
     if (!persisted.ok) {
       return { broadcast: false, error: `Could not record the transaction before sending it: ${persisted.error}` };
     }
@@ -1641,10 +1863,11 @@ async function observeWithdrawalTx(
   txHash: string,
   knownNonce: number | null,
   signedAtMs: number,
+  signerAddress: string,
 ): Promise<WithdrawalObservation> {
   let minedNonce: number | null = null;
   try {
-    const raw = await rawRpcCall("eth_getTransactionCount", [wallet.address, "latest"]) as string | null;
+    const raw = await rawRpcCall("eth_getTransactionCount", [signerAddress, "latest"]) as string | null;
     if (raw != null) minedNonce = Number(BigInt(raw));
   } catch {
     // Unknown mined nonce → no drop verdict this round.
@@ -1703,6 +1926,8 @@ export async function executeWithdrawal(
   record: WithdrawalRecord,
   gasQuote?: Erc20WithdrawalGasQuote,
 ): Promise<WithdrawResult> {
+  const v2 = getCustodyMode() === "v2" ? getV2Settings() : null;
+  if (v2) return executePayoutWithdrawal(record, v2);
   const token = record.token;
   let sent: WithdrawalBroadcast;
   let gasPrice: bigint;
@@ -1725,7 +1950,7 @@ export async function executeWithdrawal(
       const cfg = assertTokenConfigured(token);
       const units = tokenAmountToUnits(record.amount_sats, token);
       if (units <= 0n) return { outcome: "refund", reason: "never_broadcast", error: "Amount too small" };
-      const treasuryBalance = await getTokenBalance(wallet.address, token);
+      const treasuryBalance = await getTokenBalance(treasury().address, token);
       if (treasuryBalance < units) {
         return { outcome: "refund", reason: "never_broadcast", error: `Treasury has insufficient ${token}` };
       }
@@ -1756,7 +1981,7 @@ export async function executeWithdrawal(
   const poll = await pollWithdrawalOutcome({
     attempts: WITHDRAWAL_POLL_ATTEMPTS,
     intervalMs: WITHDRAWAL_POLL_INTERVAL_MS,
-    observe: () => observeWithdrawalTx(txHash, nonce, signedAt),
+    observe: () => observeWithdrawalTx(txHash, nonce, signedAt, treasury().address),
   });
   const actualGasSats = receiptGasSats(poll.observation?.receipt, gasPrice);
   const result: WithdrawResult = {
@@ -1769,6 +1994,88 @@ export async function executeWithdrawal(
   };
   if (poll.outcome === "refund") {
     result.error = poll.reason === "reverted" ? "Transaction reverted on-chain" : "Transaction was dropped by the network";
+  } else if (poll.outcome === "pending") {
+    console.warn(`[Withdraw] ${record.id}: ${txHash} unresolved after ~2 minutes (${poll.reason}); recovery will finalize it`);
+  }
+  return result;
+}
+
+/**
+ * Custody v2: pay the reserved withdrawal through HotPayout.payNative /
+ * payToken from the operator. The exact call is simulated first; a revert
+ * (paused, cap, float, recipient) means nothing is signed and the user is
+ * refunded. Completion needs a status-1 receipt carrying the matching Paid
+ * log; a refund needs paid(ref) to read false.
+ */
+async function executePayoutWithdrawal(record: WithdrawalRecord, settings: V2Settings): Promise<WithdrawResult> {
+  const operator = getOperatorWallet();
+  let ready: Extract<Awaited<ReturnType<typeof planPayout>>, { ok: true }>;
+  let sent: WithdrawalBroadcast;
+  try {
+    if (!operator) throw new Error("the payout operator key is unavailable");
+    const plan = await planPayout(settings, {
+      withdrawalId: record.id,
+      to: record.to_address,
+      token: record.token,
+      amount: record.amount_sats,
+    });
+    if (!plan.ok) {
+      if (plan.code === "already_paid") {
+        // The bot never signed this ref, yet HotPayout shows it paid: never
+        // refund it, and stop all custody signing until an admin looks.
+        await freezeCustody(`HotPayout already shows withdrawal ${record.id}'s ref as paid before the bot signed it.`, withdrawalKey(record.id));
+        return { outcome: "pending", reason: "payout_unproven", error: plan.error };
+      }
+      // paid(ref) unreadable: nothing was signed, but a refund needs paid(ref)
+      // to read false, so recovery settles the hashless row.
+      if (plan.code === "paid_unknown") return { outcome: "pending", reason: "lookup_failed", error: plan.error };
+      return { outcome: "refund", reason: "never_broadcast", error: plan.error };
+    }
+    ready = plan;
+    sent = await signPersistAndBroadcast(record, {
+      to: settings.payout,
+      data: encodePayoutCall(plan.expected),
+      gasLimit: plan.gasLimit,
+      gasPrice: plan.gasPrice,
+    }, { signer: operator, payoutRef: plan.expected.ref });
+  } catch (error) {
+    // Thrown before the hash was persisted, so nothing was broadcast.
+    return { outcome: "refund", reason: "never_broadcast", error: describeNativeWithdrawalError(error) };
+  }
+
+  const { gasSats, sentSats, expected } = ready;
+  if (!sent.broadcast) return { outcome: "refund", reason: "never_broadcast", error: sent.error, gasSats, sentSats };
+
+  const { txHash, nonce, signedAt } = sent;
+  const signerAddress = operator.address;
+  const poll = await pollWithdrawalOutcome({
+    attempts: WITHDRAWAL_POLL_ATTEMPTS,
+    intervalMs: WITHDRAWAL_POLL_INTERVAL_MS,
+    observe: async () => {
+      const observation = await observeWithdrawalTx(txHash, nonce, signedAt, signerAddress);
+      observation.payout = await gatherPayoutProof(settings, { ref: expected.ref, expected, observation, ownTxHash: txHash });
+      return observation;
+    },
+  });
+  const actualGasSats = receiptGasSats(poll.observation?.receipt, ready.gasPrice);
+  const result: WithdrawResult = {
+    outcome: poll.outcome,
+    reason: poll.reason,
+    txHash,
+    gasSats: record.token === "SATS" ? gasSats : actualGasSats ?? gasSats,
+    sentSats,
+    actualGasSats,
+  };
+  if (poll.outcome === "refund") {
+    const reverted = poll.reason === "reverted"
+      ? await explainRevertedPayout(settings, expected, (poll.observation?.receipt as { blockNumber?: unknown } | null)?.blockNumber)
+      : null;
+    result.error = poll.reason === "reverted"
+      ? reverted ?? "Transaction reverted on-chain"
+      : "Transaction was dropped by the network";
+  } else if (isPayoutAnomaly(poll)) {
+    console.error(`[Withdraw] MANUAL REVIEW: withdrawal ${record.id} (${txHash}) has no matching HotPayout Paid log; held pending`);
+    await freezeCustody(`Withdrawal ${record.id} (tx ${txHash}): HotPayout shows no Paid log matching the call the bot signed.`, withdrawalKey(record.id));
   } else if (poll.outcome === "pending") {
     console.warn(`[Withdraw] ${record.id}: ${txHash} unresolved after ~2 minutes (${poll.reason}); recovery will finalize it`);
   }
@@ -1983,6 +2290,7 @@ async function recoverPendingWithdrawalsOnce(): Promise<void> {
 }
 
 async function recoverOneWithdrawal(record: WithdrawalRecord): Promise<void> {
+  const payoutSettings = getConfiguredV2Settings();
   if (!record.tx_hash) {
     // Older code wrote tx_hash only after ~2 minutes of polling (and an old
     // replica can still do so during a deploy overlap), so only pipeline-2
@@ -1995,25 +2303,68 @@ async function recoverOneWithdrawal(record: WithdrawalRecord): Promise<void> {
       );
       return;
     }
+    if (payoutSettings) {
+      // A ref HotPayout shows as paid was paid by someone: never refund it.
+      const paid = await isRefPaid(payoutSettings, payoutRef(record.id)).catch(() => null);
+      if (paid !== false) {
+        logWithdrawalForReview(
+          record.id,
+          paid
+            ? "HotPayout shows this withdrawal's ref as paid but the bot recorded no transaction; not refunded"
+            : "could not read HotPayout.paid(ref); refund deferred",
+        );
+        if (paid) await freezeCustody(`HotPayout shows withdrawal ${record.id}'s ref as paid, but the bot never broadcast it.`, withdrawalKey(record.id));
+        return;
+      }
+    }
     const final = await finalizeWithdrawal(record, { outcome: "refund", reason: "never_broadcast" });
     console.log(`[Recovery] Withdrawal ${record.id}: no tx hash (never broadcast) → ${final.state}`);
     return;
   }
 
+  const txHash = record.tx_hash;
+  const isPayout = record.signer_address != null || record.payout_ref != null;
   const signedAt = Date.parse(record.signed_at ?? record.created_at);
-  let observation = await observeWithdrawalTx(record.tx_hash, record.nonce, signedAt);
+  let observe: () => Promise<WithdrawalObservation>;
+  if (isPayout) {
+    if (!payoutSettings) {
+      logWithdrawalForReview(record.id, "HotPayout withdrawal but custody v2 is not configured; cannot verify it");
+      return;
+    }
+    const settings = payoutSettings;
+    const signer = record.signer_address ?? settings.operator;
+    const expected = expectedPayoutForRow(settings, record);
+    observe = async () => {
+      const observation = await observeWithdrawalTx(txHash, record.nonce, signedAt, signer);
+      observation.payout = await gatherPayoutProof(settings, { ref: payoutRef(record.id), expected, observation, ownTxHash: txHash });
+      return observation;
+    };
+  } else {
+    const signer = getLegacyTreasuryAddress();
+    if (!signer) {
+      logWithdrawalForReview(record.id, "treasury withdrawal and TREASURY_PRIVATE_KEY is not set; cannot observe its nonce");
+      return;
+    }
+    observe = () => observeWithdrawalTx(txHash, record.nonce, signedAt, signer);
+  }
+
+  let observation = await observe();
   let verdict = explainWithdrawalOutcome(observation);
   if (verdict.reason === "dropped") {
     // Same re-check the live poller does before trusting a drop.
     await new Promise((resolve) => setTimeout(resolve, 4_000));
-    observation = await observeWithdrawalTx(record.tx_hash, record.nonce, signedAt);
+    observation = await observe();
     verdict = explainWithdrawalOutcome(observation);
   }
 
   if (verdict.outcome === "pending") {
-    await rebroadcastIfLost(record, observation);
+    // A frozen custody sends nothing, not even a stored signed payout.
+    if (!(isPayout && isCustodyFrozen())) await rebroadcastIfLost(record, observation);
     const ageMs = Date.now() - signedAt;
-    if (ageMs >= WITHDRAWAL_REVIEW_AFTER_MS) {
+    if (isPayoutAnomaly(verdict)) {
+      logWithdrawalForReview(record.id, `tx ${txHash}: no HotPayout Paid log matches the signed call; never refunded or completed automatically`);
+      await freezeCustody(`Withdrawal ${record.id} (tx ${txHash}): HotPayout shows no Paid log matching the call the bot signed.`, withdrawalKey(record.id));
+    } else if (ageMs >= WITHDRAWAL_REVIEW_AFTER_MS) {
       logWithdrawalForReview(
         record.id,
         `pending ${Math.round(ageMs / 60_000)} min (${verdict.reason}); tx ${record.tx_hash}, ` +
@@ -2026,7 +2377,7 @@ async function recoverOneWithdrawal(record: WithdrawalRecord): Promise<void> {
   const final = await finalizeWithdrawal(record, {
     outcome: verdict.outcome,
     reason: verdict.reason,
-    txHash: record.tx_hash,
+    txHash,
     actualGasSats: receiptGasSats(observation.receipt, null),
   });
   console.log(`[Recovery] Withdrawal ${record.id}: ${verdict.reason} → ${final.state}${final.recorded === false ? " (not recorded yet)" : ""}`);
@@ -2119,7 +2470,8 @@ async function getInFlightSatsLiabilities(): Promise<InFlightSatsLiabilities> {
 
 async function loadSatsBacking(): Promise<SatsBackingSnapshot & { treasuryWei: bigint }> {
   const [treasuryWei, snapshot, inFlight] = await Promise.all([
-    getNativeBalance(wallet.address),
+    // Vault + HotPayout in custody v2, the treasury hot wallet otherwise.
+    getHoldingsUnits("SATS"),
     getProtocolOperationalSnapshot(),
     getInFlightSatsLiabilities(),
   ]);
@@ -2200,15 +2552,15 @@ export async function warnIfSatsUnderbacked(): Promise<void> {
   }
 }
 
-/** Get treasury native balance in sats */
+/** Native holdings in sats (vault + HotPayout in custody v2, the treasury otherwise). */
 export async function getTreasuryBalanceSats(): Promise<number> {
-  const bal = await provider.getBalance(wallet.address);
-  return tokenUnitsToSats(bal);
+  return tokenUnitsToSats(await getHoldingsUnits("SATS"));
 }
 
+/** Holdings per token (vault + HotPayout in custody v2, the treasury otherwise). */
 export async function getTreasuryBalances(): Promise<Record<TokenSymbol, number>> {
   const entries = await Promise.all(TOKEN_SYMBOLS.map(async (token) => {
-    const units = await getTokenBalance(wallet.address, token);
+    const units = await getHoldingsUnits(token);
     return [token, tokenUnitsToAmount(units, token)] as const;
   }));
   return Object.fromEntries(entries) as Record<TokenSymbol, number>;

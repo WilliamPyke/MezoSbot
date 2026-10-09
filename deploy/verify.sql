@@ -2,8 +2,10 @@
 --   migrations/2026-09-21_developer_relay_channel_only.sql
 --   migrations/2026-08-12_modular_runtime.sql
 --   migrations/2026-09-24_swap_recovery.sql
+--   migrations/2026-10-09_lockdown_public_access.sql
+--   migrations/2026-10-10_custody_v2.sql
 --
--- READ-ONLY: only catalog lookups; the DO block switches its transaction to
+-- READ-ONLY: catalog lookups and row counts; the DO block switches its transaction to
 -- read-only before checking anything. Safe to run in the Supabase SQL editor
 -- or with psql. Every problem found is collected and raised together, e.g.
 --   ERROR: verify FAILED (2 problems): missing function public.x_v1(...); ...
@@ -266,6 +268,45 @@ BEGIN
   END IF;
   IF NOT has_column_privilege('anon', 'public.users', 'balance_sats', 'SELECT') THEN
     v_errors := v_errors || 'deposit page balance read (users) is not granted to anon'::TEXT;
+  END IF;
+
+  -- 2026-10-10 custody v2 ----------------------------------------------------
+  FOREACH v_sig IN ARRAY ARRAY[
+    'register_forwarder_address_v1(text, text, text, boolean)',
+    'credit_forwarder_deposit_v1(text, integer, bigint, text, text, text, integer, numeric, text, text)',
+    'custody_refund_candidates_v1(integer)'
+  ] LOOP
+    v_oid := to_regprocedure('public.' || v_sig);
+    IF v_oid IS NULL THEN
+      v_errors := v_errors || format('missing function public.%s', v_sig);
+    ELSIF NOT has_function_privilege('service_role', v_oid, 'EXECUTE') THEN
+      v_errors := v_errors || format('service_role cannot execute %s', v_sig);
+    END IF;
+  END LOOP;
+  FOREACH v_tbl IN ARRAY ARRAY['custody_cursors', 'custody_signed_txs', 'custody_forwarder_credits', 'custody_sweep_reviews',
+                                'custody_acknowledgements', 'custody_refund_checks'] LOOP
+    IF to_regclass('public.' || v_tbl) IS NULL THEN
+      v_errors := v_errors || format('missing table %s', v_tbl);
+    END IF;
+  END LOOP;
+  SELECT COUNT(*) INTO v_exists
+    FROM pg_attribute
+   WHERE attrelid = to_regclass('public.deposit_addresses')
+     AND attname IN ('address_version', 'salt', 'legacy_address') AND NOT attisdropped;
+  IF v_exists < 3 THEN
+    v_errors := v_errors || 'deposit_addresses is missing the custody v2 columns'::TEXT;
+  ELSE
+    EXECUTE 'SELECT COUNT(*) FROM public.deposit_addresses WHERE address_version = 1 AND address IS NOT NULL' INTO v_count;
+    IF v_count > 0 THEN
+      v_errors := v_errors || format('%s retired v1 deposit addresses are still in deposit_addresses.address', v_count);
+    END IF;
+    IF NOT has_column_privilege('anon', 'public.deposit_addresses', 'address', 'SELECT') THEN
+      v_errors := v_errors || 'deposit page address read (deposit_addresses) is not granted to anon'::TEXT;
+    END IF;
+    IF has_column_privilege('anon', 'public.deposit_addresses', 'legacy_address', 'SELECT')
+       OR has_column_privilege('anon', 'public.deposit_addresses', 'salt', 'SELECT') THEN
+      v_errors := v_errors || 'anon can read deposit_addresses.legacy_address or salt'::TEXT;
+    END IF;
   END IF;
 
   IF cardinality(v_errors) > 0 THEN

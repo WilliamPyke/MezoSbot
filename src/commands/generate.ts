@@ -1,6 +1,7 @@
 import { AttachmentBuilder, MessageFlags, type ChatInputCommandInteraction } from "discord.js";
 import path from "node:path";
 import { createGenerationDraft, renderGenerationDraft } from "../imgnai/interactions.js";
+import { imgnaiSigningUnavailableReason } from "../imgnai/payments.js";
 
 export const data = {
   name: "generate",
@@ -10,6 +11,11 @@ export const data = {
 export async function execute(interaction: ChatInputCommandInteraction): Promise<void> {
   if (!interaction.guildId || !interaction.channelId) {
     await interaction.reply({ content: "Image generation is only available in a server channel.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const paused = imgnaiSigningUnavailableReason();
+  if (paused) {
+    await interaction.reply({ content: paused, flags: MessageFlags.Ephemeral });
     return;
   }
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });

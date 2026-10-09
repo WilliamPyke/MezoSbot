@@ -194,3 +194,37 @@ jobs:
           END;
           $$;
           SQL
+      - name: Custody v2 credits, registration and privileges
+        run: |
+          # balance_atomic (exact MUSD credits) comes from the imgnAI migrations.
+          psql -v ON_ERROR_STOP=1 -f migrations/2026-07-13_imgnai_katana.sql
+          psql -v ON_ERROR_STOP=1 -f migrations/2026-07-13_imgnai_atomic_musd.sql
+          # A v1 user with a pending wallet challenge, to prove the migration retires both.
+          psql -v ON_ERROR_STOP=1 <<'SQL'
+          INSERT INTO users(discord_id) VALUES ('legacy-user');
+          INSERT INTO deposit_addresses(discord_id, address, deposits_enabled)
+          VALUES ('legacy-user', '0x0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c', TRUE);
+          INSERT INTO wallet_verification_challenges(discord_id, deposit_address, challenge_sats)
+          VALUES ('legacy-user', '0x0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c', 10);
+          SQL
+          psql -v ON_ERROR_STOP=1 -f migrations/2026-10-10_custody_v2.sql
+          psql -v ON_ERROR_STOP=1 -f migrations/2026-10-10_custody_v2.sql
+          # The deposit page may read addresses again only because no v1
+          # (compromised-key) address is left in deposit_addresses.address.
+          psql -v ON_ERROR_STOP=1 <<'SQL'
+          DO $$
+          BEGIN
+            IF EXISTS (SELECT 1 FROM deposit_addresses WHERE address_version = 1 AND address IS NOT NULL) THEN
+              RAISE EXCEPTION 'a v1 deposit address is still in deposit_addresses.address after the custody v2 migration';
+            END IF;
+            IF NOT has_column_privilege('anon', 'deposit_addresses', 'address', 'SELECT')
+               OR has_column_privilege('anon', 'deposit_addresses', 'legacy_address', 'SELECT')
+               OR has_column_privilege('anon', 'deposit_addresses', 'salt', 'SELECT')
+               OR has_table_privilege('anon', 'deposit_addresses', 'SELECT')
+               OR has_table_privilege('anon', 'deposit_addresses', 'UPDATE') THEN
+              RAISE EXCEPTION 'anon access to deposit_addresses must be exactly SELECT (discord_id, address)';
+            END IF;
+          END;
+          $$;
+          SQL
+          psql -v ON_ERROR_STOP=1 -f tests/custody-db.sql

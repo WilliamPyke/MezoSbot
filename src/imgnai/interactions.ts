@@ -19,6 +19,7 @@ import {
 import { getMusdBalanceAtomic } from "../balance.js";
 import { config } from "../config.js";
 import { getGuildModels } from "./catalog.js";
+import { imgnaiSigningUnavailableReason } from "./payments.js";
 import {
   queueGeneration,
   releaseReservedGeneration,
@@ -225,6 +226,8 @@ export async function handleGenerationInteraction(interaction: Interaction): Pro
     return;
   }
   if (action !== "generate") return;
+  const paused = imgnaiSigningUnavailableReason();
+  if (paused) return reject(interaction, paused);
 
   await interaction.deferUpdate();
   const freshModels = await getGuildModels(draft.guildId, true);

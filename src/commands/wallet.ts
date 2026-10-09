@@ -1,7 +1,9 @@
 import { EmbedBuilder, MessageFlags, type ChatInputCommandInteraction } from "discord.js";
 import { config } from "../config.js";
-import { isTreasuryCompromised, registerDepositAddress } from "../evm.js";
-import { CUSTODY_PAUSED_MESSAGE } from "../custody/compromised.js";
+import { registerDepositAddress } from "../evm.js";
+import { depositsBlockedMessage, getCustodyMode, getV2Settings } from "../custody/state.js";
+import { forwarderAddress } from "../custody/deposits.js";
+import { sameAddress } from "../custody/policy.js";
 import { formatSats } from "../format.js";
 import {
   createWalletVerificationChallenge,
@@ -44,8 +46,9 @@ async function verify(interaction: ChatInputCommandInteraction) {
     });
   }
   // Verification asks the user to send funds to their deposit address.
-  if (isTreasuryCompromised()) {
-    return interaction.reply({ content: `⏸️ ${CUSTODY_PAUSED_MESSAGE}`, flags: MessageFlags.Ephemeral });
+  const blocked = depositsBlockedMessage();
+  if (blocked) {
+    return interaction.reply({ content: `⏸️ ${blocked}`, flags: MessageFlags.Ephemeral });
   }
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
@@ -64,7 +67,10 @@ async function verify(interaction: ChatInputCommandInteraction) {
       { name: "Network", value: `Chain ID ${config.evm.chainId}`, inline: true },
       {
         name: "Important",
-        value: "Use the same wallet you want quests to check. Verification deposits are locked and are not credited to your bot balance.",
+        value: getCustodyMode() === "v2"
+          ? "Use the same wallet you want quests to check. The challenge amount stays in your deposit address and is " +
+            `credited to your bot balance once at least ${formatSats(config.custody.minNativeDepositSats)} is there to sweep.`
+          : "Use the same wallet you want quests to check. Verification deposits are locked and are not credited to your bot balance.",
       },
     )
     .setFooter({ text: "After the deposit confirms, /wallet status will show the verified wallet." })
@@ -96,7 +102,13 @@ async function status(interaction: ChatInputCommandInteraction) {
     );
   }
 
-  if (pending) {
+  // Only point users at an address the bot can still credit: never a
+  // retired v1 address while custody is paused or after the move to v2.
+  const v2 = getCustodyMode() === "v2" ? getV2Settings() : null;
+  const pendingAddressLive = !!pending && (
+    getCustodyMode() === "legacy" || (!!v2 && sameAddress(pending.deposit_address, forwarderAddress(v2, interaction.user.id)))
+  );
+  if (pending && pendingAddressLive) {
     embed.addFields({
       name: "Pending Challenge",
       value: `Send **${formatSats(pending.challenge_sats)}** to \`${pending.deposit_address}\` before <t:${Math.floor(Date.parse(pending.expires_at) / 1000)}:R>.`,

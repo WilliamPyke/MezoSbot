@@ -1,7 +1,14 @@
 import { randomUUID } from "node:crypto";
 import { config } from "../config.js";
 import { supabase } from "../db.js";
-import { checkSatsExitSolvency, getTokenBalance, getTreasuryAddress, getTreasuryBalances, isTreasuryCompromised } from "../evm.js";
+import {
+  checkSatsExitSolvency,
+  getTokenBalance,
+  getTreasuryAddress,
+  getTreasuryBalances,
+  treasurySignerAvailable,
+} from "../evm.js";
+import { getHoldingsUnits } from "../custody/holdings.js";
 import { roundSats } from "../format.js";
 import { recordLedgerEntry } from "../ledger.js";
 import {
@@ -140,14 +147,15 @@ async function getInventoryHolds(token: TokenSymbol): Promise<number> {
 }
 
 /**
- * Free inventory. `onchain` in the snapshot is the treasury balance minus
- * inventory held by in-flight multi-leg swaps, so internal fills (which pass
- * it as p_onchain_to) can never consume another swap's intermediate tokens.
+ * Free inventory. `onchain` in the snapshot is the holdings balance (vault +
+ * HotPayout in custody v2, the treasury otherwise) minus inventory held by
+ * in-flight multi-leg swaps, so internal fills (which pass it as
+ * p_onchain_to) can never consume another swap's intermediate tokens.
  * Balance is read before holds: a hold is written before its leg broadcasts,
  * so the ordering can only over-reserve, never under-reserve.
  */
 export async function getFreeInventory(token: TokenSymbol): Promise<ReturnType<typeof computeFreeInventory>> {
-  const onchainUnits = await getTokenBalance(getTreasuryAddress(), token);
+  const onchainUnits = await getHoldingsUnits(token);
   const [liabilities, holds] = await Promise.all([getLiabilities(), getInventoryHolds(token)]);
   const onchain = Math.max(0, tokenUnitsToAmount(onchainUnits, token) - holds);
   return computeFreeInventory(onchain, liabilities[token] ?? 0, {
@@ -221,7 +229,7 @@ export async function createSwapQuote(input: {
   const decision = decideHybridMode({
     requiredOut: internalOut,
     freeInventory: free.free,
-    hasOnchainRoute: routes.length > 0,
+    hasOnchainRoute: routes.length > 0 && treasurySignerAvailable(),
     maxInternalFraction: config.swap.maxInternalFraction,
     maxInternalAbsolute: maxInternalAbsolute(toToken),
     forceOnchain: input.forceOnchain || !priceCheck.ok,
@@ -429,7 +437,7 @@ export async function executeSwapQuote(
   const decision = decideHybridMode({
     requiredOut: internalOut,
     freeInventory: free.free,
-    hasOnchainRoute: routes.length > 0,
+    hasOnchainRoute: routes.length > 0 && treasurySignerAvailable(),
     maxInternalFraction: config.swap.maxInternalFraction,
     maxInternalAbsolute: maxInternalAbsolute(row.to_token),
     forceOnchain: forceOnchain || !priceCheck.ok,
@@ -457,11 +465,12 @@ export async function executeSwapQuote(
     return executeInternal(row, internalOut, free.onchain, volumeProxy, client);
   }
 
-  // On-chain legs sign with the treasury key; never with a compromised one.
-  if (isTreasuryCompromised()) {
+  // On-chain legs sign with the legacy treasury key, which custody v2 does
+  // not have and a compromised key never gets to use.
+  if (!treasurySignerAvailable()) {
     return {
       ok: false,
-      error: "On-chain swap routes are paused during a wallet security upgrade. Nothing was debited.",
+      error: "On-chain swap routes are not available right now. Instant swaps still work. Nothing was debited.",
       code: "custody_paused",
     };
   }

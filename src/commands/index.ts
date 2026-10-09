@@ -14,6 +14,7 @@ import * as admin from "./admin.js";
 import * as profile from "./profile.js";
 import * as history from "./history.js";
 import * as treasury from "./treasury.js";
+import * as custody from "./custody.js";
 import * as backfill from "./backfill.js";
 import * as credit from "./credit.js";
 import * as sweep from "./sweep.js";
@@ -45,6 +46,7 @@ const baseCommands = [
   profile,
   history,
   treasury,
+  custody,
   backfill,
   credit,
   sweep,

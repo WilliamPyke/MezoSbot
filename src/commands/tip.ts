@@ -1,12 +1,11 @@
 import { EmbedBuilder, MessageFlags, type ChatInputCommandInteraction } from "discord.js";
 import { creditRecipients, getBalance, refundUndeliveredCredits, subtractBalance } from "../balance.js";
 import { settledState } from "../depositPolicy.js";
-import { CUSTODY_PAUSED_MESSAGE } from "../custody/compromised.js";
+import { withdrawalsBlockedMessage } from "../custody/state.js";
 import {
   executeWithdrawal,
   finalizeWithdrawal,
   getSweepGasSponsorAddress,
-  isTreasuryCompromised,
   preflightWithdrawal,
   registerDepositAddress,
   reserveWithdrawal,
@@ -17,7 +16,12 @@ import { supabase } from "../db.js";
 import { updateUserBadges } from "../badges.js";
 import { recordLedgerEntry } from "../ledger.js";
 import { replyInsufficientBalance } from "./responses.js";
-import { reservationFailureMessage, withdrawalPreflightMessage, withdrawalsPausedMessage } from "./withdraw.js";
+import {
+  reservationFailureMessage,
+  userWithdrawalCapMessage,
+  withdrawalPreflightMessage,
+  withdrawalsPausedMessage,
+} from "./withdraw.js";
 import { TOKEN_CHOICES, formatTokenAmount, parseToken, roundTokenAmount, type TokenSymbol } from "../tokens.js";
 import { config } from "../config.js";
 
@@ -56,8 +60,9 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   if (sponsor && !config.withdrawals.enabled) {
     return interaction.reply({ content: withdrawalsPausedMessage(), flags: MessageFlags.Ephemeral });
   }
-  if (sponsor && isTreasuryCompromised()) {
-    return interaction.reply({ content: `⏸️ ${CUSTODY_PAUSED_MESSAGE}`, flags: MessageFlags.Ephemeral });
+  const custodyBlocked = sponsor ? withdrawalsBlockedMessage() : null;
+  if (custodyBlocked) {
+    return interaction.reply({ content: `⏸️ ${custodyBlocked}`, flags: MessageFlags.Ephemeral });
   }
 
   if (customMessage && customMessage.length > 200) {
@@ -186,6 +191,10 @@ async function tipGasSponsor(interaction: ChatInputCommandInteraction, amount: n
   await interaction.deferReply();
 
   const sponsorAddress = getSweepGasSponsorAddress();
+  const capMessage = await userWithdrawalCapMessage(interaction.user.id, "SATS", amount);
+  if (capMessage) {
+    return interaction.editReply({ content: capMessage });
+  }
   const preflight = await preflightWithdrawal(sponsorAddress, amount, "SATS");
   if (!preflight.ok) {
     return interaction.editReply({ content: withdrawalPreflightMessage(preflight) });

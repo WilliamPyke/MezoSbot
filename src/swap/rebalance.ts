@@ -9,7 +9,7 @@ import {
   routerOutToTokenAmount,
 } from "./router.js";
 import { getFreeInventory } from "./service.js";
-import { isTreasuryCompromised } from "../evm.js";
+import { treasurySignerAvailable } from "../evm.js";
 
 let rebalanceTimer: ReturnType<typeof setInterval> | null = null;
 let rebalanceRunning = false;
@@ -55,7 +55,8 @@ function minProbe(token: TokenSymbol): number {
  */
 export async function runInventoryRebalance(): Promise<void> {
   if (!config.swap.enabled || !config.swap.rebalanceEnabled) return;
-  if (isTreasuryCompromised()) return;
+  // Rebalancing signs with the treasury key: legacy mode only.
+  if (!treasurySignerAvailable()) return;
   if (rebalanceRunning) return;
   rebalanceRunning = true;
   try {
