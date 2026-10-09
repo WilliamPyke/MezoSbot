@@ -653,6 +653,13 @@ describe("Custody ABI the bot depends on", () => {
         );
         checked++;
       });
+      for (const fragment of expected.fragments) {
+        if (fragment.type !== "error") continue;
+        const err = fragment as ethers.ErrorFragment;
+        const actual = compiled.getError(err.selector);
+        expect(actual, `missing ${err.format("sighash")}`).to.not.equal(null);
+        checked++;
+      }
       expect(checked).to.equal(abi.length);
     });
   }

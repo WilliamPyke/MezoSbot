@@ -17,6 +17,9 @@ export const DEPOSIT_FACTORY_ABI = [
   "function setTokenAllowed(address token, bool allowed)",
   "event Swept(bytes32 indexed salt, address indexed token, uint256 amount, address indexed vault)",
   "event TokenAllowed(address indexed token, bool allowed)",
+  "error OnlyVault()",
+  "error InvalidToken()",
+  "error TokenNotAllowed()",
 ] as const;
 
 export const HOT_PAYOUT_ABI = [
@@ -34,4 +37,16 @@ export const HOT_PAYOUT_ABI = [
   "function pause()",
   "function tightenCaps(address token, uint256 perTx, uint256 daily)",
   "event Paid(bytes32 indexed ref, address indexed token, address indexed to, uint256 amount)",
+  "error InvalidRef()",
+  "error AlreadyPaid()",
+  "error BadRecipient()",
+  "error TokenNotAllowed()",
+  "error CapsNotSet()",
+  "error ZeroAmount()",
+  "error PerTxCapExceeded()",
+  "error DailyCapExceeded()",
+  "error InsufficientFloat()",
+  "error PayFailed()",
+  "error NotOperator()",
+  "error EnforcedPause()",
 ] as const;
