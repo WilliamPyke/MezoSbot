@@ -181,9 +181,11 @@ jobs:
                OR has_function_privilege('service_role', 'arcade_settle_internal(bigint)', 'EXECUTE') THEN
               RAISE EXCEPTION 'service_role function access changed';
             END IF;
-            IF NOT has_column_privilege('anon', 'users', 'balance_sats', 'SELECT')
-               OR NOT has_column_privilege('anon', 'deposit_addresses', 'address', 'SELECT') THEN
-              RAISE EXCEPTION 'deposit page reads were removed';
+            IF NOT has_column_privilege('anon', 'users', 'balance_sats', 'SELECT') THEN
+              RAISE EXCEPTION 'deposit page balance read was removed';
+            END IF;
+            IF has_column_privilege('anon', 'deposit_addresses', 'address', 'SELECT') THEN
+              RAISE EXCEPTION 'anon can read deposit_addresses before custody v2';
             END IF;
             IF has_column_privilege('anon', 'users', 'wallet_address', 'SELECT') THEN
               RAISE EXCEPTION 'anon can read users.wallet_address';

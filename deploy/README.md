@@ -14,12 +14,11 @@ Apply these in order, to staging and then production, in the Supabase SQL editor
 4. `migrations/2026-10-08_withdrawal_safety.sql` (must land before the bot
    build that uses it: withdrawals refuse to start until `reserve_withdrawal_v2`
    exists)
-5. `migrations/2026-10-09_lockdown_public_access.sql` (security fix, apply
-   immediately: enables RLS on every public table and removes all
-   anon/authenticated access except the deposit page's reads of
-   `users(discord_id, username, display_name, avatar_url, balance_sats)` and
-   `deposit_addresses(discord_id, address)`. service_role keeps exactly the
-   privileges it had)
+5. `migrations/2026-10-09_lockdown_public_access.sql` (apply first: enables
+   RLS on every public table and limits anon/authenticated to the deposit
+   page's read of `users(discord_id, username, display_name, avatar_url,
+   balance_sats)`. service_role keeps exactly the privileges it had. The
+   deposit page cannot show addresses again until the custody v2 migration)
 
 All five are additive, re-runnable, and keep the legacy code operational.
 Run `deploy/preflight.sql` first and `deploy/verify.sql` afterwards (both are

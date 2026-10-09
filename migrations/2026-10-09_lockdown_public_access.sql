@@ -1,21 +1,16 @@
--- Lock the public schema down to service_role.
+-- Restrict the public schema to service_role.
 --
--- Before this migration most ledger tables (user_token_balances, withdrawals,
--- deposits, tips, ledger_entries, verified_wallets, bot_settings, ...) had RLS
--- off, and Supabase's default privileges gave anon and authenticated full
--- INSERT/UPDATE/DELETE on them. The anon key is public by design (it ships in
--- the deposit page bundle), so anyone could edit balances or withdrawal rows
--- through PostgREST. Every legacy balance function (add_balance,
--- add_token_balance, credit_*_deposit, ...) was also executable by anon.
---
--- This only removes access. service_role (used by the bot, the games Worker
--- and every script; it bypasses RLS) keeps exactly the privileges it had: if a
--- privilege it held came only through PUBLIC, it is re-granted directly, and
+-- Enables RLS on every public table and removes all anon/authenticated
+-- privileges on tables, views, sequences and functions, including default
+-- privileges for objects created later. service_role (used by the bot, the
+-- games Worker and scripts; it bypasses RLS) keeps exactly the privileges it
+-- had: anything it held only through PUBLIC is re-granted directly, and
 -- helpers deliberately closed to it (the *_internal functions) stay closed.
--- The only anon reads that stay open are the columns the deposit page
--- (sbot-deposit) selects, through the existing SELECT policies:
+--
+-- The only anon read left is the deposit page's profile/balance lookup:
 --   users(discord_id, username, display_name, avatar_url, balance_sats)
---   deposit_addresses(discord_id, address)
+-- deposit_addresses is not readable until the custody v2 migration has
+-- cleared retired addresses and grants it again.
 --
 -- Re-runnable. Roles are checked for existence so plain Postgres (CI) works.
 
@@ -110,16 +105,13 @@ BEGIN
     END IF;
   END LOOP;
 
-  -- The deposit page's reads, column by column.
+  -- The deposit page's profile/balance lookup, column by column.
   FOREACH v_role IN ARRAY v_roles LOOP
     IF to_regclass('public.users') IS NOT NULL THEN
       EXECUTE format(
         'GRANT SELECT (discord_id, username, display_name, avatar_url, balance_sats) ON TABLE users TO %I',
         v_role
       );
-    END IF;
-    IF to_regclass('public.deposit_addresses') IS NOT NULL THEN
-      EXECUTE format('GRANT SELECT (discord_id, address) ON TABLE deposit_addresses TO %I', v_role);
     END IF;
   END LOOP;
 

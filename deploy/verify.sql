@@ -240,7 +240,7 @@ BEGIN
     v_errors := v_errors || 'developer_relay_routes.private_thread_id is still NOT NULL'::TEXT;
   END IF;
 
-  -- 2026-10-09 lockdown: no anon/authenticated access beyond the deposit page --
+  -- 2026-10-09 access restriction: anon/authenticated limited to the deposit page --
   FOR v_obj IN
     SELECT c.oid::regclass AS rel, c.relkind, c.relrowsecurity
       FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -264,9 +264,8 @@ BEGIN
   IF v_count > 0 THEN
     v_errors := v_errors || format('%s public functions are executable by anon/authenticated', v_count);
   END IF;
-  IF NOT has_column_privilege('anon', 'public.users', 'balance_sats', 'SELECT')
-     OR NOT has_column_privilege('anon', 'public.deposit_addresses', 'address', 'SELECT') THEN
-    v_errors := v_errors || 'deposit page reads (users, deposit_addresses) are not granted to anon'::TEXT;
+  IF NOT has_column_privilege('anon', 'public.users', 'balance_sats', 'SELECT') THEN
+    v_errors := v_errors || 'deposit page balance read (users) is not granted to anon'::TEXT;
   END IF;
 
   IF cardinality(v_errors) > 0 THEN
