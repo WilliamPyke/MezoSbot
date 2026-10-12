@@ -832,10 +832,13 @@ export function checkX402Requirement(
   if (allowed.payTo && !sameAddress(typeof requirement.payTo === "string" ? requirement.payTo : null, allowed.payTo)) {
     return `payTo ${String(requirement.payTo)} is not the expected ${allowed.payTo}`;
   }
-  // Only the EIP-3009 exact-amount authorization: never Permit2, whose client
-  // path can sign token permits or a raw approve transaction.
+  // EIP-3009, or Permit2 (what imgnAI asks for on Mezo). Either way the signer
+  // below only ever signs typed data; it has no transaction signing, so the
+  // client's raw-approve fallback can never run.
   const method = (requirement.extra as { assetTransferMethod?: unknown } | null | undefined)?.assetTransferMethod;
-  if (method != null && method !== "eip3009") return `asset transfer method ${String(method)} is not allowed`;
+  if (method != null && method !== "eip3009" && method !== "permit2") {
+    return `asset transfer method ${String(method)} is not allowed`;
+  }
   if (!sameAddress(typeof requirement.asset === "string" ? requirement.asset : null, allowed.asset)) {
     return `asset ${String(requirement.asset)} is not MUSD`;
   }
@@ -846,31 +849,77 @@ export function checkX402Requirement(
   return null;
 }
 
+/** Uniswap's canonical Permit2 and the x402 exact-scheme Permit2 proxy. */
+export const PERMIT2_ADDRESS = "0x000000000022D473030F116dDEE9F6B43aC78BA3";
+export const X402_PERMIT2_PROXY_ADDRESS = "0x402085c248EeA27D92E8b30b2C58ed07f9E20001";
+/** Longest validity an x402 signature may carry (imgnAI asks for 3600 s). */
+export const X402_MAX_DEADLINE_SECONDS = 2 * 60 * 60;
+
+function readAmount(value: unknown): bigint | null {
+  try {
+    return BigInt(value as string | number | bigint);
+  } catch {
+    return null;
+  }
+}
+
 /**
- * The only typed data the x402 payer signs: an EIP-3009
- * TransferWithAuthorization of MUSD on Mezo, from the payer, for no more than
- * the top-up in progress. Returns the reason to refuse, or null.
+ * The only typed data the x402 payer signs, all for MUSD on Mezo, from the
+ * payer, for no more than the top-up in progress:
+ * - EIP-3009 TransferWithAuthorization to the expected payTo;
+ * - Permit2 PermitWitnessTransferFrom through the x402 proxy whose witness
+ *   pays the expected payTo;
+ * - EIP-2612 Permit letting Permit2 move at most that amount (imgnAI's gas
+ *   sponsoring). Permit2 still needs the witness signature above to move it.
+ * Returns the reason to refuse, or null.
  */
 export function checkX402Authorization(
   typed: { domain?: Record<string, unknown>; primaryType?: unknown; message?: Record<string, unknown> },
   allowed: { chainId: number; asset: string; from: string; maxAmount: bigint | null; payTo?: string | null },
+  nowSeconds = Math.floor(Date.now() / 1000),
 ): string | null {
   if (allowed.maxAmount == null) return "no imgnAI top-up is in progress";
-  if (typed.primaryType !== "TransferWithAuthorization") return `refusing to sign ${String(typed.primaryType)}`;
   if (Number(typed.domain?.chainId) !== allowed.chainId) return `chain ${String(typed.domain?.chainId)} is not ${allowed.chainId}`;
-  if (!sameAddress(String(typed.domain?.verifyingContract ?? ""), allowed.asset)) return "token is not MUSD";
-  if (!sameAddress(String(typed.message?.from ?? ""), allowed.from)) return "authorization is not from the payer";
-  if (allowed.payTo && !sameAddress(String(typed.message?.to ?? ""), allowed.payTo)) {
-    return `authorization pays ${String(typed.message?.to)}, not the expected ${allowed.payTo}`;
+  const message = typed.message ?? {};
+  const withinTopUp = (value: bigint | null, what: string): string | null =>
+    value == null ? `${what} is unreadable`
+      : value <= 0n || value > allowed.maxAmount! ? `${what} ${value} is outside the requested top-up ${allowed.maxAmount}`
+        : null;
+  const deadlineProblem = (deadline: unknown): string | null => {
+    const value = readAmount(deadline);
+    if (value == null) return "deadline is unreadable";
+    return value > BigInt(nowSeconds + X402_MAX_DEADLINE_SECONDS) ? `deadline ${value} is too far ahead` : null;
+  };
+  const paysExpected = (to: unknown): string | null =>
+    allowed.payTo && !sameAddress(String(to ?? ""), allowed.payTo)
+      ? `authorization pays ${String(to)}, not the expected ${allowed.payTo}`
+      : null;
+
+  switch (typed.primaryType) {
+    case "TransferWithAuthorization": {
+      if (!sameAddress(String(typed.domain?.verifyingContract ?? ""), allowed.asset)) return "token is not MUSD";
+      if (!sameAddress(String(message.from ?? ""), allowed.from)) return "authorization is not from the payer";
+      return paysExpected(message.to) ?? withinTopUp(readAmount(message.value), "value");
+    }
+    case "PermitWitnessTransferFrom": {
+      if (typed.domain?.name !== "Permit2" || !sameAddress(String(typed.domain?.verifyingContract ?? ""), PERMIT2_ADDRESS)) {
+        return "Permit2 signature is not for the canonical Permit2 contract";
+      }
+      const permitted = (message.permitted ?? {}) as Record<string, unknown>;
+      const witness = (message.witness ?? {}) as Record<string, unknown>;
+      if (!sameAddress(String(permitted.token ?? ""), allowed.asset)) return "Permit2 token is not MUSD";
+      if (!sameAddress(String(message.spender ?? ""), X402_PERMIT2_PROXY_ADDRESS)) return "Permit2 spender is not the x402 proxy";
+      return paysExpected(witness.to) ?? withinTopUp(readAmount(permitted.amount), "Permit2 amount") ?? deadlineProblem(message.deadline);
+    }
+    case "Permit": {
+      if (!sameAddress(String(typed.domain?.verifyingContract ?? ""), allowed.asset)) return "permit token is not MUSD";
+      if (!sameAddress(String(message.owner ?? ""), allowed.from)) return "permit is not from the payer";
+      if (!sameAddress(String(message.spender ?? ""), PERMIT2_ADDRESS)) return "permit spender is not Permit2";
+      return withinTopUp(readAmount(message.value), "permit value") ?? deadlineProblem(message.deadline);
+    }
+    default:
+      return `refusing to sign ${String(typed.primaryType)}`;
   }
-  let value: bigint;
-  try {
-    value = BigInt(typed.message?.value as string | number | bigint);
-  } catch {
-    return "authorization value is unreadable";
-  }
-  if (value <= 0n || value > allowed.maxAmount) return `value ${value} is outside the requested top-up ${allowed.maxAmount}`;
-  return null;
 }
 
 /* ─────────── Units ─────────── */

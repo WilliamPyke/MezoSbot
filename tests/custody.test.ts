@@ -6,9 +6,11 @@ import { isCompromisedAddress } from "../src/custody/compromised.js";
 import { cloneInitCode, depositSalt, predictForwarder, withdrawalRef } from "../src/custody/forwarder.js";
 import {
   PAID_TOPIC,
+  PERMIT2_ADDRESS,
   PROBE_DISCORD_ID,
   REFUND_VERIFY_SPAN_MS,
   SWEPT_TOPIC,
+  X402_PERMIT2_PROXY_ADDRESS,
   anomalySetCode,
   applyPayoutProof,
   checkCustodyConfig,
@@ -562,17 +564,64 @@ test("imgnAI x402: only an exact MUSD TransferWithAuthorization within the top-u
     message: { from: ethers.getAddress(payerAddress), to: "0x" + "12".repeat(20), value: 10n ** 18n, validAfter: 0n, validBefore: 1n, nonce: "0x" + "00".repeat(32) },
   };
   assert.equal(checkX402Authorization(typed, allowed), null);
-  assert.match(checkX402Authorization({ ...typed, primaryType: "Permit" }, allowed)!, /Permit/);
-  assert.match(checkX402Authorization({ ...typed, primaryType: "PermitWitnessTransferFrom" }, allowed)!, /refusing/);
+  // A permit-shaped request built on the EIP-3009 message is not a valid permit.
+  assert.match(checkX402Authorization({ ...typed, primaryType: "Permit" }, allowed)!, /permit is not from the payer/);
+  assert.match(checkX402Authorization({ ...typed, primaryType: "PermitWitnessTransferFrom" }, allowed)!, /canonical Permit2/);
+  assert.match(checkX402Authorization({ ...typed, primaryType: "Mail" }, allowed)!, /refusing to sign Mail/);
   assert.match(checkX402Authorization({ ...typed, message: { ...typed.message, value: 10n ** 18n + 1n } }, allowed)!, /outside/);
   assert.match(checkX402Authorization({ ...typed, domain: { ...typed.domain, verifyingContract: "0x" + "33".repeat(20) } }, allowed)!, /MUSD/);
   assert.match(checkX402Authorization({ ...typed, domain: { ...typed.domain, chainId: 8453 } }, allowed)!, /chain/);
   assert.match(checkX402Authorization({ ...typed, message: { ...typed.message, from: "0x" + "44".repeat(20) } }, allowed)!, /payer/);
   assert.match(checkX402Authorization(typed, { ...allowed, maxAmount: null })!, /no imgnAI top-up/);
-  // The requirement screen refuses Permit2 before anything is signed.
+  // The requirement screen accepts EIP-3009 and Permit2 (imgnAI's Mezo method), nothing else.
   const req = { network: "eip155:31612", asset: MUSD, amount: "1", extra: { assetTransferMethod: "permit2" } };
-  assert.match(checkX402Requirement(req, { network: "eip155:31612", asset: MUSD, maxAmount: 1n })!, /permit2/);
-  assert.equal(checkX402Requirement({ ...req, extra: { assetTransferMethod: "eip3009" } }, { network: "eip155:31612", asset: MUSD, maxAmount: 1n }), null);
+  const reqAllowed = { network: "eip155:31612", asset: MUSD, maxAmount: 1n };
+  assert.equal(checkX402Requirement(req, reqAllowed), null);
+  assert.equal(checkX402Requirement({ ...req, extra: { assetTransferMethod: "eip3009" } }, reqAllowed), null);
+  assert.match(checkX402Requirement({ ...req, extra: { assetTransferMethod: "erc20approve" } }, reqAllowed)!, /not allowed/);
+});
+
+test("imgnAI x402: the Permit2 path signs only an exact-amount permit to Permit2 and a witness transfer to payTo", () => {
+  const MUSD = "0xdD468A1DDc392dcdbEf6db6e34E89AA338F9F186";
+  const PAY_TO = "0x5E00c23A3CB51746FA0CF3E2cCfb0757Fe2C0b5C";
+  const payerAddress = ethers.getAddress(addressOf(KEYS.imgnai));
+  const now = 1_800_000_000;
+  const amount = 10n ** 18n;
+  const allowed = { chainId: 31612, asset: MUSD, from: payerAddress, maxAmount: amount, payTo: PAY_TO };
+  const witness = {
+    domain: { name: "Permit2", chainId: 31612, verifyingContract: PERMIT2_ADDRESS },
+    primaryType: "PermitWitnessTransferFrom",
+    message: {
+      permitted: { token: MUSD, amount },
+      spender: X402_PERMIT2_PROXY_ADDRESS,
+      nonce: 7n,
+      deadline: BigInt(now + 3600),
+      witness: { to: PAY_TO, validAfter: BigInt(now - 600) },
+    },
+  };
+  const permit = {
+    domain: { name: "Mezo USD", version: "1", chainId: 31612, verifyingContract: MUSD },
+    primaryType: "Permit",
+    message: { owner: payerAddress, spender: PERMIT2_ADDRESS, value: amount, nonce: 0n, deadline: BigInt(now + 3600) },
+  };
+  assert.equal(checkX402Authorization(witness, allowed, now), null);
+  assert.equal(checkX402Authorization(permit, allowed, now), null);
+
+  const m = witness.message;
+  assert.match(checkX402Authorization({ ...witness, message: { ...m, witness: { ...m.witness, to: "0x" + "66".repeat(20) } } }, allowed, now)!, /not the expected/);
+  assert.match(checkX402Authorization({ ...witness, message: { ...m, spender: "0x" + "77".repeat(20) } }, allowed, now)!, /x402 proxy/);
+  assert.match(checkX402Authorization({ ...witness, message: { ...m, permitted: { token: MUSD, amount: amount + 1n } } }, allowed, now)!, /outside/);
+  assert.match(checkX402Authorization({ ...witness, message: { ...m, permitted: { token: "0x" + "88".repeat(20), amount } } }, allowed, now)!, /not MUSD/);
+  assert.match(checkX402Authorization({ ...witness, message: { ...m, deadline: BigInt(now + 3 * 3600) } }, allowed, now)!, /too far ahead/);
+  assert.match(checkX402Authorization({ ...witness, domain: { ...witness.domain, verifyingContract: "0x" + "99".repeat(20) } }, allowed, now)!, /canonical Permit2/);
+
+  const p = permit.message;
+  // Never an unlimited or larger approval, never to another spender, never for someone else's tokens.
+  assert.match(checkX402Authorization({ ...permit, message: { ...p, value: 2n ** 256n - 1n } }, allowed, now)!, /outside/);
+  assert.match(checkX402Authorization({ ...permit, message: { ...p, spender: X402_PERMIT2_PROXY_ADDRESS } }, allowed, now)!, /not Permit2/);
+  assert.match(checkX402Authorization({ ...permit, message: { ...p, owner: "0x" + "44".repeat(20) } }, allowed, now)!, /not from the payer/);
+  assert.match(checkX402Authorization({ ...permit, domain: { ...permit.domain, verifyingContract: "0x" + "33".repeat(20) } }, allowed, now)!, /not MUSD/);
+  assert.match(checkX402Authorization(permit, { ...allowed, maxAmount: null }, now)!, /no imgnAI top-up/);
 });
 
 test("watchdog: any consumed nonce without a record is reported", () => {

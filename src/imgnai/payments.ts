@@ -97,10 +97,13 @@ async function refusePayTo(problem: string, payTo: string | null): Promise<void>
 
 const paymentClient = new x402Client();
 if (account) {
-  // The x402 signer can only sign typed data, and only an EIP-3009
-  // TransferWithAuthorization of MUSD for the top-up in progress. It has no
-  // transaction or message signing, so no approve, Permit2 or permit path.
+  // The x402 signer can only sign typed data, and only what
+  // checkX402Authorization allows: MUSD for the top-up in progress, paid to
+  // the expected payTo (EIP-3009, or Permit2 with its EIP-2612 permit, which
+  // is how imgnAI charges on Mezo). It has no transaction or message signing;
+  // the RPC URL only lets the client read the permit nonce and allowance.
   registerExactEvmScheme(paymentClient, {
+    schemeOptions: { rpcUrl: config.evm.rpcUrl },
     signer: {
       address: account.address,
       signTypedData: async (typed) => {
