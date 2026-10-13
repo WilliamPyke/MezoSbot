@@ -21,7 +21,8 @@ What the bot proves before it changes a balance:
 
 - **Deposits are credited only from `Swept` events** of the configured factory,
   read `DEPOSIT_CONFIRMATIONS` blocks behind the head, once per
-  (transaction, log index), and only when the event's vault is `VAULT_ADDRESS`
+  (transaction, log index), and only when the event's vault is the deposit
+  target (`VAULT_ADDRESS`, or `HOT_PAYOUT_ADDRESS` with `DEPOSITS_TO_HOT_PAYOUT=true`)
   and its salt belongs to a user with deposits enabled. Anything else is
   recorded in `custody_sweep_reviews` and never credited.
 - **A withdrawal completes only** when a HotPayout `Paid` log for its
@@ -45,8 +46,8 @@ What the bot proves before it changes a balance:
   have a receipt. The watchdog freezes custody otherwise, or when HotPayout
   pays anything that does not match a pending or completed withdrawal's signed
   call in that withdrawal's own transaction.
-- **Backing** is read only from the vault and HotPayout under v2 (from the
-  treasury only in legacy mode with an uncompromised key). While custody is
+- **Backing** is read only from the vault and HotPayout under v2 (HotPayout
+  alone with `DEPOSITS_TO_HOT_PAYOUT=true`; from the treasury only in legacy mode with an uncompromised key). While custody is
   paused or v2 is not verified yet, nothing counts as backing, so instant
   swaps, imgnAI top-ups and SATS credits (`/credit`) refuse; `/treasury` and
   the imgnAI admin panel say so. Funds still sitting at old (v1) deposit
@@ -94,6 +95,18 @@ A single hardware wallet also works. The vault:
 
 Write its address down; you need it for the deploy and for `VAULT_ADDRESS`.
 
+### Option: deposits straight into HotPayout (no vault signing)
+
+Deploy with `DEPOSITS_TO_HOT_PAYOUT=yes` to make HotPayout itself the factory's
+vault. Deposits then refill withdrawals automatically, as the old treasury
+did, and nobody signs anything day to day. `VAULT_ADDRESS` becomes only
+HotPayout's admin (unpause, caps, roles, `recover`). It can be any wallet you
+own that is not on the server, and its balance is not counted as backing. The
+trade-off: every reserve sits in HotPayout, so a stolen operator key can move
+up to the caps (per transaction and per day) before the watchdog pauses it,
+instead of only a small float. The factory's token allowlist is fixed at
+deploy (only its vault could change it, and HotPayout has no function for that).
+
 ## 3. Deploy the contracts
 
 Fund the deployer address with a little BTC for gas, then dry-run:
@@ -121,8 +134,8 @@ operator key can ever move per day.
 When the plan is right, run it again with `CONFIRM_DEPLOY=yes`. The script
 reads everything back from chain and prints the bot environment:
 `VAULT_ADDRESS`, `DEPOSIT_FACTORY_ADDRESS`, `DEPOSIT_FORWARDER_IMPLEMENTATION`,
-`HOT_PAYOUT_ADDRESS` and `DEPOSIT_FACTORY_START_BLOCK` (the factory's deploy
-block; HotPayout is deployed after it). If it reports a mismatch, do not
+`HOT_PAYOUT_ADDRESS`, `DEPOSITS_TO_HOT_PAYOUT` and `DEPOSIT_FACTORY_START_BLOCK`
+(the earlier of the two deploy blocks). If it reports a mismatch, do not
 configure the bot with those contracts.
 
 ## 4. Database
@@ -156,7 +169,8 @@ Set on the bot service:
 | --- | --- |
 | `VAULT_ADDRESS` | the vault |
 | `DEPOSIT_FACTORY_ADDRESS`, `DEPOSIT_FORWARDER_IMPLEMENTATION`, `HOT_PAYOUT_ADDRESS` | from the deploy |
-| `DEPOSIT_FACTORY_START_BLOCK` | the factory deploy block |
+| `DEPOSIT_FACTORY_START_BLOCK` | from the deploy |
+| `DEPOSITS_TO_HOT_PAYOUT` | `true` if deployed with `DEPOSITS_TO_HOT_PAYOUT=yes`, otherwise unset. The boot check refuses a factory whose vault is not the matching address |
 | `PAYOUT_OPERATOR_PRIVATE_KEY`, `SWEEP_GAS_PRIVATE_KEY` | secrets from step 1 |
 | `PAYOUT_GUARDIAN_PRIVATE_KEY` | optional secret; enables automatic pause on a freeze. You may instead keep the guardian key on your own device and pause by hand when the watchdog DMs you |
 | `IMGNAI_PAYER_PRIVATE_KEY` | secret from step 1 |
@@ -167,7 +181,7 @@ Set on the bot service:
 Remove `TREASURY_PRIVATE_KEY` and `SWEEP_GAS_SPONSOR_PRIVATE_KEY`. Custody v2
 never uses them; legacy rows that are still pending are then listed for
 manual review instead of being observed. Point `ESCROW_TREASURY_ADDRESS` at
-the vault.
+the vault (at HotPayout with `DEPOSITS_TO_HOT_PAYOUT=true`).
 
 ## 6. Fund the wallets
 

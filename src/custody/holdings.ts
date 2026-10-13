@@ -4,9 +4,10 @@ import { sameAddress } from "./policy.js";
 import { getCustodyMode, getV2Settings } from "./state.js";
 
 /**
- * On-chain assets that back user balances: the vault plus the HotPayout float
- * in custody v2, the treasury hot wallet in legacy mode (uncompromised key
- * only), and nothing while custody is paused or v2 is not verified yet, so no
+ * On-chain assets that back user balances: in custody v2 the HotPayout float
+ * plus the vault, unless deposits go straight to HotPayout (then the vault is
+ * only an admin wallet and its balance is not counted); the treasury hot
+ * wallet in legacy mode (uncompromised key only); and nothing while custody is paused or v2 is not verified yet, so no
  * address someone else may control is ever counted as backing. Every
  * solvency, mint, swap-inventory and imgnAI backing check reads this.
  */
@@ -16,7 +17,10 @@ export type HoldingAccount = { label: "vault" | "payout" | "treasury"; address: 
 export function holdingAccounts(): HoldingAccount[] {
   const mode = getCustodyMode();
   const v2 = mode === "v2" ? getV2Settings() : null;
-  if (v2) return [{ label: "vault", address: v2.vault }, { label: "payout", address: v2.payout }];
+  if (v2) {
+    const payout: HoldingAccount = { label: "payout", address: v2.payout };
+    return sameAddress(v2.depositTarget, v2.payout) ? [payout] : [{ label: "vault", address: v2.vault }, payout];
+  }
   const treasury = mode === "legacy" && treasurySignerAvailable() ? getLegacyTreasuryAddress() : null;
   return treasury ? [{ label: "treasury", address: treasury }] : [];
 }

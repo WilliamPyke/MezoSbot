@@ -34,7 +34,7 @@ import { alertAdmins } from "./watchdog.js";
 
 /**
  * Custody v2 deposits. Each user's address is a keyless CREATE2 forwarder
- * that can only sweep to the vault. The poller watches forwarder balances and
+ * that can only sweep to the vault (or HotPayout, see DEPOSITS_TO_HOT_PAYOUT). The poller watches forwarder balances and
  * asks the factory to sweep them (gas from SWEEP_GAS_PRIVATE_KEY); balances
  * are credited ONLY from the factory's Swept events, so a sweep by anyone,
  * including a third party, credits the right user exactly once.
@@ -358,7 +358,7 @@ async function creditSwept(settings: V2Settings, event: SweptEvent, onDeposit?: 
     p_token_decimals: token ? getTokenConfig(token).decimals : null,
     p_amount_atomic: event.amount.toString(),
     p_vault: event.vault,
-    p_expected_vault: settings.vault,
+    p_expected_vault: settings.depositTarget,
   });
   if (error) throw new Error(`credit_forwarder_deposit_v1 ${event.txHash}:${event.logIndex}: ${error.message}`);
   const result = (data ?? {}) as CreditResult;

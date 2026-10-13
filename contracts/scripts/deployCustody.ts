@@ -9,6 +9,10 @@ import { depositSalt, predictForwarder } from "../../src/custody/forwarder";
  *   VAULT_ADDRESS=0x.. PAYOUT_OPERATOR_ADDRESS=0x.. PAYOUT_GUARDIAN_ADDRESS=0x.. \
  *   DEPLOYER_PRIVATE_KEY=0x.. npm run deploy:custody -- --network mezoMainnet
  *
+ * DEPOSITS_TO_HOT_PAYOUT=yes deploys HotPayout first and makes it the factory's vault, so
+ * deposits refill withdrawals with no vault signing; VAULT_ADDRESS then only administers
+ * HotPayout (unpause, caps, roles, recover) and the factory's token allowlist is fixed.
+ *
  * Without CONFIRM_DEPLOY=yes it validates and prints the plan, then exits without sending.
  * Optional caps: PAYOUT_NATIVE_PER_TX_SATS / PAYOUT_NATIVE_DAILY_SATS (sats), and
  * PAYOUT_<MUSD|MUSDC|MEZO>_PER_TX / _DAILY (whole tokens). 0/0 leaves a token out of payouts.
@@ -83,6 +87,7 @@ async function main() {
     ...TOKENS.map((t) => readCap(t.symbol, t.address, t.decimals, t.perTx, t.daily)),
   ];
   const payoutCaps = caps.filter((c) => c.daily > 0n);
+  const depositsToPayout = ["yes", "true"].includes(process.env.DEPOSITS_TO_HOT_PAYOUT?.trim() ?? "");
   const factoryTokens = TOKENS.map((t) => t.address);
 
   const { chainId } = await ethers.provider.getNetwork();
@@ -107,7 +112,11 @@ async function main() {
 
   console.log(`Network:   ${network.name} (chain ${chainId})`);
   console.log(`Deployer:  ${deployer.address} (${ethers.formatEther(await ethers.provider.getBalance(deployer))} BTC), no role after deploy`);
-  console.log(`Vault:     ${vault} (${vaultIsContract ? "contract, e.g. a Safe" : "EOA; a Safe is recommended"})`);
+  console.log(
+    `Vault:     ${vault} (${vaultIsContract ? "contract, e.g. a Safe" : "EOA"})` +
+    (depositsToPayout ? ", HotPayout admin only" : ""),
+  );
+  console.log(`Deposits:  swept to ${depositsToPayout ? "HotPayout (DEPOSITS_TO_HOT_PAYOUT=yes)" : "the vault"}`);
   console.log(`Operator:  ${operator}`);
   console.log(`Guardian:  ${guardian}`);
   console.log("DepositFactory sweep allowlist (native BTC is always swept):");
@@ -123,8 +132,13 @@ async function main() {
     return;
   }
 
-  const factory = await (await ethers.getContractFactory("DepositFactory")).deploy(vault, factoryTokens);
-  await factory.waitForDeployment();
+  const deployFactory = async (target: string) => {
+    const deployed = await (await ethers.getContractFactory("DepositFactory")).deploy(target, factoryTokens);
+    await deployed.waitForDeployment();
+    return deployed;
+  };
+  // With DEPOSITS_TO_HOT_PAYOUT, HotPayout goes first so the factory can point at it.
+  const factoryFirst = depositsToPayout ? null : await deployFactory(vault);
   const payout = await (await ethers.getContractFactory("HotPayout")).deploy(
     vault,
     operator,
@@ -134,20 +148,22 @@ async function main() {
     payoutCaps.map((c) => c.daily),
   );
   await payout.waitForDeployment();
+  const payoutAddress = await payout.getAddress();
+  const factory = factoryFirst ?? (await deployFactory(payoutAddress));
+  const depositTarget = depositsToPayout ? payoutAddress : vault;
   const factoryReceipt = await factory.deploymentTransaction()!.wait();
   const payoutReceipt = await payout.deploymentTransaction()!.wait();
 
   // Read everything back from chain before anyone configures the bot with these addresses.
   const factoryAddress = await factory.getAddress();
-  const payoutAddress = await payout.getAddress();
   const implementation = await factory.implementation();
   const forwarder = await ethers.getContractAt("DepositForwarder", implementation);
   const problems: string[] = [];
   const check = (ok: boolean, what: string) => {
     if (!ok) problems.push(what);
   };
-  check(sameAddress(await factory.vault(), vault), "DepositFactory.vault()");
-  check(sameAddress(await forwarder.vault(), vault), "DepositForwarder.vault()");
+  check(sameAddress(await factory.vault(), depositTarget), "DepositFactory.vault()");
+  check(sameAddress(await forwarder.vault(), depositTarget), "DepositForwarder.vault()");
   check(sameAddress(await forwarder.factory(), factoryAddress), "DepositForwarder.factory()");
   for (const t of TOKENS) check(await factory.allowedToken(t.address), `DepositFactory.allowedToken(${t.symbol})`);
   check(!(await factory.allowedToken(BTC_TOKEN)), "DepositFactory must not allowlist the BTC precompile");
@@ -182,9 +198,14 @@ async function main() {
   console.log(`DEPOSIT_FACTORY_ADDRESS=${factoryAddress}`);
   console.log(`DEPOSIT_FORWARDER_IMPLEMENTATION=${implementation}`);
   console.log(`HOT_PAYOUT_ADDRESS=${payoutAddress}`);
-  // Log scanners (Swept, and the watchdog's Paid) start here; the factory is deployed first.
-  console.log(`DEPOSIT_FACTORY_START_BLOCK=${factoryReceipt!.blockNumber}`);
-  console.log("\nNext: fund HotPayout from the vault with a small float only. The deployer key holds no role.");
+  console.log(`DEPOSITS_TO_HOT_PAYOUT=${depositsToPayout}`);
+  // Log scanners (Swept, and the watchdog's Paid) start at the earlier of the two deploys.
+  console.log(`DEPOSIT_FACTORY_START_BLOCK=${Math.min(factoryReceipt!.blockNumber, payoutReceipt!.blockNumber)}`);
+  console.log(
+    depositsToPayout
+      ? "\nNext: send reserves straight to HotPayout. The deployer key holds no role."
+      : "\nNext: fund HotPayout from the vault with a small float only. The deployer key holds no role.",
+  );
 }
 
 main().catch((error) => {

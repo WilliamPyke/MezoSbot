@@ -179,7 +179,7 @@ async function sweepForwarders(
   const embed = new EmbedBuilder()
     .setColor(sent > 0 ? 0x00cc6a : 0x95a5a6)
     .setTitle("🧹 Forwarder Sweeps Sent")
-    .setDescription("Funds move to the vault; balances are credited once each Swept event is confirmed.")
+    .setDescription("Funds move into custody; balances are credited once each Swept event is confirmed.")
     .addFields(
       { name: "Sent", value: `**${sent}**`, inline: true },
       { name: "Failed", value: `**${failed}**`, inline: true },

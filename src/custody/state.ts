@@ -31,6 +31,7 @@ const custodyEnv: CustodyEnv = {
   forwarderImplementation: config.custody.forwarderImplementation,
   depositFactoryStartBlock: config.custody.depositFactoryStartBlock,
   hotPayoutAddress: config.custody.hotPayoutAddress,
+  depositsToHotPayout: config.custody.depositsToHotPayout,
   payoutOperatorPrivateKey: config.custody.payoutOperatorPrivateKey,
   payoutGuardianPrivateKey: config.custody.payoutGuardianPrivateKey,
   sweepGasPrivateKey: config.custody.sweepGasPrivateKey,
@@ -268,7 +269,8 @@ function activate(settings: V2Settings): void {
   mode = "v2";
   reasons = [];
   console.log(
-    `[Custody] Mode v2: vault ${ethers.getAddress(settings.vault)}, factory ${ethers.getAddress(settings.factory)}, ` +
+    `[Custody] Mode v2: vault ${ethers.getAddress(settings.vault)}, deposits to ${ethers.getAddress(settings.depositTarget)}, ` +
+    `factory ${ethers.getAddress(settings.factory)}, ` +
     `HotPayout ${ethers.getAddress(settings.payout)}, operator ${ethers.getAddress(settings.operator)}, ` +
     `sweep gas ${ethers.getAddress(settings.sweepGas)}${settings.guardian ? `, guardian ${ethers.getAddress(settings.guardian)}` : ""}`,
   );
@@ -308,7 +310,7 @@ async function runChainCheck(settings: V2Settings): Promise<void> {
     return;
   }
   chainPaused = await readPaused(settings);
-  if (chainPaused) console.warn("[Custody] HotPayout is paused on-chain; withdrawals will be refused until the vault unpauses it.");
+  if (chainPaused) console.warn("[Custody] HotPayout is paused on-chain; withdrawals will be refused until the VAULT_ADDRESS wallet unpauses it.");
   await loadFreezeFlag(true);
   activate(settings);
 }

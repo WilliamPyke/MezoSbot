@@ -626,6 +626,51 @@ describe("HotPayout", () => {
   });
 });
 
+describe("DepositFactory sweeping straight into HotPayout", () => {
+  it("refills withdrawals with no vault transaction; the vault keeps admin and recovery", async () => {
+    const [, vault, operator, guardian, depositor, user, outsider] = await ethers.getSigners();
+    const Token = await ethers.getContractFactory("MockERC20");
+    const musd = await Token.deploy("Mezo USD", "MUSD");
+    const other = await Token.deploy("Other", "OTHER");
+    const payout = await (await ethers.getContractFactory("HotPayout")).deploy(
+      vault.address,
+      operator.address,
+      guardian.address,
+      [NATIVE, await musd.getAddress()],
+      [NATIVE_PER_TX, TOKEN_PER_TX],
+      [NATIVE_DAILY, TOKEN_DAILY],
+    );
+    const payoutAddress = await payout.getAddress();
+    const factory = await (await ethers.getContractFactory("DepositFactory")).deploy(payoutAddress, [await musd.getAddress()]);
+    expect(await factory.vault()).to.equal(payoutAddress);
+
+    const salt = depositSalt("direct-user");
+    const forwarder = await factory.predict(salt);
+    const native = sats(50_000);
+    const tokens = ethers.parseEther("20");
+    await depositor.sendTransaction({ to: forwarder, value: native });
+    await musd.mint(forwarder, tokens);
+
+    const sweepNative = factory.connect(outsider).sweepNative(salt);
+    await expect(sweepNative).to.emit(factory, "Swept").withArgs(salt, NATIVE, native, payoutAddress);
+    await expect(sweepNative).to.changeEtherBalances([forwarder, payout], [-native, native]);
+    await expect(factory.connect(outsider).sweepToken(salt, musd))
+      .to.emit(factory, "Swept")
+      .withArgs(salt, await musd.getAddress(), tokens, payoutAddress);
+
+    await expect(payout.connect(operator).payNative(withdrawalRef(1), user.address, native))
+      .to.changeEtherBalances([user, payout], [native, -native]);
+    await expect(payout.connect(operator).payToken(withdrawalRef(2), musd, user.address, tokens))
+      .to.changeTokenBalances(musd, [user, payout], [tokens, -tokens]);
+
+    // Recovery still goes only to the vault, and the factory's token allowlist is fixed at deploy.
+    await depositor.sendTransaction({ to: forwarder, value: native });
+    await factory.connect(outsider).sweepNative(salt);
+    await expect(payout.connect(vault).recover(NATIVE, native)).to.changeEtherBalances([vault, payout], [native, -native]);
+    await expect(factory.connect(vault).setTokenAllowed(other, true)).to.be.revertedWithCustomError(factory, "OnlyVault");
+  });
+});
+
 describe("Custody ABI the bot depends on", () => {
   const cases = [
     ["DepositFactory", DEPOSIT_FACTORY_ABI],

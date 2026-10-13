@@ -51,7 +51,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     : token === "SATS" ? (v2 ? formatSats(config.custody.minNativeDepositSats) : null)
     : `${config.deposits.minimums[token]} ${tokenLabel(token)}`;
   const howItWorks = v2
-    ? `Send **${depositAsset}** on Mezo to this address. It forwards only to the MezoSBOT vault; your balance is ` +
+    ? `Send **${depositAsset}** on Mezo to this address. It forwards only to MezoSBOT custody; your balance is ` +
       "credited once the deposit is swept there, usually within a few minutes."
     : `Send **${depositAsset}** on Mezo to this address. Your balance is credited automatically after polling.`;
 

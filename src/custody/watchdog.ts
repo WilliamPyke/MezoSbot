@@ -73,7 +73,7 @@ async function acknowledgedKeys(keys: string[]): Promise<Set<string>> {
 
 async function pausePayout(settings: V2Settings): Promise<string> {
   const guardian = getGuardianWallet();
-  if (!guardian) return "No guardian key is configured: pause HotPayout from the vault.";
+  if (!guardian) return "No guardian key is configured: pause HotPayout from the VAULT_ADDRESS wallet.";
   try {
     const { txHash } = await sendCustodyTx({
       wallet: guardian,
@@ -85,7 +85,7 @@ async function pausePayout(settings: V2Settings): Promise<string> {
     });
     return `The guardian sent HotPayout.pause() (${txHash}).`;
   } catch (error) {
-    return `The guardian could not pause HotPayout (${(error as Error).message}): pause it from the vault.`;
+    return `The guardian could not pause HotPayout (${(error as Error).message}): pause it from the VAULT_ADDRESS wallet.`;
   }
 }
 
@@ -278,7 +278,7 @@ export async function clearCustodyFreeze(actorId: string, note: string, confirmC
   try {
     const raw = await ethCall(settings.payout, PAYOUT.encodeFunctionData("paused"));
     if (PAYOUT.decodeFunctionResult("paused", raw)[0]) {
-      result.lines.push("HotPayout is still paused on-chain; withdrawals resume after the vault calls unpause().");
+      result.lines.push("HotPayout is still paused on-chain; withdrawals resume after the VAULT_ADDRESS wallet calls unpause().");
     }
   } catch {
     result.lines.push("Could not read HotPayout.paused().");
@@ -304,7 +304,7 @@ async function checkGas(settings: V2Settings): Promise<void> {
     if (Date.now() - (lowGasAlertedAt.get(signer.address) ?? 0) < LOW_GAS_ALERT_INTERVAL_MS) continue;
     lowGasAlertedAt.set(signer.address, Date.now());
     const message = `⛽ The ${signer.role} wallet ${checksum(signer.address)} has ${sats} sats of gas ` +
-      `(alert threshold ${threshold}). Top it up from the vault.`;
+      `(alert threshold ${threshold}). Top it up.`;
     console.warn(`[Watchdog] ${message}`);
     await notifyAdmins(message).catch(() => {});
   }

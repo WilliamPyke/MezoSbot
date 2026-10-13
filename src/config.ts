@@ -142,8 +142,9 @@ export const config = {
   },
   /**
    * Custody v2 (deploy/CUSTODY.md). Deposits go to keyless CREATE2 forwarders
-   * that can only sweep to the vault; withdrawals are paid from a capped
-   * HotPayout float by the operator key. src/custody/policy.ts decides the mode.
+   * that can only sweep to the vault, or straight into HotPayout when
+   * DEPOSITS_TO_HOT_PAYOUT=true; withdrawals are paid from the capped HotPayout
+   * by the operator key. src/custody/policy.ts decides the mode.
    */
   custody: {
     vaultAddress: optional("VAULT_ADDRESS", "").trim(),
@@ -152,6 +153,8 @@ export const config = {
     /** First block the Swept and Paid log scanners read (the factory deploy block). */
     depositFactoryStartBlock: optional("DEPOSIT_FACTORY_START_BLOCK", "").trim(),
     hotPayoutAddress: optional("HOT_PAYOUT_ADDRESS", "").trim(),
+    /** true: the factory was deployed with HotPayout as its vault, so deposits refill payouts. */
+    depositsToHotPayout: optional("DEPOSITS_TO_HOT_PAYOUT", "").trim(),
     payoutOperatorPrivateKey: optional("PAYOUT_OPERATOR_PRIVATE_KEY", "").trim(),
     /** Optional: lets the watchdog pause HotPayout on an anomaly. */
     payoutGuardianPrivateKey: optional("PAYOUT_GUARDIAN_PRIVATE_KEY", "").trim(),

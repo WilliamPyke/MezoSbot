@@ -53,7 +53,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
       result = !row
         ? "No deposit address is registered for this user."
         : bal > 0n
-          ? "The forwarder holds funds that are not credited yet. They are credited only after a sweep to the vault " +
+          ? "The forwarder holds funds that are not credited yet. They are credited only after a sweep into custody " +
             `(the poller sweeps at ${formatSats(config.custody.minNativeDepositSats)} or more; \`/sweep\` sweeps now).`
           : "Nothing waiting. v2 deposits are credited from confirmed Swept events only.";
     } else if (!row) {

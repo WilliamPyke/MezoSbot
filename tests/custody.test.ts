@@ -143,6 +143,7 @@ function custodyEnv(overrides: Partial<CustodyEnv> = {}): CustodyEnv {
     forwarderImplementation: IMPLEMENTATION,
     depositFactoryStartBlock: "1234",
     hotPayoutAddress: PAYOUT,
+    depositsToHotPayout: "",
     payoutOperatorPrivateKey: KEYS.operator,
     payoutGuardianPrivateKey: KEYS.guardian,
     sweepGasPrivateKey: KEYS.sweepGas,
@@ -245,15 +246,27 @@ test("mode: role keys must be distinct from each other and from other server key
   assert.ok(treasury.reasons.includes("PAYOUT_GUARDIAN_PRIVATE_KEY must not reuse TREASURY_PRIVATE_KEY"));
 });
 
-test("mode: the vault must be cold, distinct and uncompromised", () => {
+test("mode: the vault must be off-server, distinct and uncompromised", () => {
   const hot = checkCustodyConfig(custodyEnv({ vaultAddress: addressOf(KEYS.operator) }));
-  assert.ok(hot.reasons.includes("VAULT_ADDRESS must be a cold wallet, not the address of PAYOUT_OPERATOR_PRIVATE_KEY"));
+  assert.ok(hot.reasons.includes("VAULT_ADDRESS must be kept off this server, not the address of PAYOUT_OPERATOR_PRIVATE_KEY"));
   const payer = checkCustodyConfig(custodyEnv({ vaultAddress: addressOf(KEYS.imgnai) }));
-  assert.ok(payer.reasons.includes("VAULT_ADDRESS must be a cold wallet, not the address of IMGNAI_PAYER_PRIVATE_KEY"));
+  assert.ok(payer.reasons.includes("VAULT_ADDRESS must be kept off this server, not the address of IMGNAI_PAYER_PRIVATE_KEY"));
   const compromised = checkCustodyConfig(custodyEnv({ vaultAddress: COMPROMISED }));
   assert.ok(compromised.reasons.includes("VAULT_ADDRESS is a known-compromised address"));
   const sameAsPayout = checkCustodyConfig(custodyEnv({ vaultAddress: PAYOUT }));
   assert.ok(sameAsPayout.reasons.includes("VAULT_ADDRESS and HOT_PAYOUT_ADDRESS must be different addresses"));
+});
+
+test("mode: DEPOSITS_TO_HOT_PAYOUT sends deposits to HotPayout; the vault stays admin", () => {
+  const direct = checkCustodyConfig(custodyEnv({ depositsToHotPayout: "true" }));
+  assert.ok(direct.mode === "v2", direct.reasons.join("; "));
+  assert.equal(direct.settings.depositTarget, PAYOUT);
+  assert.equal(direct.settings.vault, VAULT);
+  const cold = checkCustodyConfig(custodyEnv({ depositsToHotPayout: "false" }));
+  assert.ok(cold.mode === "v2" && cold.settings.depositTarget === VAULT);
+  const bad = checkCustodyConfig(custodyEnv({ depositsToHotPayout: "yes" }));
+  assert.equal(bad.mode, "paused");
+  assert.ok(bad.reasons.includes("DEPOSITS_TO_HOT_PAYOUT must be true or false"));
 });
 
 function goodChain(settings: V2Settings): V2ChainState {
@@ -262,7 +275,7 @@ function goodChain(settings: V2Settings): V2ChainState {
     factoryCode: "0x6001",
     implementationCode: "0x6002",
     payoutCode: "0x6003",
-    factoryVault: settings.vault.toUpperCase().replace("0X", "0x"),
+    factoryVault: settings.depositTarget.toUpperCase().replace("0X", "0x"),
     factoryImplementation: settings.implementation,
     factoryPredict: predictForwarder(settings.factory, settings.implementation, depositSalt(PROBE_DISCORD_ID)),
     payoutVault: settings.vault,
@@ -306,6 +319,22 @@ test("boot chain check: every mismatch is reported", () => {
   // Without a guardian key the on-chain guardian is not compared.
   const noGuardian = { ...settings, guardian: null, guardianKey: null };
   assert.deepEqual(checkV2Chain(noGuardian, { ...goodChain(settings), payoutGuardian: "0x" + "77".repeat(20) }, 31612), []);
+});
+
+test("boot chain check: the factory must sweep to the configured deposit target", () => {
+  const direct = checkCustodyConfig(custodyEnv({ depositsToHotPayout: "true" }));
+  assert.ok(direct.mode === "v2");
+  assert.deepEqual(checkV2Chain(direct.settings, goodChain(direct.settings), 31612), []);
+  // A factory that sweeps to the vault is refused when deposits should fund HotPayout, and vice versa.
+  assert.deepEqual(
+    checkV2Chain(direct.settings, { ...goodChain(direct.settings), factoryVault: VAULT }, 31612),
+    [`DepositFactory.vault() is ${VAULT}, expected HOT_PAYOUT_ADDRESS ${PAYOUT}`],
+  );
+  const cold = v2Settings();
+  assert.deepEqual(
+    checkV2Chain(cold, { ...goodChain(cold), factoryVault: PAYOUT }, 31612),
+    [`DepositFactory.vault() is ${PAYOUT}, expected VAULT_ADDRESS ${VAULT}`],
+  );
 });
 
 const FACTORY_IFACE = new ethers.Interface(DEPOSIT_FACTORY_ABI);

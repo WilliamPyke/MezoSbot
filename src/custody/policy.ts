@@ -21,6 +21,8 @@ export type CustodyEnv = {
   forwarderImplementation: string;
   depositFactoryStartBlock: string;
   hotPayoutAddress: string;
+  /** "true" when DepositFactory sweeps straight into HotPayout instead of a separate vault. */
+  depositsToHotPayout: string;
   payoutOperatorPrivateKey: string;
   payoutGuardianPrivateKey: string;
   sweepGasPrivateKey: string;
@@ -33,7 +35,10 @@ export type CustodyEnv = {
 
 /** Validated v2 settings. Addresses are lowercase. */
 export type V2Settings = {
+  /** HotPayout's admin (its vault() role); kept off this server. */
   vault: string;
+  /** Where DepositFactory sweeps deposits: the vault, or HotPayout itself. */
+  depositTarget: string;
   factory: string;
   implementation: string;
   payout: string;
@@ -173,6 +178,9 @@ export function checkCustodyConfig(
   const sweepSponsor = env.sweepGasSponsorPrivateKey.trim() ? keyAddress(env.sweepGasSponsorPrivateKey) : null;
   const derivedSponsor = derivedV1SweepSponsorAddress(env.treasuryPrivateKey);
 
+  const depositsToPayoutRaw = env.depositsToHotPayout.trim().toLowerCase();
+  if (!["", "true", "false"].includes(depositsToPayoutRaw)) reasons.push("DEPOSITS_TO_HOT_PAYOUT must be true or false");
+
   const startRaw = env.depositFactoryStartBlock.trim();
   if (startRaw && !/^\d+$/.test(startRaw)) reasons.push("DEPOSIT_FACTORY_START_BLOCK is not a block number");
 
@@ -223,7 +231,7 @@ export function checkCustodyConfig(
     }
   }
   for (const [name, value] of [...roles, ...otherKeys]) {
-    if (sameAddress(vault, value)) reasons.push(`VAULT_ADDRESS must be a cold wallet, not the address of ${name}`);
+    if (sameAddress(vault, value)) reasons.push(`VAULT_ADDRESS must be kept off this server, not the address of ${name}`);
   }
   for (const [name, value] of roles) {
     for (const [contract, contractAddress] of contracts.slice(1)) {
@@ -239,6 +247,7 @@ export function checkCustodyConfig(
     reasons: [],
     settings: {
       vault,
+      depositTarget: depositsToPayoutRaw === "true" ? payout : vault,
       factory,
       implementation,
       payout,
@@ -290,7 +299,8 @@ export function checkV2Chain(settings: V2Settings, state: V2ChainState, expected
   const expect = (label: string, actual: string, expected: string, expectedName: string) => {
     if (!sameAddress(actual, expected)) reasons.push(`${label} is ${actual || "unreadable"}, expected ${expectedName} ${expected}`);
   };
-  expect("DepositFactory.vault()", state.factoryVault, settings.vault, "VAULT_ADDRESS");
+  const depositTargetName = sameAddress(settings.depositTarget, settings.payout) ? "HOT_PAYOUT_ADDRESS" : "VAULT_ADDRESS";
+  expect("DepositFactory.vault()", state.factoryVault, settings.depositTarget, depositTargetName);
   expect("DepositFactory.implementation()", state.factoryImplementation, settings.implementation, "DEPOSIT_FORWARDER_IMPLEMENTATION");
   expect("HotPayout.vault()", state.payoutVault, settings.vault, "VAULT_ADDRESS");
   expect("HotPayout.operator()", state.payoutOperator, settings.operator, "the PAYOUT_OPERATOR_PRIVATE_KEY address");

@@ -14,7 +14,7 @@ export const data = {
 };
 
 const MODE_LABELS = {
-  v2: "**v2**: cold vault + capped HotPayout float",
+  v2: "**v2**: keyless deposit addresses + capped HotPayout withdrawals",
   legacy: "**legacy**: treasury hot wallet",
   paused: "**paused**: on-chain deposits and withdrawals are off",
 } as const;
@@ -29,7 +29,7 @@ function units(amount: bigint, token: TokenSymbol): string {
 }
 
 function accountField(account: HoldingBalances): { name: string; value: string; inline: boolean } {
-  const label = account.label === "vault" ? "Vault" : account.label === "payout" ? "HotPayout float" : "Treasury";
+  const label = account.label === "vault" ? "Vault" : account.label === "payout" ? "HotPayout" : "Treasury";
   const balances = TOKEN_SYMBOLS.map((token) => `**${tokenLabel(token)}:** ${units(account.balances[token], token)}`);
   return { name: label, value: [link(account.address), ...balances].join("\n"), inline: true };
 }
