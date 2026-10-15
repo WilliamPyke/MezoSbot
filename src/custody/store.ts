@@ -2,7 +2,8 @@ import { supabase } from "../db.js";
 
 /**
  * Durable custody bookkeeping: log-scanner and watchdog cursors
- * (custody_cursors) and the custody freeze flag (bot_settings).
+ * (custody_cursors), the custody freeze flag (bot_settings) and per-user
+ * withdrawal holds (custody_withdrawal_holds).
  */
 
 export const CUSTODY_FROZEN_SETTING = "custody_frozen";
@@ -55,4 +56,17 @@ export async function writeFreezeFlag(flag: PersistedFreeze): Promise<void> {
 export async function deleteFreezeFlag(): Promise<void> {
   const { error } = await supabase.from("bot_settings").delete().eq("key", CUSTODY_FROZEN_SETTING);
   if (error) throw new Error(`custody freeze flag: ${error.message}`);
+}
+
+/**
+ * Admin hold on one user's on-chain withdrawals (/custody hold), checked
+ * before any debit (checkWithdrawalHolds in src/evm.ts). `held` false removes it.
+ */
+export async function setWithdrawalHold(discordId: string, held: boolean, actorId: string, note: string | null): Promise<void> {
+  const { error } = held
+    ? await supabase
+      .from("custody_withdrawal_holds")
+      .upsert({ discord_id: discordId, actor_id: actorId, note, created_at: new Date().toISOString() }, { onConflict: "discord_id" })
+    : await supabase.from("custody_withdrawal_holds").delete().eq("discord_id", discordId);
+  if (error) throw new Error(`withdrawal hold: ${error.message}`);
 }

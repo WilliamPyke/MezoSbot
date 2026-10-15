@@ -16,6 +16,9 @@ function optionalNumber(key: string, def: number): number {
   return Number.isFinite(parsed) ? parsed : def;
 }
 
+/** Mezo's public RPC refuses eth_getLogs over more than 10,000 blocks. */
+const MAX_LOG_RANGE_BLOCKS = 10_000;
+
 function optionalBool(key: string, def: boolean): boolean {
   const val = process.env[key];
   if (val === undefined) return def;
@@ -165,11 +168,11 @@ export const config = {
     watchdogMs: parseInt(optional("CUSTODY_WATCHDOG_MS", "60000"), 10),
     /** Operator / sweep-gas native balance (sats) below which admins are alerted. */
     lowGasSats: parseFloat(optional("CUSTODY_LOW_GAS_SATS", "1000")),
-    /** Block span of one eth_getLogs request. */
-    logChunkBlocks: parseInt(optional("CUSTODY_LOG_CHUNK_BLOCKS", "2000"), 10),
-    /** Every N scanner passes, re-read the last CUSTODY_DEEP_RESCAN_BLOCKS blocks (idempotent). */
+    /** Block span of one eth_getLogs request (at most 10,000). */
+    logChunkBlocks: Math.min(MAX_LOG_RANGE_BLOCKS, optionalNumber("CUSTODY_LOG_CHUNK_BLOCKS", 2000)),
+    /** Every N scanner passes, re-read the last CUSTODY_DEEP_RESCAN_BLOCKS blocks (idempotent, at most 10,000). */
     deepRescanPasses: optionalNumber("CUSTODY_DEEP_RESCAN_PASSES", 60),
-    deepRescanBlocks: optionalNumber("CUSTODY_DEEP_RESCAN_BLOCKS", 5000),
+    deepRescanBlocks: Math.min(MAX_LOG_RANGE_BLOCKS, optionalNumber("CUSTODY_DEEP_RESCAN_BLOCKS", 5000)),
   },
   depositWebUrl: optional("DEPOSIT_WEB_URL", "https://deposit.mallard.sh/sbot"),
   withdrawals: {
@@ -177,7 +180,7 @@ export const config = {
     enabled: optionalBool("WITHDRAWALS_ENABLED", false),
     eta: optional("WITHDRAWALS_ETA", "soon"),
     /** Per-user rolling 24h cap on SATS withdrawals (0 = no cap). HotPayout caps apply on top. */
-    userDailyMaxSats: optionalNumber("WITHDRAWAL_USER_DAILY_MAX_SATS", 200_000),
+    userDailyMaxSats: optionalNumber("WITHDRAWAL_USER_DAILY_MAX_SATS", 100_000),
   },
   /**
    * Public base URL of this bot's HTTP server (no trailing slash).

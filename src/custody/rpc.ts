@@ -1,6 +1,6 @@
 import { ethers } from "ethers";
 import { rawRpcCall } from "../evm.js";
-import type { RpcLog } from "./policy.js";
+import { readLogsSplitting, type RpcLog } from "./policy.js";
 
 /** JSON-RPC error raised by rawRpcCall; `data` carries revert data when the node returns it. */
 export type RpcFailure = Error & { rpcError?: boolean; code?: unknown; data?: unknown };
@@ -91,20 +91,55 @@ export async function getNonce(address: string, tag: "latest" | "pending"): Prom
   return toNumber(await rawRpcCall("eth_getTransactionCount", [address, tag]), "nonce");
 }
 
-export async function getLogs(filter: {
+type LogFilter = {
   address: string;
-  topics: Array<string | null>;
+  /** Per position: one topic, any of several, or null for any. */
+  topics: Array<string | string[] | null>;
   fromBlock: number;
   toBlock: number;
-}): Promise<RpcLog[]> {
+};
+
+async function getLogsOnce(filter: LogFilter): Promise<RpcLog[]> {
   const raw = await rawRpcCall("eth_getLogs", [{
     address: filter.address,
     topics: filter.topics,
     fromBlock: toHex(filter.fromBlock),
     toBlock: toHex(filter.toBlock),
   }]);
-  if (!Array.isArray(raw)) throw new Error("eth_getLogs returned no array");
+  if (!Array.isArray(raw)) {
+    const error = new Error("eth_getLogs returned no array") as RpcFailure;
+    error.rpcError = true;
+    throw error;
+  }
   return raw as RpcLog[];
+}
+
+/**
+ * The node answered and refused the request for its size (a JSON-RPC error,
+ * or HTTP 413), as opposed to never answering or rate limiting. Rate limits
+ * (HTTP 429, "rate limit" errors) and other HTTP errors are not split: a
+ * smaller range would only add requests.
+ */
+function nodeRefused(error: unknown): boolean {
+  const message = String((error as Error | null)?.message ?? "");
+  if (/rate.?limit|too many requests/i.test(message)) return false;
+  const http = /^RPC HTTP (\d{3}):/.exec(message);
+  if (http) return http[1] === "413";
+  return isRpcError(error);
+}
+
+/**
+ * eth_getLogs for [fromBlock, toBlock]. A range the node refuses (too many
+ * results, too wide) is read in halves, recursively (readLogsSplitting); a
+ * single block it still refuses, or a node that does not answer, throws.
+ */
+export async function getLogs(filter: LogFilter): Promise<RpcLog[]> {
+  return readLogsSplitting(
+    (fromBlock, toBlock) => getLogsOnce({ ...filter, fromBlock, toBlock }),
+    filter.fromBlock,
+    filter.toBlock,
+    { splittable: nodeRefused },
+  );
 }
 
 export type RpcReceipt = {

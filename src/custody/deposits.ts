@@ -26,6 +26,7 @@ import {
   type SweptEvent,
   type V2Settings,
 } from "./policy.js";
+import { createReviewDigest } from "./reviewDigest.js";
 import { ethCall, getBlockNumber, getLogs, getReceipt, nodeHasBlock } from "./rpc.js";
 import { sendCustodyTx } from "./signing.js";
 import { getSweepGasWallet, getV2Settings, isCustodyFrozen, onCustodyV2 } from "./state.js";
@@ -42,7 +43,15 @@ import { alertAdmins } from "./watchdog.js";
 
 const FACTORY = new ethers.Interface(DEPOSIT_FACTORY_ABI);
 
-export type DepositCallback = (discordId: string, amount: number, gasSats: number, txHash: string, token: TokenSymbol) => void;
+/** `options.notifyUser` is false for a credit below the token's deposit minimum: record it, but do not DM the user. */
+export type DepositCallback = (
+  discordId: string,
+  amount: number,
+  gasSats: number,
+  txHash: string,
+  token: TokenSymbol,
+  options?: { notifyUser: boolean },
+) => void;
 
 export function forwarderAddress(settings: V2Settings, discordId: string): string {
   return predictForwarder(settings.factory, settings.implementation, depositSalt(discordId));
@@ -65,7 +74,8 @@ let watchedLoadedAt = 0;
 /**
  * Issue (or re-issue) a user's v2 deposit address. An existing v1 address is
  * kept in legacy_address and never shown again. Refuses to replace a
- * different v2 address (a redeployed factory needs an explicit migration).
+ * different v2 address, and never re-issues a retired one (a new factory
+ * first retires the old addresses with retire_forwarder_addresses_v1).
  */
 export async function registerForwarderAddress(
   settings: V2Settings,
@@ -256,6 +266,31 @@ export async function sweepForwarderNow(
 
 /* ─────────── Balance poller ─────────── */
 
+const BALANCE_UPDATE_BATCH = 500;
+
+/**
+ * Store observed forwarder balances through update_deposit_address_balances,
+ * falling back to one update per row when that function errors (as the
+ * legacy poller in src/evm.ts does).
+ */
+async function storeObservedBalances(observed: Array<{ discord_id: string; last_checked_balance: string }>): Promise<void> {
+  for (let i = 0; i < observed.length; i += BALANCE_UPDATE_BATCH) {
+    const batch = observed.slice(i, i + BALANCE_UPDATE_BATCH);
+    const { error } = await supabase.rpc("update_deposit_address_balances", { p_updates: batch });
+    if (!error) continue;
+    warnOnce("observed", `[Deposits] Batch balance update failed (${error.message}); falling back to per-row updates`);
+    const results = await mapWithConcurrency(batch, Math.max(1, config.deposits.balanceConcurrency), async (row) => {
+      const { error: rowError } = await supabase
+        .from("deposit_addresses")
+        .update({ last_checked_balance: row.last_checked_balance })
+        .eq("discord_id", row.discord_id);
+      if (rowError) throw new Error(rowError.message);
+    });
+    const failed = results.filter((result) => result.status === "rejected").length;
+    if (failed > 0) warnOnce("observed-rows", `[Deposits] Could not store ${failed} observed forwarder balance(s)`);
+  }
+}
+
 let polling = false;
 
 async function pollOnce(settings: V2Settings): Promise<void> {
@@ -306,12 +341,9 @@ async function pollOnce(settings: V2Settings): Promise<void> {
         firstError ||= String((result.reason as Error)?.message ?? result.reason).replace(/\s+/g, " ").slice(0, 300);
       }
     }
-    if (observed.length > 0) {
-      // last_checked_balance is only an observation marker in v2 (crediting
-      // comes from Swept events); it decides when to re-run verification.
-      const { error } = await supabase.rpc("update_deposit_address_balances", { p_updates: observed });
-      if (error) warnOnce("observed", `[Deposits] Could not store observed forwarder balances: ${error.message}`);
-    }
+    // last_checked_balance is only an observation marker in v2 (crediting
+    // comes from Swept events); it decides when to re-run verification.
+    await storeObservedBalances(observed);
     if (failures > 0) warnOnce("poll", `[Deposits] ${failures} forwarder check(s) failed this poll; first error: ${firstError}`);
   } finally {
     polling = false;
@@ -345,6 +377,42 @@ type CreditResult = {
   already_recorded?: boolean;
 };
 
+/** Review alerts go to admins as one digest at most every 10 minutes, never awaited by the scanner. */
+const reviewDigest = createReviewDigest({ send: alertAdmins });
+
+/** Smallest deposit of `token` (atomic units) swept for a non-admin user; 0 when it cannot be read. */
+function depositMinimumUnits(token: TokenSymbol): bigint {
+  try {
+    return token === "SATS"
+      ? satsToTokenUnits(Math.max(0, config.custody.minNativeDepositSats))
+      : tokenDecimalToUnits(config.deposits.minimums[token], token);
+  } catch {
+    return 0n;
+  }
+}
+
+function belowDepositMinimum(token: TokenSymbol | null, amount: bigint): boolean {
+  return token != null && amount < depositMinimumUnits(token);
+}
+
+/**
+ * Hand a credit to the deposit callback (ledger entry, user DM) after the
+ * scanner has moved on, so it never waits on Discord and a failing callback
+ * never fails the scan. Credits below the token's deposit minimum are
+ * recorded without a user DM.
+ */
+function notifyDeposit(onDeposit: DepositCallback | undefined, result: CreditResult, event: SweptEvent, token: TokenSymbol): void {
+  if (!onDeposit) return;
+  const notifyUser = !belowDepositMinimum(token, event.amount);
+  setImmediate(() => {
+    try {
+      onDeposit(String(result.discord_id), Number(result.amount), 0, String(result.deposit_ref), token, { notifyUser });
+    } catch (error) {
+      console.warn(`[Deposits] Deposit callback for ${result.deposit_ref} failed: ${(error as Error)?.message ?? error}`);
+    }
+  });
+}
+
 /** Credit one Swept event (idempotent on tx hash + log index). Throws when the database call fails. */
 async function creditSwept(settings: V2Settings, event: SweptEvent, onDeposit?: DepositCallback): Promise<void> {
   const token = tokenForAddress(event.token);
@@ -366,7 +434,7 @@ async function creditSwept(settings: V2Settings, event: SweptEvent, onDeposit?: 
   switch (result.status) {
     case "credited":
       console.log(`[Deposits] Credited ${result.amount} ${result.token} to ${result.discord_id} from ${where}`);
-      onDeposit?.(String(result.discord_id), Number(result.amount), 0, String(result.deposit_ref), result.token ?? "SATS");
+      notifyDeposit(onDeposit, result, event, result.token ?? "SATS");
       return;
     case "duplicate":
       return;
@@ -375,9 +443,17 @@ async function creditSwept(settings: V2Settings, event: SweptEvent, onDeposit?: 
     case "unknown_token":
     case "conflicting_event":
       if (!result.already_recorded) {
-        const message = `Swept event ${where} was not credited (${result.status}); it is in custody_sweep_reviews.`;
-        console.error(`[Deposits] REVIEW: ${message}`);
-        await alertAdmins(`🔎 Deposit held for review: ${message}`);
+        console.error(`[Deposits] REVIEW: Swept event ${where} was not credited (${result.status}); it is in custody_sweep_reviews.`);
+        reviewDigest.queue({
+          status: result.status,
+          txHash: event.txHash,
+          logIndex: event.logIndex,
+          salt: event.salt,
+          token: event.token,
+          tokenLabel: token,
+          amount: event.amount,
+          belowMinimum: result.status === "unknown_salt" && belowDepositMinimum(token, event.amount),
+        });
       }
       return;
     default:

@@ -1010,8 +1010,9 @@ async function main() {
     });
   }
 
-  // Custody v2 watchdog: DMs every ADMIN_IDS user when it freezes custody or
-  // a custody gas wallet runs low.
+  // Custody v2 watchdog: DMs every ADMIN_IDS user when it freezes custody, a
+  // custody gas wallet runs low or HotPayout's daily limit is nearly used;
+  // deposit review alerts go through the same notifier as a digest.
   startCustodyWatchdog(async (message) => {
     for (const adminId of config.discord.adminIds) {
       await client.users.fetch(adminId).then((user) => user.send(message)).catch((err) =>
@@ -1025,7 +1026,7 @@ async function main() {
   );
   startImgnaiWorker(client);
 
-  startDepositPoller((discordId, amountSats, gasSats, txHash, token) => {
+  startDepositPoller((discordId, amountSats, gasSats, txHash, token, options) => {
     console.log(`Auto-deposit: ${formatTokenAmount(amountSats, token)} for ${discordId}`);
     recordLedgerEntry(client, {
       type: "deposit",
@@ -1037,6 +1038,8 @@ async function main() {
       referenceId: txHash,
       metadata: gasSats > 0 ? { gas_sats: gasSats } : {},
     });
+    // Credits below the token's deposit minimum are recorded without a DM.
+    if (options?.notifyUser === false) return;
     client.users.fetch(discordId).then((u) => {
       const embed = new EmbedBuilder()
         .setColor(0x00cc6a)

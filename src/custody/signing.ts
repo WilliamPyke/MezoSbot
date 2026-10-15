@@ -6,7 +6,7 @@ import { describeCustodyRevert, weiToSats } from "./policy.js";
 import { estimateGas, getNonce, isRpcError, revertData } from "./rpc.js";
 import { assertCanSign } from "./state.js";
 
-export type SignedTxPurpose = "withdrawal" | "sweep_native" | "sweep_token" | "pause";
+export type SignedTxPurpose = "withdrawal" | "sweep_native" | "sweep_token" | "pause" | "cancel" | "tighten";
 
 /**
  * Record a transaction the bot signed with a custody key BEFORE it is
@@ -31,6 +31,42 @@ export async function recordSignedTx(entry: {
     created_at: new Date().toISOString(),
   }, { onConflict: "signer,tx_hash", ignoreDuplicates: true });
   if (error) throw new Error(`could not record the signed transaction: ${error.message}`);
+}
+
+type SignedTxEntry = Parameters<typeof recordSignedTx>[0];
+
+/** How long the emergency pause waits for its record before it is broadcast anyway. */
+const EMERGENCY_RECORD_WAIT_MS = 10_000;
+const RECORD_RETRY_MIN_MS = 5_000;
+const RECORD_RETRY_MAX_MS = 60_000;
+const RECORD_RETRY_LOG_INTERVAL_MS = 10 * 60_000;
+const recordRetries = new Set<string>();
+
+/**
+ * Keep trying to record a signed transaction that was broadcast without a
+ * record (the emergency pause only), until it is stored, so the watchdog's
+ * nonce check finds it. Backs off to once a minute; logs at most every 10 minutes.
+ */
+function retryRecordUntilStored(entry: SignedTxEntry): void {
+  const key = `${entry.signer.toLowerCase()}:${entry.txHash.toLowerCase()}`;
+  if (recordRetries.has(key)) return;
+  recordRetries.add(key);
+  let delay = RECORD_RETRY_MIN_MS;
+  let loggedAt = Date.now();
+  const attempt = () => {
+    recordSignedTx(entry).then(() => {
+      recordRetries.delete(key);
+      console.warn(`[Custody] ${entry.purpose} ${entry.txHash} (nonce ${entry.nonce}) is now recorded in custody_signed_txs`);
+    }, (error) => {
+      if (Date.now() - loggedAt >= RECORD_RETRY_LOG_INTERVAL_MS) {
+        loggedAt = Date.now();
+        console.error(`[Custody] ${entry.purpose} ${entry.txHash} (nonce ${entry.nonce}) is still not recorded (retrying): ${(error as Error).message}`);
+      }
+      delay = Math.min(RECORD_RETRY_MAX_MS, delay * 2);
+      setTimeout(attempt, delay).unref?.();
+    });
+  };
+  setTimeout(attempt, delay).unref?.();
 }
 
 const signerQueues = new Map<string, Promise<void>>();
@@ -58,6 +94,9 @@ export async function withSignerLock<T>(signer: string, fn: () => Promise<T>): P
  * Sign a contract call with a custody key, record it, then broadcast. The
  * call is estimated first, so a call that would revert is never signed.
  * `bypassFreeze` is only for the guardian's pause() while freezing.
+ * `emergencyPause` (purpose "pause" only) still broadcasts when the record
+ * cannot be written, then keeps retrying the record in the background
+ * (`recorded: false`); every other transaction is sent only once recorded.
  */
 export async function sendCustodyTx(input: {
   wallet: ethers.Wallet;
@@ -66,7 +105,8 @@ export async function sendCustodyTx(input: {
   purpose: SignedTxPurpose;
   ref: string | null;
   bypassFreeze?: boolean;
-}): Promise<{ txHash: string; nonce: number }> {
+  emergencyPause?: boolean;
+}): Promise<{ txHash: string; nonce: number; recorded: boolean }> {
   const check = () => {
     if (!input.bypassFreeze) assertCanSign();
   };
@@ -100,7 +140,30 @@ export async function sendCustodyTx(input: {
       type: 0,
     });
     const txHash = ethers.keccak256(signed);
-    await recordSignedTx({ signer: from, nonce, txHash, purpose: input.purpose, ref: input.ref });
+    const entry: SignedTxEntry = { signer: from, nonce, txHash, purpose: input.purpose, ref: input.ref };
+    const emergency = input.emergencyPause === true && input.purpose === "pause";
+    let recorded = true;
+    try {
+      if (!emergency) await recordSignedTx(entry);
+      else {
+        // The pause never waits on a slow database for long (the upsert is idempotent and retried).
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        await Promise.race([
+          recordSignedTx(entry),
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new Error(`no answer within ${EMERGENCY_RECORD_WAIT_MS}ms`)), EMERGENCY_RECORD_WAIT_MS);
+          }),
+        ]).finally(() => clearTimeout(timer));
+      }
+    } catch (error) {
+      // Only the emergency pause goes out without its record.
+      if (!emergency) throw error;
+      recorded = false;
+      console.error(
+        `[Custody] EMERGENCY PAUSE ${txHash} (nonce ${nonce}) could not be recorded in custody_signed_txs ` +
+        `(${(error as Error).message}); broadcasting it anyway and retrying the record`,
+      );
+    }
     try {
       await rawRpcCall("eth_sendRawTransaction", [signed]);
     } catch (error) {
@@ -109,6 +172,7 @@ export async function sendCustodyTx(input: {
         console.warn(`[Custody] ${input.purpose} ${txHash}: broadcast errored (may still land): ${message.slice(0, 300)}`);
       }
     }
-    return { txHash, nonce };
+    if (!recorded) retryRecordUntilStored(entry);
+    return { txHash, nonce, recorded };
   });
 }

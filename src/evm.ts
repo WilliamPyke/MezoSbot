@@ -6,26 +6,33 @@ import { roundSats } from "./format.js";
 import { recordLedgerEntry } from "./ledger.js";
 import { verifyWalletFromDeposit } from "./walletVerification.js";
 import { CUSTODY_PAUSED_MESSAGE, isCompromisedAddress } from "./custody/compromised.js";
-import { registerForwarderAddress, startForwarderDeposits } from "./custody/deposits.js";
+import { registerForwarderAddress, startForwarderDeposits, type DepositCallback } from "./custody/deposits.js";
+import { newWithdrawalRef } from "./custody/forwarder.js";
 import { getHoldingsUnits } from "./custody/holdings.js";
 import {
   expectedPayoutForRow,
   explainRevertedPayout,
   gatherPayoutProof,
   isRefPaid,
-  payoutRef,
   planPayout,
 } from "./custody/payout.js";
 import {
   DAY_MS,
+  MAX_PAYOUT_GAS_LIMIT,
+  REVERTED_DESTINATION_HOLD_MS,
+  checkDepositHold,
   checkUserDailyCap,
   encodePayoutCall,
   isPayoutAnomaly,
+  revertPointsAtDestination,
+  revertedDestinationProblem,
   sumRecentSatsWithdrawals,
   withdrawalDestinationProblem,
+  type DepositHoldCheck,
+  type PayoutRevert,
   type V2Settings,
 } from "./custody/policy.js";
-import { freezeCustody } from "./custody/watchdog.js";
+import { alertAdmins, freezeCustody } from "./custody/watchdog.js";
 import { withdrawalKey } from "./custody/watchdogCore.js";
 import { recordSignedTx } from "./custody/signing.js";
 import {
@@ -1137,7 +1144,7 @@ async function reconcileNativeDepositSweep(row: DepositAddressRow): Promise<"rea
  * hadn't mined yet.
  */
 export function startDepositPoller(
-  onDeposit?: (discordId: string, amount: number, gasSats: number, txHash: string, token: TokenSymbol) => void
+  onDeposit?: DepositCallback
 ) {
   if (getConfiguredV2Settings()) {
     // v1 addresses are never polled under custody v2. If the boot check has
@@ -1451,7 +1458,7 @@ export async function quoteErc20WithdrawalGas(
   const v2 = getCustodyMode() === "v2" ? getV2Settings() : null;
   if (v2) {
     // HotPayout.payToken from the operator, simulated.
-    const plan = await planPayout(v2, { withdrawalId: null, to: normalized, token, amount });
+    const plan = await planPayout(v2, { ref: null, to: normalized, token, amount });
     if (!plan.ok) throw new Error(plan.error);
     return { gasLimit: plan.gasLimit, gasPrice: plan.gasPrice, gasSats: plan.gasSats };
   }
@@ -1491,7 +1498,10 @@ export type WithdrawalRecord = {
   signed_at: string | null;
   /** Custody v2: the operator that signed the HotPayout call; null for treasury rows. */
   signer_address: string | null;
-  /** Custody v2: HotPayout ref (withdrawalRef(id)), written with tx_hash before broadcast. */
+  /**
+   * Custody v2: HotPayout ref, random (newWithdrawalRef), stored once before
+   * the payout is planned and kept for life; tx_hash is written later.
+   */
   payout_ref: string | null;
 };
 
@@ -1533,13 +1543,15 @@ async function persistWithdrawalBroadcast(
   signedAt: number,
   payout?: { signer_address: string; payout_ref: string },
 ): Promise<{ ok: true } | { ok: false; error: string }> {
-  const { data, error } = await supabase
+  let query = supabase
     .from("withdrawals")
     .update({ tx_hash: txHash, nonce, raw_tx: rawTx, signed_at: new Date(signedAt).toISOString(), ...(payout ?? {}) })
     .eq("id", id)
     .eq("status", "pending")
-    .is("tx_hash", null)
-    .select("id");
+    .is("tx_hash", null);
+  // A payout is persisted only onto the row that holds the ref it was signed with.
+  if (payout) query = query.eq("payout_ref", payout.payout_ref);
+  const { data, error } = await query.select("id");
   if (error) return { ok: false, error: error.message };
   if (!data?.length) return { ok: false, error: "withdrawal is no longer pending" };
   return { ok: true };
@@ -1632,6 +1644,55 @@ export async function checkUserWithdrawalCap(
   return { ...checkUserDailyCap(sumRecentSatsWithdrawals(data ?? [], now), amount, capSats), capSats };
 }
 
+export type WithdrawalHoldCheck =
+  | { status: "ok" }
+  /** An admin put the user's on-chain withdrawals on hold (/custody hold). */
+  | { status: "admin_hold"; note: string | null }
+  /** Forwarder deposits credited in the last 24h cannot leave on-chain yet (checkDepositHold). */
+  | ({ status: "deposit_hold" } & DepositHoldCheck);
+
+/**
+ * Custody v2 withdrawal holds, checked before reserving and next to the
+ * per-user daily cap: an admin hold on the user (custody_withdrawal_holds),
+ * then the deposit hold, where funds credited from forwarder deposits
+ * (custody_forwarder_credits) in the last 24h cannot be withdrawn on-chain:
+ * withdrawable = balance of `token` − those credits of `token`, never
+ * negative. Like the cap, these are soft checks outside reserve_withdrawal_v2
+ * (they read, then the reservation acts); HotPayout's caps stay the hard
+ * limit. Throws when a check cannot be read.
+ */
+export async function checkWithdrawalHolds(
+  discordId: string,
+  token: TokenSymbol,
+  amount: number,
+): Promise<WithdrawalHoldCheck> {
+  if (!getConfiguredV2Settings()) return { status: "ok" };
+  const { data: hold, error: holdError } = await supabase
+    .from("custody_withdrawal_holds")
+    .select("note")
+    .eq("discord_id", discordId)
+    .maybeSingle();
+  if (holdError) throw new Error(`Could not check withdrawal holds: ${holdError.message}`);
+  if (hold) return { status: "admin_hold", note: (hold.note as string | null) ?? null };
+
+  const now = Date.now();
+  const { data: credits, error: creditError } = await supabase
+    .from("custody_forwarder_credits")
+    .select("credited_amount, created_at")
+    .eq("discord_id", discordId)
+    .eq("token", token)
+    .gte("created_at", new Date(now - DAY_MS).toISOString());
+  if (creditError) throw new Error(`Could not check recent deposits: ${creditError.message}`);
+  if (!credits?.length) return { status: "ok" };
+  const balanceQuery = token === "SATS"
+    ? supabase.from("users").select("balance:balance_sats").eq("discord_id", discordId).maybeSingle()
+    : supabase.from("user_token_balances").select("balance").eq("discord_id", discordId).eq("token", token).maybeSingle();
+  const { data: balanceRow, error: balanceError } = await balanceQuery;
+  if (balanceError) throw new Error(`Could not read the balance: ${balanceError.message}`);
+  const check = checkDepositHold(Number((balanceRow as { balance?: unknown } | null)?.balance ?? 0), amount, credits, now);
+  return check.ok ? { status: "ok" } : { status: "deposit_hold", ...check };
+}
+
 export type WithdrawalPreflight =
   | { ok: true }
   | {
@@ -1671,7 +1732,7 @@ export async function preflightWithdrawal(
     const v2 = getCustodyMode() === "v2" ? getV2Settings() : null;
     if (v2) {
       // Caps, pause, float and recipient, by simulating the HotPayout call.
-      const plan = await planPayout(v2, { withdrawalId: null, to: normalized, token, amount });
+      const plan = await planPayout(v2, { ref: null, to: normalized, token, amount });
       if (plan.ok) return { ok: true };
       const code = plan.code === "already_paid" || plan.code === "paid_unknown" ? "unavailable" : plan.code;
       return { ok: false, code, error: plan.error };
@@ -1693,8 +1754,10 @@ export async function preflightWithdrawal(
 
 /**
  * Destinations that never receive withdrawals: any deposit address (current
- * forwarders and retired v1 addresses), the custody contracts and role
- * wallets, and known-compromised addresses.
+ * forwarders, retired v1 addresses and forwarders retired with an earlier
+ * factory), the custody contracts and role wallets, and known-compromised
+ * addresses. Under custody v2 an address whose payout reverted on-chain is
+ * also refused for 7 days.
  */
 async function withdrawalDestinationRefusal(normalized: string): Promise<string | null> {
   const v2 = getConfiguredV2Settings();
@@ -1708,13 +1771,28 @@ async function withdrawalDestinationRefusal(normalized: string): Promise<string 
       { label: "payout guardian wallet", address: v2.guardian },
     ]
     : [];
-  // legacy_address exists once the custody v2 migration is applied, which v2 requires.
+  // legacy_address exists once the custody v2 migration is applied, which v2
+  // requires; retired_deposit_addresses and custody_reverted_payouts once the
+  // custody v3 bot migration is applied.
   const query = supabase.from("deposit_addresses").select("discord_id").limit(1);
-  const { data, error } = v2
-    ? await query.or(`address.eq.${normalized},legacy_address.eq.${normalized}`)
-    : await query.eq("address", normalized);
+  const [current, retired, reverted] = await Promise.all([
+    v2 ? query.or(`address.eq.${normalized},legacy_address.eq.${normalized}`) : query.eq("address", normalized),
+    v2 ? supabase.from("retired_deposit_addresses").select("address").eq("address", normalized).limit(1) : null,
+    v2
+      ? supabase
+        .from("custody_reverted_payouts")
+        .select("created_at")
+        .eq("to_address", normalized)
+        .gte("created_at", new Date(Date.now() - REVERTED_DESTINATION_HOLD_MS).toISOString())
+        .order("created_at", { ascending: false })
+        .limit(1)
+      : null,
+  ]);
+  const error = current.error ?? retired?.error ?? reverted?.error;
   if (error) throw new Error(`Could not check the destination address: ${error.message}`);
-  return withdrawalDestinationProblem(normalized, blocked, (data?.length ?? 0) > 0, isRuntimeCompromised);
+  const isDepositAddress = (current.data?.length ?? 0) > 0 || (retired?.data?.length ?? 0) > 0;
+  return withdrawalDestinationProblem(normalized, blocked, isDepositAddress, isRuntimeCompromised)
+    ?? revertedDestinationProblem(reverted?.data?.[0]?.created_at ?? null, Date.now());
 }
 
 type NativeWithdrawalPlan =
@@ -1805,6 +1883,9 @@ async function signPersistAndBroadcast(
   payout?: { signer: ethers.Wallet; payoutRef: string },
 ): Promise<WithdrawalBroadcast> {
   if (!payout) assertCustodyAvailable();
+  if (payout && request.gasLimit > MAX_PAYOUT_GAS_LIMIT) {
+    return { broadcast: false, error: `Payout gas limit ${request.gasLimit} is above the ${MAX_PAYOUT_GAS_LIMIT} maximum` };
+  }
   const signer = payout?.signer ?? treasury();
   return withWithdrawalSendLock(async () => {
     if (payout) assertCanSign();
@@ -2001,6 +2082,65 @@ export async function executeWithdrawal(
 }
 
 /**
+ * The row's HotPayout reference, generated on first use: a random ref
+ * (newWithdrawalRef) is written only onto a pending, hashless row that has
+ * none, then read back, so whatever the row holds (this ref, or one stored
+ * earlier) is its ref for life. Throws when it cannot be stored or
+ * confirmed; nothing has been signed at that point.
+ */
+async function ensurePayoutRef(record: WithdrawalRecord): Promise<string> {
+  if (record.payout_ref) return record.payout_ref;
+  const { error } = await supabase
+    .from("withdrawals")
+    .update({ payout_ref: newWithdrawalRef(record.id) })
+    .eq("id", record.id)
+    .eq("status", "pending")
+    .is("tx_hash", null)
+    .is("payout_ref", null);
+  const { data, error: readError } = await supabase
+    .from("withdrawals")
+    .select("payout_ref, status")
+    .eq("id", record.id)
+    .maybeSingle();
+  const stored = typeof data?.payout_ref === "string" ? data.payout_ref.toLowerCase() : null;
+  if (!stored || !/^0x[0-9a-f]{64}$/.test(stored)) {
+    throw new Error(`Could not store the withdrawal reference: ${error?.message ?? readError?.message ?? "not recorded"}`);
+  }
+  if (data?.status !== "pending") throw new Error("The withdrawal is no longer pending");
+  record.payout_ref = stored;
+  return stored;
+}
+
+/**
+ * A HotPayout payout for `record` was mined and reverted. When the revert
+ * points at the destination (revertPointsAtDestination: the recipient
+ * rejected the payment or ran out of gas), the address is refused for 7 days
+ * (custody_reverted_payouts) and admins get one DM per withdrawal.
+ */
+async function recordRevertedPayout(record: WithdrawalRecord, txHash: string, revert: PayoutRevert | null): Promise<void> {
+  if (!revertPointsAtDestination(revert?.error)) return;
+  const { data, error } = await supabase
+    .from("custody_reverted_payouts")
+    .upsert({
+      withdrawal_id: record.id,
+      to_address: record.to_address.toLowerCase(),
+      tx_hash: txHash.toLowerCase(),
+      reason: revert?.error ?? null,
+    }, { onConflict: "withdrawal_id", ignoreDuplicates: true })
+    .select("withdrawal_id");
+  if (error) {
+    console.error(`[Withdraw] Could not record the reverted payout of withdrawal ${record.id} (${txHash}): ${error.message}`);
+    return;
+  }
+  if (!data?.length) return;
+  const message = `⚠️ Withdrawal ${record.id} (${record.discord_id}, ${record.amount_sats} ${record.token} → ${record.to_address}) ` +
+    `reverted on-chain in ${txHash} (${revert?.error ?? "no custody error; likely out of gas at the recipient"}). ` +
+    "Withdrawals to that address are refused for 7 days; the withdrawal is refunded.";
+  console.warn(`[Withdraw] ${message}`);
+  void alertAdmins(message);
+}
+
+/**
  * Custody v2: pay the reserved withdrawal through HotPayout.payNative /
  * payToken from the operator. The exact call is simulated first; a revert
  * (paused, cap, float, recipient) means nothing is signed and the user is
@@ -2014,7 +2154,7 @@ async function executePayoutWithdrawal(record: WithdrawalRecord, settings: V2Set
   try {
     if (!operator) throw new Error("the payout operator key is unavailable");
     const plan = await planPayout(settings, {
-      withdrawalId: record.id,
+      ref: await ensurePayoutRef(record),
       to: record.to_address,
       token: record.token,
       amount: record.amount_sats,
@@ -2070,8 +2210,9 @@ async function executePayoutWithdrawal(record: WithdrawalRecord, settings: V2Set
     const reverted = poll.reason === "reverted"
       ? await explainRevertedPayout(settings, expected, (poll.observation?.receipt as { blockNumber?: unknown } | null)?.blockNumber)
       : null;
+    if (poll.reason === "reverted") await recordRevertedPayout(record, txHash, reverted);
     result.error = poll.reason === "reverted"
-      ? reverted ?? "Transaction reverted on-chain"
+      ? reverted?.message ?? "Transaction reverted on-chain"
       : "Transaction was dropped by the network";
   } else if (isPayoutAnomaly(poll)) {
     console.error(`[Withdraw] MANUAL REVIEW: withdrawal ${record.id} (${txHash}) has no matching HotPayout Paid log; held pending`);
@@ -2303,9 +2444,11 @@ async function recoverOneWithdrawal(record: WithdrawalRecord): Promise<void> {
       );
       return;
     }
-    if (payoutSettings) {
+    // A row without a stored ref was never signed for HotPayout: the ref is
+    // stored before anything is planned or signed.
+    if (payoutSettings && record.payout_ref) {
       // A ref HotPayout shows as paid was paid by someone: never refund it.
-      const paid = await isRefPaid(payoutSettings, payoutRef(record.id)).catch(() => null);
+      const paid = await isRefPaid(payoutSettings, record.payout_ref).catch(() => null);
       if (paid !== false) {
         logWithdrawalForReview(
           record.id,
@@ -2326,17 +2469,24 @@ async function recoverOneWithdrawal(record: WithdrawalRecord): Promise<void> {
   const isPayout = record.signer_address != null || record.payout_ref != null;
   const signedAt = Date.parse(record.signed_at ?? record.created_at);
   let observe: () => Promise<WithdrawalObservation>;
+  let expected: ReturnType<typeof expectedPayoutForRow> = null;
   if (isPayout) {
     if (!payoutSettings) {
       logWithdrawalForReview(record.id, "HotPayout withdrawal but custody v2 is not configured; cannot verify it");
       return;
     }
+    const ref = record.payout_ref;
+    if (!ref) {
+      logWithdrawalForReview(record.id, "HotPayout withdrawal without a stored payout_ref; cannot verify it");
+      return;
+    }
     const settings = payoutSettings;
     const signer = record.signer_address ?? settings.operator;
-    const expected = expectedPayoutForRow(settings, record);
+    const signedCall = expectedPayoutForRow(settings, record);
+    expected = signedCall;
     observe = async () => {
       const observation = await observeWithdrawalTx(txHash, record.nonce, signedAt, signer);
-      observation.payout = await gatherPayoutProof(settings, { ref: payoutRef(record.id), expected, observation, ownTxHash: txHash });
+      observation.payout = await gatherPayoutProof(settings, { ref, expected: signedCall, observation, ownTxHash: txHash });
       return observation;
     };
   } else {
@@ -2374,6 +2524,12 @@ async function recoverOneWithdrawal(record: WithdrawalRecord): Promise<void> {
     return;
   }
 
+  if (isPayout && payoutSettings && verdict.outcome === "refund" && verdict.reason === "reverted") {
+    const revert = expected
+      ? await explainRevertedPayout(payoutSettings, expected, (observation.receipt as { blockNumber?: unknown } | null)?.blockNumber)
+      : null;
+    await recordRevertedPayout(record, txHash, revert);
+  }
   const final = await finalizeWithdrawal(record, {
     outcome: verdict.outcome,
     reason: verdict.reason,

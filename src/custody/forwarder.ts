@@ -23,7 +23,30 @@ export function predictForwarder(factory: string, implementation: string, salt: 
   return ethers.getCreate2Address(ethers.getAddress(factory), salt, initCodeHash);
 }
 
-/** Bytes32 reference for a withdrawal row, used as HotPayout's replay key. */
+/**
+ * Legacy deterministic bytes32 for a withdrawal id (the custody v2 draft
+ * scheme). Withdrawals no longer use it (see newWithdrawalRef); it stays for
+ * tests that need a stable bytes32 per id.
+ */
 export function withdrawalRef(withdrawalId: number | bigint): string {
   return ethers.keccak256(ethers.toUtf8Bytes(`mezosbot-withdrawal-v2:${withdrawalId.toString()}`));
+}
+
+/** HotPayout reference for withdrawal `withdrawalId` from 32 bytes of `entropy` (lowercase bytes32). */
+export function withdrawalRefFromEntropy(withdrawalId: number | bigint, entropy: Uint8Array | string): string {
+  const bytes = ethers.getBytes(entropy);
+  if (bytes.length !== 32) throw new Error("withdrawal reference entropy must be 32 bytes");
+  return ethers.keccak256(ethers.toUtf8Bytes(
+    `mezosbot-withdrawal-v3:${withdrawalId.toString()}:${ethers.hexlify(bytes).toLowerCase()}`,
+  )).toLowerCase();
+}
+
+/**
+ * A fresh, unpredictable HotPayout reference (HotPayout's replay key) for a
+ * withdrawal row. It is generated once, stored on the row
+ * (withdrawals.payout_ref) before anything is signed, and every later step
+ * uses the stored value; a row never gets a second one.
+ */
+export function newWithdrawalRef(withdrawalId: number | bigint): string {
+  return withdrawalRefFromEntropy(withdrawalId, ethers.randomBytes(32));
 }

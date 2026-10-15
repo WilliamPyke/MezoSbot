@@ -2,11 +2,23 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { ethers } from "ethers";
 import { DEPOSIT_FACTORY_ABI, HOT_PAYOUT_ABI, NATIVE_TOKEN } from "../src/custody/abi.js";
+import { cancelCalldata, decideQueued, decodeAdminLog, describeQueued, matchExpectation, parseExpectation } from "../src/custody/adminActions.js";
 import { isCompromisedAddress } from "../src/custody/compromised.js";
-import { cloneInitCode, depositSalt, predictForwarder, withdrawalRef } from "../src/custody/forwarder.js";
 import {
+  cloneInitCode,
+  depositSalt,
+  newWithdrawalRef,
+  predictForwarder,
+  withdrawalRef,
+  withdrawalRefFromEntropy,
+} from "../src/custody/forwarder.js";
+import {
+  BTC_PRECOMPILE_ADDRESS,
+  MAX_LOG_SPLIT_READS,
+  MAX_PAYOUT_GAS_LIMIT,
   PAID_TOPIC,
   PERMIT2_ADDRESS,
+  REVERTED_DESTINATION_HOLD_MS,
   PROBE_DISCORD_ID,
   REFUND_VERIFY_SPAN_MS,
   SWEPT_TOPIC,
@@ -14,6 +26,7 @@ import {
   anomalySetCode,
   applyPayoutProof,
   checkCustodyConfig,
+  checkDepositHold,
   checkTopUpAllowance,
   checkUserDailyCap,
   checkV2Chain,
@@ -39,10 +52,16 @@ import {
   parsePaidLog,
   parseSweptLog,
   payoutCapacity,
+  payoutGasLimit,
+  readLogsSplitting,
   refundCheckOutcome,
+  revertPointsAtDestination,
+  revertedDestinationProblem,
   sortByChainPosition,
   sumRecentSatsWithdrawals,
   sumRecentTopUps,
+  tokenContractProblems,
+  topSatsWithdrawers,
   weiToSats,
   withdrawalDestinationProblem,
   type CustodyEnv,
@@ -64,6 +83,16 @@ import {
   type RefundCheckRecord,
   type WatchdogIO,
 } from "../src/custody/watchdogCore.js";
+import {
+  REVIEW_DIGEST_EXAMPLES,
+  REVIEW_DIGEST_GATHER_MS,
+  REVIEW_DIGEST_INTERVAL_MS,
+  addToBatch,
+  createReviewDigest,
+  formatReviewDigest,
+  type ReviewAlert,
+  type ReviewDigestBatch,
+} from "../src/custody/reviewDigest.js";
 import { hmacSecret } from "../src/secrets.js";
 
 test("the drained treasury address is recognised in any casing", () => {
@@ -113,7 +142,20 @@ test("forwarder prediction matches the CREATE2 formula for EIP-1167 clones", () 
   assert.equal(predictForwarder(factory, implementation, salt), expected);
 });
 
-test("withdrawal refs are unique per withdrawal id", () => {
+test("withdrawal refs are random per withdrawal and domain-separated", () => {
+  const ref = newWithdrawalRef(7);
+  assert.match(ref, /^0x[0-9a-f]{64}$/);
+  assert.notEqual(ref, newWithdrawalRef(7), "a second ref for the same id differs");
+  assert.notEqual(ref, withdrawalRef(7).toLowerCase(), "not the legacy deterministic ref");
+  const entropy = "0x" + "5a".repeat(32);
+  assert.equal(
+    withdrawalRefFromEntropy(7, entropy),
+    ethers.keccak256(ethers.toUtf8Bytes(`mezosbot-withdrawal-v3:7:${entropy}`)),
+  );
+  assert.equal(withdrawalRefFromEntropy(7n, ethers.getBytes(entropy)), withdrawalRefFromEntropy(7, entropy.toUpperCase().replace("0X", "0x")));
+  assert.notEqual(withdrawalRefFromEntropy(7, entropy), withdrawalRefFromEntropy(8, entropy));
+  assert.throws(() => withdrawalRefFromEntropy(7, "0x1234"), /32 bytes/);
+  // The legacy helper stays deterministic (contract tests use it for fixed refs).
   assert.notEqual(withdrawalRef(1), withdrawalRef(2));
   assert.equal(withdrawalRef(7), withdrawalRef(7n));
 });
@@ -281,6 +323,8 @@ function goodChain(settings: V2Settings): V2ChainState {
     payoutVault: settings.vault,
     payoutOperator: ethers.getAddress(settings.operator),
     payoutGuardian: settings.guardian ?? "",
+    payoutFactory: settings.factory,
+    payoutImplementation: settings.implementation.toLowerCase(),
   };
 }
 
@@ -306,9 +350,13 @@ test("boot chain check: every mismatch is reported", () => {
     factoryPredict: "0x" + "98".repeat(20),
     payoutOperator: addressOf(KEYS.sweepGas),
     payoutGuardian: addressOf(KEYS.operator),
+    payoutFactory: "",
+    payoutImplementation: "0x" + "97".repeat(20),
   };
   const reasons = checkV2Chain(settings, state, 31612);
-  assert.equal(reasons.length, 7, reasons.join("\n"));
+  assert.equal(reasons.length, 9, reasons.join("\n"));
+  assert.ok(reasons.some((r) => r.startsWith("HotPayout.factory() is unreadable")));
+  assert.ok(reasons.some((r) => r.startsWith("HotPayout.forwarderImplementation()")));
   assert.ok(reasons.some((r) => r.startsWith("RPC chain id 1")));
   assert.ok(reasons.some((r) => r.startsWith("HOT_PAYOUT_ADDRESS") && r.endsWith("has no contract code")));
   assert.ok(reasons.some((r) => r.startsWith("DepositFactory.vault()")));
@@ -1175,4 +1223,293 @@ test("unfreeze confirmation codes and refund verification rules", () => {
     { kind: "unpaid", state: { falseReads: 3, firstFalseAt: 1000 }, verified: true });
   assert.deepEqual(refundCheckOutcome({ falseReads: 1, firstFalseAt: 0 }, false, 2 * REFUND_VERIFY_SPAN_MS),
     { kind: "unpaid", state: { falseReads: 2, firstFalseAt: 0 }, verified: false }, "an hour alone is not enough");
+});
+
+/* ─────────── Log ranges, review digests, holds and checks ─────────── */
+
+const rangeLog = (block: number, index: number): RpcLog => ({
+  blockNumber: `0x${block.toString(16)}`,
+  logIndex: `0x${index.toString(16)}`,
+  transactionHash: hash(block * 100 + index),
+});
+const refused = () => Object.assign(new Error("query returned more than 10000 results"), { rpcError: true, code: -32005 });
+
+/** A node that refuses (JSON-RPC error) any range holding more than `limit` logs, as Mezo's public RPC does. */
+function limitedNode(logs: RpcLog[], limit: number) {
+  const reads: Array<[number, number]> = [];
+  const read = async (from: number, to: number) => {
+    reads.push([from, to]);
+    const hits = logs.filter((log) => {
+      const block = Number(BigInt(String(log.blockNumber)));
+      return block >= from && block <= to;
+    });
+    if (hits.length > limit) throw refused();
+    return hits;
+  };
+  return { read, reads };
+}
+
+test("log reads: a refused range is split in halves until every log is read, in block/log order", async () => {
+  const logs: RpcLog[] = [];
+  for (let block = 100; block <= 400; block += 3) {
+    // Block 250 holds exactly the node's limit.
+    for (let index = 0; index < (block === 250 ? 40 : 4); index++) logs.push(rangeLog(block, index));
+  }
+  const node = limitedNode(logs, 40);
+  assert.deepEqual(await readLogsSplitting(node.read, 0, 9_999), logs);
+  assert.ok(node.reads.length > 1 && node.reads.length <= MAX_LOG_SPLIT_READS, `${node.reads.length} reads`);
+  assert.ok(node.reads.every(([from, to]) => from <= to));
+  // A range the node serves is a single read.
+  const quiet = limitedNode(logs, 1_000);
+  assert.deepEqual(await readLogsSplitting(quiet.read, 0, 9_999), logs);
+  assert.deepEqual(quiet.reads, [[0, 9_999]]);
+});
+
+test("log reads: a single block the node still refuses fails the read; other errors are not split", async () => {
+  const crowded = limitedNode([rangeLog(10, 0), ...Array.from({ length: 12 }, (_, i) => rangeLog(500, i))], 10);
+  await assert.rejects(readLogsSplitting(crowded.read, 0, 1_000), /more than 10000 results/);
+  assert.ok(crowded.reads.some(([from, to]) => from === 500 && to === 500), "split down to the single block");
+
+  let calls = 0;
+  const unreachable = async (): Promise<RpcLog[]> => {
+    calls += 1;
+    throw new Error("fetch failed");
+  };
+  const nodeAnswered = (error: unknown) => !!(error as { rpcError?: boolean }).rpcError;
+  await assert.rejects(readLogsSplitting(unreachable, 0, 1_000, { splittable: nodeAnswered }), /fetch failed/);
+  assert.equal(calls, 1, "a node that never answered is not asked again per half");
+
+  // A node that refuses every range wider than one block: bounded by the read budget.
+  let narrow = 0;
+  const oneBlockOnly = async (from: number, to: number): Promise<RpcLog[]> => {
+    narrow += 1;
+    if (to > from) throw refused();
+    return [];
+  };
+  await assert.rejects(readLogsSplitting(oneBlockOnly, 0, 9_999), /more than 10000 results/);
+  assert.ok(narrow <= MAX_LOG_SPLIT_READS, `${narrow} reads`);
+  narrow = 0;
+  assert.deepEqual(await readLogsSplitting(oneBlockOnly, 0, 15), []);
+  assert.equal(narrow, 31);
+});
+
+const reviewAlert = (overrides: Partial<ReviewAlert> = {}): ReviewAlert => ({
+  status: "unknown_salt",
+  txHash: hash(1),
+  logIndex: 0,
+  salt: "0x" + "ee".repeat(32),
+  token: NATIVE_TOKEN,
+  tokenLabel: "SATS",
+  amount: 5_000n * 10n ** 10n,
+  belowMinimum: false,
+  ...overrides,
+});
+
+test("review digest: counts by status, at most a few examples, small unknown-salt sweeps only counted", () => {
+  const batch: ReviewDigestBatch = { total: 0, counts: new Map(), belowMinimum: new Map(), examples: [] };
+  for (let i = 0; i < 30; i++) addToBatch(batch, reviewAlert({ txHash: hash(100 + i), amount: 1n, belowMinimum: true }));
+  addToBatch(batch, reviewAlert({ status: "wrong_vault", txHash: hash(7) }));
+  for (let i = 0; i < 8; i++) addToBatch(batch, reviewAlert({ status: "conflicting_event", txHash: hash(200 + i) }));
+  assert.equal(batch.examples.length, REVIEW_DIGEST_EXAMPLES);
+
+  const message = formatReviewDigest(batch);
+  assert.match(message, /39 Swept events were not credited/);
+  assert.match(message, /• unknown_salt: 30 \(30 below the deposit minimum, not listed\)/);
+  assert.match(message, /• wrong_vault: 1\n/);
+  assert.match(message, /• conflicting_event: 8/);
+  assert.ok(message.includes(`tx ${hash(7)}:0`), "an example names the transaction");
+  assert.ok(!message.includes(hash(100)), "small unknown-salt sweeps are never listed");
+  assert.match(message, /…and 34 more/);
+  assert.ok(message.length <= 1800);
+
+  const short = formatReviewDigest(batch, 400);
+  assert.ok(short.length <= 400, `${short.length} characters`);
+  assert.match(short, /• conflicting_event: 8/, "the totals survive the length cap");
+});
+
+test("review digest: queued events go out as one message, at most every 10 minutes", async () => {
+  let now = 1_000_000;
+  const sent: string[] = [];
+  const timers: Array<{ fn: () => void; ms: number }> = [];
+  const digest = createReviewDigest({
+    send: async (message) => {
+      sent.push(message);
+    },
+    now: () => now,
+    schedule: (fn, ms) => timers.push({ fn, ms }),
+  });
+  const fire = async () => {
+    const timer = timers.shift()!;
+    now += timer.ms;
+    timer.fn();
+    await new Promise((resolve) => setImmediate(resolve));
+  };
+
+  digest.queue(reviewAlert());
+  digest.queue(reviewAlert({ status: "wrong_vault", txHash: hash(2) }));
+  assert.equal(sent.length, 0, "queueing never sends");
+  assert.deepEqual(timers.map((timer) => timer.ms), [REVIEW_DIGEST_GATHER_MS], "one timer per batch");
+  await fire();
+  assert.equal(sent.length, 1);
+  assert.match(sent[0], /2 Swept events were not credited/);
+  assert.equal(digest.pending(), 0);
+
+  digest.queue(reviewAlert({ txHash: hash(3) }));
+  assert.deepEqual(timers.map((timer) => timer.ms), [REVIEW_DIGEST_INTERVAL_MS], "the next digest waits out the interval");
+  await fire();
+  assert.equal(sent.length, 2);
+  assert.match(sent[1], /1 Swept event was not credited/);
+
+  now += 3 * REVIEW_DIGEST_INTERVAL_MS;
+  digest.queue(reviewAlert({ txHash: hash(4) }));
+  assert.deepEqual(timers.map((timer) => timer.ms), [REVIEW_DIGEST_GATHER_MS], "after a quiet period only the gather delay");
+  await digest.flush();
+  await digest.flush();
+  assert.equal(sent.length, 3, "an empty flush sends nothing");
+});
+
+test("deposit hold: forwarder credits of the last 24h cannot be withdrawn on-chain yet", () => {
+  const now = Date.parse("2026-10-15T12:00:00Z");
+  const hour = 3_600_000;
+  const at = (hoursAgo: number) => new Date(now - hoursAgo * hour).toISOString();
+  const credits = [
+    { credited_amount: 3_000, created_at: at(20) },
+    { credited_amount: 5_000, created_at: at(2) },
+    { credited_amount: 9_000, created_at: at(30) },
+  ];
+  assert.deepEqual(checkDepositHold(10_000, 2_000, credits, now), { ok: true, held: 8_000, withdrawable: 2_000, unlockAtMs: null });
+  assert.deepEqual(checkDepositHold(10_000, 4_000, credits, now), { ok: false, held: 8_000, withdrawable: 2_000, unlockAtMs: now + 4 * hour });
+  assert.equal(checkDepositHold(10_000, 6_000, credits, now).unlockAtMs, now + 22 * hour);
+  // Deposits already spent elsewhere: withdrawable is never negative.
+  assert.deepEqual(checkDepositHold(5_000, 1, credits, now), { ok: false, held: 8_000, withdrawable: 0, unlockAtMs: now + 4 * hour });
+  // More than the balance is left to the reservation's balance check.
+  assert.equal(checkDepositHold(10_000, 10_001, credits, now).ok, true);
+  assert.deepEqual(checkDepositHold(10_000, 10_000, [], now), { ok: true, held: 0, withdrawable: 10_000, unlockAtMs: null });
+});
+
+test("payout headroom alert lists the largest SATS withdrawers of the last 24h", () => {
+  const now = Date.parse("2026-10-15T12:00:00Z");
+  const recent = new Date(now - 3_600_000).toISOString();
+  const old = new Date(now - 25 * 3_600_000).toISOString();
+  const rows = [
+    { discord_id: "a", amount_sats: 30_000, token: "SATS", status: "completed", created_at: recent },
+    { discord_id: "a", amount_sats: 30_000, token: "SATS", status: "pending", created_at: recent },
+    { discord_id: "b", amount_sats: 70_000, token: "SATS", status: "completed", created_at: recent },
+    { discord_id: "c", amount_sats: 99_000, token: "SATS", status: "failed", created_at: recent },
+    { discord_id: "d", amount_sats: 99_000, token: "SATS", status: "completed", created_at: old },
+    { discord_id: "e", amount_sats: 99_000, token: "MUSD", status: "completed", created_at: recent },
+    ...Array.from({ length: 6 }, (_, i) => ({
+      discord_id: `u${i}`, amount_sats: 1_000 + i, token: "SATS", status: "completed", created_at: recent,
+    })),
+  ];
+  assert.deepEqual(topSatsWithdrawers(rows, now, 5), [
+    { discordId: "b", sats: 70_000 },
+    { discordId: "a", sats: 60_000 },
+    { discordId: "u5", sats: 1_005 },
+    { discordId: "u4", sats: 1_004 },
+    { discordId: "u3", sats: 1_003 },
+  ]);
+});
+
+test("withdrawal destinations: an address whose payout reverted at the recipient is refused for 7 days", () => {
+  const now = Date.parse("2026-10-15T12:00:00Z");
+  assert.equal(revertedDestinationProblem(null, now), null);
+  const sixDaysAgo = new Date(now - 6 * 24 * 3_600_000).toISOString();
+  const until = Math.ceil((Date.parse(sixDaysAgo) + REVERTED_DESTINATION_HOLD_MS) / 1000);
+  const message = revertedDestinationProblem(sixDaysAgo, now);
+  assert.ok(message?.includes("failed on-chain") && message.includes(`<t:${until}:f>`), String(message));
+  assert.equal(revertedDestinationProblem(new Date(now - REVERTED_DESTINATION_HOLD_MS - 1).toISOString(), now), null);
+
+  assert.equal(revertPointsAtDestination("PayFailed"), true);
+  assert.equal(revertPointsAtDestination("BadRecipient"), true);
+  assert.equal(revertPointsAtDestination(null), false, "an unread cause does not blame the destination");
+  for (const error of ["EnforcedPause", "DailyCapExceeded", "PerTxCapExceeded", "InsufficientFloat", "AlreadyPaid"]) {
+    assert.equal(revertPointsAtDestination(error), false, error);
+  }
+});
+
+test("payout gas: the signed limit is bounded and an estimate above the bound is refused", () => {
+  assert.equal(MAX_PAYOUT_GAS_LIMIT, 200_000n);
+  assert.equal(payoutGasLimit(60_000n, 73_000n), 73_000n);
+  assert.equal(payoutGasLimit(190_000n, 229_000n), MAX_PAYOUT_GAS_LIMIT, "the buffer never lifts it above the bound");
+  assert.equal(payoutGasLimit(200_000n, 241_000n), MAX_PAYOUT_GAS_LIMIT);
+  assert.equal(payoutGasLimit(200_001n, 241_001n), null);
+});
+
+test("token check at activation: decimals must match; no address(0), BTC precompile or shared address", () => {
+  const MUSD = "0xdD468A1DDc392dcdbEf6db6e34E89AA338F9F186";
+  const MUSDC = "0x04671C72Aab5AC02A03c1098314b1BB6B560c197";
+  assert.deepEqual(tokenContractProblems([
+    { symbol: "MUSD", address: MUSD, configuredDecimals: 18, onChainDecimals: 18 },
+    { symbol: "MUSDC", address: MUSDC, configuredDecimals: 6, onChainDecimals: 6 },
+    { symbol: "MEZO", address: "", configuredDecimals: 18, onChainDecimals: null },
+  ]), [], "an unset token is skipped");
+
+  const problems = tokenContractProblems([
+    { symbol: "MUSD", address: MUSD, configuredDecimals: 18, onChainDecimals: 6 },
+    { symbol: "MUSDC", address: NATIVE_TOKEN, configuredDecimals: 6, onChainDecimals: null },
+    { symbol: "MEZO", address: BTC_PRECOMPILE_ADDRESS.toUpperCase().replace("0X", "0x"), configuredDecimals: 18, onChainDecimals: 18 },
+  ]);
+  assert.equal(problems.length, 3, problems.join("\n"));
+  assert.match(problems[0], /^MUSD_TOKEN_DECIMALS is 18, but MUSD_TOKEN_CONTRACT 0x[0-9a-f]{40} has 6 decimals$/);
+  assert.match(problems[1], /^MUSDC_TOKEN_CONTRACT is the zero address$/);
+  assert.match(problems[2], /^MEZO_TOKEN_CONTRACT is the BTC precompile/);
+
+  const more = tokenContractProblems([
+    { symbol: "MUSD", address: MUSD, configuredDecimals: 18, onChainDecimals: null },
+    { symbol: "MUSDC", address: MUSD.toLowerCase(), configuredDecimals: 6, onChainDecimals: 18 },
+    { symbol: "MEZO", address: "0x1234", configuredDecimals: 18, onChainDecimals: null },
+  ]);
+  assert.equal(more.length, 4, more.join("\n"));
+  assert.match(more[0], /MUSD_TOKEN_CONTRACT .* does not answer decimals\(\)/);
+  assert.match(more[1], /MUSDC_TOKEN_CONTRACT and MUSD_TOKEN_CONTRACT are the same address/);
+  assert.match(more[2], /MUSDC_TOKEN_DECIMALS is 6, but .* has 18 decimals/);
+  assert.match(more[3], /MEZO_TOKEN_CONTRACT 0x1234 is not an address/);
+});
+
+/* ─────────── Queued vault actions ─────────── */
+
+test("vault actions: a queued action decodes from its event and only an exact, unexpired, unused approval matches", () => {
+  const payout = "0x" + "a1".repeat(20);
+  const factory = "0x" + "b2".repeat(20);
+  const id = "0x" + "c3".repeat(32);
+  const encoded = PAYOUT_IFACE.encodeEventLog("ActionQueued", [id, 4, NATIVE_TOKEN, 12_000_000_000_000n, 0n, 1_800_000_000n]);
+  const log = { address: payout, topics: encoded.topics, data: encoded.data, transactionHash: "0x" + "d4".repeat(32), logIndex: "0x2", blockNumber: "0x10" };
+  const decoded = decodeAdminLog(log, payout, factory);
+  assert.ok(decoded && decoded.kind === "queued");
+  assert.deepEqual(decoded.queued, { id, action: "recover", subject: NATIVE_TOKEN, value1: 12_000_000_000_000n, value2: 0n, eta: 1_800_000_000 });
+  assert.equal(describeQueued(decoded.queued), "move 1,200 sats from HotPayout to the vault");
+  assert.equal(decodeAdminLog({ ...log, address: factory }, payout, factory), null, "a HotPayout event from another address is ignored");
+  assert.equal(decodeAdminLog({ ...log, removed: true }, payout, factory), null);
+
+  const now = Date.parse("2026-10-15T12:00:00Z");
+  const approval = { id: 1, action: "recover" as const, subject: NATIVE_TOKEN, value1: "12000000000000", value2: "0", expires_at: "2026-10-16T00:00:00Z", used_by: null };
+  assert.equal(matchExpectation(decoded.queued, [approval], now)?.id, 1);
+  assert.equal(matchExpectation(decoded.queued, [{ ...approval, value1: "12000000000001" }], now), null, "another amount");
+  assert.equal(matchExpectation(decoded.queued, [{ ...approval, used_by: "0xabc:1" }], now), null, "already used");
+  assert.equal(matchExpectation(decoded.queued, [{ ...approval, expires_at: "2026-10-15T11:59:59Z" }], now), null, "expired");
+  assert.equal(matchExpectation(decoded.queued, [{ ...approval, action: "caps" as const }], now), null, "another action");
+
+  assert.equal(decideQueued(decoded.queued, true), "approved");
+  assert.equal(decideQueued(decoded.queued, false), "cancel");
+  assert.equal(decideQueued({ action: "guardian" }, false), "vault-must-cancel", "only the vault can cancel a new guardian");
+
+  const call = PAYOUT_IFACE.decodeFunctionData("cancel", cancelCalldata(decoded.queued));
+  assert.deepEqual([Number(call[0]), call[1].toLowerCase(), call[2], call[3]], [4, NATIVE_TOKEN, 12_000_000_000_000n, 0n]);
+});
+
+test("vault actions: /custody expect input becomes the exact values HotPayout emits", () => {
+  assert.deepEqual(parseExpectation("caps", "sats", "80000", "150000"), {
+    subject: NATIVE_TOKEN,
+    value1: 80_000n * 10n ** 10n,
+    value2: 150_000n * 10n ** 10n,
+  });
+  assert.deepEqual(parseExpectation("recover", "SATS", "1200", null), { subject: NATIVE_TOKEN, value1: 1_200n * 10n ** 10n, value2: 0n });
+  const operator = "0x" + "ab".repeat(20);
+  assert.deepEqual(parseExpectation("operator", operator.toUpperCase().replace("0X", "0x"), null, null), { subject: operator, value1: 0n, value2: 0n });
+  assert.ok("error" in parseExpectation("operator", "SATS", null, null));
+  assert.ok("error" in parseExpectation("caps", "SATS", "200", "100"), "per-tx above daily");
+  assert.ok("error" in parseExpectation("caps", "SATS", "100", null), "daily missing");
+  assert.ok("error" in parseExpectation("recover", "SATS", "0", null), "zero amount");
+  assert.ok("error" in parseExpectation("recover", "DOGE", "1", null), "unknown token");
 });

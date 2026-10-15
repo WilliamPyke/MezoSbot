@@ -228,3 +228,9 @@ jobs:
           $$;
           SQL
           psql -v ON_ERROR_STOP=1 -f tests/custody-db.sql
+      - name: Custody v3 bot migration
+        run: |
+          psql -v ON_ERROR_STOP=1 -f migrations/2026-10-15_custody_v3_bot.sql
+          psql -v ON_ERROR_STOP=1 -f migrations/2026-10-15_custody_v3_bot.sql
+          psql -v ON_ERROR_STOP=1 -f tests/custody-db.sql
+          psql -v ON_ERROR_STOP=1 -f tests/custody-v3-db.sql

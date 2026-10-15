@@ -8,12 +8,12 @@ touched for deposits, withdrawals and imgnAI top-ups.
 
 | Piece | What it is | Where its key lives |
 | --- | --- | --- |
-| Vault (`VAULT_ADDRESS`) | Holds the reserves. Every deposit sweep lands here. | Offline: a Safe whose owners are hardware wallets, or a hardware wallet. Never on the server. |
-| DepositFactory + forwarders | One CREATE2 deposit address per user. No key exists for it; its funds can only be swept to the vault. Anyone may trigger a sweep. | None |
-| HotPayout (`HOT_PAYOUT_ADDRESS`) | A small withdrawal float with a per-transaction cap and a daily cap per token. The daily cap is a leaky bucket: spending drains back at the daily cap per 24 hours, so `remainingDaily(token)` is the authoritative headroom. Each withdrawal reference can be paid once. | Holds no key; roles below |
+| Vault (`VAULT_ADDRESS`) | Holds the reserves (or, with `DEPOSITS_TO_HOT_PAYOUT=true`, only administers HotPayout). It is HotPayout's admin and the DepositFactory's admin. Its own powers are delayed (see "Queued vault actions"). | Offline: a Safe whose owners are hardware wallets, a hardware wallet, or (direct mode) any wallet you own that is not on the server. Never on the server. |
+| DepositFactory + forwarders | One CREATE2 deposit address per user. No key exists for it; its funds can only be swept to the deposit target. Anyone may trigger a sweep. The admin can add tokens to the sweep allowlist (never remove them) and hand tokens that are not allowlisted, sent to a deposit address by mistake, to itself. | None |
+| HotPayout (`HOT_PAYOUT_ADDRESS`) | The withdrawal float with a per-transaction cap and a daily cap per token. The daily cap is a leaky bucket: spending drains back at the daily cap per 24 hours, so `remainingDaily(token)` is the authoritative headroom. Each withdrawal reference can be paid once. It never pays the factory, its implementation or a deployed deposit address. | Holds no key; roles below |
 | Operator (`PAYOUT_OPERATOR_PRIVATE_KEY`) | Signs `payNative` / `payToken` for withdrawals, inside the caps. | Server. Holds gas only. |
 | Sweep gas (`SWEEP_GAS_PRIVATE_KEY`) | Pays gas for `sweepNative` / `sweepToken`. | Server. Holds gas only. |
-| Guardian (`PAYOUT_GUARDIAN_PRIVATE_KEY`, optional on the server) | Can only pause HotPayout and tighten caps. With its key on the server the watchdog pauses HotPayout automatically; a leaked guardian key can do no more than pause or tighten. | Server, or your own device (then pause by hand when the watchdog DMs you) |
+| Guardian (`PAYOUT_GUARDIAN_PRIVATE_KEY`, optional on the server) | Can only pause HotPayout, tighten caps and cancel queued vault actions (except a new guardian, which only the vault can cancel). With its key on the server the watchdog pauses HotPayout automatically and `/custody cancel` works; a leaked guardian key can do no more than pause, tighten or cancel. | Server, or your own device (then pause and cancel by hand when the watchdog DMs you) |
 | imgnAI payer (`IMGNAI_PAYER_PRIVATE_KEY`) | Pays x402 top-ups, capped per top-up and per 24h. It only ever signs an exact-amount MUSD transfer authorization (no approvals or permits). Without a valid, uncompromised key, image generation is paused; no other key is used instead. | Server. Small MUSD float. |
 | Deployer (`DEPLOYER_PRIVATE_KEY`) | Deploys the two contracts once; has no role afterwards. | Your machine, once |
 
@@ -90,22 +90,37 @@ A single hardware wallet also works. The vault:
 
 - receives every deposit sweep (the factory has it fixed at deploy);
 - is the only account that can unpause HotPayout, loosen caps, change the
-  operator or guardian, change the allowlists, or pull the float back
-  (`recover`, which can only send to the vault).
+  operator, guardian or vault, add factory tokens, or pull the float back
+  (`proposeRecover` / `applyRecover`, which can only send to the vault).
+  Everything that loosens control waits after it is queued: 2 days for a vault
+  handover, 4 for a new guardian, 3 for anything else.
 
 Write its address down; you need it for the deploy and for `VAULT_ADDRESS`.
 
 ### Option: deposits straight into HotPayout (no vault signing)
 
 Deploy with `DEPOSITS_TO_HOT_PAYOUT=yes` to make HotPayout itself the factory's
-vault. Deposits then refill withdrawals automatically, as the old treasury
-did, and nobody signs anything day to day. `VAULT_ADDRESS` becomes only
-HotPayout's admin (unpause, caps, roles, `recover`). It can be any wallet you
-own that is not on the server, and its balance is not counted as backing. The
-trade-off: every reserve sits in HotPayout, so a stolen operator key can move
-up to the caps (per transaction and per day) before the watchdog pauses it,
-instead of only a small float. The factory's token allowlist is fixed at
-deploy (only its vault could change it, and HotPayout has no function for that).
+deposit target. Deposits then refill withdrawals automatically, as the old
+treasury did, and nobody signs anything day to day. `VAULT_ADDRESS` becomes
+only the admin of HotPayout and the factory. It can be any wallet you own that
+is not on the server, and its balance is not counted as backing.
+
+The trade-off: every reserve sits in HotPayout. What the caps bound, exactly:
+
+- The daily cap is the most the operator key can pay out at once, so set it to
+  an amount you would accept losing, not to a day of normal withdrawals plus
+  slack.
+- Until HotPayout is paused, the bucket refills at the daily cap per 24 hours:
+  up to 2 x the daily cap in any 24-hour window. Keep the guardian and the vault
+  funded with a little gas so a pause always goes through.
+- A stolen vault key cannot move anything quickly: every recovery, cap
+  increase and role change is queued (2 days for a vault handover, 4 for a
+  new guardian, 3 otherwise), and the
+  guardian cancels at once any queued action no admin approved with
+  `/custody expect`. Hand the vault to a fresh wallet once you notice (see
+  "If the vault key may be exposed").
+- A lost vault key cannot be replaced. Payouts continue within the caps, but a
+  pause can then never be undone. Keep an offline backup of the vault key.
 
 ## 3. Deploy the contracts
 
@@ -123,13 +138,19 @@ including the caps. Cap settings (defaults in brackets):
 
 | Variable | Default |
 | --- | --- |
-| `PAYOUT_NATIVE_PER_TX_SATS` / `PAYOUT_NATIVE_DAILY_SATS` | 100000 / 300000 sats |
-| `PAYOUT_MUSD_PER_TX` / `PAYOUT_MUSD_DAILY` | 50 / 150 MUSD |
-| `PAYOUT_MUSDC_PER_TX` / `PAYOUT_MUSDC_DAILY` | 50 / 150 mUSDC |
+| `PAYOUT_NATIVE_PER_TX_SATS` / `PAYOUT_NATIVE_DAILY_SATS` | 80000 / 150000 sats |
+| `PAYOUT_MUSD_PER_TX` / `PAYOUT_MUSD_DAILY` | 15 / 30 MUSD |
+| `PAYOUT_MUSDC_PER_TX` / `PAYOUT_MUSDC_DAILY` | 0 / 0 (mUSDC not paid out) |
 | `PAYOUT_MEZO_PER_TX` / `PAYOUT_MEZO_DAILY` | 0 / 0 (MEZO not paid out) |
 
-0/0 leaves a token out of payouts. Start small: the caps bound what the
-operator key can ever move per day.
+0/0 leaves a token out of payouts. Start small: the daily cap is what a stolen
+operator key can pay out at once, and twice it is the most it can pay in any
+24 hours if nobody pauses.
+
+The factory is deployed first, aimed at the address HotPayout will get from
+the deployer's next nonce (with `DEPOSITS_TO_HOT_PAYOUT=yes`), and HotPayout
+records the factory so it never pays the factory, its implementation or a
+deployed deposit address. Send nothing from the deployer while the deploy runs.
 
 When the plan is right, run it again with `CONFIRM_DEPLOY=yes`. The script
 reads everything back from chain and prints the bot environment:
@@ -146,6 +167,8 @@ around it (see `deploy/README.md`):
 
 1. `migrations/2026-10-09_lockdown_public_access.sql`, if not applied yet.
 2. `migrations/2026-10-10_custody_v2.sql`.
+3. `migrations/2026-10-15_custody_v3_bot.sql`, before the bot build that uses it (the
+   new withdrawal checks refuse when their tables are missing).
 
 The custody migration is re-runnable. It moves every old deposit address to
 `deposit_addresses.legacy_address` and clears `address` (NULL means no safe
@@ -161,6 +184,14 @@ The migration refuses to run (and changes nothing) if `custody_signed_txs`,
 different keys than it expects, for example from an earlier draft; the error
 names the table. Migrate or drop such a table deliberately, then re-run.
 
+**When the DepositFactory changes** (a redeploy), every issued deposit address
+changes. Once every `Swept` event of the old factory is credited (the bot only
+reads the configured factory), run `SELECT retire_forwarder_addresses_v1('<note>');`
+before the bot boots on the new factory. It records each old address in
+`retired_deposit_addresses` (withdrawals to them stay refused and they are never
+issued again), clears it, and expires wallet-verification challenges on it; each
+user gets the new factory's address the next time the bot registers them.
+
 ## 5. Northflank environment
 
 Set on the bot service:
@@ -175,7 +206,7 @@ Set on the bot service:
 | `PAYOUT_GUARDIAN_PRIVATE_KEY` | optional secret; enables automatic pause on a freeze. You may instead keep the guardian key on your own device and pause by hand when the watchdog DMs you |
 | `IMGNAI_PAYER_PRIVATE_KEY` | secret from step 1 |
 | `WITHDRAWALS_ENABLED` | `false` for the first boot |
-| `DEPOSIT_CONFIRMATIONS` (2), `DEPOSIT_V2_MIN_NATIVE_SATS` (1000), `CUSTODY_WATCHDOG_MS` (60000), `CUSTODY_LOW_GAS_SATS` (1000), `CUSTODY_LOG_CHUNK_BLOCKS` (2000), `CUSTODY_DEEP_RESCAN_PASSES` (60), `CUSTODY_DEEP_RESCAN_BLOCKS` (5000), `WITHDRAWAL_USER_DAILY_MAX_SATS` (200000), `IMGNAI_X402_MAX_TOPUP_MUSD` (5), `IMGNAI_X402_DAILY_MAX_MUSD` (20) | defaults shown; adjust if needed |
+| `DEPOSIT_CONFIRMATIONS` (2), `DEPOSIT_V2_MIN_NATIVE_SATS` (1000), `CUSTODY_WATCHDOG_MS` (60000), `CUSTODY_LOW_GAS_SATS` (1000), `CUSTODY_LOG_CHUNK_BLOCKS` (2000, at most 10000), `CUSTODY_DEEP_RESCAN_PASSES` (60), `CUSTODY_DEEP_RESCAN_BLOCKS` (5000, at most 10000), `WITHDRAWAL_USER_DAILY_MAX_SATS` (100000), `IMGNAI_X402_MAX_TOPUP_MUSD` (5), `IMGNAI_X402_DAILY_MAX_MUSD` (20) | defaults shown; adjust if needed |
 | `IMGNAI_X402_PAY_TO` | imgnAI's x402 payment address. **Set it before enabling image generation**: without it, the first top-up trusts whatever address imgnAI's server asks to be paid. When set, a top-up paying any other address is refused. When unset, the first completed top-up's address is recorded and any later top-up to a different address is refused (admins get a DM) |
 
 Remove `TREASURY_PRIVATE_KEY` and `SWEEP_GAS_SPONSOR_PRIVATE_KEY`. Custody v2
@@ -189,7 +220,10 @@ From the vault:
 
 - **Operator**: a little BTC for gas (each withdrawal is one contract call).
 - **Sweep gas**: a little BTC for gas (one call per swept asset).
-- **Guardian** (if its key is on the server): enough BTC for one `pause()`.
+- **Guardian** (if its key is on the server): enough BTC for a few `pause()` and
+  `cancel()` calls (about 1,000 sats).
+- **Vault** (direct mode): about 2,000 sats, so you can pause, queue and apply
+  admin actions in an emergency without first finding gas.
 - **HotPayout float**: native BTC and the payout tokens, sized to roughly one
   or two days of withdrawals and never above what you can afford to lose. Send
   them to `HOT_PAYOUT_ADDRESS` like any transfer.
@@ -198,7 +232,10 @@ From the vault:
   funding it, so the first top-up cannot be sent elsewhere.
 
 Admins get a DM when the operator, sweep-gas or guardian wallet drops below
-`CUSTODY_LOW_GAS_SATS`. `/deposit sponsor:true` shows the sweep-gas address.
+`CUSTODY_LOW_GAS_SATS`, and an urgent hourly DM when the guardian cannot pay for
+`pause()` at all. When HotPayout's native daily headroom falls below 20% of the
+daily cap, admins get a DM (at most every 6 hours) with the top 5 SATS
+withdrawers of the last 24 hours. `/deposit sponsor:true` shows the sweep-gas address.
 
 Backing is measured as vault + HotPayout balances against everything owed to
 users. While SATS backing is short, SATS withdrawals and SATS credits
@@ -211,8 +248,9 @@ not counted.
 Deploy the `TestingRender` build. The log must show `[Custody] Mode v2: vault
 …`. If it shows `[Custody] PAUSED`, the reasons follow on the same line or the
 next ones (missing or invalid variables, a shared key, or an on-chain mismatch
-such as the wrong operator); fix them and restart. An unreachable RPC is
-retried every minute.
+such as the wrong operator, a HotPayout recording another factory, or a token
+contract whose `decimals()` differs from the configured decimals); fix them and
+restart. An unreachable RPC is retried every minute.
 
 Then, as an admin:
 
@@ -223,9 +261,11 @@ Then, as an admin:
    from the `Swept` event (`[Deposits] Credited ...`). The vault balance grows.
    After its first sweep a deposit address is a small contract that needs
    about 24,000 gas to receive BTC; senders with a fixed 21,000 gas limit
-   (some exchanges) fail and the BTC stays with the sender. `/deposit` tells
-   users to send from a normal wallet. A sweep of an empty address does
-   nothing and credits nothing.
+   (some exchanges) and contracts using Solidity `transfer()`/`send()` fail and
+   the BTC stays with the sender. A transfer through the BTC token precompile
+   (`0x7b7C000000000000000000000000000000000000`, `transfer(depositAddress,
+   amount)`) always arrives. `/deposit` tells users to send from a normal
+   wallet. A sweep of an empty address does nothing and credits nothing.
 3. Set `WITHDRAWALS_ENABLED=true`, restart, and withdraw a small amount to a
    wallet you control. `/withdraw` refuses with the remaining on-chain
    capacity when a cap or the float would be exceeded; nothing is debited then.
@@ -235,22 +275,92 @@ Then, as an admin:
 **Refill the float.** Send BTC or tokens from the vault to `HOT_PAYOUT_ADDRESS`.
 `/treasury` shows the float and what each cap still allows today.
 
-**Pull float back.** From the vault, call `HotPayout.recover(token, amount)`
-(`token` is `0x0000000000000000000000000000000000000000` for BTC). It can only
-send to the vault.
+**Queued vault actions.** Anything that loosens control is queued and can be
+applied between its delay and 7 days after (`GRACE`; after that it lapses and
+can be queued again). Several actions can be pending at once; each is keyed
+by its exact content.
 
-**Caps.** The vault calls `setCaps(token, perTx, daily)` to raise or lower
-them; the guardian can only lower them with `tightenCaps`.
+| Action | Queue (vault) | Apply | Delay | Who can cancel |
+| --- | --- | --- | --- | --- |
+| Pull float back to the vault | `proposeRecover(token, amount)` | `applyRecover(token, amount)` | 3 days | guardian |
+| Raise caps (both values >= now) | `setCaps(token, perTx, daily)` | `applyCaps(token, perTx, daily)` | 3 days | guardian |
+| New operator | `proposeOperator(address)` | `applyOperator(address)` | 3 days | guardian |
+| New guardian | `proposeGuardian(address)` | `applyGuardian(address)` | 4 days | vault only |
+| New vault | `proposeVault(address)` or `proposeVaultWithSig` | `acceptVault()` (sent by the new vault) | 2 days | guardian (only one queued after it took office) |
+
+`token` is `0x0000000000000000000000000000000000000000` for BTC.
+
+**Approve before you queue.** The watchdog reads every `ActionQueued` event.
+An action that no admin approved beforehand is cancelled by the guardian at
+once, and admins get a DM. To queue one on purpose, first run
+`/custody expect action:<recover|caps|operator|guardian|vault> subject:<…>
+[amount:<…>] [daily:<…>]` (subject is the token, `SATS`/`MUSD`/`MUSDC`/`MEZO` or
+an address, for caps and recover; the new address for roles; amounts in sats
+for SATS and whole tokens otherwise). The approval matches exactly one action
+with those values and is usable for 24 hours. The bot then DMs when it was
+queued and from when it can be applied. `/custody cancel id:<action id>`
+makes the guardian cancel a queued action by hand.
+
+A new guardian can only be cancelled by the vault, so a leaked guardian key
+cannot block its own replacement. For an unapproved one the bot DMs the exact
+`cancel(…)` call to send from the vault wallet, every 6 hours while it stays
+queued. It waits 4 days. A vault handover queued before it can take office
+cannot be cancelled by it, lands within 2 days (before anything the old key
+queues afterwards, which waits 3), and every handover drops all actions
+queued before it.
+
+**If the vault key may be exposed** (an unapproved action appeared): hand the
+vault to a fresh wallet. Approve it (`/custody expect action:vault
+subject:<fresh>`), then queue it from the vault, or sign an EIP-712
+`ProposeVault(address next,uint256 vaultEpoch,uint256 deadline)` with the
+vault key (domain: name `MezoSbot HotPayout`, version `1`, chain 31612,
+HotPayout's address) and have anyone submit `proposeVaultWithSig(next,
+deadline, signature)`; that works even when the vault wallet has no gas. Two
+days later the fresh wallet calls `acceptVault()`. Update `VAULT_ADDRESS` and
+restart.
+
+**Caps.** The vault lowers caps at once with `setCaps` (both values no higher
+than now); raising both or one (the other unchanged) is queued; lowering one
+while raising the other is refused, so tighten first, then queue the raise.
+The guardian can only lower caps with `tightenCaps`. A per-tx cap above the
+daily cap is lowered to it, and a zero in either stops the token. Lowering
+also lowers recorded spending to the new daily cap (a stop followed by a
+restore starts with a full allowance) and drops every raise queued before it.
 
 **Pause / unpause.** The guardian or the vault can call `pause()`; only the
-vault can `unpause()`. While paused, `/withdraw` refuses before debiting.
+vault can `unpause()`. Both apply at once. While paused, `/withdraw` refuses
+before debiting. While custody is frozen, run `/custody unfreeze` before
+unpausing: if HotPayout is found unpaused while custody is frozen, the
+guardian pauses it again and sets every payout cap to 0, and caps then come
+back only through a queued, approved raise (3 days).
 
-**Rotate the operator.** Generate a new key, fund it with gas, have the vault
-call `setOperator(newOperator)`, update `PAYOUT_OPERATOR_PRIVATE_KEY`, restart.
-The boot check confirms `operator()` matches the key. Withdrawals signed by
-the old operator are still recovered (each row stores its signer). Rotating
-the guardian is the same with `setGuardian`. The sweep-gas key has no
+**Rotate the operator.** Generate a new key, fund it with gas, approve it with
+`/custody expect action:operator`, have the vault call
+`proposeOperator(newOperator)` and, 3 days later, `applyOperator(newOperator)`
+(pause first if the old key may be exposed), then update
+`PAYOUT_OPERATOR_PRIVATE_KEY` and restart. The boot check confirms
+`operator()` matches the key. Withdrawals signed by the old operator are still
+recovered (each row stores its signer). Rotating the guardian is the same with
+`proposeGuardian` / `applyGuardian` (4 days). The sweep-gas key has no
 contract role: swap the secret, fund the new address, restart.
+
+**Move the vault.** Approve it, then from the current vault
+`proposeVault(newVault)` (or the signed form above); 2 days later the new
+wallet calls `acceptVault()`, which also proves it can sign. The
+DepositFactory's admin follows automatically. Update `VAULT_ADDRESS` and
+restart.
+
+**Other admin changes are announced.** Pauses, unpauses, cap changes,
+allowlist changes, role changes, recoveries and factory rescues are DM'd to
+admins as the watchdog sees them.
+
+**Tokens sent to a deposit address by mistake.** The factory only sweeps
+allowlisted tokens. For anything else, the vault calls
+`DepositFactory.rescueToken(salt, token)` to receive it, then refunds the user
+by hand. Allowlisted tokens can never be rescued this way. Funds that reached
+the factory or its implementation directly are moved to the deposit target by
+anyone calling `sweepStray(token)` (`address(0)` for BTC); they are never
+credited.
 
 **Watchdog freeze.** Custody freezes when a custody key spent a nonce the bot
 never recorded, when a spent nonce's recorded transactions have no receipt
@@ -303,24 +413,44 @@ from `Swept` events; `/withdraw` refuses. To recover:
 that were not credited: `unknown_salt` (no bot user), `unknown_token`,
 `wrong_vault`, or `conflicting_event` (a second event for an already credited
 transaction, address and token with a different amount). Admins
-get a DM for each new one. The funds are in the vault. After checking, credit
+get one digest DM at most every 10 minutes (counts by status and a few
+examples; unknown-address events below the deposit minimum are only counted).
+The funds are in the vault. After checking, credit
 the user with `/credit` if appropriate and mark the row `resolved` with a
 note. A sweep of a registered user's address is always credited, even if
 their deposits were never enabled: the deposit role gate controls who is
 shown an address, not what is credited once funds have reached the vault.
 
 **Log scanners.** The Swept and Paid scanners read each block range only once
-the RPC node serves it, re-read a short trailing window every pass, and every
+the RPC node serves it (a range the node refuses, for example for too many
+results, is split in halves down to single blocks), re-read a short trailing window every pass, and every
 `CUSTODY_DEEP_RESCAN_PASSES` passes re-read the last
 `CUSTODY_DEEP_RESCAN_BLOCKS` blocks. Re-reading is idempotent.
+
+**Withdrawal limits and holds.** Before any debit, `/withdraw` refuses (soft
+checks, outside `reserve_withdrawal_v2`; HotPayout's caps are the hard limit):
+
+- funds credited from deposits in the last 24 hours (the reply says how much is
+  held and when it unlocks);
+- more than `WITHDRAWAL_USER_DAILY_MAX_SATS` per user per rolling 24 hours;
+- a user an admin put on hold with `/custody hold user:<user> on:true`;
+- for 7 days, a destination whose HotPayout payout reverted on-chain because of
+  the destination (it rejected the payment or ran out of gas); admins get a DM.
+
+The bot signs payouts with at most 200,000 gas and refuses a withdrawal whose
+estimate is higher. Each withdrawal gets a random HotPayout reference, stored
+on its row before anything is signed and kept for life.
 
 **Withdrawals held for review.** Recovery logs `MANUAL REVIEW withdrawal <id>`
 for rows it will not settle automatically, for example a successful receipt
 without the matching `Paid` log. Such rows are never refunded or completed
 automatically; settle them by hand after checking the chain.
 
-**Old deposit addresses.** Addresses issued before custody v2 are never shown
-again and are not polled. Funds sent to one are not credited.
+**Old deposit addresses.** Addresses issued before custody v2, and v2
+addresses of a previous DepositFactory (retired with
+`retire_forwarder_addresses_v1` when the factory changes), are never shown
+again and are not polled; withdrawals to them are refused. Funds sent to one
+are not credited automatically.
 
 **Run a single bot instance.** Several safeguards serialize in-process: the
 withdrawal and sweep signing locks, the imgnAI top-up lock and the rolling

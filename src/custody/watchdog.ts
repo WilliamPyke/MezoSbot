@@ -1,11 +1,13 @@
 import { ethers } from "ethers";
 import { config, tokenUnitsToSats } from "../config.js";
 import { supabase } from "../db.js";
-import { getNativeBalance } from "../evm.js";
-import { HOT_PAYOUT_ABI } from "./abi.js";
-import { PAID_TOPIC, type V2Settings } from "./policy.js";
+import { addGasLimitBuffer, getGasPriceWei, getNativeBalance } from "../evm.js";
+import { formatSats } from "../format.js";
+import { HOT_PAYOUT_ABI, NATIVE_TOKEN } from "./abi.js";
+import { DAY_MS, PAID_TOPIC, topSatsWithdrawers, type V2Settings } from "./policy.js";
+import { runAdminWatch } from "./adminWatch.js";
 import { readPaidRefs } from "./payout.js";
-import { ethCall, getBlockNumber, getLogs, getNonce, getReceipt, nodeHasBlock } from "./rpc.js";
+import { estimateGas, ethCall, getBlockNumber, getLogs, getNonce, getReceipt, nodeHasBlock } from "./rpc.js";
 import { sendCustodyTx } from "./signing.js";
 import {
   getFreezeState,
@@ -41,6 +43,8 @@ const LOW_GAS_ALERT_INTERVAL_MS = 6 * 60 * 60_000;
 const QUERY_CHUNK = 100;
 /** The refunded-row re-check runs after the nonce and Paid checks, within this budget per pass. */
 const REFUND_CHECK_BUDGET_MS = 10_000;
+/** A freeze waits at most this long for the acknowledgement lookup. */
+const ACK_LOOKUP_WAIT_MS = 10_000;
 
 type Notify = (message: string) => Promise<void>;
 let notifyAdmins: Notify = async () => {};
@@ -75,15 +79,19 @@ async function pausePayout(settings: V2Settings): Promise<string> {
   const guardian = getGuardianWallet();
   if (!guardian) return "No guardian key is configured: pause HotPayout from the VAULT_ADDRESS wallet.";
   try {
-    const { txHash } = await sendCustodyTx({
+    // The pause goes out even when the database cannot record it (the record is retried).
+    const { txHash, recorded } = await sendCustodyTx({
       wallet: guardian,
       to: settings.payout,
       data: PAYOUT.encodeFunctionData("pause"),
       purpose: "pause",
       ref: null,
       bypassFreeze: true,
+      emergencyPause: true,
     });
-    return `The guardian sent HotPayout.pause() (${txHash}).`;
+    return `The guardian sent HotPayout.pause() (${txHash}).` + (recorded ? "" :
+      " It could not be recorded in custody_signed_txs (database error); the bot keeps retrying the record, " +
+      "and until it lands the watchdog reports the guardian's nonce as unrecorded.");
   } catch (error) {
     return `The guardian could not pause HotPayout (${(error as Error).message}): pause it from the VAULT_ADDRESS wallet.`;
   }
@@ -102,7 +110,11 @@ export async function freezeCustody(reason: string, keys: string | string[] = []
   const named = [...new Set(typeof keys === "string" ? [keys] : keys)];
   let fresh = named;
   if (named.length > 0) {
-    const acknowledged = await acknowledgedKeys(named).catch(() => new Set<string>());
+    // Unreadable (or slow) acknowledgements count as none: the freeze goes ahead.
+    const acknowledged = await Promise.race([
+      acknowledgedKeys(named).catch(() => new Set<string>()),
+      new Promise<Set<string>>((resolve) => setTimeout(() => resolve(new Set()), ACK_LOOKUP_WAIT_MS).unref?.()),
+    ]);
     fresh = named.filter((key) => !acknowledged.has(key));
     if (fresh.length === 0) {
       console.warn(`[Watchdog] Acknowledged anomaly ${named.join(", ")} (held for manual review, no freeze): ${reason}`);
@@ -126,14 +138,14 @@ export async function freezeCustody(reason: string, keys: string | string[] = []
   const at = new Date().toISOString();
   setFreezeState({ reason, at, keys: fresh, persisted: false });
   console.error(`[Watchdog] CUSTODY FROZEN: ${reason}`);
-  try {
-    await writeFreezeFlag({ reason, at, keys: fresh });
-    markPersisted(fresh);
-  } catch (error) {
-    console.error(`[Watchdog] Could not persist the freeze flag (retrying every pass): ${(error as Error).message}`);
-  }
+  // The pause does not wait for the flag write: neither depends on the other.
   const settings = getV2Settings();
-  const pause = settings ? await pausePayout(settings) : "";
+  const [, pause] = await Promise.all([
+    writeFreezeFlag({ reason, at, keys: fresh }).then(() => markPersisted(fresh), (error) => {
+      console.error(`[Watchdog] Could not persist the freeze flag (retrying every pass): ${(error as Error).message}`);
+    }),
+    settings ? pausePayout(settings) : Promise.resolve(""),
+  ]);
   await notifyAdmins(
     `🚨 **MezoSBOT custody frozen**${fresh.length > 0 ? ` (${fresh.join(", ")})` : ""}. ${reason}\n` +
     `All custody signing (withdrawals, sweeps) is blocked. ${pause}\n` +
@@ -292,22 +304,106 @@ export async function clearCustodyFreeze(actorId: string, note: string, confirmC
 /* ─────────── Gas ─────────── */
 
 const lowGasAlertedAt = new Map<string, number>();
+/** A guardian that cannot pay for pause() is re-alerted this often (other low-gas alerts every 6 hours). */
+const PAUSE_GAS_ALERT_INTERVAL_MS = 60 * 60_000;
+/** Gas assumed for pause() when it cannot be estimated (for example while HotPayout is already paused). */
+const PAUSE_GAS_FALLBACK = 60_000n;
+
+/** What the guardian needs for pause() now: estimate (with buffer) × gas price, as sendCustodyTx requires. */
+async function pauseCostWei(settings: V2Settings, guardian: string): Promise<bigint> {
+  let gas: bigint;
+  try {
+    gas = await estimateGas(guardian, settings.payout, PAYOUT.encodeFunctionData("pause"));
+  } catch {
+    gas = PAUSE_GAS_FALLBACK;
+  }
+  return addGasLimitBuffer(gas) * await getGasPriceWei();
+}
+
+async function alertGas(key: string, intervalMs: number, message: string): Promise<void> {
+  if (Date.now() - (lowGasAlertedAt.get(key) ?? 0) < intervalMs) return;
+  lowGasAlertedAt.set(key, Date.now());
+  console.warn(`[Watchdog] ${message}`);
+  await notifyAdmins(message).catch(() => {});
+}
 
 async function checkGas(settings: V2Settings): Promise<void> {
   const threshold = config.custody.lowGasSats;
   for (const signer of custodySigners(settings)) {
-    const sats = tokenUnitsToSats(await getNativeBalance(signer.address));
+    const balance = await getNativeBalance(signer.address);
+    const sats = tokenUnitsToSats(balance);
+    if (signer.role === "guardian") {
+      const pauseKey = `pause:${signer.address}`;
+      const cost = await pauseCostWei(settings, signer.address);
+      if (balance < cost) {
+        await alertGas(pauseKey, PAUSE_GAS_ALERT_INTERVAL_MS,
+          `🚨 **Cannot pause: the guardian has no gas.** The guardian wallet ${checksum(signer.address)} has ${sats} sats; ` +
+          `HotPayout.pause() needs about ${tokenUnitsToSats(cost)} sats. Top it up now: until then a freeze cannot pause HotPayout.`);
+        continue;
+      }
+      lowGasAlertedAt.delete(pauseKey);
+    }
     if (sats >= threshold) {
       lowGasAlertedAt.delete(signer.address);
       continue;
     }
-    if (Date.now() - (lowGasAlertedAt.get(signer.address) ?? 0) < LOW_GAS_ALERT_INTERVAL_MS) continue;
-    lowGasAlertedAt.set(signer.address, Date.now());
-    const message = `⛽ The ${signer.role} wallet ${checksum(signer.address)} has ${sats} sats of gas ` +
-      `(alert threshold ${threshold}). Top it up.`;
-    console.warn(`[Watchdog] ${message}`);
-    await notifyAdmins(message).catch(() => {});
+    await alertGas(signer.address, LOW_GAS_ALERT_INTERVAL_MS,
+      `⛽ The ${signer.role} wallet ${checksum(signer.address)} has ${sats} sats of gas (alert threshold ${threshold}). Top it up.`);
   }
+}
+
+/* ─────────── Payout headroom ─────────── */
+
+const HEADROOM_ALERT_INTERVAL_MS = 6 * 60 * 60_000;
+const HEADROOM_TOP_USERS = 5;
+const WITHDRAWAL_PAGE = 1000;
+let headroomAlertedAt = 0;
+
+async function readNativePayoutLimit(settings: V2Settings, fn: "dailyCap" | "remainingDaily"): Promise<bigint> {
+  const raw = await ethCall(settings.payout, PAYOUT.encodeFunctionData(fn, [NATIVE_TOKEN]));
+  return BigInt(PAYOUT.decodeFunctionResult(fn, raw)[0] as bigint);
+}
+
+async function recentWithdrawalRows(nowMs: number) {
+  const rows: Array<{ discord_id: string; amount_sats: unknown; token: unknown; status: unknown; created_at: unknown }> = [];
+  for (let from = 0; ; from += WITHDRAWAL_PAGE) {
+    const { data, error } = await supabase
+      .from("withdrawals")
+      .select("discord_id, amount_sats, token, status, created_at")
+      .gte("created_at", new Date(nowMs - DAY_MS).toISOString())
+      .in("status", ["pending", "completed"])
+      .order("id")
+      .range(from, from + WITHDRAWAL_PAGE - 1);
+    if (error) throw new Error(`recent withdrawal lookup failed: ${error.message}`);
+    rows.push(...(data ?? []));
+    if ((data?.length ?? 0) < WITHDRAWAL_PAGE) return rows;
+  }
+}
+
+/**
+ * When HotPayout's native remainingDaily drops below 20% of its native
+ * dailyCap, DM admins (at most every 6 hours) the users with the most SATS
+ * withdrawn on-chain in the last 24h, so they can act (/custody hold).
+ */
+async function checkPayoutHeadroom(settings: V2Settings): Promise<void> {
+  if (Date.now() - headroomAlertedAt < HEADROOM_ALERT_INTERVAL_MS) return;
+  const [dailyCap, remaining] = await Promise.all([
+    readNativePayoutLimit(settings, "dailyCap"),
+    readNativePayoutLimit(settings, "remainingDaily"),
+  ]);
+  if (dailyCap === 0n || remaining * 5n >= dailyCap) return;
+  const now = Date.now();
+  const top = topSatsWithdrawers(await recentWithdrawalRows(now), now, HEADROOM_TOP_USERS);
+  headroomAlertedAt = now;
+  const message = [
+    `⚠️ HotPayout's native daily limit is nearly used: ${formatSats(tokenUnitsToSats(remaining))} of ` +
+      `${formatSats(tokenUnitsToSats(dailyCap))} left (it refills over 24 hours).`,
+    top.length > 0 ? "Most SATS withdrawn on-chain in the last 24h:" : "No SATS withdrawals are recorded in the last 24h.",
+    ...top.map((entry, index) => `${index + 1}. <@${entry.discordId}> (\`${entry.discordId}\`): ${formatSats(entry.sats)}`),
+    "`/custody hold` stops one user's on-chain withdrawals.",
+  ].join("\n");
+  console.warn(`[Watchdog] ${message.replace(/\n/g, " | ")}`);
+  await notifyAdmins(message).catch(() => {});
 }
 
 let running = false;
@@ -321,7 +417,14 @@ export async function runWatchdogOnce(): Promise<void> {
     await persistPendingFreeze();
     await core.pass(settings);
     await checkGas(settings);
+    await checkPayoutHeadroom(settings).catch((error) => {
+      console.warn(`[Watchdog] Payout headroom check failed: ${(error as Error).message}`);
+    });
   } finally {
+    // Vault-action auto-cancel and the frozen-pause check run even when the steps above fail.
+    await runAdminWatch(settings, (message) => notifyAdmins(message)).catch((error) => {
+      console.warn(`[Watchdog] Vault-action watch failed: ${(error as Error).message}`);
+    });
     running = false;
   }
 }

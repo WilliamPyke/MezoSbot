@@ -16,7 +16,6 @@ import {
   type TokenSymbol,
 } from "../tokens.js";
 import { HOT_PAYOUT_ABI, NATIVE_TOKEN } from "./abi.js";
-import { withdrawalRef } from "./forwarder.js";
 import {
   PAID_TOPIC,
   decodePayoutRawTx,
@@ -26,6 +25,7 @@ import {
   paidEventMatches,
   parsePaidLog,
   payoutCapacity,
+  payoutGasLimit,
   type PayoutExpectation,
   type PayoutProof,
   type PayoutRevert,
@@ -46,9 +46,8 @@ const PAYOUT = new ethers.Interface(HOT_PAYOUT_ABI);
 /** Ref used to simulate before a withdrawal row exists. HotPayout never sees it paid. */
 const PREFLIGHT_REF = ethers.keccak256(ethers.toUtf8Bytes("mezosbot-withdrawal-v2:preflight"));
 
-export function payoutRef(withdrawalId: number): string {
-  return withdrawalRef(withdrawalId).toLowerCase();
-}
+const GAS_TOO_HIGH_MESSAGE =
+  "That address needs more gas to receive a withdrawal than MezoSBOT allows. Withdraw to a regular wallet address.";
 
 /** HotPayout token key: address(0) for native BTC (SATS). */
 export function payoutTokenAddress(token: TokenSymbol): string {
@@ -203,17 +202,20 @@ function refusal(revert: PayoutRevert, state: PayoutTokenState): Extract<PayoutP
 
 /**
  * Plan a HotPayout withdrawal and simulate the exact call from the operator.
- * Nothing is signed here. `withdrawalId` null plans with a placeholder ref
- * (pre-debit checks and gas quotes). SATS pays amount − 1.5× gas, as before.
+ * Nothing is signed here. `ref` is the row's stored payout_ref; null plans
+ * with a placeholder ref (pre-debit checks and gas quotes). SATS pays
+ * amount − 1.5× gas, as before. The signed gas limit is at most
+ * MAX_PAYOUT_GAS_LIMIT.
  */
 export async function planPayout(
   settings: V2Settings,
-  input: { withdrawalId: number | null; to: string; token: TokenSymbol; amount: number },
+  input: { ref: string | null; to: string; token: TokenSymbol; amount: number },
 ): Promise<PayoutPlan> {
   const to = input.to.toLowerCase().trim();
   if (!/^0x[0-9a-f]{40}$/.test(to)) return { ok: false, code: "invalid", error: "Invalid address" };
-  const ref = input.withdrawalId == null ? PREFLIGHT_REF : payoutRef(input.withdrawalId);
-  if (input.withdrawalId != null) {
+  if (input.ref != null && !/^0x[0-9a-fA-F]{64}$/.test(input.ref)) return { ok: false, code: "unavailable", error: "Invalid withdrawal reference" };
+  const ref = input.ref == null ? PREFLIGHT_REF : input.ref.toLowerCase();
+  if (input.ref != null) {
     // First: a ref that is already paid was paid by someone else (the bot signs
     // each ref once). Never refund or re-pay it.
     let paid: boolean;
@@ -240,19 +242,22 @@ export async function planPayout(
     return refusal(describePayoutRevert(PAYOUT.encodeErrorResult(limit, [])), state);
   }
 
-  const estimate = async (amount: bigint): Promise<{ gas: bigint } | { revert: PayoutRevert }> => {
+  const estimate = async (amount: bigint): Promise<{ gas: bigint } | { revert: PayoutRevert } | { tooMuchGas: true }> => {
+    let estimated: bigint;
     try {
-      const gas = await estimateGas(settings.operator, settings.payout, encodePayoutCall({ ref, token, to, amount }));
-      return { gas: addGasLimitBuffer(gas) };
+      estimated = await estimateGas(settings.operator, settings.payout, encodePayoutCall({ ref, token, to, amount }));
     } catch (error) {
       if (isRpcError(error)) return { revert: describePayoutRevert(revertData(error)) };
       throw error;
     }
+    const gas = payoutGasLimit(estimated, addGasLimitBuffer(estimated));
+    return gas == null ? { tooMuchGas: true } : { gas };
   };
 
   const gasPrice = await getGasPriceWei();
   const first = await estimate(gross);
   if ("revert" in first) return refusal(first.revert, state);
+  if ("tooMuchGas" in first) return { ok: false, code: "invalid", error: GAS_TOO_HIGH_MESSAGE };
   let gasLimit = first.gas;
   let amount = gross;
   let charged = 0n;
@@ -265,6 +270,7 @@ export async function planPayout(
     }
     const refined = await estimate(amount);
     if ("revert" in refined) return refusal(refined.revert, state);
+    if ("tooMuchGas" in refined) return { ok: false, code: "invalid", error: GAS_TOO_HIGH_MESSAGE };
     if (refined.gas > gasLimit) {
       gasLimit = refined.gas;
       charged = (gasLimit * gasPrice * 3n) / 2n;
@@ -295,33 +301,35 @@ export async function planPayout(
 
 /**
  * The payment a stored withdrawal row signed, checked against the row: the
- * ref is this row's, the recipient and token are the row's. Null otherwise.
+ * ref is the row's stored payout_ref, the recipient and token are the row's.
+ * Null otherwise.
  */
 export function expectedPayoutForRow(
   settings: V2Settings,
-  row: { id: number; token: TokenSymbol; to_address: string; raw_tx: string | null },
+  row: { id: number; token: TokenSymbol; to_address: string; raw_tx: string | null; payout_ref: string | null },
 ): PayoutExpectation | null {
   const signed = decodePayoutRawTx(row.raw_tx, settings.payout);
-  if (!signed) return null;
+  if (!signed || !row.payout_ref) return null;
   let token: string;
   try {
     token = payoutTokenAddress(row.token);
   } catch {
     return null;
   }
-  if (signed.ref !== payoutRef(row.id) || signed.to !== row.to_address.toLowerCase() || signed.token !== token) return null;
+  if (signed.ref !== row.payout_ref.toLowerCase() || signed.to !== row.to_address.toLowerCase() || signed.token !== token) return null;
   return signed;
 }
 
 /**
  * Best-effort reason a mined payout reverted: replays the same call from the
- * operator against the state before its block. null when it cannot tell.
+ * operator against the state before its block. null when it cannot tell
+ * (for example the recipient ran out of the gas it was given).
  */
 export async function explainRevertedPayout(
   settings: V2Settings,
   expected: PayoutExpectation,
   receiptBlock: unknown,
-): Promise<string | null> {
+): Promise<PayoutRevert | null> {
   const block = typeof receiptBlock === "string" && /^0x[0-9a-f]+$/i.test(receiptBlock) ? Number(BigInt(receiptBlock)) : null;
   try {
     await ethCall(settings.payout, encodePayoutCall(expected), settings.operator, block != null && block > 0 ? block - 1 : "latest");
@@ -329,7 +337,7 @@ export async function explainRevertedPayout(
   } catch (error) {
     if (!isRpcError(error)) return null;
     const revert = describePayoutRevert(revertData(error));
-    return revert.error ? revert.message : null;
+    return revert.error ? revert : null;
   }
 }
 

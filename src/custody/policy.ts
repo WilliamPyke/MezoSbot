@@ -275,6 +275,9 @@ export type V2ChainState = {
   payoutVault: string;
   payoutOperator: string;
   payoutGuardian: string;
+  /** HotPayout.factory() / forwarderImplementation(): the contracts it never pays. */
+  payoutFactory: string;
+  payoutImplementation: string;
 };
 
 /** Discord id whose salt is used to prove predict() matches src/custody/forwarder.ts. */
@@ -307,6 +310,13 @@ export function checkV2Chain(settings: V2Settings, state: V2ChainState, expected
   if (settings.guardian) {
     expect("HotPayout.guardian()", state.payoutGuardian, settings.guardian, "the PAYOUT_GUARDIAN_PRIVATE_KEY address");
   }
+  expect("HotPayout.factory()", state.payoutFactory, settings.factory, "DEPOSIT_FACTORY_ADDRESS");
+  expect(
+    "HotPayout.forwarderImplementation()",
+    state.payoutImplementation,
+    settings.implementation,
+    "DEPOSIT_FORWARDER_IMPLEMENTATION",
+  );
   const salt = depositSalt(PROBE_DISCORD_ID);
   if (!sameAddress(state.factoryPredict, predictForwarder(settings.factory, settings.implementation, salt))) {
     reasons.push("DepositFactory.predict() does not match the bot's deposit address derivation");
@@ -457,6 +467,43 @@ export function isDeepRescanPass(pass: number, everyPasses: number): boolean {
   return everyPasses > 0 && pass > 0 && pass % Math.floor(everyPasses) === 0;
 }
 
+/** Reads one log query may spend on splitting refused ranges before it gives up. */
+export const MAX_LOG_SPLIT_READS = 64;
+
+/**
+ * Logs for [from, to] through `read`, splitting ranges the node refuses
+ * (too many results, range too wide): when a read of more than one block
+ * fails with an error `splittable` accepts, both halves are read
+ * (recursively) and their logs concatenated, so the result stays in
+ * block/log order. A single-block range that still fails, an error
+ * `splittable` rejects (the node never answered), or a split that would take
+ * the query past `maxReads` reads passes the error on.
+ */
+export async function readLogsSplitting<T>(
+  read: (from: number, to: number) => Promise<T[]>,
+  from: number,
+  to: number,
+  options: { splittable?: (error: unknown) => boolean; maxReads?: number } = {},
+): Promise<T[]> {
+  const splittable = options.splittable ?? (() => true);
+  const maxReads = options.maxReads ?? MAX_LOG_SPLIT_READS;
+  // Reads made or reserved; a split reserves both halves first, so the total never exceeds maxReads.
+  let reads = 1;
+  const readRange = async (start: number, end: number): Promise<T[]> => {
+    try {
+      return await read(start, end);
+    } catch (error) {
+      if (end <= start || reads + 2 > maxReads || !splittable(error)) throw error;
+      reads += 2;
+      const middle = start + Math.floor((end - start) / 2);
+      const first = await readRange(start, middle);
+      const second = await readRange(middle + 1, end);
+      return first.concat(second);
+    }
+  };
+  return readRange(from, to);
+}
+
 /* ─────────── HotPayout calls ─────────── */
 
 export function encodePayoutCall(expected: PayoutExpectation): string {
@@ -535,7 +582,6 @@ export function describePayoutRevert(data: unknown): PayoutRevert {
 const FACTORY_REVERT_MESSAGES: Record<string, string> = {
   TokenNotAllowed: "the DepositFactory does not allowlist this token",
   InvalidToken: "the DepositFactory rejects this token address",
-  OnlyVault: "only the vault may call this DepositFactory function",
 };
 
 /** Name and operator-facing text of a DepositFactory or HotPayout revert, for logs. */
@@ -570,6 +616,34 @@ export function withdrawalDestinationProblem(
   }
   const hit = blocked.find((entry) => sameAddress(entry.address, to));
   return hit ? `That is the MezoSBOT ${hit.label}. Withdraw to a wallet you control.` : null;
+}
+
+/**
+ * Most gas the operator signs for one payNative / payToken. HotPayout
+ * forwards the remaining gas to the recipient, so a destination whose
+ * estimate is above this is refused instead of signed with an open-ended limit.
+ */
+export const MAX_PAYOUT_GAS_LIMIT = 200_000n;
+
+/**
+ * Gas limit to sign for a payout estimated at `estimated` (`buffered` is the
+ * estimate with the usual buffer): never above MAX_PAYOUT_GAS_LIMIT; null
+ * when the estimate itself is above it.
+ */
+export function payoutGasLimit(estimated: bigint, buffered: bigint): bigint | null {
+  if (estimated > MAX_PAYOUT_GAS_LIMIT) return null;
+  return buffered > MAX_PAYOUT_GAS_LIMIT ? MAX_PAYOUT_GAS_LIMIT : buffered;
+}
+
+/**
+ * Whether a payout that reverted on-chain points at its destination: the
+ * recipient rejected the payment or used up the gas it was forwarded (both
+ * end in PayFailed), or HotPayout refused it as a recipient (BadRecipient).
+ * Reverts from HotPayout's own state, and reverts whose cause could not be
+ * read back, do not.
+ */
+export function revertPointsAtDestination(error: string | null | undefined): boolean {
+  return error === "PayFailed" || error === "BadRecipient";
 }
 
 /** Largest amount HotPayout would pay right now under its caps and float. */
@@ -778,6 +852,82 @@ export function sumRecentSatsWithdrawals(
   return total;
 }
 
+/** Rows of withdrawals as the soft checks read them. */
+type RecentWithdrawalRow = { amount_sats: unknown; token?: unknown; status?: unknown; created_at: unknown };
+
+/** Users with the most SATS withdrawn (or in flight) in the 24h before `nowMs`, largest first. */
+export function topSatsWithdrawers(
+  rows: ReadonlyArray<RecentWithdrawalRow & { discord_id: unknown }>,
+  nowMs: number,
+  limit = 5,
+): Array<{ discordId: string; sats: number }> {
+  const byUser = new Map<string, RecentWithdrawalRow[]>();
+  for (const row of rows) {
+    const id = String(row.discord_id ?? "");
+    if (!id) continue;
+    byUser.set(id, [...(byUser.get(id) ?? []), row]);
+  }
+  return [...byUser]
+    .map(([discordId, userRows]) => ({ discordId, sats: sumRecentSatsWithdrawals(userRows, nowMs) }))
+    .filter((entry) => entry.sats > 0)
+    .sort((a, b) => b.sats - a.sats || a.discordId.localeCompare(b.discordId))
+    .slice(0, Math.max(0, limit));
+}
+
+export type DepositHoldCheck = {
+  ok: boolean;
+  /** Forwarder credits of the last 24h. */
+  held: number;
+  /** Balance minus `held`, never negative. */
+  withdrawable: number;
+  /** When enough held credits are older than 24h for the amount to fit (balance unchanged); null when it fits. */
+  unlockAtMs: number | null;
+};
+
+/**
+ * Custody v2 deposit hold: funds credited from forwarder deposits in the 24h
+ * before `nowMs` cannot be withdrawn on-chain yet. withdrawable = balance −
+ * those credits, never negative. An amount above the balance itself is left
+ * to the reservation's balance check.
+ */
+export function checkDepositHold(
+  balance: number,
+  amount: number,
+  credits: ReadonlyArray<{ credited_amount: unknown; created_at: unknown }>,
+  nowMs: number,
+): DepositHoldCheck {
+  const recent = credits
+    .map((credit) => {
+      const at = timeMs(credit.created_at);
+      // An unreadable time counts as credited now.
+      return { amount: Number(credit.credited_amount), at: Number.isFinite(at) ? at : nowMs };
+    })
+    .filter((credit) => Number.isFinite(credit.amount) && credit.amount > 0 && credit.at > nowMs - DAY_MS)
+    .sort((a, b) => a.at - b.at);
+  const held = recent.reduce((sum, credit) => sum + credit.amount, 0);
+  const total = Number.isFinite(balance) ? Math.max(0, balance) : 0;
+  const withdrawable = Math.max(0, total - held);
+  if (amount <= withdrawable + 1e-9 || amount > total + 1e-9) return { ok: true, held, withdrawable, unlockAtMs: null };
+  let unlocked = withdrawable;
+  for (const credit of recent) {
+    unlocked += credit.amount;
+    if (amount <= unlocked + 1e-9) return { ok: false, held, withdrawable, unlockAtMs: credit.at + DAY_MS };
+  }
+  return { ok: false, held, withdrawable, unlockAtMs: recent.length > 0 ? recent[recent.length - 1].at + DAY_MS : null };
+}
+
+/** A destination whose HotPayout payout reverted on-chain is refused for this long. */
+export const REVERTED_DESTINATION_HOLD_MS = 7 * DAY_MS;
+
+/** Refusal for a destination whose payout last reverted at `revertedAt`, or null once the hold has passed. */
+export function revertedDestinationProblem(revertedAt: unknown, nowMs: number): string | null {
+  const at = timeMs(revertedAt);
+  if (!(at > nowMs - REVERTED_DESTINATION_HOLD_MS)) return null;
+  const until = Math.ceil((at + REVERTED_DESTINATION_HOLD_MS) / 1000);
+  return "A recent withdrawal to that address failed on-chain because the address did not accept the payment. " +
+    `Withdraw to a different wallet, or to this one again after <t:${until}:f>.`;
+}
+
 /** Per-user rolling 24h soft cap. A cap of 0 or less disables it. */
 export function checkUserDailyCap(
   usedSats: number,
@@ -945,4 +1095,59 @@ export function weiToSats(wei: bigint): number {
   const fraction = (abs % 10_000_000_000n).toString().padStart(10, "0");
   const value = Number(`${whole}.${fraction}`);
   return negative ? -value : value;
+}
+
+/* ─────────── Token contracts ─────────── */
+
+/** Mezo's BTC precompile: native BTC, never one of the configured ERC-20 tokens. */
+export const BTC_PRECOMPILE_ADDRESS = "0x7b7c000000000000000000000000000000000000";
+
+export type TokenContractReading = {
+  symbol: string;
+  /** As configured; null or "" when the token is not configured (then it is skipped). */
+  address: string | null;
+  configuredDecimals: number;
+  /** decimals() as read; null when it reverted or returned nothing decodable. */
+  onChainDecimals: number | null;
+};
+
+/**
+ * Problems with the configured ERC-20 token contracts, checked when custody
+ * v2 activates (readTokenContractProblems in src/custody/tokenCheck.ts):
+ * decimals() must equal *_TOKEN_DECIMALS, and no token may be the zero
+ * address, the BTC precompile or another token's address. Unset tokens are
+ * skipped.
+ */
+export function tokenContractProblems(readings: ReadonlyArray<TokenContractReading>): string[] {
+  const problems: string[] = [];
+  const seen = new Map<string, string>();
+  for (const reading of readings) {
+    const raw = (reading.address ?? "").trim();
+    if (!raw) continue;
+    const name = `${reading.symbol}_TOKEN_CONTRACT`;
+    if (!/^0x[0-9a-fA-F]{40}$/.test(raw)) {
+      problems.push(`${name} ${raw} is not an address`);
+      continue;
+    }
+    const address = raw.toLowerCase();
+    if (address === NATIVE_TOKEN) {
+      problems.push(`${name} is the zero address`);
+      continue;
+    }
+    if (address === BTC_PRECOMPILE_ADDRESS) {
+      problems.push(`${name} is the BTC precompile ${ethers.getAddress(BTC_PRECOMPILE_ADDRESS)}, not a token contract`);
+      continue;
+    }
+    const other = seen.get(address);
+    if (other) problems.push(`${name} and ${other}_TOKEN_CONTRACT are the same address ${address}`);
+    seen.set(address, reading.symbol);
+    if (reading.onChainDecimals == null) {
+      problems.push(`${name} ${address} does not answer decimals()`);
+    } else if (reading.onChainDecimals !== reading.configuredDecimals) {
+      problems.push(
+        `${reading.symbol}_TOKEN_DECIMALS is ${reading.configuredDecimals}, but ${name} ${address} has ${reading.onChainDecimals} decimals`,
+      );
+    }
+  }
+  return problems;
 }

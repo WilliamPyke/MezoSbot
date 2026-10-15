@@ -1,6 +1,7 @@
 import { EmbedBuilder, MessageFlags, type ChatInputCommandInteraction } from "discord.js";
 import {
   checkUserWithdrawalCap,
+  checkWithdrawalHolds,
   executeWithdrawal,
   finalizeWithdrawal,
   preflightWithdrawal,
@@ -60,10 +61,32 @@ export function withdrawalPreflightMessage(preflight: Exclude<WithdrawalPrefligh
 }
 
 /**
- * Per-user rolling 24h cap (WITHDRAWAL_USER_DAILY_MAX_SATS), checked before
- * any debit. Returns the refusal text, or null when the withdrawal fits.
+ * Per-user soft checks before any debit (outside reserve_withdrawal_v2): an
+ * admin withdrawal hold, the 24h hold on funds credited from forwarder
+ * deposits (checkWithdrawalHolds), then the rolling 24h cap
+ * (WITHDRAWAL_USER_DAILY_MAX_SATS). Returns the refusal text, or null when
+ * the withdrawal may go ahead.
  */
-export async function userWithdrawalCapMessage(discordId: string, token: TokenSymbol, amount: number): Promise<string | null> {
+export async function userWithdrawalLimitMessage(discordId: string, token: TokenSymbol, amount: number): Promise<string | null> {
+  try {
+    const hold = await checkWithdrawalHolds(discordId, token, amount);
+    if (hold.status === "admin_hold") {
+      return "⏸️ On-chain withdrawals are on hold for your account while an admin reviews it. " +
+        "Your balance is unaffected and nothing was debited.";
+    }
+    if (hold.status === "deposit_hold") {
+      const unlock = hold.unlockAtMs != null ? Math.ceil(hold.unlockAtMs / 1000) : null;
+      return (
+        `⏳ **${formatTokenAmount(hold.held, token)}** of your balance was deposited in the last 24 hours and can be ` +
+        `withdrawn on-chain once it has been in MezoSBOT for 24 hours. You can withdraw up to ` +
+        `**${formatTokenAmount(hold.withdrawable, token)}** right now` +
+        (unlock != null ? `; this amount unlocks around <t:${unlock}:f> (<t:${unlock}:R>)` : "") +
+        ". Nothing was debited."
+      );
+    }
+  } catch {
+    return "⚠️ Could not check your withdrawal holds. Nothing was debited — please try again shortly.";
+  }
   try {
     const cap = await checkUserWithdrawalCap(discordId, token, amount);
     if (cap.ok) return null;
@@ -136,11 +159,11 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     });
   }
 
-  // 2. Every check runs before the user is debited: the per-user daily cap;
+  // 2. Every check runs before the user is debited: withdrawal holds and the per-user daily cap;
   //    SATS needs solvent holdings and an amount that covers gas; custody v2
   //    simulates the HotPayout call (pause, caps, float, recipient); ERC-20s
   //    then need a gas quote.
-  const capMessage = await userWithdrawalCapMessage(interaction.user.id, token, amount);
+  const capMessage = await userWithdrawalLimitMessage(interaction.user.id, token, amount);
   if (capMessage) {
     return interaction.editReply({ content: capMessage });
   }

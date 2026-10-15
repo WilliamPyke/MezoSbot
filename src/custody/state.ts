@@ -17,6 +17,7 @@ import {
 } from "./policy.js";
 import { ethCall, getChainId, getCode, isRevertError } from "./rpc.js";
 import { readFreezeFlag } from "./store.js";
+import { readTokenContractProblems } from "./tokenCheck.js";
 
 /**
  * Process-wide custody state: the mode (decided once at boot, see
@@ -205,13 +206,24 @@ async function readChainState(settings: V2Settings): Promise<V2ChainState> {
     getCode(settings.implementation),
     getCode(settings.payout),
   ]);
-  const [factoryVault, factoryImplementation, factoryPredict, payoutVault, payoutOperator, payoutGuardian] = await Promise.all([
+  const [
+    factoryVault,
+    factoryImplementation,
+    factoryPredict,
+    payoutVault,
+    payoutOperator,
+    payoutGuardian,
+    payoutFactory,
+    payoutImplementation,
+  ] = await Promise.all([
     readAddress(settings.factory, FACTORY, "vault"),
     readAddress(settings.factory, FACTORY, "implementation"),
     readAddress(settings.factory, FACTORY, "predict", [depositSalt(PROBE_DISCORD_ID)]),
     readAddress(settings.payout, PAYOUT, "vault"),
     readAddress(settings.payout, PAYOUT, "operator"),
     readAddress(settings.payout, PAYOUT, "guardian"),
+    readAddress(settings.payout, PAYOUT, "factory"),
+    readAddress(settings.payout, PAYOUT, "forwarderImplementation"),
   ]);
   return {
     chainId,
@@ -224,6 +236,8 @@ async function readChainState(settings: V2Settings): Promise<V2ChainState> {
     payoutVault,
     payoutOperator,
     payoutGuardian,
+    payoutFactory,
+    payoutImplementation,
   };
 }
 
@@ -287,8 +301,10 @@ const CHAIN_CHECK_RETRY_MS = 60_000;
 
 async function runChainCheck(settings: V2Settings): Promise<void> {
   let state: V2ChainState;
+  let tokenProblems: string[];
   try {
     state = await readChainState(settings);
+    tokenProblems = await readTokenContractProblems();
   } catch (error) {
     // RPC unreachable or erroring: stay paused, retry. Mismatches below never retry.
     reasons = [`custody v2 on-chain checks could not run (${(error as Error).message}); retrying every minute`];
@@ -300,7 +316,7 @@ async function runChainCheck(settings: V2Settings): Promise<void> {
     retryTimer.unref?.();
     return;
   }
-  const problems = checkV2Chain(settings, state, config.evm.chainId);
+  const problems = [...checkV2Chain(settings, state, config.evm.chainId), ...tokenProblems];
   if (problems.length > 0) {
     reasons = problems;
     console.error(

@@ -4,14 +4,14 @@ import { depositSalt, predictForwarder } from "../../src/custody/forwarder";
 /**
  * Deploys DepositFactory and HotPayout with every role, allowlist entry and cap set in the
  * constructors, so the deployer key holds no power afterwards and the vault needs no setup
- * transactions.
+ * transactions. The factory goes first; HotPayout records it and never pays its clones.
  *
  *   VAULT_ADDRESS=0x.. PAYOUT_OPERATOR_ADDRESS=0x.. PAYOUT_GUARDIAN_ADDRESS=0x.. \
  *   DEPLOYER_PRIVATE_KEY=0x.. npm run deploy:custody -- --network mezoMainnet
  *
- * DEPOSITS_TO_HOT_PAYOUT=yes deploys HotPayout first and makes it the factory's vault, so
- * deposits refill withdrawals with no vault signing; VAULT_ADDRESS then only administers
- * HotPayout (unpause, caps, roles, recover) and the factory's token allowlist is fixed.
+ * DEPOSITS_TO_HOT_PAYOUT=yes points the factory at HotPayout's address (the deployer's next
+ * nonce), so deposits refill withdrawals with no vault signing; VAULT_ADDRESS then only
+ * administers HotPayout and the factory's allowlist and rescues.
  *
  * Without CONFIRM_DEPLOY=yes it validates and prints the plan, then exits without sending.
  * Optional caps: PAYOUT_NATIVE_PER_TX_SATS / PAYOUT_NATIVE_DAILY_SATS (sats), and
@@ -28,8 +28,8 @@ const MAINNET_CHAIN_ID = 31612n;
 const HARDHAT_CHAIN_ID = 31337n;
 
 const TOKENS = [
-  { symbol: "MUSD", address: "0xdD468A1DDc392dcdbEf6db6e34E89AA338F9F186", decimals: 18, perTx: "50", daily: "150" },
-  { symbol: "MUSDC", address: "0x04671C72Aab5AC02A03c1098314b1BB6B560c197", decimals: 6, perTx: "50", daily: "150" },
+  { symbol: "MUSD", address: "0xdD468A1DDc392dcdbEf6db6e34E89AA338F9F186", decimals: 18, perTx: "15", daily: "30" },
+  { symbol: "MUSDC", address: "0x04671C72Aab5AC02A03c1098314b1BB6B560c197", decimals: 6, perTx: "0", daily: "0" },
   { symbol: "MEZO", address: "0x7B7c000000000000000000000000000000000001", decimals: 18, perTx: "0", daily: "0" },
 ];
 
@@ -45,6 +45,12 @@ function requireAddress(name: string): string {
   const value = process.env[name]?.trim();
   if (!value) throw new Error(`${name} is required`);
   return ethers.getAddress(value);
+}
+
+/** Runtime code of an OpenZeppelin EIP-1167 clone of `implementation` (what CREATE2 leaves behind). */
+function cloneRuntimeCode(implementation: string): string {
+  const address = ethers.getAddress(implementation).slice(2).toLowerCase();
+  return `0x363d3d373d3d3d363d73${address}5af43d82803e903d91602b57fd5bf3`;
 }
 
 function sameAddress(a: string, b: string): boolean {
@@ -83,7 +89,7 @@ async function main() {
   }
 
   const caps = [
-    readCap("BTC", NATIVE, 18, "100000", "300000"),
+    readCap("BTC", NATIVE, 18, "80000", "150000"),
     ...TOKENS.map((t) => readCap(t.symbol, t.address, t.decimals, t.perTx, t.daily)),
   ];
   const payoutCaps = caps.filter((c) => c.daily > 0n);
@@ -132,37 +138,40 @@ async function main() {
     return;
   }
 
-  const deployFactory = async (target: string) => {
-    const deployed = await (await ethers.getContractFactory("DepositFactory")).deploy(target, factoryTokens);
-    await deployed.waitForDeployment();
-    return deployed;
-  };
-  // With DEPOSITS_TO_HOT_PAYOUT, HotPayout goes first so the factory can point at it.
-  const factoryFirst = depositsToPayout ? null : await deployFactory(vault);
+  // The factory goes first so HotPayout can record it. With DEPOSITS_TO_HOT_PAYOUT the factory
+  // targets the address HotPayout will get from the deployer's next nonce; HotPayout's constructor
+  // and the read-back below both fail if that prediction is wrong.
+  const nonce = await ethers.provider.getTransactionCount(deployer.address, "pending");
+  const predictedPayout = ethers.getCreateAddress({ from: deployer.address, nonce: nonce + 1 });
+  const depositTarget = depositsToPayout ? predictedPayout : vault;
+  const factory = await (await ethers.getContractFactory("DepositFactory")).deploy(depositTarget, factoryTokens, { nonce });
+  await factory.waitForDeployment();
+  const factoryAddress = await factory.getAddress();
   const payout = await (await ethers.getContractFactory("HotPayout")).deploy(
     vault,
     operator,
     guardian,
+    factoryAddress,
     payoutCaps.map((c) => c.token),
     payoutCaps.map((c) => c.perTx),
     payoutCaps.map((c) => c.daily),
+    { nonce: nonce + 1 },
   );
   await payout.waitForDeployment();
   const payoutAddress = await payout.getAddress();
-  const factory = factoryFirst ?? (await deployFactory(payoutAddress));
-  const depositTarget = depositsToPayout ? payoutAddress : vault;
   const factoryReceipt = await factory.deploymentTransaction()!.wait();
   const payoutReceipt = await payout.deploymentTransaction()!.wait();
 
   // Read everything back from chain before anyone configures the bot with these addresses.
-  const factoryAddress = await factory.getAddress();
   const implementation = await factory.implementation();
   const forwarder = await ethers.getContractAt("DepositForwarder", implementation);
   const problems: string[] = [];
   const check = (ok: boolean, what: string) => {
     if (!ok) problems.push(what);
   };
+  if (depositsToPayout) check(sameAddress(payoutAddress, predictedPayout), "HotPayout address differs from the prediction");
   check(sameAddress(await factory.vault(), depositTarget), "DepositFactory.vault()");
+  check(sameAddress(await factory.admin(), vault), "DepositFactory.admin()");
   check(sameAddress(await forwarder.vault(), depositTarget), "DepositForwarder.vault()");
   check(sameAddress(await forwarder.factory(), factoryAddress), "DepositForwarder.factory()");
   for (const t of TOKENS) check(await factory.allowedToken(t.address), `DepositFactory.allowedToken(${t.symbol})`);
@@ -176,6 +185,12 @@ async function main() {
   check(sameAddress(await payout.operator(), operator), "HotPayout.operator()");
   check(sameAddress(await payout.guardian(), guardian), "HotPayout.guardian()");
   check(!(await payout.paused()), "HotPayout.paused()");
+  check(sameAddress(await payout.factory(), factoryAddress), "HotPayout.factory()");
+  check(sameAddress(await payout.forwarderImplementation(), implementation), "HotPayout.forwarderImplementation()");
+  check(
+    (await payout.forwarderCodeHash()) === ethers.keccak256(cloneRuntimeCode(implementation)),
+    "HotPayout.forwarderCodeHash()",
+  );
   for (const c of caps) {
     const listed = c.daily > 0n;
     check((await payout.allowedToken(c.token)) === listed, `HotPayout.allowedToken(${c.symbol})`);

@@ -18,7 +18,7 @@ import { recordLedgerEntry } from "../ledger.js";
 import { replyInsufficientBalance } from "./responses.js";
 import {
   reservationFailureMessage,
-  userWithdrawalCapMessage,
+  userWithdrawalLimitMessage,
   withdrawalPreflightMessage,
   withdrawalsPausedMessage,
 } from "./withdraw.js";
@@ -191,7 +191,7 @@ async function tipGasSponsor(interaction: ChatInputCommandInteraction, amount: n
   await interaction.deferReply();
 
   const sponsorAddress = getSweepGasSponsorAddress();
-  const capMessage = await userWithdrawalCapMessage(interaction.user.id, "SATS", amount);
+  const capMessage = await userWithdrawalLimitMessage(interaction.user.id, "SATS", amount);
   if (capMessage) {
     return interaction.editReply({ content: capMessage });
   }
