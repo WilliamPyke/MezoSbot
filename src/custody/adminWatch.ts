@@ -136,6 +136,14 @@ export async function guardianCancel(settings: V2Settings, q: Pick<QueuedAction,
   const guardian = getGuardianWallet();
   if (!guardian) throw new Error("no guardian key is configured");
   if (q.action === "guardian") throw new Error("a new guardian can only be cancelled from the vault wallet");
+  if (q.action === "vault") {
+    // Only the guardian in office when a handover was queued can cancel it.
+    const raw = await ethCall(settings.payout, PAYOUT.encodeFunctionData("handoverGuardian", [q.id]));
+    const owner = String(PAYOUT.decodeFunctionResult("handoverGuardian", raw)[0]);
+    if (owner.toLowerCase() !== guardian.address.toLowerCase()) {
+      throw new Error(`only the guardian in office when it was queued (${owner}) can cancel this handover`);
+    }
+  }
   const { txHash } = await sendCustodyTx({
     wallet: guardian,
     to: settings.payout,
@@ -219,7 +227,10 @@ async function handleQueued(settings: V2Settings, event: DecodedAdminLog & { kin
       if (error) throw new Error(`custody_expected_actions: ${error.message}`);
       if ((claimed ?? []).length === 1) {
         await recordQueued(settings, event, "approved", expectation.id);
-        lines.push(`✅ Approved vault action queued: ${what}. It can be applied from ${when(q.eta)} until ${when(grace)}. id \`${q.id}\``);
+        lines.push(
+          `✅ Approved vault action queued: ${what}. It can be applied from ${when(q.eta)} until ${when(grace)}` +
+          `${q.action === "vault" ? "; have the new wallet call `acceptVault()` as soon as it can" : ""}. id \`${q.id}\``,
+        );
         return;
       }
     }
@@ -230,10 +241,10 @@ async function handleQueued(settings: V2Settings, event: DecodedAdminLog & { kin
     lines.push(
       `🚨 **Unapproved vault action queued: ${what}** (tx ${event.txHash}). Only the vault wallet can cancel a new guardian: ` +
       `from \`${checksum(settings.vault)}\` call HotPayout \`${cancelCallText(q)}\` before ${when(q.eta)}. ` +
-      `If nobody on the team queued it, the vault key is exposed: also queue a vault handover to a fresh wallet before ${when(q.eta)} ` +
-      "(approve it with `/custody expect action:vault`, then `proposeVault`, or a signed `proposeVaultWithSig` anyone can submit). " +
-      "A handover queued before this guardian could take office cannot be cancelled by it, lands first, and drops everything " +
-      "the old key queued.",
+      "If nobody on the team queued it, the vault key is exposed: queue a vault handover to a fresh wallet **now**, well before " +
+      `${when(q.eta)} (approve it with \`/custody expect action:vault\`, then \`proposeVault\`, or a signed \`proposeVaultWithSig\` ` +
+      "anyone can submit), and have the fresh wallet call `acceptVault()` the moment it can be applied. A handover queued while " +
+      "the current guardian is in office can only be cancelled by it, lands first, and drops everything the old key queued.",
     );
     return;
   }

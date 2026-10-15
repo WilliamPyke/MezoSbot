@@ -74,11 +74,9 @@ contract HotPayout is ReentrancyGuard, Pausable {
     address public vault;
     address public operator;
     address public guardian;
-    /// @notice When the current guardian took office (0 for the guardian set at deploy).
-    uint256 public guardianSince;
-    /// @notice The guardian before the current one. A vault handover queued no later than
-    ///         guardianSince can only be cancelled by it, the guardian in office when it was queued.
-    address public previousGuardian;
+    /// @notice The guardian in office when each vault handover was queued; only it can cancel that
+    ///         handover, however many guardian changes follow.
+    mapping(bytes32 => address) public handoverGuardian;
 
     /// @notice Deposit factory whose implementation and forwarder clones never receive payouts;
     ///         address(0) when none was given.
@@ -257,17 +255,17 @@ contract HotPayout is ReentrancyGuard, Pausable {
 
     /// @notice Cancels one queued vault action. The guardian cancels everything except a new
     ///         guardian, which only the vault can cancel, so neither role can block its own
-    ///         replacement. A vault handover is cancelled by the guardian that was in office when it
-    ///         was queued: one queued no later than guardianSince only by previousGuardian, so a
-    ///         guardian installed by whoever held the vault key cannot stop the handover that
-    ///         replaces that key, and a handover the old guardian should have stopped stays stoppable.
+    ///         replacement. A vault handover can only be cancelled by the guardian that was in office
+    ///         when it was queued (handoverGuardian), so a guardian installed later by whoever held the
+    ///         vault key cannot stop the handover that replaces that key, and a handover the guardian
+    ///         of the day should have stopped stays stoppable by it.
     function cancel(Action action, address subject, uint256 value1, uint256 value2) external {
         bytes32 id = actionId(action, subject, value1, value2);
         uint256 eta = queuedEta[id];
         if (action == Action.Guardian) {
             if (msg.sender != vault) revert NotVault();
-        } else if (action == Action.Vault && eta != 0 && eta - VAULT_DELAY <= guardianSince) {
-            if (msg.sender != previousGuardian) revert QueuedBeforeGuardian();
+        } else if (action == Action.Vault && eta != 0) {
+            if (msg.sender != handoverGuardian[id]) revert QueuedBeforeGuardian();
         } else if (msg.sender != guardian) {
             revert NotGuardian();
         }
@@ -365,9 +363,7 @@ contract HotPayout is ReentrancyGuard, Pausable {
         _take(Action.Guardian, next, 0, 0);
         _checkRoles(vault, operator, next);
         emit GuardianSet(guardian, next);
-        previousGuardian = guardian;
         guardian = next;
-        guardianSince = block.timestamp;
     }
 
     function applyCaps(address token, uint256 perTx, uint256 daily) external onlyVault {
@@ -492,6 +488,7 @@ contract HotPayout is ReentrancyGuard, Pausable {
         uint256 eta = block.timestamp +
             (action == Action.Guardian ? GUARDIAN_DELAY : action == Action.Vault ? VAULT_DELAY : DELAY);
         queuedEta[id] = eta;
+        if (action == Action.Vault) handoverGuardian[id] = guardian;
         emit ActionQueued(id, action, subject, value1, value2, eta);
     }
 

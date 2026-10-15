@@ -915,7 +915,7 @@ describe("HotPayout", () => {
     await payout.connect(vault).proposeVault(nextRole.address);
     await time.increase(WINDOW);
     await payout.connect(vault).applyGuardian(unexpectedGuardian.address);
-    expect(await payout.guardianSince()).to.equal(BigInt(await time.latest()));
+    expect(await payout.handoverGuardian(await payout.actionId(Action.vault, nextRole.address, 0n, 0n))).to.equal(guardian.address);
     await expect(payout.connect(unexpectedGuardian).cancel(Action.vault, nextRole.address, 0n, 0n)).to.be.revertedWithCustomError(
       payout,
       "QueuedBeforeGuardian",
@@ -945,7 +945,7 @@ describe("HotPayout", () => {
     await payout.connect(vault).proposeGuardian(newGuardian.address);
     await time.increase(GUARDIAN_DELAY);
     await payout.connect(vault).applyGuardian(newGuardian.address);
-    expect(await payout.previousGuardian()).to.equal(guardian.address);
+    expect(await payout.handoverGuardian(await payout.actionId(Action.vault, unexpectedVault.address, 0n, 0n))).to.equal(guardian.address);
     await expect(payout.connect(newGuardian).cancel(Action.vault, unexpectedVault.address, 0n, 0n)).to.be.revertedWithCustomError(
       payout,
       "QueuedBeforeGuardian",
@@ -956,6 +956,35 @@ describe("HotPayout", () => {
     );
     await expect(payout.connect(guardian).cancel(Action.vault, unexpectedVault.address, 0n, 0n)).to.emit(payout, "ActionCancelled");
     await expect(payout.connect(unexpectedVault).acceptVault()).to.be.revertedWithCustomError(payout, "NothingPending");
+  });
+
+  it("two guardian changes in a row cannot cancel a handover queued before them", async () => {
+    const { vault, guardian, nextRole, payout } = await loadFixture(payoutFixture);
+    const [, , , , , , , first, second, unexpectedVault] = await ethers.getSigners();
+    await payout.connect(vault).proposeGuardian(first.address);
+    await payout.connect(vault).proposeGuardian(second.address);
+    await time.increase(WINDOW);
+    await payout.connect(vault).proposeVault(nextRole.address);
+    await time.increase(GUARDIAN_DELAY - WINDOW);
+    await payout.connect(vault).applyGuardian(first.address);
+    await payout.connect(vault).applyGuardian(second.address);
+    await payout.connect(vault).proposeVault(unexpectedVault.address);
+    for (const signer of [first, second]) {
+      await expect(payout.connect(signer).cancel(Action.vault, nextRole.address, 0n, 0n)).to.be.revertedWithCustomError(
+        payout,
+        "QueuedBeforeGuardian",
+      );
+    }
+    await expect(payout.connect(first).cancel(Action.vault, unexpectedVault.address, 0n, 0n)).to.be.revertedWithCustomError(
+      payout,
+      "QueuedBeforeGuardian",
+    );
+    // The handover queued first lands first and drops the later one.
+    await payout.connect(nextRole).acceptVault();
+    await time.increase(VAULT_DELAY);
+    await expect(payout.connect(unexpectedVault).acceptVault()).to.be.revertedWithCustomError(payout, "NothingPending");
+    expect(await payout.vault()).to.equal(nextRole.address);
+    expect(guardian.address).to.not.equal(second.address);
   });
 
   it("cancel needs something pending and the right role", async () => {
@@ -1241,8 +1270,7 @@ describe("Custody ABI the bot depends on", () => {
         "DELAY()",
         "GUARDIAN_DELAY()",
         "VAULT_DELAY()",
-        "guardianSince()",
-        "previousGuardian()",
+        "handoverGuardian(bytes32)",
         "usedSignatures(bytes32)",
         "MAX_CAP()",
         "PROPOSE_VAULT_TYPEHASH()",

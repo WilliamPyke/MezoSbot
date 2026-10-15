@@ -286,7 +286,7 @@ by its exact content.
 | Raise caps (both values >= now) | `setCaps(token, perTx, daily)` | `applyCaps(token, perTx, daily)` | 3 days | guardian |
 | New operator | `proposeOperator(address)` | `applyOperator(address)` | 3 days | guardian |
 | New guardian | `proposeGuardian(address)` | `applyGuardian(address)` | 4 days | vault only |
-| New vault | `proposeVault(address)` or `proposeVaultWithSig` | `acceptVault()` (sent by the new vault) | 2 days | guardian (only one queued after it took office) |
+| New vault | `proposeVault(address)` or `proposeVaultWithSig` | `acceptVault()` (sent by the new vault) | 2 days | the guardian in office when it was queued |
 
 `token` is `0x0000000000000000000000000000000000000000` for BTC.
 
@@ -304,10 +304,13 @@ makes the guardian cancel a queued action by hand.
 A new guardian can only be cancelled by the vault, so a leaked guardian key
 cannot block its own replacement. For an unapproved one the bot DMs the exact
 `cancel(…)` call to send from the vault wallet, every 6 hours while it stays
-queued. It waits 4 days. A vault handover queued before it can take office
-cannot be cancelled by it, lands within 2 days (before anything the old key
-queues afterwards, which waits 3), and every handover drops all actions
-queued before it.
+queued. It waits 4 days. A vault handover can only be cancelled by the guardian
+that was in office when it was queued, so one queued before an unwanted
+guardian takes office cannot be cancelled by it (or by any guardian after it);
+it lands within 2 days, before anything the old key queues afterwards (which
+waits 3), and every handover drops all actions queued before it. Keep an
+outgoing guardian key, with a little gas, for 9 days after a rotation so it
+can still cancel handovers queued while it was in office.
 
 **If the vault key may be exposed** (an unapproved action appeared): hand the
 vault to a fresh wallet. Approve it (`/custody expect action:vault
