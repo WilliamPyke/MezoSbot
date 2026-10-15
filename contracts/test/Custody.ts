@@ -1,5 +1,5 @@
 import { expect } from "chai";
-import type { ErrorFragment } from "ethers";
+import type { ContractTransactionResponse, ErrorFragment } from "ethers";
 import { ethers } from "hardhat";
 import { loadFixture, time } from "@nomicfoundation/hardhat-network-helpers";
 import { DEPOSIT_FACTORY_ABI, HOT_PAYOUT_ABI, NATIVE_TOKEN, PAYOUT_ACTIONS } from "../../src/custody/abi";
@@ -18,6 +18,14 @@ const NATIVE_DAILY = sats(150_000);
 const TOKEN_PER_TX = ethers.parseEther("15");
 const TOKEN_DAILY = ethers.parseEther("30");
 const Action = Object.fromEntries(PAYOUT_ACTIONS.map((name, i) => [name, i])) as Record<(typeof PAYOUT_ACTIONS)[number], number>;
+
+/** The transaction once mined, and the eta an action it queued gets: its block's timestamp plus `delay`. */
+async function queuedAt(sent: Promise<ContractTransactionResponse>, delay: bigint) {
+  const tx = await sent;
+  const receipt = await tx.wait();
+  const block = await ethers.provider.getBlock(receipt!.blockNumber);
+  return { tx, eta: BigInt(block!.timestamp) + delay };
+}
 
 /** Runtime code of an EIP-1167 clone pointing at `implementation`. */
 function cloneRuntime(implementation: string): string {
@@ -478,9 +486,10 @@ describe("HotPayout", () => {
     );
     // Caps above the current (0, 0) are a loosening, so they wait DELAY.
     const id = await payout.actionId(Action.caps, other, 10n, 20n);
-    await expect(payout.connect(vault).setCaps(other, 10n, 20n))
+    const caps = await queuedAt(payout.connect(vault).setCaps(other, 10n, 20n), DELAY);
+    await expect(caps.tx)
       .to.emit(payout, "ActionQueued")
-      .withArgs(id, Action.caps, await other.getAddress(), 10n, 20n, (await time.latest()) + Number(DELAY) + 1);
+      .withArgs(id, Action.caps, await other.getAddress(), 10n, 20n, caps.eta);
     await time.increase(DELAY);
     await expect(payout.connect(vault).applyCaps(other, 10n, 20n)).to.emit(payout, "ActionApplied").withArgs(id, Action.caps);
     await payout.connect(operator).payToken(withdrawalRef(7), other, user.address, 10n);
@@ -684,9 +693,10 @@ describe("HotPayout", () => {
     }
 
     const id = await payout.actionId(Action.operator, nextRole.address, 0n, 0n);
-    await expect(payout.connect(vault).proposeOperator(nextRole.address))
+    const proposed = await queuedAt(payout.connect(vault).proposeOperator(nextRole.address), DELAY);
+    await expect(proposed.tx)
       .to.emit(payout, "ActionQueued")
-      .withArgs(id, Action.operator, nextRole.address, 0n, 0n, (await time.latest()) + Number(DELAY) + 1);
+      .withArgs(id, Action.operator, nextRole.address, 0n, 0n, proposed.eta);
     await expect(payout.connect(vault).proposeOperator(nextRole.address)).to.be.revertedWithCustomError(
       payout,
       "ActionPending",
@@ -866,16 +876,10 @@ describe("HotPayout", () => {
       payout,
       "BadSignature",
     );
-    await expect(payout.connect(guardian).proposeVaultWithSig(nextRole.address, deadline, signature))
+    const signed = await queuedAt(payout.connect(guardian).proposeVaultWithSig(nextRole.address, deadline, signature), VAULT_DELAY);
+    await expect(signed.tx)
       .to.emit(payout, "ActionQueued")
-      .withArgs(
-        await payout.actionId(Action.vault, nextRole.address, 0n, 0n),
-        Action.vault,
-        nextRole.address,
-        0n,
-        0n,
-        (await time.latest()) + Number(VAULT_DELAY) + 1,
-      );
+      .withArgs(await payout.actionId(Action.vault, nextRole.address, 0n, 0n), Action.vault, nextRole.address, 0n, 0n, signed.eta);
     // The same signature cannot be used again, even after a cancel.
     await payout.connect(guardian).cancel(Action.vault, nextRole.address, 0n, 0n);
     await expect(payout.connect(outsider).proposeVaultWithSig(nextRole.address, deadline, signature)).to.be.revertedWithCustomError(
@@ -1240,12 +1244,21 @@ describe("Custody ABI the bot depends on", () => {
       [],
       [],
     );
-    await expect(payout.connect(vault).proposeOperator(nextRole.address))
+    const operatorQueued = await queuedAt(payout.connect(vault).proposeOperator(nextRole.address), DELAY);
+    await expect(operatorQueued.tx)
       .to.emit(payout, "ActionQueued")
-      .withArgs(await payout.actionId(Action.operator, nextRole.address, 0n, 0n), Action.operator, nextRole.address, 0n, 0n, (await time.latest()) + Number(DELAY) + 1);
-    await expect(payout.connect(vault).proposeRecover(NATIVE, 5n))
+      .withArgs(
+        await payout.actionId(Action.operator, nextRole.address, 0n, 0n),
+        Action.operator,
+        nextRole.address,
+        0n,
+        0n,
+        operatorQueued.eta,
+      );
+    const recoverQueued = await queuedAt(payout.connect(vault).proposeRecover(NATIVE, 5n), DELAY);
+    await expect(recoverQueued.tx)
       .to.emit(payout, "ActionQueued")
-      .withArgs(await payout.actionId(Action.recover, NATIVE, 5n, 0n), Action.recover, NATIVE, 5n, 0n, (await time.latest()) + Number(DELAY) + 1);
+      .withArgs(await payout.actionId(Action.recover, NATIVE, 5n, 0n), Action.recover, NATIVE, 5n, 0n, recoverQueued.eta);
     await expect(payout.connect(vault).proposeVault(operator.address)).to.be.revertedWithCustomError(payout, "InvalidRoles");
   });
 
