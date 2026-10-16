@@ -15,6 +15,7 @@ export const data = {
     { name: "amount", type: 10 as const, description: "Token amount to add (negative to debit)", required: true },
     { name: "token", type: 3 as const, description: "Token to adjust", required: false, choices: TOKEN_CHOICES },
     { name: "reason", type: 3 as const, description: "Reason for adjustment", required: false },
+    { name: "allow_unbacked", type: 5 as const, description: "Credit SATS even when holdings don't cover all balances", required: false },
   ],
 };
 
@@ -34,12 +35,18 @@ export async function execute(interaction: ChatInputCommandInteraction) {
 
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
+  let unbackedShortfall: number | null = null;
   if (amount > 0 && token === "SATS") {
     const mint = await canMintSats(amount);
     if (!mint.ok) {
-      return interaction.editReply({
-        content: `❌ Cannot credit unbacked SATS. Treasury is short **${formatSats(mint.shortfallSats)}**. Send native BTC to the treasury address first.`,
-      });
+      if (!interaction.options.getBoolean("allow_unbacked")) {
+        return interaction.editReply({
+          content: `❌ Cannot credit unbacked SATS. Treasury is short **${formatSats(mint.shortfallSats)}**. ` +
+            "Send native BTC to the treasury address first, or repeat with `allow_unbacked:True`.",
+        });
+      }
+      unbackedShortfall = mint.shortfallSats;
+      console.warn(`[Credit] ${interaction.user.id} credited ${amount} SATS to ${target.id} unbacked (short ${mint.shortfallSats} sats)`);
     }
   }
 
@@ -58,7 +65,11 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     senderId: amount > 0 ? "treasury" : target.id,
     receiverId: amount > 0 ? target.id : "treasury",
     guildId: interaction.guildId,
-    metadata: { reason, admin_id: interaction.user.id },
+    metadata: {
+      reason,
+      admin_id: interaction.user.id,
+      ...(unbackedShortfall != null ? { unbacked: true, shortfall_sats: unbackedShortfall } : {}),
+    },
   });
 
   const action = amount > 0 ? "Credited" : "Debited";
@@ -73,6 +84,9 @@ export async function execute(interaction: ChatInputCommandInteraction) {
       { name: "Reason", value: reason },
     )
     .setTimestamp();
+  if (unbackedShortfall != null) {
+    embed.addFields({ name: "⚠️ Unbacked", value: `Holdings were short **${formatSats(unbackedShortfall)}** including this credit.` });
+  }
 
   await interaction.editReply({ embeds: [embed], allowedMentions: { parse: [] } });
 }
