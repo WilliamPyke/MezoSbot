@@ -598,22 +598,23 @@ export async function registerDepositAddress(
 
 /**
  * Get a reliable gas price with multiple fallbacks.
- * The Mezo RPC sometimes returns null from getFeeData(), so we
- * try several approaches before falling back to a safe default.
+ * Never ethers' getFeeData().maxFeePerGas: when eth_gasPrice and
+ * eth_maxPriorityFeePerGas both fail it adds a 1 gwei default tip,
+ * ~700x Mezo's gas price, so every gas check and pinned price balloons.
  */
 async function getGasPrice(): Promise<bigint> {
-  // 1) Standard ethers fee data
-  try {
-    const feeData = await provider.getFeeData();
-    if (feeData.gasPrice && feeData.gasPrice > 0n) return feeData.gasPrice;
-    if (feeData.maxFeePerGas && feeData.maxFeePerGas > 0n) return feeData.maxFeePerGas;
-  } catch {}
-
-  // 2) Direct eth_gasPrice RPC call
+  // 1) eth_gasPrice (rawRpcCall retries transport errors)
   try {
     const raw = await rawRpcCall("eth_gasPrice", []) as string;
     const price = BigInt(raw);
     if (price > 0n) return price;
+  } catch {}
+
+  // 2) Twice the latest base fee
+  try {
+    const block = await rawRpcCall("eth_getBlockByNumber", ["latest", false]) as { baseFeePerGas?: string } | null;
+    const baseFee = BigInt(block?.baseFeePerGas ?? 0);
+    if (baseFee > 0n) return baseFee * 2n;
   } catch {}
 
   // 3) Conservative fallback based on observed Mezo gas (~1.3M wei/gas)
