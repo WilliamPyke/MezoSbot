@@ -181,6 +181,11 @@ export const config = {
     eta: optional("WITHDRAWALS_ETA", "soon"),
     /** Per-user rolling 24h cap on SATS withdrawals (0 = no cap). HotPayout caps apply on top. */
     userDailyMaxSats: optionalNumber("WITHDRAWAL_USER_DAILY_MAX_SATS", 100_000),
+    /**
+     * Allow SATS withdrawals while total backing is below liabilities. Each
+     * payout is still simulated against HotPayout's float and caps first.
+     */
+    allowUnderbacked: optionalBool("WITHDRAWALS_ALLOW_UNDERBACKED", false),
   },
   /**
    * Public base URL of this bot's HTTP server (no trailing slash).

@@ -1724,7 +1724,8 @@ export async function preflightWithdrawal(
   try {
     if (token === "SATS") {
       const solvency = await checkSatsExitSolvency();
-      if (!solvency.ok) {
+      const underbackedAllowed = !solvency.ok && solvency.reason === "underbacked" && config.withdrawals.allowUnderbacked;
+      if (!solvency.ok && !underbackedAllowed) {
         return solvency.reason === "underbacked"
           ? { ok: false, code: "underbacked", error: "Treasury SATS backing is below liabilities plus reserve" }
           : { ok: false, code: "backing_unavailable", error: solvency.error };
