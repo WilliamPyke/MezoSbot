@@ -1,0 +1,13 @@
+{
+  "name": "mezosbot-render-keepalive",
+  "main": "index.js",
+  "compatibility_date": "2026-08-12",
+  "account_id": "df8279c833d38dca96f9a091ca3a9219",
+  "workers_dev": false,
+  "observability": { "enabled": true },
+  "triggers": { "crons": ["*/10 * * * *"] },
+  "vars": {
+    // The Render service URL, without a trailing slash.
+    "RENDER_URL": "https://mezosbot.onrender.com"
+  }
+}
