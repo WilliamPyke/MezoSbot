@@ -8,6 +8,6 @@
   "triggers": { "crons": ["*/10 * * * *"] },
   "vars": {
     // The Render service URL, without a trailing slash.
-    "RENDER_URL": "https://mezosbot.onrender.com"
+    "RENDER_URL": "https://mezosbot-r9bj.onrender.com"
   }
 }
