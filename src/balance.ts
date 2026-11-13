@@ -165,6 +165,30 @@ export function describeUndeliveredCredits(
   return lines.length > 0 ? lines.join("\n") : null;
 }
 
+/**
+ * Move funds from one user to another in a single database transaction.
+ * Returns false, with nothing moved, when the sender cannot pay. Throws when
+ * the call fails; use isDefiniteDbFailure(error) to tell "nothing moved" from
+ * "may have moved".
+ */
+export async function transferBalance(
+  senderId: string,
+  recipientId: string,
+  amount: number,
+  token: TokenSymbol = "SATS",
+): Promise<boolean> {
+  const rounded = token === "SATS" ? roundSats(amount) : roundTokenAmount(amount, token);
+  if (rounded <= 0) return false;
+  const { data, error } = await supabase.rpc("transfer_balance_v1", {
+    p_sender_id: senderId,
+    p_recipient_id: recipientId,
+    p_token: token,
+    p_amount: rounded,
+  });
+  if (error) throw error;
+  return data === true;
+}
+
 export async function subtractBalance(discordId: string, amountSats: number, token: TokenSymbol = "SATS"): Promise<boolean> {
   const rounded = token === "SATS" ? roundSats(amountSats) : roundTokenAmount(amountSats, token);
   if (rounded <= 0) return false;

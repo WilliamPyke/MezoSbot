@@ -363,7 +363,29 @@ client.once(Events.ClientReady, async (c) => {
   }
 });
 
-client.on(Events.InteractionCreate, async (interaction) => {
+/* ── Interactions and graceful shutdown ───────────────────────────── */
+
+// Interactions still being handled. On SIGTERM (Render deploys, restarts and
+// sleeps all send one) the bot takes no new interactions and lets these
+// finish, so a command is never cut off between moving funds and replying.
+const inFlightInteractions = new Set<Promise<void>>();
+let shuttingDown = false;
+const SHUTDOWN_DRAIN_MS = 20_000;
+
+client.on(Events.InteractionCreate, (interaction) => {
+  if (shuttingDown) {
+    // Left unanswered on purpose: an instance that is starting up can still
+    // take it, and nothing has been changed.
+    console.warn(`[Shutdown] Ignoring interaction ${interaction.id} from ${interaction.user.tag} while shutting down`);
+    return;
+  }
+  const run: Promise<void> = handleInteraction(interaction)
+    .catch((err) => console.error("[Discord] Interaction handler failed:", (err as Error)?.message ?? err))
+    .finally(() => inFlightInteractions.delete(run));
+  inFlightInteractions.add(run);
+});
+
+async function handleInteraction(interaction: Interaction): Promise<void> {
   // Arrival latency = how long Discord took to deliver this to us. If this is
   // consistently >500ms, the gateway connection is unhealthy (we're behind on
   // events, often due to event-loop starvation or a recent reconnect).
@@ -575,7 +597,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await interaction.reply(msg).catch(() => {});
     }
   }
-});
+}
 
 client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
   await handleQuestVoiceStateUpdate(client, oldState, newState).catch((err) =>
@@ -1083,22 +1105,33 @@ async function main() {
   }
 }
 
-// Graceful shutdown: save game state before exit
-process.on("SIGINT", async () => {
-  console.log("\n[Shutdown] Received SIGINT, saving game state...");
-  if (!config.services.emulatorRemote) {
-    await import("./emulator.js").then((module) => module.stopEmulator());
+// Graceful shutdown: finish interactions in progress, save game state, exit.
+async function shutdown(signal: NodeJS.Signals): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`\n[Shutdown] Received ${signal}; finishing ${inFlightInteractions.size} interaction(s) in progress`);
+  const drained = await Promise.race([
+    Promise.allSettled([...inFlightInteractions]).then(() => true),
+    sleep(SHUTDOWN_DRAIN_MS).then(() => false),
+  ]);
+  if (!drained) {
+    console.error(
+      `[Shutdown] ${inFlightInteractions.size} interaction(s) still running after ${SHUTDOWN_DRAIN_MS}ms; exiting anyway`,
+    );
+  }
+  try {
+    if (!config.services.emulatorRemote) {
+      await import("./emulator.js").then((module) => module.stopEmulator());
+    }
+    await client.destroy();
+  } catch (err) {
+    console.warn("[Shutdown] Cleanup failed:", (err as Error)?.message ?? err);
   }
   process.exit(0);
-});
+}
 
-process.on("SIGTERM", async () => {
-  console.log("\n[Shutdown] Received SIGTERM, saving game state...");
-  if (!config.services.emulatorRemote) {
-    await import("./emulator.js").then((module) => module.stopEmulator());
-  }
-  process.exit(0);
-});
+process.on("SIGINT", () => void shutdown("SIGINT"));
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
 
 main().catch((err) => {
   console.error(err);

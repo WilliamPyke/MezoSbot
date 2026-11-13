@@ -37,6 +37,7 @@ jobs:
       - run: npm run test:modular
       - run: npm run test:operations
       - run: npm run test:withdrawals
+      - run: npm run test:transfers
       - run: npm run test:custody
       - run: npm run test:swap
 
@@ -144,6 +145,11 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f migrations/2026-10-08_withdrawal_safety.sql
           psql -v ON_ERROR_STOP=1 -f migrations/2026-10-08_withdrawal_safety.sql
           psql -v ON_ERROR_STOP=1 -f tests/withdrawal-db.sql
+      - name: Tip and drop transfer invariants
+        run: |
+          psql -v ON_ERROR_STOP=1 -f migrations/2026-11-13_atomic_tips_and_drops.sql
+          psql -v ON_ERROR_STOP=1 -f migrations/2026-11-13_atomic_tips_and_drops.sql
+          psql -v ON_ERROR_STOP=1 -f tests/tips-drops-db.sql
       - name: Public schema lockdown
         run: |
           psql -v ON_ERROR_STOP=1 -f migrations/2026-10-09_lockdown_public_access.sql

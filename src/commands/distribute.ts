@@ -2,7 +2,6 @@ import { EmbedBuilder, MessageFlags, type ChatInputCommandInteraction } from "di
 import {
   creditRecipients,
   describeUndeliveredCredits,
-  getBalance,
   refundUndeliveredCredits,
   subtractBalance,
 } from "../balance.js";
@@ -50,16 +49,14 @@ export async function execute(interaction: ChatInputCommandInteraction) {
 
   const totalNeeded = roundTokenAmount(perUser * validUsers.length, token);
 
-  const balance = await getBalance(interaction.user.id, token);
-  if (balance < totalNeeded) {
-    return replyInsufficientBalance(interaction);
-  }
+  // Acknowledge before any balance changes, so a second delivery of this
+  // interaction fails here with nothing debited and a slow database cannot
+  // expire it after the sender has paid.
+  await interaction.deferReply();
 
   if (!(await subtractBalance(interaction.user.id, totalNeeded, token))) {
     return replyInsufficientBalance(interaction);
   }
-
-  await interaction.deferReply();
 
   // Credit each recipient independently. Only shares that provably failed go
   // back to the sender; unconfirmed ones may have landed and are logged.

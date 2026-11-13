@@ -1,6 +1,6 @@
 import { EmbedBuilder, MessageFlags, type ChatInputCommandInteraction } from "discord.js";
-import { creditRecipients, getBalance, refundUndeliveredCredits, subtractBalance } from "../balance.js";
-import { settledState } from "../depositPolicy.js";
+import { transferBalance } from "../balance.js";
+import { isDefiniteDbFailure, settledState } from "../depositPolicy.js";
 import { withdrawalsBlockedMessage } from "../custody/state.js";
 import {
   executeWithdrawal,
@@ -22,7 +22,7 @@ import {
   withdrawalPreflightMessage,
   withdrawalsPausedMessage,
 } from "./withdraw.js";
-import { TOKEN_CHOICES, formatTokenAmount, parseToken, roundTokenAmount, type TokenSymbol } from "../tokens.js";
+import { TOKEN_CHOICES, formatTokenAmount, parseToken, roundTokenAmount } from "../tokens.js";
 import { config } from "../config.js";
 
 
@@ -77,26 +77,38 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     return interaction.reply({ content: "❌ You can't tip bots.", flags: MessageFlags.Ephemeral });
   }
 
-  const balance = await getBalance(interaction.user.id, token);
-  if (balance < amount) {
-    return replyInsufficientBalance(interaction);
-  }
-
   if (sponsor) return tipGasSponsor(interaction, amount);
-
-  if (!(await subtractBalance(interaction.user.id, amount, token))) {
-    return replyInsufficientBalance(interaction);
-  }
-
-  await interaction.deferReply();
-
   if (!target) throw new Error("Tip destination was not resolved");
 
-  const credit = await creditTipOrRefund(interaction.user.id, target.id, amount, token);
-  if (credit !== "credited") {
-    return interaction.editReply({ content: TIP_FAILURE_MESSAGES[credit] });
+  // Acknowledge before any balance changes. If this interaction is delivered
+  // twice (two instances overlap during a deploy), the second copy fails here
+  // with nothing debited, and a slow database cannot expire the interaction
+  // after the sender has paid.
+  await interaction.deferReply();
+
+  // Debit and credit happen in one database transaction: both or neither.
+  let sent: boolean;
+  try {
+    sent = await transferBalance(interaction.user.id, target.id, amount, token);
+  } catch (error) {
+    const message = (error as Error)?.message ?? String(error);
+    if (isDefiniteDbFailure(error)) {
+      console.error(`[Tip] Transfer of ${amount} ${token} from ${interaction.user.id} to ${target.id} failed: ${message}`);
+      return interaction.editReply({ content: TIP_FAILED_MESSAGE });
+    }
+    console.error(
+      `[Tip] MANUAL REPAIR: transfer of ${amount} ${token} from ${interaction.user.id} to ${target.id} ` +
+      `is unconfirmed (${message}); check both balances`,
+    );
+    return interaction.editReply({ content: TIP_UNCONFIRMED_MESSAGE });
   }
-  await registerDepositAddress(target.id);
+  if (!sent) {
+    return replyInsufficientBalance(interaction);
+  }
+
+  await registerDepositAddress(target.id).catch((err) => {
+    console.warn(`[Tip] Failed to register deposit address for ${target.id}:`, (err as Error)?.message ?? err);
+  });
   await sendTransferReceivedDm({
     client: interaction.client,
     recipientId: target.id,
@@ -150,36 +162,9 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   await interaction.editReply({ embeds: [embed], allowedMentions: { parse: [] } });
 }
 
-const TIP_FAILURE_MESSAGES = {
-  refunded: "❌ The tip could not be delivered and was refunded. Please try again.",
-  unconfirmed: "⚠️ The tip's delivery could not be confirmed. An admin has been alerted to reconcile it — please don't resend.",
-  stranded: "❌ The tip could not be delivered and the refund did not go through. An admin has been alerted to restore your balance.",
-} as const;
-
-/**
- * Credit the recipient. Only a credit that provably did not apply is handed
- * back to the sender; an unconfirmed credit may have landed, so refunding it
- * could pay twice and it is logged for manual repair instead.
- */
-async function creditTipOrRefund(
-  senderId: string,
-  recipientId: string,
-  amount: number,
-  token: TokenSymbol,
-): Promise<"credited" | keyof typeof TIP_FAILURE_MESSAGES> {
-  const [credit] = await creditRecipients([{ discordId: recipientId, amount }], token);
-  if (credit.outcome === "credited") return "credited";
-  if (credit.outcome === "unconfirmed") {
-    console.error(
-      `[Tip] MANUAL REPAIR: credit of ${amount} ${token} from ${senderId} to ${recipientId} is unconfirmed ` +
-      `(${credit.error}); the sender was debited — check the recipient's balance`,
-    );
-    return "unconfirmed";
-  }
-  console.error(`[Tip] Credit of ${amount} ${token} to ${recipientId} failed: ${credit.error}`);
-  const { refundConfirmed } = await refundUndeliveredCredits(senderId, [credit], token, "Tip");
-  return refundConfirmed ? "refunded" : "stranded";
-}
+const TIP_FAILED_MESSAGE = "❌ The tip could not be sent and nothing was taken from your balance. Please try again.";
+const TIP_UNCONFIRMED_MESSAGE =
+  "⚠️ The tip could not be confirmed. An admin has been alerted to check it. Please don't resend.";
 
 /**
  * Admin SATS contribution to the sweep gas sponsor. It sends custodial SATS

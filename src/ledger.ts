@@ -28,6 +28,7 @@ export type LedgerEntryType =
   | "distribute"
   | "drop_create"
   | "drop_claim"
+  | "drop_refund"
   | "event_quest_reward"
   | "quest_reward"
   | "admin_credit"
@@ -55,6 +56,7 @@ const TYPE_LABELS: Record<LedgerEntryType, string> = {
   distribute: "Distribute",
   drop_create: "Drop Created",
   drop_claim: "Drop Claim",
+  drop_refund: "Drop Refund",
   event_quest_reward: "Quest Reward",
   quest_reward: "Quest Reward",
   admin_credit: "Admin Credit",

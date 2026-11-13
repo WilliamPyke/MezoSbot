@@ -119,6 +119,66 @@ export function buildClaimButton(dropId: number, disabled = false) {
 }
 
 /* ------------------------------------------------------------------ */
+/*  Create and cancel                                                 */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Debit the creator and create the drop in one database transaction.
+ * Returns the drop id, or null (nothing debited) when the creator cannot pay.
+ * Throws when the call fails; use isDefiniteDbFailure(error) to tell
+ * "nothing happened" from "may have happened".
+ */
+export async function createFundedDrop(params: {
+  channelId: string;
+  creatorId: string;
+  token: TokenSymbol;
+  total: number;
+  perClaim: number;
+  maxClaims: number;
+  eligibleRoleId: string | null;
+}): Promise<number | null> {
+  const { data, error } = await supabase.rpc("create_drop_funded_v1", {
+    p_channel_id: params.channelId,
+    p_creator_id: params.creatorId,
+    p_token: params.token,
+    p_total: params.total,
+    p_per_claim: params.perClaim,
+    p_max_claims: params.maxClaims,
+    p_eligible_role_id: params.eligibleRoleId,
+  });
+  if (error) throw error;
+  return data == null ? null : Number(data);
+}
+
+/**
+ * Close an active drop and give its creator back what nobody claimed, in one
+ * database transaction. Returns the refund, or null when the drop was no
+ * longer active. Throws when the call fails.
+ */
+export async function cancelDropAndRefund(
+  client: Client | null,
+  drop: { id: number; creatorId: string; token: TokenSymbol; guildId: string | null },
+): Promise<number | null> {
+  const { data, error } = await supabase.rpc("cancel_drop_refund_v1", { p_drop_id: drop.id });
+  if (error) throw error;
+  if (data == null) return null;
+  const refund = Number(data);
+  if (refund > 0) {
+    recordLedgerEntry(client, {
+      type: "drop_refund",
+      amountSats: refund,
+      token: drop.token,
+      senderId: null,
+      receiverId: drop.creatorId,
+      guildId: drop.guildId,
+      referenceType: "drops",
+      referenceId: String(drop.id),
+    });
+  }
+  return refund;
+}
+
+/* ------------------------------------------------------------------ */
 /*  Fetch claimants for a drop                                        */
 /* ------------------------------------------------------------------ */
 
