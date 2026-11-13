@@ -52,7 +52,7 @@ BEGIN
   ASSERT (SELECT balance_sats FROM users WHERE discord_id = 't_alice') = 100, 'no extra debit';
 
   -- Cancel after one claim refunds only the unclaimed part, once.
-  v_claim := claim_drop_atomic(v_drop, 't_bob');
+  v_claim := claim_drop_atomic(v_drop, 't_bob', ARRAY[]::TEXT[], 1, FALSE);
   ASSERT (v_claim->>'ok')::boolean, v_claim::text;
   v_refund := cancel_drop_refund_v1(v_drop);
   ASSERT v_refund = 450, 'refund is total minus claims';
@@ -62,7 +62,7 @@ BEGIN
   ASSERT (SELECT balance_sats FROM users WHERE discord_id = 't_alice') = 550, 'no double refund';
 
   -- A cancelled drop cannot be claimed.
-  v_claim := claim_drop_atomic(v_drop, 't_carol');
+  v_claim := claim_drop_atomic(v_drop, 't_carol', ARRAY[]::TEXT[], 1, FALSE);
   ASSERT NOT (v_claim->>'ok')::boolean, v_claim::text;
   ASSERT (SELECT balance_sats FROM users WHERE discord_id = 't_carol') = 100, 'carol not paid';
 
