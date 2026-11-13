@@ -1,3 +1,5 @@
+// First: it wraps fetch before any module captures it.
+import "./egress.js";
 import {
   ActionRowBuilder,
   ButtonBuilder,

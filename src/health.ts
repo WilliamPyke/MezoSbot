@@ -1,4 +1,5 @@
 import http from "node:http";
+import { meterServer } from "./egress.js";
 
 export async function startBotHealth(port: number, status: () => Record<string, unknown>): Promise<http.Server> {
   const server = http.createServer((request, response) => {
@@ -21,6 +22,7 @@ export async function startBotHealth(port: number, status: () => Record<string, 
     }
     response.end(body);
   });
+  meterServer(server);
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
     server.listen(port, "0.0.0.0", () => resolve());

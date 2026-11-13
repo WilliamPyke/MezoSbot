@@ -9,6 +9,7 @@ import { join, normalize } from "node:path";
 import { WebSocketServer, WebSocket } from "ws";
 import { deflate } from "node:zlib";
 import { promisify } from "node:util";
+import { meterServer } from "./egress.js";
 import {
   getLatestFrameRef,
   subscribeFrames,
@@ -415,6 +416,7 @@ export async function startStream(): Promise<void> {
         sendJson(res, 500, { error: "internal_error" });
       });
     });
+    meterServer(httpServer);
 
     // Spectator WebSocket server for live arcade match viewing.
     const spectateWss = new WebSocketServer({

@@ -12,6 +12,7 @@ import {
 } from "../tokens.js";
 import { verifyWalletFromDeposit } from "../walletVerification.js";
 import { DEPOSIT_FACTORY_ABI, NATIVE_TOKEN } from "./abi.js";
+import { BALANCE_SCAN_ADDRESS, BALANCE_SCAN_CODE, createBalanceScanner } from "./balanceScan.js";
 import { depositSalt, predictForwarder } from "./forwarder.js";
 import {
   RESCAN_BLOCKS,
@@ -27,7 +28,7 @@ import {
   type V2Settings,
 } from "./policy.js";
 import { createReviewDigest } from "./reviewDigest.js";
-import { ethCall, getBlockNumber, getLogs, getReceipt, nodeHasBlock } from "./rpc.js";
+import { ethCall, ethCallWithCode, getBlockNumber, getLogs, getReceipt, isRpcError, nodeHasBlock } from "./rpc.js";
 import { sendCustodyTx } from "./signing.js";
 import { getSweepGasWallet, getV2Settings, isCustodyFrozen, onCustodyV2 } from "./state.js";
 import { readNumberCursor, writeCursor } from "./store.js";
@@ -229,6 +230,7 @@ async function requestSweep(
     ref: row.salt,
   });
   inFlightSweeps.set(key, { txHash, sentAt: Date.now() });
+  lastSweepSentAt = Date.now();
   console.log(`[Deposits] Sweeping ${token} for ${row.discord_id}: ${txHash}`);
   return txHash;
 }
@@ -291,6 +293,13 @@ async function storeObservedBalances(observed: Array<{ discord_id: string; last_
   }
 }
 
+/** One request per chunk of forwarders; a forwarder it could not read is read with single requests. */
+const scanBalances = createBalanceScanner({
+  call: (data) => ethCallWithCode(BALANCE_SCAN_ADDRESS, BALANCE_SCAN_CODE, data),
+  nodeAnswered: isRpcError,
+  warn: (message) => warnOnce("balance-scan", message),
+});
+
 let polling = false;
 
 async function pollOnce(settings: V2Settings): Promise<void> {
@@ -309,9 +318,13 @@ async function pollOnce(settings: V2Settings): Promise<void> {
     let failures = 0;
     let firstError = "";
 
-    const results = await mapWithConcurrency(rows, Math.max(1, config.deposits.balanceConcurrency), async (row) => {
+    const scanned = await scanBalances(
+      rows.map((row) => row.address),
+      tokens.map((token) => assertTokenConfigured(token).contractAddress!),
+    );
+    const results = await mapWithConcurrency(rows.map((row, index) => ({ row, balances: scanned[index] })), Math.max(1, config.deposits.balanceConcurrency), async ({ row, balances }) => {
       const isAdmin = config.discord.adminIds.includes(row.discord_id);
-      const native = await getDepositNativeBalance(row.address);
+      const native = balances ? balances[0]! : await getDepositNativeBalance(row.address);
       const previous = BigInt(row.last_checked_balance || "0");
       if (native > previous) {
         // Verification looks for the challenge transfer itself, so it runs on
@@ -328,8 +341,8 @@ async function pollOnce(settings: V2Settings): Promise<void> {
       }
       if (native > 0n && (isAdmin || native >= minNative)) await sweep(row, "SATS");
 
-      for (const token of tokens) {
-        const balance = await getDepositTokenBalance(row.address, token);
+      for (const [index, token] of tokens.entries()) {
+        const balance = balances ? balances[index + 1]! : await getDepositTokenBalance(row.address, token);
         if (balance === 0n) continue;
         const minimum = isAdmin ? 0n : tokenDecimalToUnits(config.deposits.minimums[token], token);
         if (balance >= minimum) await sweep(row, token);
@@ -353,6 +366,15 @@ async function pollOnce(settings: V2Settings): Promise<void> {
 /* ─────────── Swept log scanner ─────────── */
 
 const SCAN_INTERVAL_MS = 15_000;
+/**
+ * Between scans when the bot has sent no sweep for SCAN_BUSY_MS. A pass costs
+ * about seven requests, and the bot's own sweeps are what the scanner usually
+ * waits for; a sweep sent by anyone else is credited within this interval.
+ */
+const SCAN_IDLE_INTERVAL_MS = 60_000;
+const SCAN_BUSY_MS = 10 * 60_000;
+let lastSweepSentAt = 0;
+let lastScanAt = 0;
 const MAX_CHUNKS_PER_PASS = 25;
 
 function sweptCursor(settings: V2Settings): string {
@@ -520,13 +542,19 @@ export function startForwarderDeposits(onDeposit?: DepositCallback): void {
     const settings = getV2Settings();
     if (!settings) return;
     const poll = () => pollOnce(settings).catch((error) => warnOnce("poll-error", `[Deposits] Poll failed: ${(error as Error).message}`));
-    const scan = () => scanSweptLogs(settings, onDeposit).catch((error) => {
-      warnOnce("scan-error", `[Deposits] Swept scan failed (will retry): ${(error as Error).message}`);
-    });
+    const scan = () => {
+      const now = Date.now();
+      const busy = now - lastSweepSentAt < SCAN_BUSY_MS;
+      if (!busy && now - lastScanAt < SCAN_IDLE_INTERVAL_MS - SCAN_INTERVAL_MS / 2) return;
+      lastScanAt = now;
+      scanSweptLogs(settings, onDeposit).catch((error) => {
+        warnOnce("scan-error", `[Deposits] Swept scan failed (will retry): ${(error as Error).message}`);
+      });
+    };
     setInterval(poll, Math.max(5_000, config.deposits.pollMs));
     setTimeout(poll, Math.max(1_000, config.deposits.initialPollDelayMs));
     setInterval(scan, SCAN_INTERVAL_MS);
     setTimeout(scan, 5_000);
-    console.log(`[Deposits] Custody v2 deposits: forwarder poller every ${config.deposits.pollMs}ms, Swept scanner every ${SCAN_INTERVAL_MS}ms`);
+    console.log(`[Deposits] Custody v2 deposits: forwarder poller every ${config.deposits.pollMs}ms, Swept scanner every ${SCAN_INTERVAL_MS}ms after a sweep, else every ${SCAN_IDLE_INTERVAL_MS}ms`);
   });
 }

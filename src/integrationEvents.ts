@@ -8,12 +8,15 @@ type EventRow = {
 };
 
 const POLL_INTERVAL_MS = 2_000;
+/** Wait after a poll that found nothing. Each poll is a request, and an idle bot made 43,000 a day at 2 seconds. */
+const IDLE_POLL_INTERVAL_MS = 15_000;
 const PURGE_INTERVAL_MS = 60 * 60_000;
 const PURGE_BATCH_SIZE = 5000;
 const PURGE_MAX_BATCHES = 50;
 
 /**
- * Outbox consumer. Delivery is poll-only: claim_integration_events_v1 locks a
+ * Outbox consumer. It polls every 2 seconds while events arrive and every 15
+ * seconds once a poll comes back empty. Delivery is poll-only: claim_integration_events_v1 locks a
  * batch with FOR UPDATE SKIP LOCKED, so several bot replicas can poll safely.
  * integration_events is intentionally NOT in the supabase_realtime publication
  * (see migrations/2026-08-12_modular_runtime.sql). Failed events back off and
@@ -24,10 +27,13 @@ export function startIntegrationEventConsumer(handler: (event: GameEvent) => Pro
   const workerId = `bot:${process.env.NORTHFLANK_SERVICE_ID ?? process.pid}:${crypto.randomUUID()}`;
   let polling = false;
   let stopped = false;
+  let nextPollAt = 0;
 
   const poll = async () => {
-    if (polling || stopped) return;
+    if (polling || stopped || Date.now() < nextPollAt) return;
     polling = true;
+    // A failed poll also waits the idle interval.
+    nextPollAt = Date.now() + IDLE_POLL_INTERVAL_MS - POLL_INTERVAL_MS / 2;
     try {
       const { data, error } = await supabase.rpc("claim_integration_events_v1", {
         p_worker_id: workerId,
@@ -35,6 +41,7 @@ export function startIntegrationEventConsumer(handler: (event: GameEvent) => Pro
         p_lock_seconds: 30,
       });
       if (error) throw error;
+      if ((data ?? []).length > 0) nextPollAt = 0;
       for (const row of (data ?? []) as EventRow[]) {
         let success = false;
         let failure = "invalid_event";

@@ -46,6 +46,11 @@ export async function ethCall(to: string, data: string, from?: string, block: nu
   return raw;
 }
 
+/** eth_call to `to` with `code` placed there for this call only (a state override); nothing is deployed. */
+export async function ethCallWithCode(to: string, code: string, data: string): Promise<unknown> {
+  return rawRpcCall("eth_call", [{ to, data }, "latest", { [to]: { code } }]);
+}
+
 /** Multicall3, deployed at the same address on Mezo mainnet and most EVM chains. */
 export const MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11";
 const MULTICALL3 = new ethers.Interface([
