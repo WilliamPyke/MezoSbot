@@ -56,7 +56,13 @@ export function rejectLongRateLimit(info: RateLimitData): boolean {
  */
 export function watchDiscordRateLimits(client: Client): void {
   const log = throttledLogger("[Discord] 429");
+  const tally = createInvalidRequestTally();
+  setInterval(() => {
+    const line = tally.report();
+    if (line) console.warn(line);
+  }, INVALID_WINDOW_MS).unref();
   client.rest.on(RESTEvents.Response, (request, response) => {
+    tally.add(request.method.toUpperCase(), request.route, response.status);
     if (response.status !== 429) return;
     const headers = response.headers;
     const summary =
@@ -69,4 +75,38 @@ export function watchDiscordRateLimits(client: Client): void {
       .catch(() => "")
       .then((body) => log(`${summary} body=${JSON.stringify(String(body).replace(/\s+/g, " ").slice(0, 160))}`));
   });
+}
+
+/**
+ * Discord blocks an IP address for about an hour (Cloudflare "error code: 1015")
+ * once it sends 10,000 requests in 10 minutes that end in 401, 403 or 429.
+ * Counting this bot's own invalid requests over the same window shows whether
+ * the bot caused a block, or something else sharing the host's IP did.
+ */
+export const INVALID_WINDOW_MS = 10 * 60_000;
+const INVALID_STATUSES = new Set([401, 403, 429]);
+
+export function createInvalidRequestTally() {
+  let total = 0;
+  const invalid = new Map<string, number>();
+  return {
+    add(method: string, route: string, status: number): void {
+      total += 1;
+      if (!INVALID_STATUSES.has(status)) return;
+      const key = `${status} ${method} ${route}`;
+      invalid.set(key, (invalid.get(key) ?? 0) + 1);
+    },
+    /** One line for the window just ended, or null when it had no invalid requests; then starts a new window. */
+    report(): string | null {
+      const count = [...invalid.values()].reduce((sum, n) => sum + n, 0);
+      const top = [...invalid.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([key, n]) => `${key} x${n}`);
+      const line = count === 0
+        ? null
+        : `[Discord] ${count} invalid request(s) (401/403/429) of ${total} in the last 10 min; ` +
+          `Discord blocks the IP at 10000: ${top.join(", ")}`;
+      total = 0;
+      invalid.clear();
+      return line;
+    },
+  };
 }
