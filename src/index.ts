@@ -1,5 +1,6 @@
 // First: it wraps fetch before any module captures it.
 import "./egress.js";
+import { rejectLongRateLimit, watchDiscordRateLimits } from "./discordRateLimits.js";
 import {
   ActionRowBuilder,
   ButtonBuilder,
@@ -120,7 +121,9 @@ let discordState = "not_started";
 const client = new Client({
   intents,
   partials: [Partials.Channel],
+  rest: { rejectOnRateLimit: rejectLongRateLimit },
 });
+watchDiscordRateLimits(client);
 
 const commandMap = new Map(commands.map((c) => [c.data.name, c.execute]));
 const autocompleteMap = new Map(
@@ -589,7 +592,7 @@ async function handleInteraction(interaction: Interaction): Promise<void> {
       console.warn(`[Discord] /${interaction.commandName} token expired (arrivalLag=${arrivalLagMs}ms, totalMs=${Date.now() - startMs}) — interaction was likely stale on arrival`);
       return;
     }
-    console.error(`Command /${interaction.commandName} error:`, (err as Error)?.message ?? err);
+    console.error(`Command /${interaction.commandName} error:`, (err as Error)?.message || (err as Error)?.name || err);
     const msg = { content: "❌ Something went wrong.", flags: MessageFlags.Ephemeral as const };
     if (interaction.replied || interaction.deferred) {
       await interaction.followUp(msg).catch(() => {});
