@@ -7,7 +7,8 @@
   "observability": { "enabled": true },
   "triggers": { "crons": ["*/10 * * * *"] },
   "vars": {
-    // The Render service URL, without a trailing slash.
-    "RENDER_URL": "https://mezosbot-r9bj.onrender.com"
+    // The Render service URL, without a trailing slash (the Ohio service since 2026-11-14;
+    // the Virginia one, mezosbot-r9bj, is suspended).
+    "RENDER_URL": "https://mezosbot-owcz.onrender.com"
   }
 }

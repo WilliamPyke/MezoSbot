@@ -1,13 +1,21 @@
-# Render free web service running the bot image (deploy/Dockerfile.bot), deployed on every push to
-# TestingRender. Variables are set in the dashboard. A free service sleeps after 15 minutes without
-# inbound traffic; deploy/render-keepalive pings /healthz every 10 minutes to keep it awake.
+# Render free web service running the bot, deployed on every push to TestingRender. Since
+# 2026-11-14 it is the Ohio service (mezosbot-owcz), a native Node service; the original Virginia
+# Docker service (mezosbot-r9bj) is suspended. It moved because Discord's Cloudflare blocked the
+# Virginia service's shared outbound IP ("error code: 1015").
+#
+# MEZOSBOT_RUNTIME_ROLE=bot must be set in the dashboard: the Docker image set it itself, a native
+# service does not, and without it the bot starts in the legacy role.
+#
+# Variables are set in the dashboard. A free service sleeps after 15 minutes without inbound
+# traffic; deploy/render-keepalive pings /healthz every 10 minutes to keep it awake.
 services:
   - type: web
-    name: mezosbot
-    runtime: docker
+    name: MezoSbot
+    runtime: node
+    region: ohio
     plan: free
     branch: TestingRender
-    dockerfilePath: ./deploy/Dockerfile.bot
-    dockerContext: .
+    buildCommand: npm install && npm run build
+    startCommand: npm run start
     healthCheckPath: /healthz
     autoDeploy: true
